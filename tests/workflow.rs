@@ -1072,3 +1072,29 @@ fn report_fails_on_malformed_sensors_and_ignores_unrelated_candidate_names() {
     assert_eq!(report().status.code(), Some(2), "truncated sensors.json");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn sensors_documents_must_be_objects() {
+    assert!(omgs::shape::sensors("[[],[],[]]").is_err());
+    assert!(omgs::shape::sensors(
+        r#"{"tools_run":[],"tools_unavailable":[],"hits":[["gitleaks","r","f",1,false]]}"#
+    )
+    .is_err());
+    assert!(
+        omgs::shape::sensors(r#"{"tools_run":[],"tools_unavailable":[],"hits":[],"hits":[]}"#)
+            .is_err()
+    );
+    assert!(omgs::shape::sensors(r#"{"tools_run":["gitleaks"],"tools_unavailable":[],"hits":[{"tool":"gitleaks","rule":"r","file":"f","line":1,"vendored":false}]}"#).is_ok());
+    let dir = scratch("sensors-array");
+    std::fs::write(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    std::fs::write(dir.join("sensors.json"), "[[],[],[]]").unwrap();
+    let out = omgs(&[
+        "report",
+        "--findings",
+        dir.join("findings.json").to_str().unwrap(),
+        "--out",
+        dir.join("out").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let _ = std::fs::remove_dir_all(&dir);
+}
