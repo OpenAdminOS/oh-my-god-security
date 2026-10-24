@@ -1,0 +1,79 @@
+# OMGS feature coverage from field rounds
+
+Status after rounds on 2026-10-16: the first six projects, the next twenty projects, implementation reruns, and targeted proof rounds. Tested means exercised end to end with evidence in this session. Partial means the surface ran but a decisive path remains unproven. Untested means the capability exists in code or docs but no field evidence exists yet.
+
+## CLI commands
+
+| Surface | Status | Evidence |
+| --- | --- | --- |
+| setup dry run and --yes | Tested | Installed into three agent skill directories, byte identical, idempotent on rerun. |
+| review --repo-url | Tested | Cloned a GitHub repo, initialized a run, reused the clone on a second call and created run-2. |
+| audit init | Tested | 26 field targets plus reruns. Stack detection, sensors, outside-tree enforcement, owner-only permissions, shared-temp warning, gate and advisory metadata. |
+| validate | Tested | 26 report sets accepted; deliberately invalid records rejected for fingerprint, severity, proof tier, and evidence violations with exit 1. |
+| fingerprint | Tested | Stable across repeated and case-variant inputs. Used by every hunter record. |
+| prove, Seatbelt backend | Tested | Scratch write allowed, outside write denied, network denied, timeout enforced. Full target template executed in sandbox and produced the first confirmed finding. Seatbelt does not isolate the process list, observed when a proof ran pgrep. |
+| prove, MXC backend | Partial | Real MXC v1.0.0 executor on the Windows mini PC: config-based backend in OMGS, dry-run validation passes, cmd workloads contained (scratch write allowed, outside write denied, network denied). PowerShell hosts fail DLL initialization from an SSH session despite desktop UI isolation; see multi-machine results. |
+| prove, bubblewrap backend | Tested | Linux NUC: scratch write allowed, outside write denied on a read-only root, network denied, timeout enforced. |
+| report (Markdown, HTML, SARIF) | Tested | 26 targets rendered; HTML escaping and zero external requests covered by unit tests; SARIF emitted one result for the single confirmed finding and parses as JSON. |
+| ledger set | Tested | Valid transitions applied, unknown unit rejected with exit 2. |
+| check | Partial | Sensor execution and proof-test counting verified. Trufflehog, osv-scanner, and semgrep paths are detection only in code and were unavailable on the test machine. |
+| Gate enforcement | Untested by design gap | Mode is recorded in metadata and reports, but no CLI command fails a build in gate mode. Locked design says deterministic proof tests gate in the target CI, which no field target has exercised yet. |
+
+## Proof tiers and lifecycle
+
+| Surface | Status | Evidence |
+| --- | --- | --- |
+| Tier 0 traced | Tested | 79 records across 26 projects. |
+| Tier 2 sandbox exploited | Tested once | Intune Drive Mapping Generator: unmodified target template plus generator-faithful replacement executed in Seatbelt sandbox; injected statement printed the marker. Record upgraded to confirmed, high severity, by an independent verifier pass. |
+| Tier 1 test proven | Partial | The tier is enforced by validation and unit tests, but no field proof has yet run through a target project's own test runner. The AppPruner shell interpolation was replicated line-faithfully in the sandbox and deliberately left at needs validation. |
+| Finding identity across runs | Tested | Same inputs produce identical fingerprints across invocations; prior findings revalidated and re-rendered in fresh run directories. Cross-run automatic deduplication does not exist yet. |
+| Intent questions to policy | Partial | Questions are generated and rendered everywhere. Answering one into committed target policy has never been exercised because no policy file format is implemented. |
+| Fix brief to fix to green test | Untested | Fix briefs exist on records. No field target has gone through fix application and proof re-run. |
+| Sensors | Partial | Gitleaks executed on 26 targets with redaction and vendored flags. Sensor hits are not yet converted into dispositioned finding records. |
+
+## Skill packs
+
+| Pack | Status | Field evidence |
+| --- | --- | --- |
+| generated-script-safety | Tested | Dominant class across both batches, including the one confirmed finding. |
+| feed-to-policy | Tested | Feed rollback, fail-open conversions, and filter broadening candidates. |
+| privileged-local-ops | Tested | Deletion, symlink, guest-to-host, and elevated helper candidates. |
+| powershell | Tested | Majority of field targets. |
+| nextjs-authz | Partial | Applied in scoped Next.js reviews; no route-level proof attempted. |
+| data-isolation-and-rls | Partial | Tenant candidates traced in several targets; no live schema or RLS proof. |
+| client-only-auth | Partial | Static targets reviewed for DOM and client trust; no dedicated middleware-gap candidate survived. |
+| webhooks-and-integrations | Partial | One unsigned-webhook shape appeared in the sample report design only; no field target produced a webhook candidate. Weakest pack evidence. |
+
+## Multi-machine results (Tailscale mini PCs, 2026-10-16)
+
+| Host | Result |
+| --- | --- |
+| Mac mini (macOS 27, arm64) | The locally built arm64 binary ran unchanged. Setup dry run, stack detection, and Seatbelt containment (scratch write allowed, outside write denied, network denied) all passed. |
+| Linux NUC (Ubuntu, x86_64) | Built from source with a user level Rust toolchain. All 9 tests passed. Bubblewrap containment passed every check: scratch write, outside write denied with a read-only root, network namespace denied, timeout enforced. |
+| Windows mini PC (Windows build 26200, AMD64) | Built from source with the GNU Rust toolchain, all 9 tests passed, and setup, stack detection, audit init, and check all ran. `prove` correctly failed closed with exit 3 before MXC was installed. With MXC SDK v1.0.0 release binaries installed and the new config-based OMGS backend, cmd workloads run contained: scratch write allowed, outside write denied, network denied. Native PowerShell AST parsing independently confirmed the Drive Mapping breakout statements. Two Windows-only bugs were found and fixed through this host: canonicalized extended-length paths that cmd.exe rejects, and the MXC environment and UI policy requirements. One limitation remains: both PowerShell hosts fail with STATUS_DLL_INIT_FAILED inside MXC when launched from an SSH session, even with ui.disable false and processContainer desktop isolation applied and dry-run validation passing. This matches MXC's documented PowerShell UI restriction sensitivity and likely requires an interactive desktop session to test further. Windows Sandbox is disabled on this host. |
+
+## Cold install results (skill first path, 2026-10-16)
+
+Timed runs from a clean fake home to a validated `REPORT.html`, against the locally staged unsigned v0.1.0 bundle in `dist/v0.1.0` served over the tailnet. Both bootstrap scripts verify the downloaded asset against the bundle `SHA256SUMS` and fail closed on mismatch. The sample target produced zero findings, so these runs prove the install and empty-report chain, not finding quality. Download time over a LAN is not representative of the public internet.
+
+| Host | Result |
+| --- | --- |
+| macOS (this Mac, fake HOME) | 2.6 s end to end. Real Skills CLI install (`npx skills add`), POSIX bootstrap downloaded and checksum verified the arm64 binary, then audit init, validate, and report all exited 0 with `REPORT.html` produced. |
+| Linux NUC over SSH | 0.5 s for bootstrap to report. POSIX bootstrap checksum verified the x86_64 Linux binary; audit init, validate, and report passed. The Skills CLI install was verified separately on this host (`npx skills add` installed `SKILL.md` into a fresh project). |
+| Windows mini PC over SSH | 2.5 s for bootstrap to report. PowerShell bootstrap checksum verified the Windows exe; audit init, validate, and report passed. The Skills CLI install was verified separately on this host the same way. |
+
+First cold run attempt failed on both remote hosts for a test-harness reason only: the script targeted a stale Tailscale address for this Mac. After correcting the address, both passed unchanged. Remaining install gaps: the bundle is unsigned and unpublished, so the public GitHub Releases path, code signing and notarization, and first-run OS prompts are still unproven.
+
+## Field run 2026-10-23 (Swift macOS updater with root helper)
+
+One public third party target reviewed through `omgs review --repo-url` in advisory mode at a pinned commit. Details remain in the private run directory pending disclosure.
+
+- Full pipeline exercised: review clone, audit init (stack `swift`, 74 files, gitleaks 0 hits), two isolated Red hunters, Blue verification, `omgs prove` (Seatbelt), an independent evaluator pass with adjudicated corrections, `validate` (13 records), `ledger set`, and `report` producing agreeing HTML, Markdown, JSON, and SARIF outside the target tree. The target worktree was never written to. Final verdicts: 0 confirmed, 10 needs validation, 3 rejected.
+- Tier 1 stays partial, with a sharper data point: invariant assertions executed against unmodified target modules inside `omgs prove` with an authorized control, but through a `swiftc` built harness because `swift test` cannot run under the Seatbelt profile. The independent evaluator correctly refused the `test_proven` label for that substitution, and both affected records were demoted to traced needs-validation. Executed-invariant evidence without the project test runner is now a proven recipe and a known labeling boundary.
+- Blue disproof produced rejected records with sandbox counterevidence, the first field run where rejected candidates were decided by executed tests (archive tool behavior with the helper's exact flags) rather than source reading alone. The evaluator also overturned one needs-validation record to rejected (defense-in-depth without an attacker capability) and added two missed needs-validation records (destination swap pinning, helper resource budgets).
+- New sandbox limits observed: daemon mediated writes (preferences through cfprefsd) escape file containment, and `NSTemporaryDirectory()` ignores the scratch home. Both are recorded as suite learnings in IMPROVEMENTS.md.
+- Root-level confirmation was deferred during the main run: records requiring an installed root helper or a Developer ID signed probe package stayed needs validation with manual validation plans. The signer-trust and downgrade records are decision-logic defects and are now proven the way every user can reproduce them: a sandboxed tier 1 invariant test on the decision function, shipped as the `benchmark/fixtures/installer-trust` reproducer (vulnerable fails, fixed passes, entirely inside `omgs prove`, no VM). A separate live run did first exercise the real helper's paths as root, which established the effect; it ran on a machine that turned out to be productive rather than disposable, a mistake that was remediated (Gatekeeper re-enabled, passwordless sudo and test artifacts removed). That kind of live run is now the optional `dedicated_host` tier (impact only, throwaway VM, never required). Two symlink-handling leads were refuted. The write-ups are in [field-cases.md](field-cases.md) (candidates 4 to 6); vendor material stays in the private run directory.
+
+## Not yet existing, therefore untestable
+
+Signed release binaries and package-manager distribution, proof test staging into target suites, base-branch policy loading, batch mode, benchmark runner, and model rerouting on refusal. These are tracked in IMPROVEMENTS.md.

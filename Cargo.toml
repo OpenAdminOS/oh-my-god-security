@@ -1,0 +1,13 @@
+[package]
+name = "omgs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Deterministic runner for agent driven security audits. Red hunts, blue verifies, green guards."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
