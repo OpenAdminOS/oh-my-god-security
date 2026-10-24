@@ -5,11 +5,12 @@
 // signing material and performs no install; it only exercises the pure decision
 // function `decide(_:)` provided by the target source in vulnerable/ or fixed/.
 //
-// Build and run one snapshot, for example:
-//   swiftc probe.swift vulnerable/Verifier.swift -o /tmp/probe && /tmp/probe
-// The vulnerable snapshot violates the invariants and exits non-zero; the fixed
-// snapshot upholds them and the authorized control, and exits zero. Run it
-// through `omgs prove` so the compile and execution stay sandboxed.
+// Run one snapshot through the sandbox, writing the binary to scratch:
+//   omgs prove --cwd benchmark/fixtures/installer-trust \
+//     --cmd 'swiftc main.swift vulnerable/Verifier.swift -o "$TMPDIR/probe" && "$TMPDIR/probe"'
+// The vulnerable snapshot violates the invariants and exits non-zero; swap
+// vulnerable for fixed and it upholds them plus the authorized control and exits
+// zero. See README.md. Keep compile and execution inside `omgs prove`.
 
 import Foundation
 

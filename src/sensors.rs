@@ -111,10 +111,28 @@ fn run_semgrep(target: &Path, scratch_dir: &Path, report: &mut SensorsReport) {
         report.tools_unavailable.push("semgrep".into());
         return;
     }
+    let registry_ok = std::env::var("OMGS_SEMGREP_ALLOW_REGISTRY").is_ok_and(|v| v == "1");
+    // A nonempty OMGS_SEMGREP_CONFIG is only trusted when it names an existing
+    // local file or directory. A registry shorthand ("auto", "p/default"), a
+    // URL, or any nonexistent value would make semgrep fetch rules over the
+    // network, so it is allowed only under the explicit registry opt-in.
     let config = match std::env::var("OMGS_SEMGREP_CONFIG") {
-        Ok(c) if !c.trim().is_empty() => c,
+        Ok(c) if !c.trim().is_empty() => {
+            let raw = c.trim();
+            let path = Path::new(raw);
+            if path.exists() {
+                std::fs::canonicalize(path)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| raw.to_string())
+            } else if registry_ok {
+                raw.to_string()
+            } else {
+                report.tools_unavailable.push("semgrep".into());
+                return;
+            }
+        }
         _ => {
-            if std::env::var("OMGS_SEMGREP_ALLOW_REGISTRY").is_ok_and(|v| v == "1") {
+            if registry_ok {
                 "auto".into()
             } else {
                 // Present but no offline ruleset: do not fetch rules silently.
@@ -140,13 +158,17 @@ fn run_semgrep(target: &Path, scratch_dir: &Path, report: &mut SensorsReport) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    if status.is_ok() {
-        report.tools_run.push("semgrep".into());
-        if let Ok(text) = std::fs::read_to_string(&raw) {
-            parse_semgrep(&text, target, report);
+    // semgrep exits 0 with no findings and 1 with findings; both are a real
+    // scan. Any other code (bad rules, invalid YAML, internal error) or a
+    // signal is a failed scan and must not look like a clean, zero-hit run.
+    match status.as_ref().map(|s| s.code()) {
+        Ok(Some(0)) | Ok(Some(1)) => {
+            report.tools_run.push("semgrep".into());
+            if let Ok(text) = std::fs::read_to_string(&raw) {
+                parse_semgrep(&text, target, report);
+            }
         }
-    } else {
-        report.tools_unavailable.push("semgrep".into());
+        _ => report.tools_unavailable.push("semgrep".into()),
     }
     let _ = std::fs::remove_file(&raw);
 }

@@ -189,7 +189,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         }
     }
     let hunters = flag(args, "--hunters").and_then(|s| s.parse::<u32>().ok());
-    let verifier = flag(args, "--verifier");
+    let verifier = flag(args, "--verifier").filter(|s| !s.trim().is_empty());
     let agent_calls = flag(args, "--agent-calls").and_then(|s| s.parse::<u32>().ok());
     if hunters.is_none() || verifier.is_none() || agent_calls.is_none() {
         eprintln!(

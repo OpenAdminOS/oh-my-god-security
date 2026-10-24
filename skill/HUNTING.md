@@ -10,7 +10,7 @@ Stop on a complete candidate, a traced effective control, a precise blocker, or 
 
 ## Candidate contract
 
-Candidates are hypotheses, not confirmed findings. This is the agent handoff contract, not an extension to the CLI findings schema. Each hunter writes its candidates as a schema-shaped file into the run directory, validated against [schemas/candidates.schema.json](../schemas/candidates.schema.json), plus a short prose summary, so deduplication and fingerprinting are mechanical rather than hand-merged from free-form reports. Return structured records with these fields and no severity:
+Candidates are hypotheses, not confirmed findings. This is the agent handoff contract, not an extension to the CLI findings schema. Each hunter writes its candidates as a schema-shaped file into the run directory, validated against [schemas/candidates.schema.json](schemas/candidates.schema.json), plus a short prose summary, so deduplication and fingerprinting are mechanical rather than hand-merged from free-form reports. Return structured records with these fields and no severity:
 
 | Field | Content |
 | --- | --- |

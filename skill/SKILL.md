@@ -40,6 +40,8 @@ The runner must attest an OS enforced sandbox with external network denied, isol
 
 Store draft tests outside the target. The runner must stage them and any writable build workspace in its assigned scratch while preserving the read only target. If it cannot do so, stop execution. If any sandbox control, dependency, runtime, or needed local service is unavailable, retain the highest earned tier, record the exact blocker and a safe local manual validation plan. Never run an unsandboxed fallback. Stop immediately on an unexpected external destination, real secret, or effect outside the synthetic fixture.
 
+The one case that executes a capability the process sandbox cannot grant (real root, Gatekeeper) is the optional tier 3 `dedicated_host` path in [VALIDATION-AND-REPORTING.md](VALIDATION-AND-REPORTING.md). It does not relax this rule: containment moves to a dedicated, network-isolated, disposable VM that is itself the boundary, and the step runs through `omgs prove` wherever it still fits. It is never a fallback to unprotected execution on the review host or any machine with real data, is never required, and if a disposable isolated host cannot be guaranteed the record stays `needs_validation`.
+
 ## Six phases
 
 1. **Initialize.** Run `omgs audit init` with the resolved setup values through the documented interface. Record source identity, trusted base policy, mode, limits, and locally available tools. Let deterministic sensors inspect secrets and supply chain data; do not spend model calls duplicating those sensors or execute target code for reconnaissance.
