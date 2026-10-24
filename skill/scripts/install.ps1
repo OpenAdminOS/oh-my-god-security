@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 $Base = if ($env:OMGS_RELEASE_BASE) { $env:OMGS_RELEASE_BASE } else { 'https://github.com/OpenAdminOS/oh-my-god-security/releases/latest/download' }
 $DestRoot = if ($env:OMGS_HOME) { $env:OMGS_HOME } else { Join-Path $env:USERPROFILE '.local\share\omgs' }
 $Dest = Join-Path $DestRoot 'bin'
-$asset = 'omgs-x86_64-pc-windows-gnu.exe'
+$asset = 'omgs-x86_64-pc-windows-msvc.exe'
 
 $tmp = Join-Path $env:TEMP ('omgs-bootstrap-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force $tmp | Out-Null

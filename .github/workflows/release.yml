@@ -1,0 +1,176 @@
+name: release
+
+# Build, sign, and publish the per-platform omgs binaries that the skill's
+# first-run bootstrap (skill/scripts/install.sh and install.ps1) downloads and
+# verifies against SHA256SUMS. Triggered by pushing a version tag, for example
+# `git tag v0.1.0 && git push origin v0.1.0`.
+#
+# Required secrets (set once at the OpenAdminOS org level; the same names as the
+# proven TenuVault pipeline, so one set serves both repos):
+#   macOS notarization + signing:
+#     MAC_CSC_LINK                 base64 of the Developer ID Application .p12
+#     MAC_CSC_KEY_PASSWORD         password for that .p12
+#     APPLE_API_KEY                contents of the App Store Connect .p8 key
+#     APPLE_API_KEY_ID             the key id
+#     APPLE_API_ISSUER             the issuer id
+#   Windows via Azure Trusted Signing (app: openadminos-signing):
+#     AZURE_SIGNING_TENANT_ID
+#     AZURE_SIGNING_CLIENT_ID
+#     AZURE_SIGNING_CLIENT_SECRET
+#     AZURE_TRUSTED_SIGNING_ENDPOINT
+#     AZURE_TRUSTED_SIGNING_ACCOUNT_NAME
+#     AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME
+#     AZURE_TRUSTED_SIGNING_PUBLISHER_NAME
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (for manual runs)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build both arches
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Sign and notarize
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          for v in MAC_CSC_LINK MAC_CSC_KEY_PASSWORD APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER; do
+            if [ -z "${!v:-}" ]; then echo "::error::missing signing secret $v"; exit 1; fi
+          done
+          # Import the Developer ID cert into a dedicated keychain this job owns.
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kpw="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+          security create-keychain -p "$kpw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kpw" "$keychain"
+          printf '%s' "$MAC_CSC_LINK" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MAC_CSC_KEY_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kpw" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk '/Developer ID Application/ {print $2; exit}')"
+          if [ -z "$identity" ]; then echo "::error::no Developer ID Application identity in the imported cert"; exit 1; fi
+          printf '%s' "$APPLE_API_KEY" > "$RUNNER_TEMP/api.p8"
+          mkdir -p dist
+          for pair in "aarch64-apple-darwin:omgs-aarch64-apple-darwin" "x86_64-apple-darwin:omgs-x86_64-apple-darwin"; do
+            target="${pair%%:*}"; asset="${pair##*:}"
+            bin="target/$target/release/omgs"
+            codesign --force --timestamp --options runtime --keychain "$keychain" --sign "$identity" "$bin"
+            codesign --verify --strict --verbose=2 "$bin"
+            ( cd "$(dirname "$bin")" && /usr/bin/ditto -c -k "omgs" "$RUNNER_TEMP/$asset.zip" )
+            xcrun notarytool submit "$RUNNER_TEMP/$asset.zip" \
+              --key "$RUNNER_TEMP/api.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait
+            cp "$bin" "dist/$asset"
+          done
+          security delete-keychain "$keychain" || true
+          rm -f "$RUNNER_TEMP/api.p8" "$RUNNER_TEMP/cert.p12"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  linux:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: omgs-x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: omgs-aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: |
+          set -euo pipefail
+          cargo build --release --locked --target ${{ matrix.target }}
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/omgs" "dist/${{ matrix.asset }}"
+          strip "dist/${{ matrix.asset }}" || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: dist/*
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          mkdir -p dist
+          cp "target/x86_64-pc-windows-msvc/release/omgs.exe" "dist/omgs-x86_64-pc-windows-msvc.exe"
+      - name: Sign with Azure Trusted Signing
+        uses: azure/trusted-signing-action@v0.5.9
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_SIGNING_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  release:
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+      - name: Assemble assets and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find staging -type f -name 'omgs-*' -exec cp {} release/ \;
+          cd release
+          ls -1
+          sha256sum omgs-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            release/omgs-*
+            release/SHA256SUMS
+          fail_on_unmatched_files: true
