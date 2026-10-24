@@ -26,14 +26,14 @@ pub struct Ledger {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// `id`, `surface`, `attack_classes`, and `status` are required, matching the
+/// ledger schema, so a unit with a dropped or misspelled field fails to parse
+/// instead of passing with a default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Unit {
     pub id: String,
-    #[serde(default)]
     pub surface: String,
-    #[serde(default)]
     pub attack_classes: Vec<String>,
-    #[serde(default = "planned")]
     pub status: String,
     /// What shows the unit was examined: finding fingerprints, candidate
     /// files, or repo paths.
@@ -44,10 +44,6 @@ pub struct Unit {
     pub note: Option<String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-fn planned() -> String {
-    "planned".into()
 }
 
 impl Unit {
@@ -69,6 +65,9 @@ impl Unit {
 /// Rule violations for one unit, without the "units[i]" prefix.
 fn unit_errors(u: &Unit) -> Vec<String> {
     let mut errors = Vec::new();
+    if u.surface.trim().is_empty() {
+        errors.push("surface is empty".into());
+    }
     if !STATUSES.contains(&u.status.as_str()) {
         errors.push(format!(
             "status '{}' is not one of {}",

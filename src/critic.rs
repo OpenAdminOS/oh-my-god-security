@@ -9,24 +9,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// The fields of a hunter candidate the critic reads. Everything else in the
-/// candidates schema is prose for the verifier.
+/// candidates schema is prose for the verifier. Every field is required, so a
+/// candidate with a dropped identity input fails to parse instead of being
+/// fingerprinted over a default.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Candidate {
-    #[serde(default)]
     pub fingerprint: String,
-    #[serde(default)]
-    pub hunter: Option<String>,
-    #[serde(default)]
+    pub hunter: String,
     pub unit_ids: Vec<String>,
-    #[serde(default)]
     pub title: String,
-    #[serde(default)]
     pub attack_class: String,
-    #[serde(default)]
     pub entry_point: String,
-    #[serde(default)]
     pub sink: String,
-    #[serde(default)]
     pub boundary: String,
 }
 
@@ -111,6 +105,17 @@ pub fn critique(
         let c = &sc.candidate;
         let at = format!("{} candidate '{}'", sc.file, c.title);
         let expected = crate::fingerprint(&c.attack_class, &c.entry_point, &c.sink, &c.boundary);
+        for (name, value) in [
+            ("title", &c.title),
+            ("attack_class", &c.attack_class),
+            ("entry_point", &c.entry_point),
+            ("sink", &c.sink),
+            ("boundary", &c.boundary),
+        ] {
+            if value.trim().is_empty() {
+                gaps.push(format!("{at}: {name} is empty"));
+            }
+        }
         if !is_fingerprint(&c.fingerprint) {
             gaps.push(format!(
                 "{at}: fingerprint '{}' is not an omgs fingerprint",
@@ -124,7 +129,7 @@ pub fn critique(
                 c.fingerprint
             ));
         }
-        match identity(&c.hunter) {
+        match identity(&Some(c.hunter.clone())) {
             Some(h) => {
                 hunters.entry(c.fingerprint.as_str()).or_default().insert(h);
             }
