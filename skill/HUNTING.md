@@ -10,10 +10,11 @@ Stop on a complete candidate, a traced effective control, a precise blocker, or 
 
 ## Candidate contract
 
-Candidates are hypotheses, not confirmed findings. This is the agent handoff contract, not an extension to the CLI findings schema. Each hunter writes its candidates as a schema-shaped file into the run directory, validated against [schemas/candidates.schema.json](schemas/candidates.schema.json), plus a short prose summary, so deduplication and fingerprinting are mechanical rather than hand-merged from free-form reports. Return structured records with these fields and no severity:
+Candidates are hypotheses, not confirmed findings. This is the agent handoff contract, not an extension to the CLI findings schema. Each hunter writes its candidates as a schema-shaped file named `candidates-<hunter>.json` into the run directory (an empty `candidates` list when it found nothing), validated against [schemas/candidates.schema.json](schemas/candidates.schema.json), plus a short prose summary, so deduplication and fingerprinting are mechanical rather than hand-merged from free-form reports. Return structured records with these fields and no severity:
 
 | Field | Content |
 | --- | --- |
+| `hunter` | The hunter's own identity, such as `red-installer`. The record's `hunted_by` repeats it, and the verifier must be someone else. |
 | `unit_ids`, `source_ref` | Ledger provenance and exact reviewed source. |
 | `title`, `attack_class` | Concrete claimed unauthorized result and stable class identifier. |
 | `entry_point` | Repository-relative path plus HTTP method/route or exported action symbol. |
@@ -28,7 +29,7 @@ Candidates are hypotheses, not confirmed findings. This is the agent handoff con
 | `proof_plan` | Minimum synthetic fixture, safe invariant assertion, expected vulnerable failure and control success, local prerequisites, and stop condition. |
 | `fingerprint` | Output from `omgs fingerprint` using the four identity inputs below. |
 
-Use stable attack class names across runs, such as `missing_authorization`, `idor`, `tenant_isolation`, `webhook_verification`, `webhook_replay`, `integration_url`, and `client_only_authorization`. Apply the installed CLI's canonicalization and accepted schema; this vocabulary does not invent extra schema fields.
+Use stable attack class names across runs, starting from the ones `omgs audit init` seeds into the ledger (such as `missing_authz`, `idor_tenant_isolation`, `client_only_auth`, `webhook_signature`, `generated_script_injection`, `feed_to_policy_write`, `privileged_local_ops`). Apply the installed CLI's canonicalization and accepted schema; this vocabulary does not invent extra schema fields.
 
 ## Identity and deduplication
 
@@ -40,4 +41,4 @@ Merge duplicate traces into one candidate without discarding unit provenance or 
 
 The critic challenges the ledger, not just the candidate list. Check that every discovered handler method, action, principal transition, data access path, and relevant backend delegation has a unit and disposition. Look for unassigned units, UI-only assumptions, uncovered middleware matchers, alternate privileged clients, and unexamined methods behind a reviewed URL.
 
-For each gap, add a bounded unit or record why it remains unexamined. Reconcile assignments, evidence, source revisions, duplicate fingerprints, and exhausted budgets. Send candidates to a fresh verifier with source and counterevidence. Do not endorse them by consensus, promote source traces to confirmed, or claim completeness because all dispatched hunters returned.
+For each gap, add a bounded unit with `omgs ledger add` or record why it remains unexamined with `omgs ledger set --status deferred|blocked|out_of_scope --note <reason>`. The mechanical half of this pass is `omgs critic --run <run-dir>`, which fails on unreconciled units, unverified candidates, and records whose verifier hunted them. Reconcile assignments, evidence, source revisions, duplicate fingerprints, and exhausted budgets. Send candidates to a fresh verifier with source and counterevidence. Do not endorse them by consensus, promote source traces to confirmed, or claim completeness because all dispatched hunters returned.

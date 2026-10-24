@@ -48,7 +48,7 @@ impl Severity {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Location {
     pub path: String,
     #[serde(default)]
@@ -69,6 +69,10 @@ pub struct Finding {
     pub sink: String,
     pub boundary: String,
     pub location: Location,
+    /// Further locations of the same root cause, so one defect copied into
+    /// several places stays one record and counts once.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<Location>,
     #[serde(default)]
     pub evidence: String,
     #[serde(default)]
@@ -81,9 +85,17 @@ pub struct Finding {
     /// Attacker prerequisites, kept separate from evidence prose.
     #[serde(default)]
     pub prerequisites: Option<String>,
-    /// Identity of the independent verifier, when one reviewed this record.
+    /// Identity of the hunter whose candidate produced this record.
+    #[serde(default)]
+    pub hunted_by: Option<String>,
+    /// Identity of the independent verifier who decided this record. Must
+    /// differ from `hunted_by`: the author never certifies its own candidate.
     #[serde(default)]
     pub verified_by: Option<String>,
+    /// Fingerprints of further candidates the verifier merged into this
+    /// record. The record's own fingerprint is implicit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -92,10 +104,33 @@ pub struct FindingsFile {
     pub findings: Vec<Finding>,
 }
 
+/// Normalized agent identity for separation checks: trimmed, lowercase.
+pub fn identity(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+}
+
+/// True for the `omgs fingerprint` output shape `omgs-` plus 16 hex digits.
+pub fn is_fingerprint(value: &str) -> bool {
+    value.len() == 21
+        && value.starts_with("omgs-")
+        && value[5..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Enforce the locked evidence rules. Returns every violation found.
 pub fn validate(file: &FindingsFile) -> Vec<String> {
     let mut errors = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let own: std::collections::HashSet<String> = file
+        .findings
+        .iter()
+        .map(|f| crate::fingerprint(&f.attack_class, &f.entry_point, &f.sink, &f.boundary))
+        .collect();
+    let mut absorbed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (i, f) in file.findings.iter().enumerate() {
         let at = format!("findings[{i}] '{}'", f.title);
         let expected = crate::fingerprint(&f.attack_class, &f.entry_point, &f.sink, &f.boundary);
@@ -109,6 +144,53 @@ pub fn validate(file: &FindingsFile) -> Vec<String> {
         }
         if !seen.insert(expected.clone()) {
             errors.push(format!("{at}: duplicate finding identity {expected}"));
+        }
+        let mut places = std::collections::HashSet::new();
+        for loc in std::iter::once(&f.location).chain(&f.locations) {
+            if loc.path.trim().is_empty() {
+                errors.push(format!("{at}: location path is empty"));
+            } else if !places.insert(loc) {
+                errors.push(format!(
+                    "{at}: location {}{} is listed more than once",
+                    loc.path,
+                    loc.line.map(|l| format!(":{l}")).unwrap_or_default()
+                ));
+            }
+        }
+        match (identity(&f.hunted_by), identity(&f.verified_by)) {
+            (None, _) => errors.push(format!(
+                "{at}: hunted_by is required, record which hunter produced the candidate"
+            )),
+            (_, None) => errors.push(format!(
+                "{at}: verified_by is required, every record needs an independent verifier pass"
+            )),
+            (Some(h), Some(v)) if h == v => errors.push(format!(
+                "{at}: verified_by must differ from hunted_by, a hunter never verifies its own candidate"
+            )),
+            _ => {}
+        }
+        for c in &f.candidates {
+            if !is_fingerprint(c) {
+                errors.push(format!(
+                    "{at}: candidates entry '{c}' is not an omgs fingerprint"
+                ));
+            } else if *c == expected {
+                errors.push(format!(
+                    "{at}: candidates must not repeat the record's own fingerprint"
+                ));
+            } else if own.contains(c) {
+                errors.push(format!(
+                    "{at}: candidate {c} is another record's identity and cannot also be merged here"
+                ));
+            } else if let Some(prev) = absorbed.insert(c.clone(), i) {
+                if prev != i {
+                    errors.push(format!(
+                        "{at}: candidate {c} is already merged into findings[{prev}]"
+                    ));
+                } else {
+                    errors.push(format!("{at}: candidate {c} is listed more than once"));
+                }
+            }
         }
         match f.verdict {
             Verdict::Confirmed => {

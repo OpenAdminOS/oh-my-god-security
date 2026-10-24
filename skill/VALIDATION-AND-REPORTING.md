@@ -55,6 +55,10 @@ Serialize the following semantic fields using the installed CLI schema. Fields u
 | `sink` | Stable module and effect-producing symbol. |
 | `boundary` | Principal/resource boundary and violated invariant. |
 | `location` | Object containing repository-relative `path` and one-based `line` in the reviewed source. |
+| `locations` | Further locations of the same root cause, each with `path` and `line`. One defect copied into several places stays one record and counts once; do not emit one record per copy. |
+| `hunted_by` | Identity of the hunter whose candidate produced the record, matching that candidate's `hunter`. Required. |
+| `verified_by` | Identity of the independent verifier that decided the record. Required, and `omgs validate` rejects it when it equals `hunted_by`. |
+| `candidates` | Fingerprints of further candidates merged into this record when several hunters raised one root cause under different identities. The record's own fingerprint is implicit. |
 | `evidence` | Source trace, attacker prerequisites, concrete result, controls/counterevidence, external artifact references and runner evidence. For pending records include the exact missing fact and blocker; for rejection include the decisive refutation. |
 | `fix_brief` | Confirmed: invariant, narrowest effective change, proof test acceptance check. Otherwise null or absent per schema. |
 | `intent_question` | Unresolved plain language intent question with scope, otherwise null or absent per schema. |
@@ -65,7 +69,7 @@ Fix brief example: **Invariant:** members access only their workspace's private 
 
 ## Validate, render, and hand off
 
-Use `omgs fingerprint` after any identity correction, then `omgs validate` over the final records and required run inputs. Resolve schema errors, duplicate identity conflicts, missing evidence, invalid severity/verdict combinations, and inconsistent tiers before `omgs report`. A validator pass checks structure and deterministic consistency, not the truth of an agent's claim.
+Use `omgs fingerprint` after any identity correction, then `omgs validate` over the final records and required run inputs. Then run `omgs critic --run <run-dir>`: it reconciles the ledger, every `candidates*.json`, and `findings.json`, and exits 1 on any gap (a unit still `planned` or `candidate`, a `covered` unit without evidence, a candidate no finding accounts for, a finding whose verifier hunted one of its candidates, a finding no unit cites as evidence). Close each gap in the ledger with `omgs ledger set` (evidence or a note) or by verifying the missing candidate; do not report over open gaps. `omgs report` also runs the critic and prints its result in the report. Resolve schema errors, duplicate identity conflicts, missing evidence, invalid severity/verdict combinations, and inconsistent tiers before `omgs report`. A validator pass checks structure and deterministic consistency, not the truth of an agent's claim.
 
 The CLI renders `findings.json`, SARIF, `REPORT.md`, and `REPORT.html` from the same verified records outside the target. Check that the offline HTML escapes target text, embeds no scripts from the target, makes no external requests, and agrees with the other views. Treat reports as sensitive. Include pending intent, exact blockers, unexamined ledger units, mode, budget and spend, agent/model identity, and sandbox backend/policy. No score or coverage percentage.
 

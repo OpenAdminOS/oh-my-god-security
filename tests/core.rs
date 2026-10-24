@@ -21,12 +21,15 @@ fn finding(verdict: Verdict, tier: ProofTier, severity: Option<Severity>) -> Fin
             path: "app/api/orders/[id]/route.ts".into(),
             line: Some(12),
         },
+        locations: vec![],
         evidence: "dummy tenant B order returned to tenant A".into(),
         fix_brief: None,
         intent_question: None,
         family: None,
         prerequisites: None,
-        verified_by: None,
+        hunted_by: Some("red-1".into()),
+        verified_by: Some("blue-1".into()),
+        candidates: vec![],
     }
 }
 
@@ -100,6 +103,7 @@ fn html_report_escapes_target_content() {
             hunters: None,
             verifier: None,
             agent_calls: None,
+            critic: None,
         },
     );
     assert!(!html.contains("<script>alert"));
@@ -194,6 +198,7 @@ fn markdown_report_shows_rejected_and_pending_evidence() {
             hunters: None,
             verifier: None,
             agent_calls: None,
+            critic: None,
         },
     );
     assert!(md.contains("Rejected after verification"));
@@ -212,6 +217,7 @@ fn meta() -> ReportMeta {
         hunters: Some(2),
         verifier: Some("blue-1".into()),
         agent_calls: Some(37),
+        critic: None,
     }
 }
 
@@ -331,6 +337,7 @@ fn html_escapes_hostile_strings_end_to_end() {
         hunters: None,
         verifier: Some("<script>alert(11)</script>".into()),
         agent_calls: None,
+        critic: None,
     };
     let html = render_html(&file, &hostile_meta);
     let lower = html.to_lowercase();
@@ -497,6 +504,7 @@ fn report_shows_run_metadata_or_not_recorded() {
         hunters: None,
         verifier: None,
         agent_calls: None,
+        critic: None,
     };
     let md2 = render_markdown(&file, &bare);
     assert!(

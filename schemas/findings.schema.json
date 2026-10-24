@@ -8,7 +8,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["fingerprint", "title", "verdict", "proof_tier", "attack_class", "entry_point", "sink", "boundary", "location"],
+        "required": ["fingerprint", "title", "verdict", "proof_tier", "attack_class", "entry_point", "sink", "boundary", "location", "hunted_by", "verified_by"],
         "properties": {
           "fingerprint": { "type": "string", "pattern": "^omgs-[0-9a-f]{16}$" },
           "title": { "type": "string" },
@@ -24,12 +24,28 @@
             "required": ["path"],
             "properties": { "path": { "type": "string" }, "line": { "type": "integer" } }
           },
+          "locations": {
+            "type": "array",
+            "description": "Further locations of the same root cause, so one copied defect stays one record.",
+            "items": {
+              "type": "object",
+              "required": ["path"],
+              "properties": { "path": { "type": "string" }, "line": { "type": "integer" } }
+            }
+          },
           "evidence": { "type": "string" },
           "fix_brief": { "type": "string" },
           "intent_question": { "type": "string" },
           "family": { "type": "string" },
           "prerequisites": { "type": "string" },
-          "verified_by": { "type": "string" }
+          "hunted_by": { "type": "string", "minLength": 1, "description": "Hunter whose candidate produced this record." },
+          "verified_by": { "type": "string", "minLength": 1, "description": "Independent verifier who decided this record. Must differ from hunted_by." },
+          "candidates": {
+            "type": "array",
+            "uniqueItems": true,
+            "description": "Fingerprints of further candidates merged into this record; its own fingerprint is implicit.",
+            "items": { "type": "string", "pattern": "^omgs-[0-9a-f]{16}$" }
+          }
         }
       }
     }
