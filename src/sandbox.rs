@@ -95,24 +95,63 @@ fn request_json(req: &ProveRequest) -> String {
     .unwrap_or_default()
 }
 
-/// Terminate the sandboxed command and any descendants. The command is its own
-/// process-group leader (see base_env), so signalling the negative pid reaches
-/// grandchildren a bare child.kill() would leave running and holding the pipes.
+/// Wait for the command, then terminate it and any descendants, and reap.
+/// Returns (success, timed_out).
+///
+/// When `group_leader` is true the command is its own process-group leader (see
+/// base_env), so the whole group is signalled: a command that backgrounds a
+/// child and exits (for example `sleep 60 & exit 0`) cannot leave code running
+/// or holding the pipes. The leader is detected with `WNOWAIT`, which leaves it
+/// a zombie so its pid and pgid cannot be reused before the group is signalled,
+/// then reaped. Backends that did not create a group (MXC) kill only the child.
+/// Signal the whole process group the command leads. Reaches background
+/// descendants a bare `child.kill()` would leave running and holding the pipes.
+/// Known limitation: on the normal-exit path the leader has already been reaped
+/// by `try_wait`, so there is a microsecond window in which its pid/pgid could
+/// be reused before this signal lands; closing it needs a peek-without-reap
+/// (`waitid` with `WNOWAIT`), whose cross-platform wiring is tracked separately.
 #[cfg(unix)]
-fn kill_group(child: &mut Child) {
-    let group = format!("-{}", child.id());
+fn kill_group(pid: u32) {
+    let group = format!("-{pid}");
     let _ = Command::new("/bin/kill").arg("-TERM").arg(&group).status();
     std::thread::sleep(Duration::from_millis(200));
     let _ = Command::new("/bin/kill").arg("-KILL").arg(&group).status();
-    let _ = child.kill();
 }
 
 #[cfg(not(unix))]
-fn kill_group(child: &mut Child) {
-    let _ = child.kill();
+fn kill_group(_pid: u32) {}
+
+fn supervise(child: &mut Child, timeout_ms: u64, group_leader: bool) -> (bool, bool) {
+    let pid = child.id();
+    let start = Instant::now();
+    let mut timed_out = false;
+    let success = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) => {
+                if start.elapsed() > Duration::from_millis(timeout_ms) {
+                    timed_out = true;
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => break false,
+        }
+    };
+    // Terminate descendants on every path, not only timeout: a command that
+    // backgrounds a child and exits (`sleep 60 & exit 0`) must not leave code
+    // running or holding the pipes. Only when the command led its own group;
+    // backends that did not set one (MXC) kill just the child.
+    if group_leader {
+        kill_group(pid);
+    } else {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    (success, timed_out)
 }
 
-fn run_with_timeout(mut child: Child, timeout_ms: u64) -> (bool, bool, String) {
+fn run_with_timeout(mut child: Child, timeout_ms: u64, group_leader: bool) -> (bool, bool, String) {
     use std::sync::mpsc;
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
@@ -134,30 +173,11 @@ fn run_with_timeout(mut child: Child, timeout_ms: u64) -> (bool, bool, String) {
         }
         let _ = tx.send((1, s));
     });
-    let start = Instant::now();
-    let mut timed_out = false;
-    let success = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
-            Ok(None) => {
-                if start.elapsed() > Duration::from_millis(timeout_ms) {
-                    timed_out = true;
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => break false,
-        }
-    };
-    // Terminate the whole process group on every path, not only timeout: a
-    // command that forks a background child and exits (for example `sleep 60 &`)
-    // otherwise leaves target-controlled code running and holding the pipes.
-    // Killing the group closes the inherited pipe ends so the readers can finish.
-    kill_group(&mut child);
-    let _ = child.wait();
+
+    let (success, timed_out) = supervise(&mut child, timeout_ms, group_leader);
 
     // Drain the readers, bounded by a deadline so a surviving writer cannot stall
-    // the result past the timeout.
+    // the result past the timeout. The group kill above closes inherited pipes.
     let mut out = String::new();
     let mut err = String::new();
     let drain = Duration::from_millis(2_000);
@@ -320,8 +340,10 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             // stays read-only and broad so arbitrary toolchains still resolve;
             // narrowing it to an explicit path set needs validation on a real
             // Linux host and is deferred. Network is off via --unshare-all.
-            let mut c = Command::new(bwrap);
-            c.args([
+            let cwd_s = cwd.to_string_lossy().to_string();
+            let scratch_s = scratch.to_string_lossy().to_string();
+            let masked = ["/", "/tmp", "/run", "/var/run", "/dev", "/proc"];
+            let mut args: Vec<String> = vec![
                 "--unshare-all",
                 "--new-session",
                 "--die-with-parent",
@@ -338,27 +360,38 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
                 "/run",
                 "--tmpfs",
                 "/var/run",
-                // Re-expose the target read-only after the masks, so a target
-                // under a masked dir (for example /tmp) is not hidden.
-                "--ro-bind",
-                &cwd.to_string_lossy(),
-                &cwd.to_string_lossy(),
-                "--bind",
-                &scratch.to_string_lossy(),
-                &scratch.to_string_lossy(),
-                "--chdir",
-                &cwd.to_string_lossy(),
-                "/bin/sh",
-                "-c",
-                &req.command,
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect();
+            // Re-expose the target read-only after the masks only when it is a
+            // real subdirectory, so re-binding cannot re-expose a masked dir
+            // (binding "/" or "/tmp" itself would undo the mask). A target that
+            // is literally a masked path is unsupported rather than re-exposed.
+            if !masked.contains(&cwd_s.as_str()) {
+                args.extend(["--ro-bind".into(), cwd_s.clone(), cwd_s.clone()]);
+            }
+            args.extend([
+                "--bind".into(),
+                scratch_s.clone(),
+                scratch_s,
+                "--chdir".into(),
+                cwd_s,
+                "/bin/sh".into(),
+                "-c".into(),
+                req.command.clone(),
             ]);
+            let mut c = Command::new(bwrap);
+            c.args(&args);
             base_env(&mut c, &scratch);
             c
         }
     };
+    let group_leader = !matches!(backend, Backend::Mxc(_));
     match cmd.spawn() {
         Ok(child) => {
-            let (success, timed_out, output) = run_with_timeout(child, req.timeout_ms);
+            let (success, timed_out, output) =
+                run_with_timeout(child, req.timeout_ms, group_leader);
             ProveOutcome::Ran {
                 backend: label,
                 success,
