@@ -5,8 +5,11 @@ name: release
 # verifies against SHA256SUMS. Triggered by pushing a version tag, for example
 # `git tag v0.1.0 && git push origin v0.1.0`.
 #
-# Every build checks out the exact commit the tag resolves to (prepare job), so
-# a manual run cannot attach binaries built from a different ref to the tag.
+# The prepare job resolves the version to an immutable commit SHA from its git
+# TAG ref (not a same-named branch) and every build job checks out that SHA, so
+# a manual run cannot attach binaries built from a different ref to the tag. The
+# release job re-verifies the tag still points at that commit and pins the
+# release to it with target_commitish before publishing.
 #
 # Required secrets (same names as the proven TenuVault pipeline):
 #   macOS: MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER
@@ -27,6 +30,12 @@ on:
 permissions:
   contents: read
 
+# Serialize all runs for the same tag so two runs cannot both pass the
+# published-release guard and then race to upload mismatched assets.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -38,6 +47,7 @@ jobs:
       - id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           VERSION: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
@@ -45,9 +55,21 @@ jobs:
           if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
             echo "::error::'$VERSION' is not a vMAJOR.MINOR.PATCH[-prerelease] tag"; exit 1
           fi
-          # Resolve the tag to an immutable commit SHA; fails if the tag is absent.
-          sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${VERSION}" --jq '.sha')"
-          if [ -z "$sha" ]; then echo "::error::tag $VERSION does not resolve to a commit"; exit 1; fi
+          # Resolve the git TAG ref specifically; a branch of the same name must
+          # not qualify, and a missing tag must fail closed (git/ref/tags is an
+          # exact lookup that 404s when the tag is absent).
+          ref="$(gh api "repos/${REPO}/git/ref/tags/${VERSION}")"
+          objtype="$(printf '%s' "$ref" | jq -r '.object.type')"
+          objsha="$(printf '%s' "$ref" | jq -r '.object.sha')"
+          if [ "$objtype" = "tag" ]; then
+            # Annotated tag: peel to the commit it points at.
+            sha="$(gh api "repos/${REPO}/git/tags/${objsha}" --jq '.object.sha')"
+          else
+            sha="$objsha"
+          fi
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::tag $VERSION did not resolve to a commit SHA"; exit 1
+          fi
           # A hyphen in the version marks a prerelease (v0.2.0-rc.1).
           case "$VERSION" in *-*) pre=true ;; *) pre=false ;; esac
           {
@@ -55,7 +77,7 @@ jobs:
             echo "sha=$sha"
             echo "prerelease=$pre"
           } >> "$GITHUB_OUTPUT"
-          echo "resolved $VERSION -> $sha (prerelease=$pre)"
+          echo "resolved tag $VERSION -> $sha (prerelease=$pre)"
 
   macos:
     needs: prepare
@@ -85,6 +107,9 @@ jobs:
             if [ -z "${!v:-}" ]; then echo "::error::missing signing secret $v"; exit 1; fi
           done
           keychain="$RUNNER_TEMP/signing.keychain-db"
+          # Always remove the keychain and secret material, even on failure.
+          cleanup() { security delete-keychain "$keychain" 2>/dev/null || true; rm -f "$RUNNER_TEMP/api.p8" "$RUNNER_TEMP/cert.p12"; }
+          trap cleanup EXIT
           kpw="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
           security create-keychain -p "$kpw" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
@@ -115,8 +140,6 @@ jobs:
             fi
             cp "$bin" "dist/$asset"
           done
-          security delete-keychain "$keychain" || true
-          rm -f "$RUNNER_TEMP/api.p8" "$RUNNER_TEMP/cert.p12"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos
@@ -197,15 +220,51 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: staging
-      - name: Guard against clobbering a published release
+      - name: Re-verify the tag still points at the built commit
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.version }}
+          EXPECTED: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          ref="$(gh api "repos/${REPO}/git/ref/tags/${TAG}")"
+          objtype="$(printf '%s' "$ref" | jq -r '.object.type')"
+          objsha="$(printf '%s' "$ref" | jq -r '.object.sha')"
+          if [ "$objtype" = "tag" ]; then
+            cur="$(gh api "repos/${REPO}/git/tags/${objsha}" --jq '.object.sha')"
+          else
+            cur="$objsha"
+          fi
+          if [ "$cur" != "$EXPECTED" ]; then
+            echo "::error::tag $TAG now points at $cur but binaries were built from $EXPECTED; aborting"; exit 1
+          fi
+          echo "tag $TAG still at $EXPECTED"
+      - name: Guard the target release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          if draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+          body="$RUNNER_TEMP/rel.json"; err="$RUNNER_TEMP/rel.err"
+          if gh api "repos/${REPO}/releases/tags/${TAG}" > "$body" 2>"$err"; then
+            draft="$(jq -r '.draft' "$body")"
             if [ "$draft" != "true" ]; then
               echo "::error::release $TAG is already published; bump the version instead of re-signing"; exit 1
+            fi
+            # A leftover draft may hold stale assets not covered by our SHA256SUMS;
+            # delete it so the published release contains exactly our binaries.
+            echo "deleting existing draft release $TAG for a clean slate"
+            gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag=false
+          else
+            # Distinguish an explicit absence (fine) from any other API error
+            # (fail closed so a transient failure never bypasses this guard).
+            if grep -q 'HTTP 404' "$err"; then
+              echo "no existing release for $TAG; proceeding"
+            else
+              echo "::error::could not determine release state for $TAG; failing closed"
+              cat "$err" || true; exit 1
             fi
           fi
       - name: Assemble assets and checksums
@@ -214,11 +273,14 @@ jobs:
           mkdir -p release
           find staging -type f -name 'omgs-*' -exec cp {} release/ \;
           cd release
-          # Every expected asset must be present before we publish; a missing
-          # platform must fail, not ship a partial release.
+          # Publish exactly this set: every expected asset must be present, and no
+          # unexpected omgs-* binary may be shipped (keeps SHA256SUMS authoritative).
           expected="omgs-aarch64-apple-darwin omgs-x86_64-apple-darwin omgs-x86_64-unknown-linux-gnu omgs-aarch64-unknown-linux-gnu omgs-x86_64-pc-windows-msvc.exe"
           for a in $expected; do
             if [ ! -f "$a" ]; then echo "::error::missing release asset $a"; exit 1; fi
+          done
+          for f in omgs-*; do
+            case " $expected " in *" $f "*) ;; *) echo "::error::unexpected asset $f"; exit 1 ;; esac
           done
           sha256sum $expected > SHA256SUMS
           cat SHA256SUMS
@@ -226,6 +288,7 @@ jobs:
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ needs.prepare.outputs.sha }}
           prerelease: ${{ needs.prepare.outputs.prerelease }}
           make_latest: ${{ needs.prepare.outputs.prerelease == 'true' && 'false' || 'true' }}
           files: |
