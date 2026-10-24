@@ -979,3 +979,61 @@ fn zero_lines_and_dangling_ledgers_are_errors() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[test]
+fn round_trips_flag_values_and_ledgerless_candidates() {
+    // A location without a line survives serialization and strict parsing.
+    let mut f = record("a");
+    f.location.line = None;
+    f.locations = vec![Location {
+        path: "b.ts".into(),
+        line: None,
+    }];
+    let text = serde_json::to_string(&file(vec![f])).unwrap();
+    assert!(!text.contains("\"line\":null"));
+    assert!(omgs::shape::findings(&text).is_ok());
+
+    let dir = scratch("flags-and-candidates");
+    let (ledger, _, _) = complete_run();
+    let lp = dir.join("coverage-ledger.json");
+    std::fs::write(&lp, serde_json::to_string(&ledger).unwrap()).unwrap();
+    let before = std::fs::read(&lp).unwrap();
+    for args in [
+        vec![
+            "--status",
+            "blocked",
+            "--evidence",
+            "--note",
+            "needs a database",
+        ],
+        vec!["--status", "blocked", "--note"],
+    ] {
+        let mut full = vec![
+            "ledger",
+            "set",
+            "--ledger",
+            lp.to_str().unwrap(),
+            "--unit",
+            "route:x",
+        ];
+        full.extend(args);
+        let out = omgs(&full);
+        assert_eq!(out.status.code(), Some(2), "{full:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("requires a value"));
+        assert_eq!(std::fs::read(&lp).unwrap(), before, "nothing written");
+    }
+
+    std::fs::remove_file(&lp).unwrap();
+    std::fs::write(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    std::fs::write(dir.join("candidates-red.json"), "[[]]").unwrap();
+    let out = omgs(&[
+        "report",
+        "--findings",
+        dir.join("findings.json").to_str().unwrap(),
+        "--out",
+        dir.join("out").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!dir.join("out/REPORT.html").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
