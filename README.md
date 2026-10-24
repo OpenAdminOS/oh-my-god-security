@@ -30,7 +30,7 @@ Three steps. You do not install a binary by hand.
    - A remote repository: say `run an OMGS security review on https://github.com/owner/repo`. OMGS clones it locally first, then reviews it exactly like a local folder. It never reviews code in the cloud.
 3. **On first run, approve the one-time binary download.** The skill fetches the `omgs` binary for your platform, verifies it against the published SHA-256 checksums, installs it without elevation into a per-user directory, and continues into the review. Later runs reuse it.
 
-You read the report it produces (a self contained `REPORT.html`, plus `REPORT.md` and SARIF) in a run directory that lives outside your code. OMGS changes nothing in your repository and applies no fixes unless you explicitly ask.
+You read the report it produces (a self contained `REPORT.html`, plus `REPORT.md` and SARIF) in a run directory that lives outside your code. As a side effect of the reconnaissance it also maps your application: `ARCHITECTURE.html` (and `ARCHITECTURE.md`) show your stack, components by trust zone, data flows, and attack surface as an auto-laid-out diagram. OMGS changes nothing in your repository and applies no fixes unless you explicitly ask.
 
 > Early v0 status: the first public signed release is not published yet, so the automatic download cannot resolve today. Until it is, build the binary once and place it where the skill looks for it, then the agent flow above works:
 > ```sh
@@ -85,6 +85,7 @@ If you are a coding agent asked to install OMGS and review a project, follow the
 4. Follow the skill's pipeline (map, isolated hunt, independent verify, prove, adjudicate, report). Validate every findings file with `omgs validate --findings <run-dir>/findings.json` before reporting.
 5. Execute proof tests or a locally built app only through `omgs prove --cmd "<test command>"`. If prove reports that no sandbox backend is available, stop at the traced tier, record the exact blocker, and tell the user. Never run target code unsandboxed to keep the flow moving.
 6. Render outputs with `omgs report --findings <run-dir>/findings.json --out <run-dir> --repo <name> --ref <commit> --mode <gate|advisory>`. Present `REPORT.html` or `REPORT.md`, ask intent questions in plain language, and hand over fix briefs. Do not apply fixes or commit anything unless the user explicitly asks.
+7. During reconnaissance, record the architecture map in `architecture.json` (schema in `schemas/`) and render it with `omgs architecture --in <run-dir>/architecture.json --out <run-dir>`. It produces `ARCHITECTURE.md` and a self-contained `ARCHITECTURE.html` describing the target's stack, components, trust boundaries, data flows, and attack surface. Descriptive only; it never changes a verdict.
 
 Shortcuts: `omgs review --repo-url <github-url>` clones a repository into the local OMGS targets area and initializes a run with stack detection and sensors. `omgs check --target <repo>` runs deterministic sensors and counts committed proof tests without executing target code. `omgs ledger set --ledger <run-dir>/coverage-ledger.json --unit <id> --status covered` records coverage progress.
 
@@ -101,7 +102,7 @@ cargo build --release
 
 ## Repository layout
 
-- `src/`: the deterministic Rust CLI (findings schema, finding identity across runs, stack detection, coverage ledger, redacted sensor execution, sandbox proof execution, and report rendering to Markdown, a self contained HTML one pager, and SARIF).
+- `src/`: the deterministic Rust CLI (findings schema, finding identity across runs, stack detection, coverage ledger, redacted sensor execution, sandbox proof execution, report rendering to Markdown, a self contained HTML one pager, and SARIF, and the architecture map renderer).
 - `schemas/`: findings and coverage ledger JSON schemas.
 - `skill/`: the agent skill pack and attack class packs that your agent follows.
 - `.github/workflows/release.yml`: the signed, notarized, checksummed release pipeline.

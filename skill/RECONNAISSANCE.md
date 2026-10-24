@@ -13,6 +13,12 @@ Read source as text. Never import modules, run the framework, discover tests thr
 
 For each boundary, write `untrusted principal/input -> enforcement location -> trusted resource/effect`, with file, symbol, and line references. Typical boundaries are anonymous to authenticated, member to administrator, owner to another owner, tenant A to tenant B, unsigned sender to trusted webhook, and caller-chosen URL to authorized integration destination. Record the application's intended allow/deny behavior and its source; unresolved intent becomes a question.
 
+## Record the architecture map
+
+Write the structured map to `architecture.json` in the output directory, following [../schemas/architecture.schema.json](../schemas/architecture.schema.json): the detected `stack`, trust `zones` (ordered least to most trusted), `components` tagged with their zone and marked `entry_point` when externally reachable, `principals`, `boundaries` with their `enforcement`, directed `flows` between components (set `crosses` when a flow crosses a boundary), the externally reachable `input_surfaces`, and `unexamined` areas stated plainly. `omgs audit init` seeds a stub you fill in.
+
+Then render it: `omgs architecture --in architecture.json --out <output-dir>`. This writes a deterministic `ARCHITECTURE.md` and an offline `ARCHITECTURE.html` with an auto-laid-out flow graph, so the reviewer can see how the target is built and what its attack surface is. The map is descriptive only; it never asserts a finding or changes a verdict. Keep all free-text target-derived; the renderer escapes it.
+
 ## Seed the coverage ledger
 
 A unit is one concrete surface, one violated boundary under investigation, and one attack class. Do not use whole folders as units or multiply by irrelevant classes. Split HTTP methods and materially different principal/resource operations. Multiple units may share a root cause and later deduplicate to one fingerprint.
