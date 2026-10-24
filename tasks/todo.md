@@ -38,8 +38,11 @@ recorded in IMPROVEMENTS.md under "Deferred past 0.1".
 See the plan: every PR green on fmt/clippy/test in CI on macOS and Ubuntu; each feature's
 criteria (grouped locations count once; equal or missing hunter/verifier rejected; critic exits
 1 per gap class; batch index deterministic and offline; watch serves only two loopback routes;
-route records reroutes; unknown intent id rejected; deny-by-default profile keeps the Swift
-fixture behaviour; setsid and posix_spawn survivors killed and reported; no `--ro-bind / /`).
+route records reroutes; unknown intent id rejected).
+
+Deferred past 0.1 with PR D, so not part of the 0.1 gate: the deny-by-default profile keeping
+the Swift fixture behaviour, setsid and posix_spawn survivors killed and reported, and no
+`--ro-bind / /`.
 
 ## Review
 
