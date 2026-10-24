@@ -32,7 +32,7 @@ name: release
 #   Windows (Azure Trusted Signing, app openadminos-signing):
 #     AZURE_SIGNING_TENANT_ID, AZURE_SIGNING_CLIENT_ID, AZURE_SIGNING_CLIENT_SECRET,
 #     AZURE_TRUSTED_SIGNING_ENDPOINT, AZURE_TRUSTED_SIGNING_ACCOUNT_NAME,
-#     AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME, AZURE_TRUSTED_SIGNING_PUBLISHER_NAME
+#     AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME
 
 on:
   push:
@@ -55,6 +55,7 @@ concurrency:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       sha: ${{ steps.resolve.outputs.sha }}
@@ -98,6 +99,7 @@ jobs:
   macos:
     needs: prepare
     runs-on: macos-14
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -174,6 +176,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             asset: omgs-aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -195,6 +198,7 @@ jobs:
   windows:
     needs: prepare
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -231,6 +235,7 @@ jobs:
   release:
     needs: [prepare, macos, linux, windows]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
@@ -308,9 +313,10 @@ jobs:
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
           set -euo pipefail
-          # Create-only: if a release for this tag already exists (for example a
-          # racing external publisher that appeared after the guard), POST returns
-          # 422 and we fail closed instead of adopting and overwriting it.
+          # Create-only: if a published release for this tag already exists (for
+          # example a racing external publisher after the guard), POST returns 422
+          # and we fail closed instead of adopting and overwriting it. A duplicate
+          # draft is prevented by the preceding guard and the concurrency group.
           id="$(gh api -X POST "repos/${REPO}/releases" \
             -f tag_name="$TAG" -f target_commitish="$SHA" \
             -F draft=true -F prerelease="$PRERELEASE" --jq '.id')"
@@ -343,6 +349,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.version }}
+          EXPECTED: ${{ needs.prepare.outputs.sha }}
           RELEASE_ID: ${{ steps.draft.outputs.id }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
         run: |
@@ -355,6 +363,16 @@ jobs:
           if [ "$remote" != "$expected" ]; then
             echo "::error::draft asset set does not match expected; refusing to publish"
             printf 'remote:\n%s\nexpected:\n%s\n' "$remote" "$expected"; exit 1
+          fi
+          # Final tag/commit recheck immediately before flipping to published, to
+          # shrink the window after the earlier re-verify (belt and suspenders on
+          # top of the operator's immutable-tag prerequisite).
+          r="$(gh api "repos/${REPO}/git/ref/tags/${TAG}")"
+          ot="$(printf '%s' "$r" | jq -r '.object.type')"
+          os="$(printf '%s' "$r" | jq -r '.object.sha')"
+          if [ "$ot" = "tag" ]; then os="$(gh api "repos/${REPO}/git/tags/${os}" --jq '.object.sha')"; fi
+          if [ "$os" != "$EXPECTED" ]; then
+            echo "::error::tag $TAG moved to $os (built from $EXPECTED) before publish; aborting"; exit 1
           fi
           make_latest=true
           [ "$PRERELEASE" = "true" ] && make_latest=false
