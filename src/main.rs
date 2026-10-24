@@ -24,7 +24,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <url> [--mode gate|advisory] [--budget <n>]\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--cwd <dir>] [--scratch <dir>] [--timeout-ms <n>]\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs check --target <repo> [--out <run-dir>]\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <url> [--mode gate|advisory] [--budget <n>]\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--cwd <dir>] [--scratch <dir>] [--timeout-ms <n>]\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs check --target <repo> [--out <run-dir>]\n\nEvery option except --yes and --no-sensors takes a value, and a value may not begin with --.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -243,7 +243,10 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             let has_candidates = std::fs::read_dir(dir)
                 .map_err(|e| format!("read {}: {e}", dir.display()))?
                 .flatten()
-                .any(|e| e.file_name().to_string_lossy().starts_with("candidates"));
+                .any(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.starts_with("candidates") && name.ends_with(".json")
+                });
             if has_candidates {
                 return Err(format!(
                     "{} has candidates files but no coverage-ledger.json; restore the ledger so the critic can run",
@@ -270,8 +273,16 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     }
     let mut sensors_summary: Option<String> = None;
     if let Some(dir) = &findings_dir {
-        if let Ok(text) = std::fs::read_to_string(dir.join("sensors.json")) {
-            if let Ok(rep) = serde_json::from_str::<omgs::sensors::SensorsReport>(&text) {
+        let path = dir.join("sensors.json");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("read {}: {e}", path.display())),
+        };
+        if let Some(text) = text {
+            {
+                let rep = serde_json::from_str::<omgs::sensors::SensorsReport>(&text)
+                    .map_err(|e| format!("parse {}: {e}", path.display()))?;
                 let vendored = rep.hits.iter().filter(|h| h.vendored).count();
                 sensors_summary = Some(format!(
                     "{} run, {} hit(s), {} vendored",
