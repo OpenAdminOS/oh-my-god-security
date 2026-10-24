@@ -77,3 +77,7 @@ One public third party target reviewed through `omgs review --repo-url` in advis
 ## Not yet existing, therefore untestable
 
 Signed release binaries and package-manager distribution, proof test staging into target suites, base-branch policy loading, batch mode, benchmark runner, and model rerouting on refusal. These are tracked in IMPROVEMENTS.md.
+
+## Field run 2026-10-24 (full multi-agent pipeline on a macOS updater)
+
+A second field run on the same public macOS updater with a root helper, this time the full multi-agent pipeline rather than a single pass: three isolated red hunters (one per boundary), an independent blue verifier that deduped and disproved, tier-1 `omgs prove` sandbox proofs on unmodified target code, and a separate evaluator adjudication. About 21 raw candidates deduped to 12 records: 0 confirmed, 8 needs validation, 4 rejected, 3 of them carrying test_proven mechanism evidence. The run exercised the coverage ledger end to end (six boundary units, five covered, one deferred) and produced agreeing HTML, Markdown, JSON, and SARIF outside the target tree. It demonstrated both halves of the discipline: it surfaced sharper genuine issues the earlier static pass missed and it independently rejected four weak leads with counterevidence. Target specifics stay in the private run directory pending disclosure.
