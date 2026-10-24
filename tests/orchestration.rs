@@ -615,8 +615,10 @@ fn intent_answers_are_keyed_by_the_full_target_path() {
 
 #[test]
 fn batch_file_requires_runs() {
-    assert!(serde_json::from_str::<omgs::batch::BatchFile>(r#"{"run": []}"#).is_err());
-    assert!(serde_json::from_str::<omgs::batch::BatchFile>(r#"{"runs": []}"#).is_ok());
+    assert!(omgs::batch::parse_batch(r#"{"run": []}"#).is_err());
+    assert!(omgs::batch::parse_batch(r#"[0, []]"#).is_err());
+    assert!(omgs::batch::parse_batch(r#"{"runs": [["u", null, null, "failed"]]}"#).is_err());
+    assert!(omgs::batch::parse_batch(r#"{"runs": []}"#).is_ok());
 }
 
 #[test]
@@ -661,7 +663,6 @@ fn concurrent_route_and_status_updates_are_not_lost() {
         serde_json::from_str(&std::fs::read_to_string(dir.join("pipeline-status.json")).unwrap())
             .unwrap();
     assert_eq!(status["stages"][0]["children"].as_array().unwrap().len(), 4);
-    assert!(!dir.join(".omgs-run.lock").exists(), "lock released");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -829,5 +830,152 @@ fn answers_files_are_strict_and_bound_to_the_run_target() {
     assert!(String::from_utf8_lossy(&res.stderr).contains("answers not shown"));
     let md = std::fs::read_to_string(dir.join("REPORT.md")).unwrap();
     assert!(!md.contains("Recorded answer"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_index_follows_symlinks_before_dotdot() {
+    let dir = scratch("alias-dotdot");
+    let target = dir.join("target");
+    std::fs::create_dir_all(target.join("child")).unwrap();
+    std::os::unix::fs::symlink(target.join("child"), dir.join("alias")).unwrap();
+    let batch = serde_json::json!({"runs": [{"url": "https://github.com/a/b",
+        "target": target.to_string_lossy(), "status": "failed", "error": "x"}]});
+    std::fs::write(dir.join("batch.json"), batch.to_string()).unwrap();
+    let res = omgs(&[
+        "batch",
+        "index",
+        "--batch",
+        dir.join("batch.json").to_str().unwrap(),
+        "--out",
+        dir.join("alias/../idx").to_str().unwrap(),
+    ]);
+    assert_eq!(
+        res.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert!(!target.join("idx").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_slow_response_reader_cannot_hold_the_watch_server() {
+    let dir = scratch("slow-reader");
+    std::fs::write(
+        dir.join("run-metadata.json"),
+        r#"{"run_status":"in_progress"}"#,
+    )
+    .unwrap();
+    let big = format!(
+        r#"{{"stages":[],"updated_ms":1,"pad":"{}"}}"#,
+        "x".repeat(900_000)
+    );
+    std::fs::write(dir.join("pipeline-status.json"), big).unwrap();
+    let (listener, port) = omgs::watch::bind().unwrap();
+    let d = dir.clone();
+    let start = std::time::Instant::now();
+    let server = std::thread::spawn(move || {
+        omgs::watch::serve(listener, port, &d, std::time::Duration::from_millis(300))
+    });
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    use std::io::Write;
+    write!(
+        s,
+        "GET /pipeline-status.json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+    )
+    .unwrap();
+    // Never read the response.
+    server.join().unwrap();
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(4),
+        "{:?}",
+        start.elapsed()
+    );
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn concurrent_intent_answers_and_ledger_updates_are_not_lost() {
+    let dir = scratch("answers-race");
+    let home = dir.join("home");
+    let target = dir.join("app");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let mut kids = Vec::new();
+    for i in 0..20 {
+        kids.push(
+            std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .env("HOME", &home)
+                .args(["intent", "answer", "--target", target.to_str().unwrap()])
+                .args([
+                    "--id",
+                    "web.public-resource",
+                    "--answer",
+                    "public",
+                    "--source",
+                    "o",
+                ])
+                .args(["--scope", &format!("src/m{i}")])
+                .spawn()
+                .unwrap(),
+        );
+    }
+    let ledger = dir.join("coverage-ledger.json");
+    std::fs::write(&ledger, r#"{"units": []}"#).unwrap();
+    for i in 0..20 {
+        kids.push(
+            std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .args(["ledger", "add", "--ledger", ledger.to_str().unwrap()])
+                .args(["--unit", &format!("u{i}"), "--surface", "."])
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for mut k in kids {
+        assert!(k.wait().unwrap().success());
+    }
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    let path = omgs::intent::answers_file(&home.join(".local/share/omgs"), &canonical);
+    let answers = omgs::intent::load_answers(&path).unwrap();
+    assert_eq!(answers.answers.len(), 20);
+    let l = omgs::shape::ledger(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    assert_eq!(l.units.len(), 20);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn malformed_routing_history_stops_route() {
+    let dir = scratch("route-malformed");
+    let models = dir.join("models.json");
+    std::fs::write(&models, r#"{"roles":{"hunter":["m1","m2"]}}"#).unwrap();
+    for bad in [
+        r#"{"reroutes":{}}"#,
+        r#"{"reroutes":[{"role":"hunter"}]}"#,
+        r#"{"models":[]}"#,
+    ] {
+        std::fs::write(dir.join("run-metadata.json"), bad).unwrap();
+        let out = omgs(&[
+            "route",
+            "--run",
+            dir.to_str().unwrap(),
+            "--role",
+            "hunter",
+            "--models",
+            models.to_str().unwrap(),
+            "--refused",
+            "m1",
+            "--reason",
+            "declined",
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{bad}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("run-metadata.json")).unwrap(),
+            bad
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

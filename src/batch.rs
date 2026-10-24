@@ -105,6 +105,21 @@ pub struct BatchRun {
     pub error: Option<String>,
 }
 
+/// Parse `batch.json`, requiring a JSON object with a `runs` array of
+/// objects, so a positional or misshapen file is an error.
+pub fn parse_batch(text: &str) -> Result<BatchFile, String> {
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let runs = v
+        .as_object()
+        .and_then(|o| o.get("runs"))
+        .and_then(|r| r.as_array())
+        .ok_or("batch.json must be an object with a runs array")?;
+    if runs.iter().any(|r| !r.is_object()) {
+        return Err("every batch.json run must be a JSON object".into());
+    }
+    serde_json::from_value(v).map_err(|e| e.to_string())
+}
+
 /// What the index shows for one run, gathered from its run directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunSummary {
@@ -137,7 +152,7 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> RunSummary {
     };
     match std::fs::read_to_string(dir.join("findings.json"))
         .ok()
-        .and_then(|t| serde_json::from_str::<crate::model::FindingsFile>(&t).ok())
+        .and_then(|t| crate::shape::findings(&t).ok())
     {
         Some(f) => {
             use crate::model::Verdict;
@@ -168,7 +183,7 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> RunSummary {
         }
     }
     if let Ok(text) = std::fs::read_to_string(dir.join("coverage-ledger.json")) {
-        match serde_json::from_str::<crate::ledger::Ledger>(&text) {
+        match crate::shape::ledger(&text) {
             Ok(ledger) => {
                 for u in ledger.units.iter().filter(|u| u.status == "blocked") {
                     s.blockers.push(format!("blocked unit {}", u.id));

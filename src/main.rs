@@ -484,10 +484,11 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolve `p` through its nearest existing ancestor, so a symlink anywhere
-/// in an output path is followed before the outside-the-target check.
-fn resolve_existing_prefix(p: &Path) -> PathBuf {
-    let p = &omgs::runmeta::normalize(p);
+/// Resolve `p` physically through its nearest existing ancestor, so every
+/// symlink (and any `..` after one) is followed by the OS before the
+/// outside-the-target check. A `..` that follows a missing directory cannot be
+/// resolved, so it fails closed rather than being guessed lexically.
+fn resolve_existing_prefix(p: &Path) -> Result<PathBuf, String> {
     let mut existing = p.to_path_buf();
     let mut rest = Vec::new();
     while !existing.exists() {
@@ -496,14 +497,20 @@ fn resolve_existing_prefix(p: &Path) -> PathBuf {
                 rest.push(name.to_os_string());
                 existing = parent.to_path_buf();
             }
-            _ => return p.to_path_buf(),
+            _ => {
+                return Err(format!(
+                    "cannot resolve {} ('..' after a missing directory); use a path without it",
+                    p.display()
+                ))
+            }
         }
     }
-    let mut resolved = std::fs::canonicalize(&existing).unwrap_or(existing);
+    let mut resolved = std::fs::canonicalize(&existing)
+        .map_err(|e| format!("resolve {}: {e}", existing.display()))?;
     for name in rest.iter().rev() {
         resolved.push(name);
     }
-    resolved
+    Ok(resolved)
 }
 
 /// Initialize a run and return its directory.
@@ -516,7 +523,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "target".into());
     let outside = |p: &Path| -> Result<(), String> {
-        if resolve_existing_prefix(p).starts_with(&target) {
+        if resolve_existing_prefix(p)?.starts_with(&target) {
             Err(
                 "run output must live outside the target tree, so findings never enter git history"
                     .into(),
@@ -535,7 +542,6 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
                     .map_err(|e| e.to_string())?
                     .join(&out)
             };
-            let out_abs = omgs::runmeta::normalize(&out_abs);
             outside(&out_abs)?;
             // A run directory is always fresh: reusing one would overwrite a
             // finished run or mix two targets' evidence and answers.
@@ -876,7 +882,7 @@ fn read_ledger(path: &str) -> Result<Ledger, String> {
 
 fn write_ledger(path: &str, ledger: &Ledger) -> Result<(), String> {
     let text = serde_json::to_string_pretty(ledger).map_err(|e| e.to_string())?;
-    std::fs::write(path, format!("{text}\n")).map_err(|e| format!("write {path}: {e}"))
+    omgs::runmeta::write_atomic(Path::new(path), &format!("{text}\n"))
 }
 
 /// Every value given for a repeatable flag, in order.
@@ -892,6 +898,17 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
     let sub = args.first().map(|s| s.as_str()).ok_or(usage)?;
     let rest = &args[1..];
     let path = flag(rest, "--ledger").ok_or("ledger requires --ledger <file>")?;
+    let lock = Path::new(&path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .join(".omgs-run.lock");
+    omgs::runmeta::with_lock_file(&lock, || ledger_locked(sub, rest, &path))
+}
+
+fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
+    let usage = "usage: omgs ledger list|add|set --ledger <file> ...";
+    let path = path.to_string();
     let mut ledger = read_ledger(&path)?;
     match sub {
         "list" => {
@@ -1119,30 +1136,34 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
         Some("index") => {
             let path = flag(rest, "--batch").ok_or("batch index requires --batch <batch.json>")?;
             let text = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
-            let batch: omgs::batch::BatchFile =
-                serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))?;
+            let batch =
+                omgs::batch::parse_batch(&text).map_err(|e| format!("parse {path}: {e}"))?;
             let out = PathBuf::from(flag(rest, "--out").ok_or("batch index requires --out <dir>")?);
             let out_abs = if out.is_absolute() {
                 out.clone()
             } else {
                 std::env::current_dir().map_err(|e| e.to_string())?.join(&out)
             };
-            let resolved = resolve_existing_prefix(&out_abs);
-            for run in &batch.runs {
-                let Some(t) = run.target.as_deref().and_then(|t| std::fs::canonicalize(t).ok())
-                else {
-                    continue;
-                };
-                if resolved.starts_with(&t) {
-                    return Err(format!(
+            let targets: Vec<PathBuf> = batch
+                .runs
+                .iter()
+                .filter_map(|r| r.target.as_deref().and_then(|t| std::fs::canonicalize(t).ok()))
+                .collect();
+            let inside = |p: &Path| -> Result<(), String> {
+                match targets.iter().find(|t| p.starts_with(t)) {
+                    Some(t) => Err(format!(
                         "index output must live outside every reviewed target, and {} is inside {}",
                         out_abs.display(),
                         t.display()
-                    ));
+                    )),
+                    None => Ok(()),
                 }
-            }
+            };
+            inside(&resolve_existing_prefix(&out_abs)?)?;
             std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+            // Recheck the directory as it now exists, before writing anything.
             let out = std::fs::canonicalize(&out).map_err(|e| e.to_string())?;
+            inside(&out)?;
             let runs: Vec<_> = batch
                 .runs
                 .iter()
@@ -1245,16 +1266,37 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
     // Read the refusal history, pick the next model, and record the result in
     // one locked transaction, so concurrent reroutes never lose an entry.
     let next = omgs::runmeta::update(&run, |m| {
-        let mut refused: Vec<String> = m
+        // Malformed history must stop the command: silently ignoring it would
+        // forget earlier refusals and send work back to a refusing model.
+        for (key, ok) in [
+            ("reroutes", m.get("reroutes").is_none_or(|v| v.is_array())),
+            ("models", m.get("models").is_none_or(|v| v.is_object())),
+            ("blockers", m.get("blockers").is_none_or(|v| v.is_array())),
+        ] {
+            if !ok {
+                return Err(format!("run metadata field '{key}' is malformed"));
+            }
+        }
+        let mut refused: Vec<String> = Vec::new();
+        for (i, r) in m
             .get("reroutes")
             .and_then(|r| r.as_array())
-            .map(|list| {
-                list.iter()
-                    .filter(|r| r.get("role").and_then(|v| v.as_str()) == Some(role.as_str()))
-                    .filter_map(|r| r.get("from").and_then(|v| v.as_str()).map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let (Some(r_role), Some(from)) = (
+                r.get("role").and_then(|v| v.as_str()),
+                r.get("from").and_then(|v| v.as_str()),
+            ) else {
+                return Err(format!(
+                    "run metadata reroutes[{i}] needs string role and from"
+                ));
+            };
+            if r_role == role {
+                refused.push(from.to_string());
+            }
+        }
         if let Some(model) = &newly {
             if !refused.contains(model) {
                 refused.push(model.clone());
@@ -1345,6 +1387,11 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             }
+            let id = answer.id.clone();
+            // The whole load, merge, and replace runs under a per-target lock
+            // so concurrent answers are never lost.
+            let lock = path.with_extension("lock");
+            omgs::runmeta::with_lock_file(&lock, || {
             let mut answers = omgs::intent::load_answers(&path)?;
             let target_s = target.to_string_lossy().to_string();
             if !answers.target.is_empty() && answers.target != target_s {
@@ -1355,10 +1402,11 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
                 ));
             }
             answers.target = target_s;
-            let id = answer.id.clone();
             omgs::intent::record(&mut answers, answer)?;
             let text = serde_json::to_string_pretty(&answers).map_err(|e| e.to_string())?;
             omgs::runmeta::write_atomic(&path, &format!("{text}\n"))?;
+            Ok(())
+            })?;
             println!("recorded {id} in {}", path.display());
             Ok(())
         }

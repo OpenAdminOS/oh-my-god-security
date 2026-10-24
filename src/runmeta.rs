@@ -46,43 +46,45 @@ pub fn read(dir: &Path) -> Result<Map<String, Value>, String> {
 }
 
 const LOCK: &str = ".omgs-run.lock";
-/// A lock older than this is from a crashed process and is broken.
-const STALE_LOCK: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Run `f` while holding the run directory's lock, so concurrent omgs
-/// processes (parallel hunters updating status, route, report) serialize
-/// their read-modify-write cycles instead of losing each other's changes.
-pub fn with_lock<T>(dir: &Path, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    let lock = dir.join(LOCK);
+/// Run `f` while holding an exclusive OS file lock on `lock_path`. The OS
+/// releases the lock when the file is closed, including when the process
+/// crashes, so there is no stale-lock breaking that could let two holders in.
+pub fn with_lock_file<T>(
+    lock_path: &Path,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)
+        .map_err(|e| format!("open lock {}: {e}", lock_path.display()))?;
     let start = std::time::Instant::now();
     loop {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-        {
-            Ok(_) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&lock)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.elapsed().ok())
-                    .is_some_and(|age| age > STALE_LOCK);
-                if stale {
-                    let _ = std::fs::remove_file(&lock);
-                    continue;
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if start.elapsed() > std::time::Duration::from_secs(30) {
+                    return Err(format!("timed out waiting for {}", lock_path.display()));
                 }
-                if start.elapsed() > std::time::Duration::from_secs(10) {
-                    return Err(format!("timed out waiting for {}", lock.display()));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            Err(e) => return Err(format!("lock {}: {e}", lock.display())),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!("lock {}: {e}", lock_path.display()))
+            }
         }
     }
     let result = f();
-    let _ = std::fs::remove_file(&lock);
+    let _ = file.unlock();
     result
+}
+
+/// Run `f` under the run directory's lock, so concurrent omgs processes
+/// (parallel hunters updating status, route, ledger, report) serialize their
+/// read-modify-write cycles instead of losing each other's changes.
+pub fn with_lock<T>(dir: &Path, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    with_lock_file(&dir.join(LOCK), f)
 }
 
 /// Apply `change` to the run metadata in `dir` under the run lock and write
@@ -109,23 +111,6 @@ pub fn clock(ms: u64) -> String {
         (secs / 60) % 60,
         secs % 60
     )
-}
-
-/// Remove `.` and resolve `..` lexically, so a later existence walk never
-/// stops on a `..` after a missing component.
-pub fn normalize(p: &Path) -> std::path::PathBuf {
-    use std::path::Component;
-    let mut out = std::path::PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 pub fn is_complete(dir: &Path) -> bool {

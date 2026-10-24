@@ -77,8 +77,13 @@ pub fn respond(raw: &str, port: u16, run_dir: &Path) -> Response {
             body: DASHBOARD.as_bytes().to_vec(),
         },
         "/pipeline-status.json" => {
-            let body = std::fs::read(run_dir.join(crate::status::FILE))
-                .unwrap_or_else(|_| EMPTY_STATUS.as_bytes().to_vec());
+            let path = run_dir.join(crate::status::FILE);
+            let too_big = std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_STATUS);
+            let body = if too_big {
+                EMPTY_STATUS.as_bytes().to_vec()
+            } else {
+                std::fs::read(&path).unwrap_or_else(|_| EMPTY_STATUS.as_bytes().to_vec())
+            };
             Response {
                 status: 200,
                 content_type: "application/json",
@@ -89,7 +94,26 @@ pub fn respond(raw: &str, port: u16, run_dir: &Path) -> Response {
     }
 }
 
-fn write_response(stream: &mut TcpStream, r: &Response) {
+/// Write all of `bytes` before `deadline`, or give up. A reader that drains
+/// slowly cannot stretch one response past the request deadline.
+fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> bool {
+    while !bytes.is_empty() {
+        let Some(left) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+        else {
+            return false;
+        };
+        let _ = stream.set_write_timeout(Some(left));
+        match stream.write(bytes) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => bytes = &bytes[n..],
+        }
+    }
+    true
+}
+
+fn write_response(stream: &mut TcpStream, r: &Response, deadline: Instant) {
     let head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\nContent-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n",
         r.status,
@@ -97,17 +121,20 @@ fn write_response(stream: &mut TcpStream, r: &Response) {
         r.content_type,
         r.body.len()
     );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(&r.body);
+    if write_until(stream, head.as_bytes(), deadline) {
+        write_until(stream, &r.body, deadline);
+    }
 }
 
 /// Total time one connection may take to send its request, so a client that
 /// trickles bytes cannot hold the single server thread.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
+/// Largest status file served; the dashboard needs a few kilobytes.
+const MAX_STATUS: u64 = 1024 * 1024;
 
 fn handle(mut stream: TcpStream, port: u16, run_dir: &Path) {
+    // One absolute deadline covers reading the request and writing the reply.
     let deadline = Instant::now() + REQUEST_DEADLINE;
-    let _ = stream.set_write_timeout(Some(REQUEST_DEADLINE));
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -123,14 +150,14 @@ fn handle(mut stream: TcpStream, port: u16, run_dir: &Path) {
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if buf.len() > MAX_REQUEST {
-                    write_response(&mut stream, &text(400));
+                    write_response(&mut stream, &text(400), deadline);
                     return;
                 }
             }
         }
     }
     let raw = String::from_utf8_lossy(&buf);
-    write_response(&mut stream, &respond(&raw, port, run_dir));
+    write_response(&mut stream, &respond(&raw, port, run_dir), deadline);
 }
 
 /// Bind loopback and return the listener with its port, so callers can print
