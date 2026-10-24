@@ -17,6 +17,10 @@ Status after rounds on 2026-10-16: the first six projects, the next twenty proje
 | report (Markdown, HTML, SARIF) | Tested | 26 targets rendered; HTML escaping and zero external requests covered by unit tests; SARIF emitted one result for the single confirmed finding and parses as JSON. |
 | ledger set | Tested | Valid transitions applied, unknown unit rejected with exit 2. Since 2026-10-24 `covered` requires `--evidence` and `deferred`, `blocked`, `out_of_scope` require `--note` (unit and end-to-end tests). |
 | ledger add, ledger list | Unit tested | Duplicate ids and unknown statuses refused; list exits 1 on rule violations. No field run yet. |
+| batch init, batch index | Unit tested | URL validation table, index determinism and escaping, run summaries. No field batch yet. |
+| status, watch | Unit tested | Status updates, routes, Host check, loopback bind, shutdown on completion over a real socket. |
+| route | Unit tested | Fallback order, persisted refusals, exhaustion recorded as a blocker. |
+| intent list, intent answer | Unit tested | Library well formed, unknown ids rejected, grouping, path-scoped answers keyed by target. |
 | critic | Unit tested | Every gap class covered by tests and one end-to-end CLI run; report embeds the result. No field run yet. |
 | check | Partial | Sensor execution and proof-test counting verified. Trufflehog, osv-scanner, and semgrep paths are detection only in code and were unavailable on the test machine. |
 | Gate enforcement | Untested by design gap | Mode is recorded in metadata and reports, but no CLI command fails a build in gate mode. Locked design says deterministic proof tests gate in the target CI, which no field target has exercised yet. |

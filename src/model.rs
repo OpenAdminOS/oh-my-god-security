@@ -79,6 +79,10 @@ pub struct Finding {
     pub fix_brief: Option<String>,
     #[serde(default)]
     pub intent_question: Option<String>,
+    /// Library question this record asks (see `omgs intent list`), so one
+    /// recorded answer resolves every record that shares it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_id: Option<String>,
     /// Root cause family shared across copied locations, for honest counts.
     #[serde(default)]
     pub family: Option<String>,
@@ -161,6 +165,13 @@ pub fn validate(file: &FindingsFile) -> Vec<String> {
                 ));
             }
         }
+        if let Some(id) = &f.intent_id {
+            if crate::intent::find(id).is_none() {
+                errors.push(format!(
+                    "{at}: intent_id '{id}' is not in the intent library, see omgs intent list"
+                ));
+            }
+        }
         match (identity(&f.hunted_by), identity(&f.verified_by)) {
             (None, _) => errors.push(format!(
                 "{at}: hunted_by is required, record which hunter produced the candidate"
@@ -218,7 +229,8 @@ pub fn validate(file: &FindingsFile) -> Vec<String> {
                     .intent_question
                     .as_deref()
                     .map(|q| !q.trim().is_empty())
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || f.intent_id.is_some();
                 if !has_question && f.evidence.trim().is_empty() {
                     errors.push(format!(
                         "{at}: needs_validation requires an intent_question or the exact missing fact in evidence"

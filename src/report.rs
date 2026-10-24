@@ -20,6 +20,51 @@ pub struct ReportMeta {
     pub agent_calls: Option<u32>,
     /// Coverage critic result, when the run files were available to check.
     pub critic: Option<CriticReport>,
+    /// Model per role, for example "hunter: model-a", from run metadata.
+    pub models: Vec<String>,
+    /// Recorded reroutes after a refusal, one line each.
+    pub reroutes: Vec<String>,
+    /// The reviewer's recorded intent answers for this run.
+    pub intent_answers: crate::intent::Answers,
+}
+
+/// The intent question a record asks: its own text, else the library text
+/// for its `intent_id`.
+fn question_of(f: &Finding) -> Option<String> {
+    nonblank(&f.intent_question).map(String::from).or_else(|| {
+        f.intent_id
+            .as_deref()
+            .and_then(crate::intent::find)
+            .map(|q| q.question.clone())
+    })
+}
+
+/// Recorded answers that apply to a record, as display lines.
+fn answers_for(meta: &ReportMeta, f: &Finding) -> Vec<String> {
+    let Some(id) = f.intent_id.as_deref() else {
+        return Vec::new();
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for loc in std::iter::once(&f.location).chain(&f.locations) {
+        for a in crate::intent::applicable(&meta.intent_answers, id, &loc.path) {
+            let line = format!("{} (scope {}, from {})", a.answer, a.scope, a.source);
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+    }
+    lines
+}
+
+fn models_text(meta: &ReportMeta) -> Option<String> {
+    let mut parts = Vec::new();
+    if !meta.models.is_empty() {
+        parts.push(meta.models.join(", "));
+    }
+    if !meta.reroutes.is_empty() {
+        parts.push(format!("reroutes: {}", meta.reroutes.join("; ")));
+    }
+    (!parts.is_empty()).then(|| parts.join(". "))
 }
 
 fn critic_text(meta: &ReportMeta) -> String {
@@ -88,6 +133,9 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
     }
     out.push_str(&format!("Run: {}\n\n", run_meta_text(meta)));
     out.push_str(&format!("Coverage critic: {}\n\n", critic_text(meta)));
+    if let Some(models) = models_text(meta) {
+        out.push_str(&format!("Models: {models}\n\n"));
+    }
     for f in &conf {
         out.push_str(&format!(
             "## {} ({}, {})\n\n{}\n\n{}\n\n",
@@ -118,8 +166,11 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
             if let Some(p) = &f.prerequisites {
                 out.push_str(&format!("Prerequisites: {p}\n\n"));
             }
-            if let Some(q) = &f.intent_question {
+            if let Some(q) = question_of(f) {
                 out.push_str(&format!("Intent question: {q}\n\n"));
+            }
+            for a in answers_for(meta, f) {
+                out.push_str(&format!("Recorded answer: {a}\n\n"));
             }
         }
     }
@@ -525,7 +576,7 @@ fn render_facts(f: &Finding) -> String {
     out
 }
 
-fn render_finding(r: &Record) -> String {
+fn render_finding(r: &Record, meta: &ReportMeta) -> String {
     let f = r.f;
     let parts = split_evidence(&f.evidence);
     // An open record leads with what is missing, ahead of the supporting trace.
@@ -536,10 +587,19 @@ fn render_finding(r: &Record) -> String {
                 .is_some_and(|l| l.starts_with("Missing fact"))
     });
     let mut callouts = String::new();
-    if let Some(q) = nonblank(&f.intent_question) {
+    if let Some(q) = question_of(f) {
+        let answers: String = answers_for(meta, f)
+            .iter()
+            .map(|a| {
+                format!(
+                    "<p class=\"answer\">Recorded answer: {}</p>",
+                    html_escape(a)
+                )
+            })
+            .collect();
         callouts.push_str(&format!(
-            "<div class=\"callout c-intent\"><h4>Question for you</h4><p>{}</p></div>",
-            html_escape(q)
+            "<div class=\"callout c-intent\"><h4>Question for you</h4><p>{}</p>{answers}</div>",
+            html_escape(&q)
         ));
     }
     for part in &missing {
@@ -596,11 +656,29 @@ fn render_section(id: &str, title: &str, intro: &str, body: &str) -> String {
     format!("<section class=\"sec sec-{id}\" id=\"{id}\" aria-labelledby=\"{id}-h\"><h2 id=\"{id}-h\">{title}</h2>{intro}{body}</section>")
 }
 
-fn render_cards(list: &[Record], empty: &str) -> String {
+fn render_cards(list: &[Record], empty: &str, meta: &ReportMeta) -> String {
     if list.is_empty() {
         return format!("<p class=\"empty\">{empty}</p>");
     }
-    list.iter().map(render_finding).collect()
+    list.iter().map(|r| render_finding(r, meta)).collect()
+}
+
+/// Records that ask the same library question form one group, so one answer
+/// resolves them together; a free-text question is its own group.
+fn intent_groups<'a>(records: &[&'a Record<'a>]) -> Vec<Vec<&'a Record<'a>>> {
+    let mut groups: Vec<Vec<&Record>> = Vec::new();
+    for r in records {
+        let shared = r.f.intent_id.as_deref().and_then(|id| {
+            groups
+                .iter()
+                .position(|g| g[0].f.intent_id.as_deref() == Some(id))
+        });
+        match shared {
+            Some(i) => groups[i].push(r),
+            None => groups.push(vec![r]),
+        }
+    }
+    groups
 }
 
 pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
@@ -612,11 +690,12 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
         .iter()
         .chain(&pending)
         .chain(&rejected)
-        .filter(|r| nonblank(&r.f.intent_question).is_some())
+        .filter(|r| question_of(r.f).is_some())
         .collect();
+    let groups = intent_groups(&intent);
     let pending_open = pending
         .iter()
-        .filter(|r| nonblank(&r.f.intent_question).is_none())
+        .filter(|r| question_of(r.f).is_none())
         .count();
     let mut families = std::collections::BTreeSet::new();
     for f in &file.findings {
@@ -625,19 +704,22 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
     let sensors_text = meta.sensors.as_deref().unwrap_or("not recorded");
 
     let masthead = format!(
-        "<header class=\"masthead\"><div class=\"wrap\"><p class=\"eyebrow\">OMGS security review</p><h1>Security review of {repo}</h1><dl class=\"meta\"><div><dt>Commit</dt><dd><code>{source_ref}</code></dd></div><div><dt>Mode</dt><dd>{mode}</dd></div><div><dt>Sandbox</dt><dd>{sandbox}</dd></div><div><dt>Sensors</dt><dd>{sensors}</dd></div><div><dt>Run</dt><dd>{run}</dd></div></dl></div></header>",
+        "<header class=\"masthead\"><div class=\"wrap\"><p class=\"eyebrow\">OMGS security review</p><h1>Security review of {repo}</h1><dl class=\"meta\"><div><dt>Commit</dt><dd><code>{source_ref}</code></dd></div><div><dt>Mode</dt><dd>{mode}</dd></div><div><dt>Sandbox</dt><dd>{sandbox}</dd></div><div><dt>Sensors</dt><dd>{sensors}</dd></div><div><dt>Run</dt><dd>{run}</dd></div>{models}</dl></div></header>",
         repo = html_escape(&meta.repo),
         source_ref = html_escape(&meta.source_ref),
         mode = html_escape(&meta.mode),
         sandbox = html_escape(&meta.sandbox),
         sensors = html_escape(sensors_text),
         run = html_escape(&run_meta_text(meta)),
+        models = models_text(meta)
+            .map(|m| format!("<div><dt>Models</dt><dd>{}</dd></div>", html_escape(&m)))
+            .unwrap_or_default(),
     );
 
     let nav = format!(
         "<nav class=\"toc\" aria-label=\"Report sections\"><ol><li><a href=\"#summary\">Summary</a></li><li><a href=\"#index\">Index</a></li><li><a href=\"#confirmed\">Confirmed <span class=\"c\">{}</span></a></li><li><a href=\"#intent\">Needs your intent <span class=\"c\">{}</span></a></li><li><a href=\"#pending\">Needs validation <span class=\"c\">{}</span></a></li><li><a href=\"#rejected\">Rejected <span class=\"c\">{}</span></a></li><li><a href=\"#coverage\">Coverage</a></li><li><a href=\"#reading\">Reading this report</a></li></ol></nav>",
         conf.len(),
-        intent.len(),
+        groups.len(),
         pending.len(),
         rejected.len(),
     );
@@ -650,12 +732,12 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
             plural(conf.len(), "confirmed finding", "confirmed findings")
         )
     };
-    let decide_line = if intent.is_empty() {
+    let decide_line = if groups.is_empty() {
         "No open questions about intended behavior.".to_string()
     } else {
         format!(
             "{} about intended behavior, listed under Needs your intent.",
-            plural(intent.len(), "question", "questions")
+            plural(groups.len(), "question", "questions")
         )
     };
     let validate_line = if pending_open == 0 {
@@ -708,7 +790,7 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
                 plural(r.f.locations.len(), "more location", "more locations")
             )
         };
-        let question = if nonblank(&r.f.intent_question).is_some() {
+        let question = if question_of(r.f).is_some() {
             "<span class=\"q\">Has a question</span>"
         } else {
             ""
@@ -740,22 +822,60 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
         &render_cards(
             &conf,
             "No finding was confirmed in this run. Confirmation requires executed proof, so open records stay under Needs validation until their missing fact is established.",
+            meta,
         ),
     );
 
-    let intent_body = if intent.is_empty() {
+    let intent_body = if groups.is_empty() {
         "<p class=\"empty\">No open questions about intended behavior.</p>".to_string()
     } else {
         let mut items = String::from("<ol class=\"intents\">");
-        for (n, r) in intent.iter().enumerate() {
+        for (n, group) in groups.iter().enumerate() {
+            let first = group[0];
+            let refs: Vec<String> = group
+                .iter()
+                .map(|r| {
+                    format!(
+                        "<a href=\"#{}\">{}</a>",
+                        html_escape(&r.anchor),
+                        html_escape(&r.reference)
+                    )
+                })
+                .collect();
+            let abouts: String = group
+                .iter()
+                .map(|r| {
+                    format!(
+                        "<p class=\"about\"><a href=\"#{id}\">{title}</a> <code>{loc}</code></p>",
+                        id = html_escape(&r.anchor),
+                        title = html_escape(&r.f.title),
+                        loc = html_escape(&location(r.f)),
+                    )
+                })
+                .collect();
+            let mut answers: Vec<String> = Vec::new();
+            for r in group {
+                for a in answers_for(meta, r.f) {
+                    if !answers.contains(&a) {
+                        answers.push(a);
+                    }
+                }
+            }
+            let answers: String = answers
+                .iter()
+                .map(|a| {
+                    format!(
+                        "<p class=\"answer\">Recorded answer: {}</p>",
+                        html_escape(a)
+                    )
+                })
+                .collect();
             items.push_str(&format!(
-                "<li class=\"intent-item\" id=\"q-{id}\"><p class=\"ref\">Q{n}, about <a href=\"#{id}\">{reference}</a></p><p class=\"question\">{question}</p><p class=\"about\"><a href=\"#{id}\">{title}</a> <code>{loc}</code></p></li>",
+                "<li class=\"intent-item\" id=\"q-{id}\"><p class=\"ref\">Q{n}, about {refs}</p><p class=\"question\">{question}</p>{answers}{abouts}</li>",
                 n = n + 1,
-                id = html_escape(&r.anchor),
-                reference = html_escape(&r.reference),
-                question = html_escape(nonblank(&r.f.intent_question).unwrap_or_default()),
-                title = html_escape(&r.f.title),
-                loc = html_escape(&location(r.f)),
+                id = html_escape(&first.anchor),
+                refs = refs.join(", "),
+                question = html_escape(&question_of(first.f).unwrap_or_default()),
             ));
         }
         items.push_str("</ol>");
@@ -764,10 +884,10 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
     let intent_html = render_section(
         "intent",
         "Needs your intent",
-        if intent.is_empty() {
+        if groups.is_empty() {
             ""
         } else {
-            "These records turn on how the project is meant to behave. Each question links to its full record."
+            "These records turn on how the project is meant to behave. Each question links to its records; one answer resolves every record that asks it."
         },
         &intent_body,
     );
@@ -780,7 +900,7 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
         } else {
             "These records are plausible from the source but not decided. Each one states what is still missing. None of them is a confirmed vulnerability."
         },
-        &render_cards(&pending, "No records need validation."),
+        &render_cards(&pending, "No records need validation.", meta),
     );
 
     let rejected_html = render_section(
@@ -791,7 +911,7 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
         } else {
             "These leads were investigated and ruled out. The counterevidence is kept here so the same question does not need to be reopened."
         },
-        &render_cards(&rejected, "No candidates were rejected in this run."),
+        &render_cards(&rejected, "No candidates were rejected in this run.", meta),
     );
 
     let coverage_body = if meta.coverage.is_empty() {
@@ -954,6 +1074,7 @@ table.index{width:100%;border-collapse:collapse;background:var(--surface);border
 .intent-item{margin:0 0 12px;padding:14px 18px;background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--violet);border-radius:8px;scroll-margin-top:56px}
 .question{margin:4px 0 8px;max-width:70ch;font-size:16.5px;line-height:1.5;font-weight:500}
 .about{margin:0;font-size:13.5px;color:var(--muted)}
+.answer{margin:4px 0 8px;font-size:14px;font-weight:600;color:var(--violet)}
 .sec-rejected>.intro{padding:10px 14px;border-left:3px solid var(--green);border-radius:6px;background:var(--green-bg);color:var(--text)}
 .gaps{margin:4px 0 0;padding-left:20px;font-size:13.5px}
 .coverage{margin:0;padding:12px 18px 12px 36px;background:var(--surface);border:1px solid var(--line);border-radius:8px;font-family:var(--mono);font-size:13px}

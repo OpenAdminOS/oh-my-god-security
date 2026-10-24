@@ -34,3 +34,12 @@ For signer and version trust on a privileged installer, prove the decision logic
 - Symlink components rejected explicitly before any recursive operation.
 - A destination or in-archive symlink pointing outside the allowed tree that the installer replaces atomically rather than writing through: if the out-of-tree target's owner and contents are unchanged and a sentinel survives, the symlink path is sound.
 - A signer check that fails closed when the expected value is absent, or a version guard that reads back the installed version and refuses a downgrade.
+
+## Intent questions
+
+When a record turns on intent, set its `intent_id` to one of these library questions instead of writing a new one, so one recorded answer resolves every record that asks it (`omgs intent list` shows them all):
+
+- `local.privileged-delete-scope`: Which directories may this tool delete from, and may the user control any parent of those paths?
+- `local.installer-signer`: Must every installed payload be signed by one expected team and match the requested version?
+- `local.downgrade`: May an older version ever replace a newer installed version?
+- `script.dry-run-executes`: Must a dry run be free of side effects, including executing commands built from input?

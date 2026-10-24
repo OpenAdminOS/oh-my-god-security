@@ -825,7 +825,7 @@ fn md_code(s: &str) -> String {
         .collect()
 }
 
-fn md_inline(s: &str) -> String {
+pub(crate) fn md_inline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {

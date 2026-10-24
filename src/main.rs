@@ -24,7 +24,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <url> [--mode gate|advisory] [--budget <n>]\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--cwd <dir>] [--scratch <dir>] [--timeout-ms <n>]\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs check --target <repo> [--out <run-dir>]\n\nEvery option except --yes and --no-sensors takes a value, and a value may not begin with --.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--cwd <dir>] [--scratch <dir>] [--timeout-ms <n>]\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n\nEvery option except --yes and --no-sensors takes a value, and a value may not begin with --.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -73,6 +73,11 @@ fn main() -> ExitCode {
         "architecture" => cmd_architecture(rest),
         "ledger" => cmd_ledger(rest),
         "critic" => cmd_critic(rest),
+        "batch" => cmd_batch(rest),
+        "status" => cmd_status(rest),
+        "watch" => cmd_watch(rest),
+        "route" => cmd_route(rest),
+        "intent" => cmd_intent(rest),
         "check" => cmd_check(rest),
         other => Err(format!("unknown command '{other}'")),
     };
@@ -129,12 +134,12 @@ fn cmd_architecture(args: &[String]) -> Result<(), String> {
     }
     let dir = Path::new(&out);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    std::fs::write(
+    write_out(
         dir.join("ARCHITECTURE.md"),
         render_architecture_markdown(&file),
     )
     .map_err(|e| e.to_string())?;
-    std::fs::write(
+    write_out(
         dir.join("ARCHITECTURE.html"),
         render_architecture_html(&file),
     )
@@ -318,6 +323,14 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             "warning: run metadata incomplete; pass --hunters <n>, --verifier <id>, and --agent-calls <n>. Unrecorded values render as \"not recorded\"."
         );
     }
+    if let Some(dir) = findings_dir
+        .as_deref()
+        .filter(|d| std::fs::symlink_metadata(d.join(omgs::runmeta::FILE)).is_ok())
+    {
+        let m = omgs::runmeta::read(dir)?;
+        omgs::batch::check_meta_types(&m)
+            .map_err(|e| format!("{}: {e}", dir.join(omgs::runmeta::FILE).display()))?;
+    }
     let meta = ReportMeta {
         repo: flag(args, "--repo").unwrap_or_else(|| "target".into()),
         source_ref: flag(args, "--ref").unwrap_or_else(|| "working tree".into()),
@@ -329,14 +342,15 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         verifier,
         agent_calls,
         critic,
+        models: run_models(findings_dir.as_deref()),
+        reroutes: run_reroutes(findings_dir.as_deref()),
+        intent_answers: run_answers(findings_dir.as_deref())?,
     };
     let dir = Path::new(&out);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("REPORT.md"), render_markdown(&file, &meta))
-        .map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("REPORT.html"), render_html(&file, &meta))
-        .map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("findings.sarif.json"), render_sarif(&file, &meta))
+    write_out(dir.join("REPORT.md"), render_markdown(&file, &meta)).map_err(|e| e.to_string())?;
+    write_out(dir.join("REPORT.html"), render_html(&file, &meta)).map_err(|e| e.to_string())?;
+    write_out(dir.join("findings.sarif.json"), render_sarif(&file, &meta))
         .map_err(|e| e.to_string())?;
     println!(
         "wrote {}, {}, {}",
@@ -344,7 +358,200 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         dir.join("REPORT.html").display(),
         dir.join("findings.sarif.json").display()
     );
+    // Record what this report rendered in the run metadata and mark the run
+    // complete, which also lets a running omgs watch shut itself down.
+    if let Some(run) = findings_dir
+        .as_deref()
+        .filter(|d| d.join(omgs::runmeta::FILE).is_file())
+    {
+        omgs::runmeta::update(run, |m| {
+            if let Some(n) = meta.hunters {
+                m.insert("hunters".into(), serde_json::json!(n));
+            }
+            if let Some(v) = &meta.verifier {
+                m.insert("verifier".into(), serde_json::json!(v));
+            }
+            if let Some(n) = meta.agent_calls {
+                m.insert("agent_calls_used".into(), serde_json::json!(n));
+            }
+            m.insert("run_status".into(), serde_json::json!("complete"));
+            m.insert(
+                "completed_unix".into(),
+                serde_json::json!(omgs::runmeta::now_unix()),
+            );
+            Ok(())
+        })?;
+    }
     Ok(())
+}
+
+/// The reviewer's answer store for `target`, only when it physically lives
+/// outside the target: HOME, the store directory, or any parent resolving
+/// into the target (or the store file being a link) would let the target
+/// author "recorded" answers.
+fn trusted_store(target: &Path) -> Result<PathBuf, String> {
+    let path = omgs::intent::answers_file(&home().join(".local/share/omgs"), target);
+    if resolve_existing_prefix(&path)?.starts_with(target) {
+        return Err(format!(
+            "the intent answer store {} resolves inside the target {}; refusing to use it",
+            path.display(),
+            target.display()
+        ));
+    }
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
+        return Err(format!(
+            "the intent answer store {} is not a regular file; refusing to use it",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+/// Read the reviewer's answer store through a descriptor opened without
+/// following links, and only when it is a regular file with exactly one link,
+/// so neither a symlink nor a hardlink planted in the target can change what
+/// the store says. A missing store means no answers yet. Platforms without a
+/// stable link count fail closed: stored answers are Unix only.
+fn read_store(path: &Path) -> Result<omgs::intent::Answers, String> {
+    use std::io::Read;
+    if !cfg!(unix) {
+        return Err("stored intent answers are supported on Unix only".into());
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = match opts.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(format!("open {}: {e}", path.display())),
+    };
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !meta.is_file() || meta.nlink() != 1 {
+            return Err(format!(
+                "{} must be a regular file with a single link; refusing to trust it",
+                path.display()
+            ));
+        }
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    omgs::intent::parse_answers(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+/// The run's intent answers, only when they belong to the run's target as
+/// recorded in run metadata; anything else is ignored with a warning.
+fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
+    let Some(dir) = dir else {
+        return Ok(Default::default());
+    };
+    let answers = omgs::intent::load_answers(&dir.join("intent-answers.json"))?;
+    if answers.answers.is_empty() {
+        return Ok(answers);
+    }
+    // Provenance: answers render only when the run directory sits outside the
+    // target it names, and each answer also exists in the reviewer's own
+    // store for that target. Files next to the findings could have been
+    // written by the target itself, so matching them to each other proves
+    // nothing.
+    let refuse = |why: &str| {
+        eprintln!("warning: intent answers not shown: {why}");
+        Ok(Default::default())
+    };
+    let target = omgs::runmeta::read(dir)
+        .ok()
+        .and_then(|m| m.get("target").and_then(|t| t.as_str()).map(PathBuf::from))
+        .and_then(|t| std::fs::canonicalize(t).ok());
+    let Some(target) = target else {
+        return refuse("run metadata names no existing target");
+    };
+    let run = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+    if run.starts_with(&target) {
+        return refuse("the run directory is inside the target");
+    }
+    if Path::new(&answers.target) != target {
+        return refuse("they belong to a different target");
+    }
+    let store_path = match trusted_store(&target) {
+        Ok(p) => p,
+        Err(e) => return refuse(&e),
+    };
+    let store = match read_store(&store_path) {
+        Ok(s) => s,
+        Err(e) => return refuse(&e),
+    };
+    if Path::new(&store.target) != target {
+        return refuse("the reviewer's store for this path belongs to another target");
+    }
+    let total = answers.answers.len();
+    let kept: Vec<_> = answers
+        .answers
+        .into_iter()
+        .filter(|a| store.answers.contains(a))
+        .collect();
+    if kept.len() < total {
+        eprintln!(
+            "warning: {} intent answer(s) not in the reviewer's store were not shown",
+            total - kept.len()
+        );
+    }
+    Ok(omgs::intent::Answers {
+        target: answers.target,
+        answers: kept,
+    })
+}
+
+/// "role: model" lines from run metadata `models`, sorted by role.
+fn run_models(dir: Option<&Path>) -> Vec<String> {
+    let Some(meta) = dir.and_then(|d| omgs::runmeta::read(d).ok()) else {
+        return Vec::new();
+    };
+    meta.get("models")
+        .and_then(|m| m.as_object())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(role, model)| model.as_str().map(|v| format!("{role}: {v}")))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One line per recorded reroute, in the order they happened.
+fn run_reroutes(dir: Option<&Path>) -> Vec<String> {
+    let Some(meta) = dir.and_then(|d| omgs::runmeta::read(d).ok()) else {
+        return Vec::new();
+    };
+    meta.get("reroutes")
+        .and_then(|r| r.as_array())
+        .map(|list| {
+            list.iter()
+                .map(|r| {
+                    let get = |k: &str| r.get(k).and_then(|v| v.as_str()).unwrap_or("none");
+                    format!(
+                        "{} {} to {} ({})",
+                        get("role"),
+                        get("from"),
+                        get("to"),
+                        get("reason")
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every file OMGS writes into a run or output directory goes through an
+/// atomic replace, so a planted symlink or hardlink at the destination is
+/// replaced rather than written through into another location.
+fn write_out(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    omgs::runmeta::write_atomic_bytes(path.as_ref(), contents.as_ref())
 }
 
 fn home() -> PathBuf {
@@ -384,7 +591,42 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
     if args.first().map(|s| s.as_str()) != Some("init") {
         return Err("usage: omgs audit init --target <repo>".into());
     }
-    let rest = &args[1..];
+    let run = audit_init(&args[1..])?;
+    println!("{}", run.display());
+    Ok(())
+}
+
+/// Resolve `p` physically through its nearest existing ancestor, so every
+/// symlink (and any `..` after one) is followed by the OS before the
+/// outside-the-target check. A `..` that follows a missing directory cannot be
+/// resolved, so it fails closed rather than being guessed lexically.
+fn resolve_existing_prefix(p: &Path) -> Result<PathBuf, String> {
+    let mut existing = p.to_path_buf();
+    let mut rest = Vec::new();
+    while !existing.exists() {
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name.to_os_string());
+                existing = parent.to_path_buf();
+            }
+            _ => {
+                return Err(format!(
+                    "cannot resolve {} ('..' after a missing directory); use a path without it",
+                    p.display()
+                ))
+            }
+        }
+    }
+    let mut resolved = std::fs::canonicalize(&existing)
+        .map_err(|e| format!("resolve {}: {e}", existing.display()))?;
+    for name in rest.iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
+}
+
+/// Initialize a run and return its directory.
+fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     let target_raw = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
     let target =
         std::fs::canonicalize(&target_raw).map_err(|e| format!("target {target_raw}: {e}"))?;
@@ -392,34 +634,101 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "target".into());
-    let out = match flag(rest, "--out") {
-        Some(o) => PathBuf::from(o),
+    // Validate every input and read the answer store before claiming a run
+    // directory, so a mistyped option or an untrusted store never leaves a
+    // claimed, half-written run behind.
+    let mode = flag(rest, "--mode").unwrap_or_else(|| "advisory".into());
+    if mode != "gate" && mode != "advisory" {
+        return Err("--mode must be gate or advisory".into());
+    }
+    let budget: Option<u64> = match flag(rest, "--budget") {
+        Some(v) => Some(
+            v.parse()
+                .map_err(|_| format!("--budget must be a whole number, got '{v}'"))?,
+        ),
+        None => None,
+    };
+    let answers_src = trusted_store(&target)?;
+    let answers = if answers_src.is_file() {
+        let answers = read_store(&answers_src)?;
+        if Path::new(&answers.target) == target {
+            Some(answers)
+        } else {
+            eprintln!(
+                "warning: {} belongs to {}, not {}; intent answers not copied",
+                answers_src.display(),
+                answers.target,
+                target.display()
+            );
+            None
+        }
+    } else {
+        None
+    };
+    let outside = |p: &Path| -> Result<(), String> {
+        if resolve_existing_prefix(p)?.starts_with(&target) {
+            Err(
+                "run output must live outside the target tree, so findings never enter git history"
+                    .into(),
+            )
+        } else {
+            Ok(())
+        }
+    };
+    let out_abs = match flag(rest, "--out") {
+        Some(o) => {
+            let out = PathBuf::from(o);
+            let out_abs = if out.is_absolute() {
+                out
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| e.to_string())?
+                    .join(&out)
+            };
+            outside(&out_abs)?;
+            // A run directory is always fresh: reusing one would overwrite a
+            // finished run or mix two targets' evidence and answers.
+            if std::fs::read_dir(&out_abs).is_ok_and(|mut d| d.next().is_some()) {
+                return Err(format!(
+                    "{} already exists and is not empty; choose a new run directory",
+                    out_abs.display()
+                ));
+            }
+            std::fs::create_dir_all(&out_abs).map_err(|e| e.to_string())?;
+            out_abs
+        }
         None => {
+            // Claim run-N with an exclusive create, so parallel inits (batch
+            // mode) never share a run directory.
             let base = home().join(".local/share/omgs").join(&repo);
+            std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
             let mut n = 1;
             loop {
                 let candidate = base.join(format!("run-{n}"));
-                if !candidate.exists() {
-                    break candidate;
+                outside(&candidate)?;
+                match std::fs::create_dir(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+                    Err(e) => return Err(format!("create {}: {e}", candidate.display())),
                 }
-                n += 1;
             }
         }
     };
-    let out_abs = if out.is_absolute() {
-        out.clone()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| e.to_string())?
-            .join(&out)
-    };
-    if out_abs.starts_with(&target) {
-        return Err(
-            "run output must live outside the target tree, so findings never enter git history"
-                .into(),
-        );
-    }
-    std::fs::create_dir_all(&out_abs).map_err(|e| e.to_string())?;
+    // The check above ran before creation; recheck the created directory in
+    // case a link was swapped in between.
+    outside(&std::fs::canonicalize(&out_abs).map_err(|e| e.to_string())?)?;
+    // Claim the directory exclusively, so two concurrent inits given the same
+    // --out cannot both pass the emptiness check and overwrite each other.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out_abs.join(".omgs-claim"))
+        .map_err(|e| {
+            format!(
+                "{} is already claimed by another run ({e}); choose a new run directory",
+                out_abs.display()
+            )
+        })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -428,11 +737,6 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
     if out_abs.starts_with("/tmp") || out_abs.starts_with("/private/tmp") {
         eprintln!("warning: run output is under a shared temp directory and describes vulnerabilities. Prefer the default runs directory under your home.");
     }
-    let mode = flag(rest, "--mode").unwrap_or_else(|| "advisory".into());
-    if mode != "gate" && mode != "advisory" {
-        return Err("--mode must be gate or advisory".into());
-    }
-    let budget: Option<u64> = flag(rest, "--budget").and_then(|v| v.parse().ok());
     let source_ref = std::process::Command::new("git")
         .args([
             "-C",
@@ -529,17 +833,17 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
         "hunter": flag(rest, "--hunter"),
         "verifier": flag(rest, "--verifier")
     });
-    std::fs::write(
+    write_out(
         out_abs.join("run-metadata.json"),
         serde_json::to_string_pretty(&meta).unwrap(),
     )
     .map_err(|e| e.to_string())?;
-    std::fs::write(
+    write_out(
         out_abs.join("coverage-ledger.json"),
         serde_json::to_string_pretty(&ledger).unwrap(),
     )
     .map_err(|e| e.to_string())?;
-    std::fs::write(out_abs.join("findings.json"), "{\n  \"findings\": []\n}\n")
+    write_out(out_abs.join("findings.json"), "{\n  \"findings\": []\n}\n")
         .map_err(|e| e.to_string())?;
     let arch_seed = serde_json::json!({
         "target": target.to_string_lossy(),
@@ -557,21 +861,27 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
         "components": [],
         "notes": "Seeded by omgs audit. The reconnaissance agent fills zones, components, principals, boundaries, flows, and input_surfaces, records what was not examined in 'unexamined', then renders the map with: omgs architecture --in architecture.json --out <run-dir>."
     });
-    std::fs::write(
+    write_out(
         out_abs.join("architecture.json"),
         format!("{}\n", serde_json::to_string_pretty(&arch_seed).unwrap()),
     )
     .map_err(|e| e.to_string())?;
     if !has(rest, "--no-sensors") {
         let sensors = run_sensors(&target, &out_abs);
-        std::fs::write(
+        write_out(
             out_abs.join("sensors.json"),
             serde_json::to_string_pretty(&sensors).unwrap_or_default(),
         )
         .map_err(|e| e.to_string())?;
     }
-    println!("{}", out_abs.display());
-    Ok(())
+    // Bring the reviewer's recorded intent answers for this exact target into
+    // the run, so earlier answers resolve matching questions in the report.
+    if let Some(answers) = answers {
+        let text = serde_json::to_string_pretty(&answers).map_err(|e| e.to_string())?;
+        write_out(out_abs.join("intent-answers.json"), format!("{text}\n"))
+            .map_err(|e| format!("copy intent answers: {e}"))?;
+    }
+    Ok(out_abs)
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
@@ -694,7 +1004,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     if let Some(out) = flag(args, "--out") {
         let dir = PathBuf::from(out);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        std::fs::write(
+        write_out(
             dir.join("sensors.json"),
             serde_json::to_string_pretty(&sensors).unwrap_or_default(),
         )
@@ -711,7 +1021,7 @@ fn read_ledger(path: &str) -> Result<Ledger, String> {
 
 fn write_ledger(path: &str, ledger: &Ledger) -> Result<(), String> {
     let text = serde_json::to_string_pretty(ledger).map_err(|e| e.to_string())?;
-    std::fs::write(path, format!("{text}\n")).map_err(|e| format!("write {path}: {e}"))
+    omgs::runmeta::write_atomic(Path::new(path), &format!("{text}\n"))
 }
 
 /// Every value given for a repeatable flag, in order.
@@ -727,6 +1037,17 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
     let sub = args.first().map(|s| s.as_str()).ok_or(usage)?;
     let rest = &args[1..];
     let path = flag(rest, "--ledger").ok_or("ledger requires --ledger <file>")?;
+    let lock = Path::new(&path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .join(".omgs-run.lock");
+    omgs::runmeta::with_lock_file(&lock, || ledger_locked(sub, rest, &path))
+}
+
+fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
+    let usage = "usage: omgs ledger list|add|set --ledger <file> ...";
+    let path = path.to_string();
     let mut ledger = read_ledger(&path)?;
     match sub {
         "list" => {
@@ -791,42 +1112,552 @@ fn cmd_critic(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn cmd_review(args: &[String]) -> Result<(), String> {
-    let url = flag(args, "--repo-url").ok_or("review requires --repo-url <url>")?;
-    let name = url
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or("target")
-        .trim_end_matches(".git")
-        .to_string();
-    let dest = home().join(".local/share/omgs/targets").join(&name);
-    if !dest.exists() {
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+/// Clone (or reuse) a repository for review. Only validated https URLs reach
+/// git, as a positional argument after `--`, with every other transport
+/// disabled and no prompts; a reused clone must have the same origin.
+fn clone_target(raw_url: &str) -> Result<PathBuf, String> {
+    let repo = omgs::batch::parse_repo_url(raw_url)?;
+    let targets = home().join(".local/share/omgs/targets");
+    let dest = targets.join(&repo.host).join(&repo.owner).join(&repo.name);
+    let git = || {
+        let mut c = std::process::Command::new("git");
+        c.env("GIT_TERMINAL_PROMPT", "0").args([
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.https.allow=always",
+        ]);
+        c
+    };
+    let parent = dest.parent().ok_or("invalid clone destination")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&targets, std::fs::Permissions::from_mode(0o700));
+    }
+    // One lock per destination covers the existence check, the clone, and
+    // any cleanup, so a concurrent review of the same URL can never delete a
+    // clone another process just created.
+    let lock = parent.join(format!(".{}.lock", repo.name));
+    omgs::runmeta::with_lock_file(&lock, || {
+        if dest.exists() {
+            let origin = git()
+                .args(["-C", &dest.to_string_lossy(), "remote", "get-url", "origin"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            // Compare the repository identity, not the spelling: a trailing
+            // slash, `.git`, or host case must not reject a reused clone.
+            let same = origin
+                .as_deref()
+                .and_then(|o| omgs::batch::parse_repo_url(o).ok())
+                .is_some_and(|o| {
+                    o.host == repo.host
+                        && o.owner.eq_ignore_ascii_case(&repo.owner)
+                        && o.name.eq_ignore_ascii_case(&repo.name)
+                });
+            if !same {
+                return Err(format!(
+                    "{} exists but its origin is {}, not {}; remove it or review that URL",
+                    dest.display(),
+                    origin.as_deref().unwrap_or("unknown"),
+                    repo.url
+                ));
+            }
+            return Ok(dest.clone());
         }
-        let status = std::process::Command::new("git")
-            .args(["clone", "--depth", "1", &url, &dest.to_string_lossy()])
+        let status = git()
+            .args(["clone", "--depth", "1", "--no-recurse-submodules", "--"])
+            .arg(&repo.url)
+            .arg(&dest)
             .status()
             .map_err(|e| e.to_string())?;
         if !status.success() {
-            return Err(format!("git clone failed for {url}"));
+            let _ = std::fs::remove_dir_all(&dest);
+            return Err(format!("git clone failed for {}", repo.url));
+        }
+        Ok(dest.clone())
+    })
+}
+
+fn init_args(dest: &Path, args: &[String], out: Option<&Path>) -> Vec<String> {
+    let mut v = vec!["--target".to_string(), dest.to_string_lossy().to_string()];
+    for name in ["--mode", "--budget"] {
+        if let Some(value) = flag(args, name) {
+            v.push(name.into());
+            v.push(value);
         }
     }
-    let mut init_args = vec![
-        "init".to_string(),
-        "--target".to_string(),
-        dest.to_string_lossy().to_string(),
-    ];
-    if let Some(mode) = flag(args, "--mode") {
-        init_args.push("--mode".into());
-        init_args.push(mode);
+    if let Some(o) = out {
+        v.push("--out".into());
+        v.push(o.to_string_lossy().to_string());
     }
-    if let Some(budget) = flag(args, "--budget") {
-        init_args.push("--budget".into());
-        init_args.push(budget);
+    if has(args, "--no-sensors") {
+        v.push("--no-sensors".into());
     }
-    cmd_audit(&init_args)?;
-    println!("agent brief: load the omgs skill, follow its pipeline against {}, validate findings with omgs validate, prove only through omgs prove, and render with omgs report.", dest.display());
+    v
+}
+
+fn brief(dest: &Path, run: &Path) -> String {
+    format!("agent brief: load the omgs skill, follow its pipeline against {} with run directory {}, validate findings with omgs validate, prove only through omgs prove, reconcile with omgs critic, and render with omgs report.", dest.display(), run.display())
+}
+
+fn cmd_review(args: &[String]) -> Result<(), String> {
+    let url = flag(args, "--repo-url").ok_or("review requires --repo-url <url>")?;
+    let dest = clone_target(&url)?;
+    let run = audit_init(&init_args(&dest, args, None))?;
+    println!("{}", run.display());
+    println!("{}", brief(&dest, &run));
     Ok(())
+}
+
+fn cmd_batch(args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(|s| s.as_str());
+    let rest = args.get(1..).unwrap_or_default();
+    match sub {
+        Some("init") => {
+            let list = flag(rest, "--list").ok_or("batch init requires --list <file>")?;
+            let out = PathBuf::from(flag(rest, "--out").ok_or("batch init requires --out <dir>")?);
+            let text = std::fs::read_to_string(&list).map_err(|e| format!("read {list}: {e}"))?;
+            let urls = omgs::batch::read_list(&text);
+            if urls.is_empty() {
+                return Err(format!("{list} lists no repository URLs"));
+            }
+            // Reject bad shared options before cloning or claiming anything.
+            if let Some(m) = flag(rest, "--mode") {
+                if m != "gate" && m != "advisory" {
+                    return Err("--mode must be gate or advisory".into());
+                }
+            }
+            if let Some(b) = flag(rest, "--budget") {
+                b.parse::<u64>()
+                    .map_err(|_| format!("--budget must be a whole number, got '{b}'"))?;
+            }
+            // The batch output must sit outside the targets area and every
+            // target in the list, including ones that later fail to clone.
+            let targets_root = home().join(".local/share/omgs/targets");
+            let dests: Vec<PathBuf> = urls
+                .iter()
+                .filter_map(|u| omgs::batch::parse_repo_url(u).ok())
+                .map(|r| targets_root.join(&r.host).join(&r.owner).join(&r.name))
+                .collect();
+            let out_abs = if out.is_absolute() {
+                out.clone()
+            } else {
+                std::env::current_dir().map_err(|e| e.to_string())?.join(&out)
+            };
+            let resolved = resolve_existing_prefix(&out_abs)?;
+            for t in std::iter::once(&targets_root).chain(&dests) {
+                if resolved.starts_with(resolve_existing_prefix(t)?) {
+                    return Err(format!(
+                        "batch output must live outside the reviewed targets, and {} is inside {}",
+                        out_abs.display(),
+                        t.display()
+                    ));
+                }
+            }
+            // The batch directory must be new or empty: anything already in it
+            // (a planted symlink at <host>/<owner> for example) could redirect
+            // a run into a target.
+            if std::fs::read_dir(&out).is_ok_and(|mut d| d.next().is_some()) {
+                return Err(format!(
+                    "{} is not empty; batch init needs a new or empty --out",
+                    out.display()
+                ));
+            }
+            std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o700));
+            }
+            let out = std::fs::canonicalize(&out).map_err(|e| e.to_string())?;
+            let resolved_targets = std::iter::once(&targets_root)
+                .chain(&dests)
+                .map(|t| resolve_existing_prefix(t))
+                .collect::<Result<Vec<_>, String>>()?;
+            let contained = |p: &Path| -> Result<(), String> {
+                let p = resolve_existing_prefix(p)?;
+                match resolved_targets.iter().find(|t| p.starts_with(t)) {
+                    Some(t) => Err(format!(
+                        "run directory {} resolves inside {}",
+                        p.display(),
+                        t.display()
+                    )),
+                    None => Ok(()),
+                }
+            };
+            // Claim the batch directory exclusively before any work, so two
+            // concurrent batch inits sharing --out cannot both proceed and
+            // overwrite each other's batch.json.
+            if out.join("batch.json").exists() {
+                return Err(format!(
+                    "{} already holds a batch; choose a new --out",
+                    out.display()
+                ));
+            }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(out.join(".omgs-batch-claim"))
+                .map_err(|e| {
+                    format!(
+                        "{} is already claimed by another batch ({e}); choose a new --out",
+                        out.display()
+                    )
+                })?;
+            let mut batch = omgs::batch::BatchFile {
+                created_unix: omgs::runmeta::now_unix(),
+                runs: Vec::new(),
+            };
+            for url in urls {
+                let attempt = omgs::batch::parse_repo_url(&url).and_then(|r| {
+                    // One path component per part keeps runs distinct: no
+                    // separator inside a part can make two URLs collide.
+                    let run_dir = out.join(&r.host).join(&r.owner).join(&r.name);
+                    // Every run path is checked against every listed target,
+                    // before the run is created and again after.
+                    contained(&run_dir)?;
+                    let dest = clone_target(&url)?;
+                    contained(&run_dir)?;
+                    let run = audit_init(&init_args(&dest, rest, Some(&run_dir)))?;
+                    contained(&run)?;
+                    Ok((dest, run))
+                });
+                match attempt {
+                    Ok((dest, run)) => {
+                        println!("{}", brief(&dest, &run));
+                        batch.runs.push(omgs::batch::BatchRun {
+                            url,
+                            target: Some(dest.to_string_lossy().to_string()),
+                            run_dir: Some(run.to_string_lossy().to_string()),
+                            status: "initialized".into(),
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("failed: {url}: {e}");
+                        // Keep the target path a valid URL maps to, so later
+                        // containment checks still know it.
+                        let target = omgs::batch::parse_repo_url(&url).ok().map(|r| {
+                            targets_root
+                                .join(&r.host)
+                                .join(&r.owner)
+                                .join(&r.name)
+                                .to_string_lossy()
+                                .to_string()
+                        });
+                        batch.runs.push(omgs::batch::BatchRun {
+                            url,
+                            target,
+                            status: "failed".into(),
+                            error: Some(e),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+            let path = out.join("batch.json");
+            let text = serde_json::to_string_pretty(&batch).map_err(|e| e.to_string())?;
+            omgs::runmeta::write_atomic(&path, &format!("{text}\n"))?;
+            let failed = batch.runs.iter().filter(|r| r.status == "failed").count();
+            println!(
+                "{}: {} initialized, {failed} failed",
+                path.display(),
+                batch.runs.len() - failed
+            );
+            if failed > 0 {
+                Err("__EXIT1__".into())
+            } else {
+                Ok(())
+            }
+        }
+        Some("index") => {
+            let path = flag(rest, "--batch").ok_or("batch index requires --batch <batch.json>")?;
+            let text = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
+            let batch =
+                omgs::batch::parse_batch(&text).map_err(|e| format!("parse {path}: {e}"))?;
+            let out = PathBuf::from(flag(rest, "--out").ok_or("batch index requires --out <dir>")?);
+            let out_abs = if out.is_absolute() {
+                out.clone()
+            } else {
+                std::env::current_dir().map_err(|e| e.to_string())?.join(&out)
+            };
+            let mut targets: Vec<PathBuf> = vec![resolve_existing_prefix(
+                &home().join(".local/share/omgs/targets"),
+            )?];
+            for r in &batch.runs {
+                if let Some(t) = r.target.as_deref() {
+                    targets.push(resolve_existing_prefix(Path::new(t))?);
+                }
+            }
+            let inside = |p: &Path| -> Result<(), String> {
+                match targets.iter().find(|t| p.starts_with(t)) {
+                    Some(t) => Err(format!(
+                        "index output must live outside every reviewed target, and {} is inside {}",
+                        out_abs.display(),
+                        t.display()
+                    )),
+                    None => Ok(()),
+                }
+            };
+            inside(&resolve_existing_prefix(&out_abs)?)?;
+            std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+            // Recheck the directory as it now exists, before writing anything.
+            let out = std::fs::canonicalize(&out).map_err(|e| e.to_string())?;
+            inside(&out)?;
+            let runs = batch
+                .runs
+                .iter()
+                .map(|r| omgs::batch::summarize(r, &out))
+                .collect::<Result<Vec<_>, String>>()?;
+            write_out(out.join("INDEX.md"), omgs::batch::render_index_markdown(&runs))
+                .map_err(|e| e.to_string())?;
+            write_out(out.join("INDEX.html"), omgs::batch::render_index_html(&runs))
+                .map_err(|e| e.to_string())?;
+            println!(
+                "wrote {}, {}",
+                out.join("INDEX.md").display(),
+                out.join("INDEX.html").display()
+            );
+            Ok(())
+        }
+        _ => Err("usage: omgs batch init --list <file> --out <dir> | omgs batch index --batch <batch.json> --out <dir>".into()),
+    }
+}
+
+fn cmd_status(args: &[String]) -> Result<(), String> {
+    let run = flag(args, "--run").ok_or("status requires --run <run-dir>")?;
+    let stage = flag(args, "--stage").ok_or("status requires --stage <id>")?;
+    let state = flag(args, "--state").ok_or("status requires --state <state>")?;
+    let mut counters = Vec::new();
+    for c in flags(args, "--counter") {
+        let (k, v) = c
+            .split_once('=')
+            .ok_or_else(|| format!("--counter expects name=number, got '{c}'"))?;
+        let n: u64 = v
+            .parse()
+            .map_err(|_| format!("--counter {k} needs a whole number"))?;
+        counters.push((k.to_string(), n));
+    }
+    let label = flag(args, "--label");
+    let parent = flag(args, "--parent");
+    let detail = flag(args, "--detail");
+    let log = flag(args, "--log");
+    omgs::status::apply(
+        Path::new(&run),
+        &omgs::status::Update {
+            stage: &stage,
+            label: label.as_deref(),
+            parent: parent.as_deref(),
+            state: &state,
+            detail: detail.as_deref(),
+            counters: &counters,
+            log: log.as_deref(),
+        },
+    )?;
+    println!("{stage}: {state}");
+    Ok(())
+}
+
+fn cmd_watch(args: &[String]) -> Result<(), String> {
+    let run = PathBuf::from(flag(args, "--run").ok_or("watch requires --run <run-dir>")?);
+    if !run.join(omgs::runmeta::FILE).is_file() {
+        return Err(format!(
+            "{} is not a run directory (no {})",
+            run.display(),
+            omgs::runmeta::FILE
+        ));
+    }
+    let max_ms: u64 = match flag(args, "--max-ms") {
+        Some(v) => v.parse().map_err(|_| "--max-ms needs a whole number")?,
+        None => 4 * 60 * 60 * 1000,
+    };
+    let (listener, port) = omgs::watch::bind()?;
+    println!("progress: http://127.0.0.1:{port}/ (loopback only; stops when the run completes)");
+    omgs::watch::serve(
+        listener,
+        port,
+        &run,
+        std::time::Duration::from_millis(max_ms),
+    );
+    Ok(())
+}
+
+fn models_path(args: &[String]) -> PathBuf {
+    flag(args, "--models")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".local/share/omgs/models.json"))
+}
+
+fn cmd_route(args: &[String]) -> Result<(), String> {
+    let run = PathBuf::from(flag(args, "--run").ok_or("route requires --run <run-dir>")?);
+    let role = flag(args, "--role").ok_or("route requires --role <role>")?;
+    if !omgs::route::ROLES.contains(&role.as_str()) {
+        return Err(format!(
+            "--role must be one of {}",
+            omgs::route::ROLES.join(", ")
+        ));
+    }
+    let models = omgs::route::load_models(&models_path(args))?;
+    let newly = flag(args, "--refused");
+    let reason = flag(args, "--reason").unwrap_or_default();
+    if newly.is_some() && reason.trim().is_empty() {
+        return Err("--refused requires --reason <text>".into());
+    }
+    // Read the refusal history, pick the next model, and record the result in
+    // one locked transaction, so concurrent reroutes never lose an entry.
+    let next = omgs::runmeta::update(&run, |m| {
+        // Malformed history must stop the command: silently ignoring it would
+        // forget earlier refusals and send work back to a refusing model.
+        omgs::batch::check_meta_types(m)?;
+        for (key, ok) in [
+            ("reroutes", m.get("reroutes").is_none_or(|v| v.is_array())),
+            ("models", m.get("models").is_none_or(|v| v.is_object())),
+            ("blockers", m.get("blockers").is_none_or(|v| v.is_array())),
+        ] {
+            if !ok {
+                return Err(format!("run metadata field '{key}' is malformed"));
+            }
+        }
+        let mut refused: Vec<String> = Vec::new();
+        for (i, r) in m
+            .get("reroutes")
+            .and_then(|r| r.as_array())
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let (Some(r_role), Some(from)) = (
+                r.get("role").and_then(|v| v.as_str()),
+                r.get("from").and_then(|v| v.as_str()),
+            ) else {
+                return Err(format!(
+                    "run metadata reroutes[{i}] needs string role and from"
+                ));
+            };
+            if r_role == role {
+                refused.push(from.to_string());
+            }
+        }
+        if let Some(model) = &newly {
+            if !refused.contains(model) {
+                refused.push(model.clone());
+            }
+        }
+        let next = omgs::route::next_model(&models, &role, &refused);
+        if let Some(from) = &newly {
+            let entry = serde_json::json!({
+                "role": role,
+                "from": from,
+                "to": next.as_ref().ok(),
+                "reason": reason,
+                "at_unix": omgs::runmeta::now_unix(),
+            });
+            if let Some(list) = m
+                .entry("reroutes")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+            {
+                list.push(entry);
+            }
+        }
+        match &next {
+            Ok(model) => {
+                if let Some(obj) = m
+                    .entry("models")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                {
+                    obj.insert(role.clone(), serde_json::json!(model));
+                }
+            }
+            Err(e) => {
+                if let Some(list) = m
+                    .entry("blockers")
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut()
+                {
+                    let e = serde_json::json!(e);
+                    if !list.contains(&e) {
+                        list.push(e);
+                    }
+                }
+            }
+        }
+        Ok(next)
+    })?;
+    match next {
+        Ok(model) => {
+            println!("{model}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("blocked: {e}");
+            Err("__EXIT1__".into())
+        }
+    }
+}
+
+fn cmd_intent(args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(|s| s.as_str());
+    let rest = args.get(1..).unwrap_or_default();
+    match sub {
+        Some("list") => {
+            let stack = flag(rest, "--stack");
+            let class = flag(rest, "--attack-class");
+            for q in omgs::intent::list(stack.as_deref(), class.as_deref()) {
+                println!("{}: {}", q.id, q.question);
+                if !q.answers.is_empty() {
+                    println!("  answers: {}", q.answers.join(" | "));
+                }
+            }
+            Ok(())
+        }
+        Some("answer") => {
+            let target_raw = flag(rest, "--target").ok_or("intent answer requires --target <repo>")?;
+            let target = std::fs::canonicalize(&target_raw)
+                .map_err(|e| format!("target {target_raw}: {e}"))?;
+            let get = |n: &str| flag(rest, n).ok_or_else(|| format!("intent answer requires {n}"));
+            let answer = omgs::intent::Answer {
+                id: get("--id")?,
+                answer: get("--answer")?,
+                scope: flag(rest, "--scope").unwrap_or_else(|| "repo".into()),
+                source: get("--source")?,
+                recorded_unix: omgs::runmeta::now_unix(),
+            };
+            let path = trusted_store(&target)?;
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            // Recheck after creating the directories, in case a parent link
+            // appeared in between.
+            let path = trusted_store(&target)?;
+            let id = answer.id.clone();
+            // The whole load, merge, and replace runs under a per-target lock
+            // so concurrent answers are never lost.
+            let lock = path.with_extension("lock");
+            omgs::runmeta::with_lock_file(&lock, || {
+            let mut answers = read_store(&path)?;
+            let target_s = target.to_string_lossy().to_string();
+            if !answers.target.is_empty() && answers.target != target_s {
+                return Err(format!(
+                    "{} belongs to {}, refusing to mix answers",
+                    path.display(),
+                    answers.target
+                ));
+            }
+            answers.target = target_s;
+            omgs::intent::record(&mut answers, answer)?;
+            let text = serde_json::to_string_pretty(&answers).map_err(|e| e.to_string())?;
+            omgs::runmeta::write_atomic(&path, &format!("{text}\n"))?;
+            Ok(())
+            })?;
+            println!("recorded {id} in {}", path.display());
+            Ok(())
+        }
+        _ => Err("usage: omgs intent list [--stack <s>] [--attack-class <c>] | omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]".into()),
+    }
 }

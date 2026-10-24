@@ -31,3 +31,9 @@ Write tests in the existing framework and run only through `omgs prove`. Stop at
 - A mock or sandbox transport failure is the only evidence of a supposed external request.
 
 If event freshness, accepted senders, or destination scope is unclear, ask a plain language intent question and store the reviewed answer as policy. Never invent a universal requirement that every webhook needs login or every configurable URL is unsafe.
+
+## Intent questions
+
+When a record turns on intent, set its `intent_id` to one of these library questions instead of writing a new one, so one recorded answer resolves every record that asks it (`omgs intent list` shows them all):
+
+- `webhook.sender-scope`: Which senders may call this webhook, and must every delivery be signed and fresh?

@@ -36,6 +36,7 @@
           "evidence": { "type": "string" },
           "fix_brief": { "type": "string" },
           "intent_question": { "type": "string" },
+          "intent_id": { "type": "string", "description": "Intent library question this record asks (omgs intent list)." },
           "family": { "type": "string" },
           "prerequisites": { "type": "string" },
           "hunted_by": { "type": "string", "minLength": 1, "description": "Hunter whose candidate produced this record." },

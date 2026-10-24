@@ -27,3 +27,10 @@ Write a test with a value containing the sink's quote character and a harmless m
 - Single-quoted PowerShell literals where apostrophes are doubled correctly before insertion.
 - Argv-style process APIs where each value stays a separate argument and no shell parses it.
 - Code the same principal fully controls end to end, with no import, sharing, or deployment step crossing a boundary.
+
+## Intent questions
+
+When a record turns on intent, set its `intent_id` to one of these library questions instead of writing a new one, so one recorded answer resolves every record that asks it (`omgs intent list` shows them all):
+
+- `script.manifest-supplier`: Who is allowed to supply the manifest, project, or configuration file whose values reach a generated script?
+- `script.dry-run-executes`: Must a dry run be free of side effects, including executing commands built from input?

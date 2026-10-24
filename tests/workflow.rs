@@ -24,6 +24,7 @@ fn record(key: &str) -> Finding {
         evidence: "Trace: x. Sandbox evidence: failed invariant.".into(),
         fix_brief: None,
         intent_question: None,
+        intent_id: None,
         family: None,
         prerequisites: None,
         hunted_by: Some("red-1".into()),
