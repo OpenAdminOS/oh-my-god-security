@@ -16,9 +16,10 @@ pub const STATUSES: [&str; 6] = [
 /// Statuses that close a unit without examining it, so each needs a reason.
 const NEEDS_NOTE: [&str; 3] = ["deferred", "blocked", "out_of_scope"];
 
+/// `units` is required, so a misspelled key fails to parse instead of reading
+/// as an empty ledger that would pass every coverage check.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Ledger {
-    #[serde(default)]
     pub units: Vec<Unit>,
     /// Fields this version does not know, kept so a rewrite never drops data.
     #[serde(flatten)]

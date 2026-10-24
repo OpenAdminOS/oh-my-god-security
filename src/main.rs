@@ -244,18 +244,15 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             }
         }
     }
-    // Identities recorded on the findings stand in for unpassed flags.
-    let recorded = |pick: fn(&omgs::model::Finding) -> &Option<String>| {
-        file.findings
-            .iter()
-            .filter_map(|f| identity(pick(f)))
-            .collect::<std::collections::BTreeSet<_>>()
-    };
-    let hunter_ids = recorded(|f| &f.hunted_by);
-    let verifier_ids = recorded(|f| &f.verified_by);
-    let hunters = flag(args, "--hunters")
-        .and_then(|s| s.parse::<u32>().ok())
-        .or_else(|| (!hunter_ids.is_empty()).then_some(hunter_ids.len() as u32));
+    // Verifier identities recorded on the findings stand in for an unpassed
+    // --verifier. The hunter count is not inferred: hunters that found nothing
+    // or were merged into another record would be missed.
+    let verifier_ids: std::collections::BTreeSet<String> = file
+        .findings
+        .iter()
+        .filter_map(|f| identity(&f.verified_by))
+        .collect();
+    let hunters = flag(args, "--hunters").and_then(|s| s.parse::<u32>().ok());
     let verifier = flag(args, "--verifier")
         .filter(|s| !s.trim().is_empty())
         .or_else(|| {
