@@ -634,6 +634,37 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "target".into());
+    // Validate every input and read the answer store before claiming a run
+    // directory, so a mistyped option or an untrusted store never leaves a
+    // claimed, half-written run behind.
+    let mode = flag(rest, "--mode").unwrap_or_else(|| "advisory".into());
+    if mode != "gate" && mode != "advisory" {
+        return Err("--mode must be gate or advisory".into());
+    }
+    let budget: Option<u64> = match flag(rest, "--budget") {
+        Some(v) => Some(
+            v.parse()
+                .map_err(|_| format!("--budget must be a whole number, got '{v}'"))?,
+        ),
+        None => None,
+    };
+    let answers_src = trusted_store(&target)?;
+    let answers = if answers_src.is_file() {
+        let answers = read_store(&answers_src)?;
+        if Path::new(&answers.target) == target {
+            Some(answers)
+        } else {
+            eprintln!(
+                "warning: {} belongs to {}, not {}; intent answers not copied",
+                answers_src.display(),
+                answers.target,
+                target.display()
+            );
+            None
+        }
+    } else {
+        None
+    };
     let outside = |p: &Path| -> Result<(), String> {
         if resolve_existing_prefix(p)?.starts_with(&target) {
             Err(
@@ -706,11 +737,6 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     if out_abs.starts_with("/tmp") || out_abs.starts_with("/private/tmp") {
         eprintln!("warning: run output is under a shared temp directory and describes vulnerabilities. Prefer the default runs directory under your home.");
     }
-    let mode = flag(rest, "--mode").unwrap_or_else(|| "advisory".into());
-    if mode != "gate" && mode != "advisory" {
-        return Err("--mode must be gate or advisory".into());
-    }
-    let budget: Option<u64> = flag(rest, "--budget").and_then(|v| v.parse().ok());
     let source_ref = std::process::Command::new("git")
         .args([
             "-C",
@@ -850,21 +876,10 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     }
     // Bring the reviewer's recorded intent answers for this exact target into
     // the run, so earlier answers resolve matching questions in the report.
-    let answers_src = trusted_store(&target)?;
-    if answers_src.is_file() {
-        let answers = read_store(&answers_src)?;
-        if Path::new(&answers.target) == target {
-            let text = serde_json::to_string_pretty(&answers).map_err(|e| e.to_string())?;
-            write_out(out_abs.join("intent-answers.json"), format!("{text}\n"))
-                .map_err(|e| format!("copy intent answers: {e}"))?;
-        } else {
-            eprintln!(
-                "warning: {} belongs to {}, not {}; intent answers not copied",
-                answers_src.display(),
-                answers.target,
-                target.display()
-            );
-        }
+    if let Some(answers) = answers {
+        let text = serde_json::to_string_pretty(&answers).map_err(|e| e.to_string())?;
+        write_out(out_abs.join("intent-answers.json"), format!("{text}\n"))
+            .map_err(|e| format!("copy intent answers: {e}"))?;
     }
     Ok(out_abs)
 }
@@ -1133,7 +1148,17 @@ fn clone_target(raw_url: &str) -> Result<PathBuf, String> {
                 .ok()
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-            if origin.as_deref() != Some(repo.url.as_str()) {
+            // Compare the repository identity, not the spelling: a trailing
+            // slash, `.git`, or host case must not reject a reused clone.
+            let same = origin
+                .as_deref()
+                .and_then(|o| omgs::batch::parse_repo_url(o).ok())
+                .is_some_and(|o| {
+                    o.host == repo.host
+                        && o.owner.eq_ignore_ascii_case(&repo.owner)
+                        && o.name.eq_ignore_ascii_case(&repo.name)
+                });
+            if !same {
                 return Err(format!(
                     "{} exists but its origin is {}, not {}; remove it or review that URL",
                     dest.display(),
@@ -1199,6 +1224,16 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             let urls = omgs::batch::read_list(&text);
             if urls.is_empty() {
                 return Err(format!("{list} lists no repository URLs"));
+            }
+            // Reject bad shared options before cloning or claiming anything.
+            if let Some(m) = flag(rest, "--mode") {
+                if m != "gate" && m != "advisory" {
+                    return Err("--mode must be gate or advisory".into());
+                }
+            }
+            if let Some(b) = flag(rest, "--budget") {
+                b.parse::<u64>()
+                    .map_err(|_| format!("--budget must be a whole number, got '{b}'"))?;
             }
             // The batch output must sit outside the targets area and every
             // target in the list, including ones that later fail to clone.

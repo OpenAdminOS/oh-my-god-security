@@ -1645,3 +1645,77 @@ fn a_hardlinked_answer_store_is_never_trusted() {
     assert!(!run.join("intent-answers.json").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_rejected_option_leaves_no_claimed_run_directory() {
+    let dir = scratch("no-claim-on-error");
+    let target = dir.join("app");
+    std::fs::create_dir_all(&target).unwrap();
+    let out = dir.join("run");
+    for bad in [["--mode", "Gate"], ["--budget", "many"]] {
+        let res = omgs(&[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--no-sensors",
+            bad[0],
+            bad[1],
+        ]);
+        assert_eq!(res.status.code(), Some(2), "{bad:?}");
+        assert!(!out.exists(), "nothing claimed for {bad:?}");
+    }
+    let ok = omgs(&[
+        "audit",
+        "init",
+        "--target",
+        target.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--no-sensors",
+        "--mode",
+        "gate",
+    ]);
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_reused_clone_matches_by_repository_identity_not_spelling() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("origin-spelling");
+    let home = dir.join("home");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(home.join(".local/share/omgs/targets/github.com/acme/shop")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("git"),
+        "#!/bin/sh\ncase \" $* \" in\n  *' get-url '*) echo https://GitHub.com/acme/shop.git ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let res = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args([
+            "review",
+            "--repo-url",
+            "https://github.com/acme/shop/",
+            "--no-sensors",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
