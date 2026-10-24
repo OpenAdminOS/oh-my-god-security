@@ -499,3 +499,93 @@ fn cli_ledger_and_critic_end_to_end() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn critic_includes_findings_validation() {
+    let (ledger, cands, mut findings) = complete_run();
+    findings.findings[0].verified_by = None;
+    let gaps = critique(&ledger, 1, &cands, &findings).gaps;
+    assert!(has(&gaps, "findings findings[0]"));
+    assert!(has(&gaps, "verified_by is required"));
+}
+
+#[test]
+fn critic_rejects_a_misspelled_candidates_file() {
+    let dir = scratch("misspelled");
+    let (ledger, _cands, _findings) = complete_run();
+    std::fs::write(
+        dir.join("coverage-ledger.json"),
+        serde_json::to_string(&ledger).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    std::fs::write(dir.join("candidates-red-1.json"), r#"{"candidate": []}"#).unwrap();
+    let err = omgs::critic::critique_run(&dir).unwrap_err();
+    assert!(err.contains("candidates-red-1.json"), "{err}");
+    std::fs::write(dir.join("candidates-red-1.json"), r#"{"candidates": []}"#).unwrap();
+    assert!(omgs::critic::critique_run(&dir).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn report_critic_describes_the_rendered_findings() {
+    let dir = scratch("selected");
+    let (ledger, cands, findings) = complete_run();
+    std::fs::write(
+        dir.join("coverage-ledger.json"),
+        serde_json::to_string(&ledger).unwrap(),
+    )
+    .unwrap();
+    let c = &cands[0].candidate;
+    std::fs::write(
+        dir.join("candidates-red-1.json"),
+        serde_json::json!({"candidates": [{
+            "fingerprint": c.fingerprint, "hunter": "red-1", "unit_ids": ["route:x"],
+            "title": c.title, "attack_class": c.attack_class, "entry_point": c.entry_point,
+            "sink": c.sink, "boundary": c.boundary
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    // A stale sibling findings.json must not be what the critic checks.
+    std::fs::write(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    std::fs::write(
+        dir.join("selected.json"),
+        serde_json::to_string(&findings).unwrap(),
+    )
+    .unwrap();
+    let out_dir = dir.join("out");
+    let out = omgs(&[
+        "report",
+        "--findings",
+        dir.join("selected.json").to_str().unwrap(),
+        "--out",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let md = std::fs::read_to_string(out_dir.join("REPORT.md")).unwrap();
+    assert!(md.contains("Coverage critic: pass (1 units, 1 candidates, 1 findings)"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn critic_gaps_are_escaped_in_html() {
+    let (mut ledger, cands, findings) = complete_run();
+    ledger.units.push(Unit::new(
+        "<img src=x onerror=alert(1)>",
+        ".",
+        &[],
+        "planned",
+    ));
+    let meta = ReportMeta {
+        critic: Some(critique(&ledger, 1, &cands, &findings)),
+        ..ReportMeta::default()
+    };
+    let html = render_html(&findings, &meta);
+    assert!(!html.contains("<img src=x"));
+    assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
+}

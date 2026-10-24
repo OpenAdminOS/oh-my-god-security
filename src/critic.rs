@@ -3,7 +3,7 @@
 //! dropped and no record is certified by the hunter that produced it.
 
 use crate::ledger::{validate_ledger, Ledger};
-use crate::model::{identity, is_fingerprint, FindingsFile};
+use crate::model::{identity, is_fingerprint, validate, FindingsFile};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -30,9 +30,11 @@ pub struct Candidate {
     pub boundary: String,
 }
 
+/// A hunter's handoff file. `candidates` is required, so a misspelled key
+/// fails to parse instead of reading as an empty handoff; a hunter that found
+/// nothing writes `{"candidates": []}`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CandidatesFile {
-    #[serde(default)]
     pub candidates: Vec<Candidate>,
 }
 
@@ -81,6 +83,9 @@ pub fn critique(
     findings: &FindingsFile,
 ) -> CriticReport {
     let mut gaps = Vec::new();
+    for e in validate(findings) {
+        gaps.push(format!("findings {e}"));
+    }
     for e in validate_ledger(ledger) {
         gaps.push(format!("ledger {e}"));
     }
@@ -206,17 +211,26 @@ pub fn critique(
     }
 }
 
-/// Load a run directory and critique it. The ledger and findings must exist;
-/// candidates are read from every `candidates*.json` in the directory.
+fn read_in(dir: &Path, name: &str) -> Result<String, String> {
+    let path = dir.join(name);
+    std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))
+}
+
+/// Load a run directory's `findings.json` and critique it together with the
+/// ledger and candidates beside it.
 pub fn critique_run(dir: &Path) -> Result<CriticReport, String> {
-    let read = |name: &str| {
-        let path = dir.join(name);
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))
-    };
+    let findings: FindingsFile = serde_json::from_str(&read_in(dir, "findings.json")?)
+        .map_err(|e| format!("parse findings.json: {e}"))?;
+    critique_dir(dir, &findings)
+}
+
+/// Critique the given findings against the ledger and every
+/// `candidates*.json` in `dir`. Used by `omgs report`, so the critic result
+/// always describes the exact findings being rendered.
+pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport, String> {
+    let read = |name: &str| read_in(dir, name);
     let ledger: Ledger = serde_json::from_str(&read("coverage-ledger.json")?)
         .map_err(|e| format!("parse coverage-ledger.json: {e}"))?;
-    let findings: FindingsFile = serde_json::from_str(&read("findings.json")?)
-        .map_err(|e| format!("parse findings.json: {e}"))?;
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .map_err(|e| format!("read {}: {e}", dir.display()))?
         .flatten()
@@ -238,5 +252,5 @@ pub fn critique_run(dir: &Path) -> Result<CriticReport, String> {
                 }),
         );
     }
-    Ok(critique(&ledger, names.len(), &candidates, &findings))
+    Ok(critique(&ledger, names.len(), &candidates, findings))
 }
