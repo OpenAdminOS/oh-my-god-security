@@ -815,3 +815,17 @@ fn architecture_html_neutralizes_banned_byte_sequences() {
     // but the text is still readable
     assert!(html.contains("service.example"));
 }
+
+#[test]
+fn architecture_clamps_wide_labels_only_when_needed() {
+    // normal labels must not be width-clamped (clamping would stretch them)
+    assert!(!render_architecture_html(&arch()).contains("textLength"));
+
+    // pathological wide labels get a width clamp so they stay inside their box
+    let mut a = arch();
+    a.zones[0].name = "W".repeat(300);
+    a.components[0].name = "W".repeat(20);
+    let html = render_architecture_html(&a);
+    assert!(html.contains("class=\"arch-zone\" text-anchor=\"middle\" textLength=\"290\""));
+    assert!(html.contains("class=\"arch-name\" textLength=\"180\""));
+}

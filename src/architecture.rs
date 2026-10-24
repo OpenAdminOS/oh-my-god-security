@@ -516,9 +516,29 @@ fn esc(s: &str) -> String {
         .replace("url(", "url&#40;")
 }
 
+/// Estimate a string's rendered width in SVG units for a given font size,
+/// using per-character width classes so all-wide strings (WWWW) are not
+/// under-counted. Integer only. Returns an upper-ish estimate so the width
+/// clamp triggers before a label can overflow.
+fn est_width(s: &str, font_px: i64) -> i64 {
+    let mut tenths = 0i64;
+    for c in s.chars() {
+        tenths += match c {
+            'W' | 'M' | 'm' | 'w' | '@' | '\u{2026}' => 11,
+            'i' | 'l' | 'I' | 'j' | 't' | 'f' | 'r' | '.' | ',' | ':' | ';' | '\'' | '|' | '!'
+            | ' ' | '(' | ')' | '[' | ']' => 4,
+            c if c.is_ascii_uppercase() => 8,
+            c if c.is_ascii_digit() => 6,
+            c if c.is_ascii() => 6,
+            _ => 10, // non-ASCII: assume wide
+        };
+    }
+    tenths * font_px / 10
+}
+
 /// An SVG `<text>` whose rendered width is bounded: it truncates by character
-/// count, and when the estimate still exceeds `budget` it adds `textLength` so a
-/// pathological label is compressed to fit its box instead of overflowing.
+/// count, and when the estimated width exceeds `budget` it adds `textLength` so
+/// a pathological label is compressed to fit its box instead of overflowing.
 #[allow(clippy::too_many_arguments)]
 fn svg_text(
     x: i64,
@@ -528,10 +548,10 @@ fn svg_text(
     text: &str,
     max_chars: usize,
     budget: i64,
-    px: i64,
+    font_px: i64,
 ) -> String {
     let t = trunc(text, max_chars);
-    let len = if t.chars().count() as i64 * px > budget {
+    let len = if est_width(&t, font_px) > budget {
         format!(" textLength=\"{budget}\" lengthAdjust=\"spacingAndGlyphs\"")
     } else {
         String::new()
@@ -573,8 +593,8 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
             "middle",
             zone_label(z),
             26,
-            200,
-            7,
+            290,
+            12,
         ));
     }
 
@@ -709,7 +729,7 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
             &c.name,
             24,
             180,
-            8,
+            14,
         ));
         let kind = c.kind.as_deref().unwrap_or("");
         if !kind.is_empty() {
@@ -721,7 +741,7 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
                 kind,
                 26,
                 180,
-                6,
+                11,
             ));
         }
         let sub = if !c.tech.is_empty() {
@@ -738,7 +758,7 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
                 sub,
                 28,
                 180,
-                6,
+                12,
             ));
         }
     }
