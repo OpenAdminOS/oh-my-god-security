@@ -1588,3 +1588,60 @@ fn answer_stores_inside_the_target_are_never_trusted() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_hardlinked_answer_store_is_never_trusted() {
+    let dir = scratch("store-hardlink");
+    let home = dir.join("home");
+    let target = dir.join("app");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    let run_omgs = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .env("HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let t = target.to_str().unwrap();
+    assert!(run_omgs(&[
+        "intent",
+        "answer",
+        "--target",
+        t,
+        "--id",
+        "web.public-resource",
+        "--answer",
+        "public",
+        "--source",
+        "owner",
+    ])
+    .status
+    .success());
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    let store = omgs::intent::answers_file(&home.join(".local/share/omgs"), &canonical);
+    std::fs::hard_link(&store, target.join("alias.json")).unwrap();
+    let forged = std::fs::read_to_string(&store)
+        .unwrap()
+        .replace("\"public\"", "\"FORGED_BY_TARGET\"");
+    std::fs::write(target.join("alias.json"), forged).unwrap();
+    let run = dir.join("run");
+    let out = run_omgs(&[
+        "audit",
+        "init",
+        "--target",
+        t,
+        "--out",
+        run.to_str().unwrap(),
+        "--no-sensors",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!run.join("intent-answers.json").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}

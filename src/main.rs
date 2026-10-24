@@ -407,6 +407,45 @@ fn trusted_store(target: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// Read the reviewer's answer store through a descriptor opened without
+/// following links, and only when it is a regular file with exactly one link,
+/// so neither a symlink nor a hardlink planted in the target can change what
+/// the store says. A missing store means no answers yet. Platforms without a
+/// stable link count fail closed: stored answers are Unix only.
+fn read_store(path: &Path) -> Result<omgs::intent::Answers, String> {
+    use std::io::Read;
+    if !cfg!(unix) {
+        return Err("stored intent answers are supported on Unix only".into());
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = match opts.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(format!("open {}: {e}", path.display())),
+    };
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if !meta.is_file() || meta.nlink() != 1 {
+            return Err(format!(
+                "{} must be a regular file with a single link; refusing to trust it",
+                path.display()
+            ));
+        }
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    omgs::intent::parse_answers(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
 /// The run's intent answers, only when they belong to the run's target as
 /// recorded in run metadata; anything else is ignored with a warning.
 fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
@@ -444,7 +483,10 @@ fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
         Ok(p) => p,
         Err(e) => return refuse(&e),
     };
-    let store = omgs::intent::load_answers(&store_path)?;
+    let store = match read_store(&store_path) {
+        Ok(s) => s,
+        Err(e) => return refuse(&e),
+    };
     if Path::new(&store.target) != target {
         return refuse("the reviewer's store for this path belongs to another target");
     }
@@ -810,7 +852,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     // the run, so earlier answers resolve matching questions in the report.
     let answers_src = trusted_store(&target)?;
     if answers_src.is_file() {
-        let answers = omgs::intent::load_answers(&answers_src)?;
+        let answers = read_store(&answers_src)?;
         if Path::new(&answers.target) == target {
             let text = serde_json::to_string_pretty(&answers).map_err(|e| e.to_string())?;
             write_out(out_abs.join("intent-answers.json"), format!("{text}\n"))
@@ -1563,7 +1605,7 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
             // so concurrent answers are never lost.
             let lock = path.with_extension("lock");
             omgs::runmeta::with_lock_file(&lock, || {
-            let mut answers = omgs::intent::load_answers(&path)?;
+            let mut answers = read_store(&path)?;
             let target_s = target.to_string_lossy().to_string();
             if !answers.target.is_empty() && answers.target != target_s {
                 return Err(format!(
