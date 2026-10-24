@@ -738,3 +738,20 @@ fn architecture_from_json_is_lenient() {
     assert!(validate_architecture(&a).is_empty());
     let _ = render_architecture_html(&a);
 }
+
+#[test]
+fn architecture_markdown_neutralizes_link_injection() {
+    let mut a = arch();
+    a.components[1].name = "![x](http://evil)".into();
+    a.components[1].tech = "[click](javascript:alert(1))".into();
+    let md = render_architecture_markdown(&a);
+    assert!(
+        !md.contains("]("),
+        "link/image target syntax must be escaped"
+    );
+    assert!(!md.contains("!["), "image syntax must be escaped");
+    assert!(
+        md.contains("\\!\\[x\\]"),
+        "payload should appear backslash-escaped"
+    );
+}

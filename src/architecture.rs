@@ -663,11 +663,18 @@ fn md_inline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
+            '\n' | '\r' => out.push(' '),
             '|' => out.push_str("\\|"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
-            '\n' | '\r' => out.push(' '),
-            '`' => out.push('\''),
+            '&' => out.push_str("&amp;"),
+            // Backslash-escape CommonMark punctuation so target-derived text
+            // cannot inject a link, image, emphasis, heading, list, or table.
+            '\\' | '`' | '[' | ']' | '(' | ')' | '!' | '*' | '_' | '#' | '+' | '-' | '.' | '{'
+            | '}' | '~' => {
+                out.push('\\');
+                out.push(ch);
+            }
             _ => out.push(ch),
         }
     }
