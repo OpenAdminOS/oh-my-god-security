@@ -207,23 +207,25 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     let mut coverage: Vec<String> = Vec::new();
     let mut critic = None;
     if let Some(dir) = &findings_dir {
-        if let Ok(text) = std::fs::read_to_string(dir.join("coverage-ledger.json")) {
-            if let Ok(ledger) = omgs::shape::ledger(&text) {
-                coverage = coverage_lines(&ledger);
+        // An absent ledger means the critic does not apply; a ledger or
+        // candidates file that exists but does not parse is an error, so a
+        // malformed run can never render as a clean report.
+        let ledger_path = dir.join("coverage-ledger.json");
+        if ledger_path.exists() {
+            let text = std::fs::read_to_string(&ledger_path)
+                .map_err(|e| format!("read {}: {e}", ledger_path.display()))?;
+            let ledger = omgs::shape::ledger(&text)
+                .map_err(|e| format!("parse {}: {e}", ledger_path.display()))?;
+            coverage = coverage_lines(&ledger);
+            let c = critique_dir(dir, &file)?;
+            if !c.passed() {
+                eprintln!(
+                    "warning: coverage critic found {} gap(s); they are listed in the report. Run omgs critic --run {} for detail.",
+                    c.gaps.len(),
+                    dir.display()
+                );
             }
-            match critique_dir(dir, &file) {
-                Ok(c) => {
-                    if !c.passed() {
-                        eprintln!(
-                            "warning: coverage critic found {} gap(s); they are listed in the report. Run omgs critic --run {} for detail.",
-                            c.gaps.len(),
-                            dir.display()
-                        );
-                    }
-                    critic = Some(c);
-                }
-                Err(e) => eprintln!("warning: coverage critic not run: {e}"),
-            }
+            critic = Some(c);
         }
     }
     let mut sensors_summary: Option<String> = None;

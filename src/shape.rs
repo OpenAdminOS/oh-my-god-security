@@ -1,13 +1,94 @@
-//! Structural checks applied before deserializing run inputs.
+//! Strict parsing of run inputs.
 //!
-//! Serde's derived structs also accept a JSON array in place of an object
-//! (fields by position) and `null` for an optional field. Run inputs are
-//! security evidence, so every object the schemas declare must be a JSON
-//! object, and an optional integer that is present must be an integer. Any
-//! other shape is an error, never a silently empty or defaulted value.
+//! serde_json and derived structs are lenient in ways that can turn malformed
+//! evidence into a pass: a duplicate key keeps only its last value, a struct
+//! accepts a JSON array (fields by position), an enum accepts an object form,
+//! and an optional field accepts `null`. Run inputs are security evidence, so
+//! they are read with a parser that rejects duplicate keys at every depth,
+//! then checked so every schema object is a JSON object, every enum is a
+//! string, and a present line is an integer. Any other shape is an error.
 
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
+
+/// A JSON value whose objects never contained a duplicate key.
+struct Strict(Value);
+
+impl<'de> serde::Deserialize<'de> for Strict {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(StrictVisitor)
+    }
+}
+
+struct StrictVisitor;
+
+impl<'de> Visitor<'de> for StrictVisitor {
+    type Value = Strict;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON")
+    }
+    fn visit_bool<E>(self, v: bool) -> Result<Strict, E> {
+        Ok(Strict(Value::Bool(v)))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Strict, E> {
+        Ok(Strict(v.into()))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Strict, E> {
+        Ok(Strict(v.into()))
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Strict, E> {
+        serde_json::Number::from_f64(v)
+            .map(|n| Strict(Value::Number(n)))
+            .ok_or_else(|| E::custom("non-finite number"))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<Strict, E> {
+        Ok(Strict(Value::String(v.to_string())))
+    }
+    fn visit_string<E>(self, v: String) -> Result<Strict, E> {
+        Ok(Strict(Value::String(v)))
+    }
+    fn visit_unit<E>(self) -> Result<Strict, E> {
+        Ok(Strict(Value::Null))
+    }
+    fn visit_none<E>(self) -> Result<Strict, E> {
+        Ok(Strict(Value::Null))
+    }
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Strict, A::Error> {
+        let mut out = Vec::new();
+        while let Some(Strict(v)) = seq.next_element()? {
+            out.push(v);
+        }
+        Ok(Strict(Value::Array(out)))
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Strict, A::Error> {
+        let mut out = Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if out.contains_key(&key) {
+                return Err(A::Error::custom(format!("duplicate key '{key}'")));
+            }
+            let Strict(v) = map.next_value()?;
+            out.insert(key, v);
+        }
+        Ok(Strict(Value::Object(out)))
+    }
+}
+
+/// Parse JSON text, rejecting duplicate keys at every depth.
+pub fn strict_json(text: &str) -> Result<Value, String> {
+    serde_json::from_str::<Strict>(text)
+        .map(|s| s.0)
+        .map_err(|e| e.to_string())
+}
+
+/// A present enum field must be a plain string, never serde's object form.
+fn enum_string(obj: &Map<String, Value>, key: &str, at: &str) -> Result<(), String> {
+    match obj.get(key) {
+        None => Ok(()),
+        Some(Value::String(_)) => Ok(()),
+        Some(_) => Err(format!("{at}.{key} must be a string")),
+    }
+}
 
 fn object<'a>(v: &'a Value, at: &str) -> Result<&'a Map<String, Value>, String> {
     v.as_object()
@@ -39,7 +120,7 @@ fn parse<T: DeserializeOwned>(
     what: &str,
     check: impl Fn(&Value) -> Result<(), String>,
 ) -> Result<T, String> {
-    let value: Value = serde_json::from_str(text).map_err(|e| format!("{what}: {e}"))?;
+    let value = strict_json(text).map_err(|e| format!("{what}: {e}"))?;
     check(&value).map_err(|e| format!("{what}: {e}"))?;
     serde_json::from_value(value).map_err(|e| format!("{what}: {e}"))
 }
@@ -50,6 +131,10 @@ pub fn findings(text: &str) -> Result<crate::model::FindingsFile, String> {
         let top = object(v, "document")?;
         let list = top.get("findings").ok_or("findings is required")?;
         for (i, f) in objects(list, "findings")?.into_iter().enumerate() {
+            let at = format!("findings[{i}]");
+            for key in ["verdict", "proof_tier", "severity"] {
+                enum_string(f, key, &at)?;
+            }
             if let Some(l) = f.get("location") {
                 location(l, &format!("findings[{i}].location"))?;
             }
@@ -70,7 +155,12 @@ pub fn findings(text: &str) -> Result<crate::model::FindingsFile, String> {
 pub fn ledger(text: &str) -> Result<crate::ledger::Ledger, String> {
     parse(text, "ledger", |v| {
         let top = object(v, "document")?;
-        objects(top.get("units").ok_or("units is required")?, "units")?;
+        for (i, u) in objects(top.get("units").ok_or("units is required")?, "units")?
+            .into_iter()
+            .enumerate()
+        {
+            enum_string(u, "status", &format!("units[{i}]"))?;
+        }
         Ok(())
     })
 }
