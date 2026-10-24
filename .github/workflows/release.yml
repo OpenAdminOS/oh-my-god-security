@@ -273,7 +273,21 @@ jobs:
               case "$p" in
                 '~ALL') covered=yes ;;
                 *'**'*|*'?'*|*'['*|*']'*|*'{'*|*'}'*) : ;;   # unsupported metachars: do not certify
-                *'*') pre="${p%\*}"; case "$ref" in "$pre"*) covered=yes ;; esac ;;
+                *'*')
+                  # GitHub '*' never crosses '/', so a trailing-'*' pattern only
+                  # covers our (slash-free) tag when it is refs/tags/<prefix>* with
+                  # no '/' or extra '*' in <prefix>. Reject bare '*', refs/*,
+                  # refs/tags* and the like, which would be a false certification.
+                  pre="${p%\*}"
+                  case "$p" in
+                    refs/tags/*)
+                      rest="${pre#refs/tags/}"
+                      case "$rest" in
+                        *'*'*|*/*) : ;;
+                        *) case "$ref" in "$pre"*) covered=yes ;; esac ;;
+                      esac ;;
+                    *) : ;;
+                  esac ;;
                 *) [ "$p" = "$ref" ] && covered=yes ;;
               esac
             done < <(printf '%s\n' "$inc")
