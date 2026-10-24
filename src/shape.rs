@@ -85,7 +85,9 @@ pub fn strict_json(text: &str) -> Result<Value, String> {
 fn enum_string(obj: &Map<String, Value>, key: &str, at: &str) -> Result<(), String> {
     match obj.get(key) {
         None => Ok(()),
-        Some(Value::String(_)) => Ok(()),
+        // null is how an absent optional enum serializes; a required enum
+        // given null still fails deserialization.
+        Some(Value::String(_)) | Some(Value::Null) => Ok(()),
         Some(_) => Err(format!("{at}.{key} must be a string")),
     }
 }
@@ -108,8 +110,10 @@ fn objects<'a>(v: &'a Value, at: &str) -> Result<Vec<&'a Map<String, Value>>, St
 fn location(v: &Value, at: &str) -> Result<(), String> {
     let loc = object(v, at)?;
     if let Some(line) = loc.get("line") {
-        if !line.is_u64() {
-            return Err(format!("{at}.line must be a positive integer when present"));
+        if line.as_u64().is_none_or(|n| n < 1) {
+            return Err(format!(
+                "{at}.line must be a one-based integer when present"
+            ));
         }
     }
     Ok(())

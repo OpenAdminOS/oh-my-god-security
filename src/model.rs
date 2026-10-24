@@ -148,6 +148,9 @@ pub fn validate(file: &FindingsFile) -> Vec<String> {
         }
         let mut places = std::collections::HashSet::new();
         for loc in std::iter::once(&f.location).chain(&f.locations) {
+            if loc.line == Some(0) {
+                errors.push(format!("{at}: location line must be one-based"));
+            }
             if loc.path.trim().is_empty() {
                 errors.push(format!("{at}: location path is empty"));
             } else if !places.insert(loc) {
