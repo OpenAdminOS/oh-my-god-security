@@ -168,10 +168,13 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> RunSummary {
         }
     }
     if let Ok(text) = std::fs::read_to_string(dir.join("coverage-ledger.json")) {
-        if let Ok(ledger) = serde_json::from_str::<crate::ledger::Ledger>(&text) {
-            for u in ledger.units.iter().filter(|u| u.status == "blocked") {
-                s.blockers.push(format!("blocked unit {}", u.id));
+        match serde_json::from_str::<crate::ledger::Ledger>(&text) {
+            Ok(ledger) => {
+                for u in ledger.units.iter().filter(|u| u.status == "blocked") {
+                    s.blockers.push(format!("blocked unit {}", u.id));
+                }
             }
+            Err(_) => s.blockers.push("coverage-ledger.json is malformed".into()),
         }
     }
     match crate::critic::critique_run(dir) {

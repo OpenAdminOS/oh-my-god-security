@@ -128,7 +128,7 @@ fn batch_summary_reads_a_run_directory() {
     .unwrap();
     std::fs::write(
         run.join("coverage-ledger.json"),
-        r#"{"units":[{"id":"u1","status":"blocked","note":"no db"}]}"#,
+        r#"{"units":[{"id":"u1","surface":".","attack_classes":[],"status":"blocked","note":"no db"}]}"#,
     )
     .unwrap();
     std::fs::write(run.join("REPORT.html"), "x").unwrap();
