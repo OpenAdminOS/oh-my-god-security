@@ -1049,3 +1049,26 @@ fn ledger_notes_must_be_strings() {
     assert!(omgs::shape::ledger(&unit("7")).is_err());
     assert!(omgs::shape::ledger(&unit(r#""why""#)).is_ok());
 }
+
+#[test]
+fn report_fails_on_malformed_sensors_and_ignores_unrelated_candidate_names() {
+    let dir = scratch("sensors-bad");
+    std::fs::write(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    std::fs::write(dir.join("candidates-notes.md"), "notes").unwrap();
+    let report = || {
+        omgs(&[
+            "report",
+            "--findings",
+            dir.join("findings.json").to_str().unwrap(),
+            "--out",
+            dir.join("out").to_str().unwrap(),
+        ])
+    };
+    assert!(
+        report().status.success(),
+        "a stray candidates-notes.md is not a candidates file"
+    );
+    std::fs::write(dir.join("sensors.json"), "{\"tools_run\": [").unwrap();
+    assert_eq!(report().status.code(), Some(2), "truncated sensors.json");
+    let _ = std::fs::remove_dir_all(&dir);
+}
