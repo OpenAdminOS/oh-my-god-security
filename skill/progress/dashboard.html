@@ -119,8 +119,10 @@ function render(d){
   document.getElementById("foot").textContent="Local dashboard. Polls pipeline-status.json every 2s. No external resources.";
 }
 async function tick(){
-  try{const r=await fetch("pipeline-status.json?_="+now());const d=await r.json();render(d);
-    document.getElementById("dot").classList.remove("stale");}
+  // Let render() decide staleness from the timestamp age on a successful fetch
+  // (a stopped orchestrator leaves old JSON, which must still read as stale);
+  // a fetch failure marks stale directly.
+  try{const r=await fetch("pipeline-status.json?_="+now());const d=await r.json();render(d);}
   catch(e){const upd=document.getElementById("upd");upd.textContent="waiting for status…";document.getElementById("dot").classList.add("stale");}
 }
 tick();setInterval(tick,2000);

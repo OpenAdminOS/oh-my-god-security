@@ -50,6 +50,7 @@
       "type": "array",
       "items": {
         "type": "object",
+        "required": ["m"],
         "properties": {
           "ts": { "type": "string" },
           "kind": { "type": "string" },

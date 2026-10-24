@@ -646,6 +646,6 @@ fn cmd_review(args: &[String]) -> Result<(), String> {
         init_args.push(budget);
     }
     cmd_audit(&init_args)?;
-    println!("agent brief: load the omgs skill, follow its six phases against {}, validate findings with omgs validate, prove only through omgs prove, and render with omgs report.", dest.display());
+    println!("agent brief: load the omgs skill, follow its pipeline against {}, validate findings with omgs validate, prove only through omgs prove, and render with omgs report.", dest.display());
     Ok(())
 }
