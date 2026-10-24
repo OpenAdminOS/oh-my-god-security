@@ -5,22 +5,15 @@ name: release
 # verifies against SHA256SUMS. Triggered by pushing a version tag, for example
 # `git tag v0.1.0 && git push origin v0.1.0`.
 #
-# Required secrets (set once at the OpenAdminOS org level; the same names as the
-# proven TenuVault pipeline, so one set serves both repos):
-#   macOS notarization + signing:
-#     MAC_CSC_LINK                 base64 of the Developer ID Application .p12
-#     MAC_CSC_KEY_PASSWORD         password for that .p12
-#     APPLE_API_KEY                contents of the App Store Connect .p8 key
-#     APPLE_API_KEY_ID             the key id
-#     APPLE_API_ISSUER             the issuer id
-#   Windows via Azure Trusted Signing (app: openadminos-signing):
-#     AZURE_SIGNING_TENANT_ID
-#     AZURE_SIGNING_CLIENT_ID
-#     AZURE_SIGNING_CLIENT_SECRET
-#     AZURE_TRUSTED_SIGNING_ENDPOINT
-#     AZURE_TRUSTED_SIGNING_ACCOUNT_NAME
-#     AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME
-#     AZURE_TRUSTED_SIGNING_PUBLISHER_NAME
+# Every build checks out the exact commit the tag resolves to (prepare job), so
+# a manual run cannot attach binaries built from a different ref to the tag.
+#
+# Required secrets (same names as the proven TenuVault pipeline):
+#   macOS: MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER
+#   Windows (Azure Trusted Signing, app openadminos-signing):
+#     AZURE_SIGNING_TENANT_ID, AZURE_SIGNING_CLIENT_ID, AZURE_SIGNING_CLIENT_SECRET,
+#     AZURE_TRUSTED_SIGNING_ENDPOINT, AZURE_TRUSTED_SIGNING_ACCOUNT_NAME,
+#     AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME, AZURE_TRUSTED_SIGNING_PUBLISHER_NAME
 
 on:
   push:
@@ -28,17 +21,49 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to build (for manual runs)"
+        description: "Existing version tag to build and publish (e.g. v0.1.0)"
         required: true
 
 permissions:
   contents: read
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Validate the tag is a semantic version (prerelease suffix allowed).
+          if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$VERSION' is not a vMAJOR.MINOR.PATCH[-prerelease] tag"; exit 1
+          fi
+          # Resolve the tag to an immutable commit SHA; fails if the tag is absent.
+          sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${VERSION}" --jq '.sha')"
+          if [ -z "$sha" ]; then echo "::error::tag $VERSION does not resolve to a commit"; exit 1; fi
+          # A hyphen in the version marks a prerelease (v0.2.0-rc.1).
+          case "$VERSION" in *-*) pre=true ;; *) pre=false ;; esac
+          {
+            echo "version=$VERSION"
+            echo "sha=$sha"
+            echo "prerelease=$pre"
+          } >> "$GITHUB_OUTPUT"
+          echo "resolved $VERSION -> $sha (prerelease=$pre)"
+
   macos:
+    needs: prepare
     runs-on: macos-14
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -59,7 +84,6 @@ jobs:
           for v in MAC_CSC_LINK MAC_CSC_KEY_PASSWORD APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER; do
             if [ -z "${!v:-}" ]; then echo "::error::missing signing secret $v"; exit 1; fi
           done
-          # Import the Developer ID cert into a dedicated keychain this job owns.
           keychain="$RUNNER_TEMP/signing.keychain-db"
           kpw="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
           security create-keychain -p "$kpw" "$keychain"
@@ -79,8 +103,16 @@ jobs:
             codesign --force --timestamp --options runtime --keychain "$keychain" --sign "$identity" "$bin"
             codesign --verify --strict --verbose=2 "$bin"
             ( cd "$(dirname "$bin")" && /usr/bin/ditto -c -k "omgs" "$RUNNER_TEMP/$asset.zip" )
-            xcrun notarytool submit "$RUNNER_TEMP/$asset.zip" \
-              --key "$RUNNER_TEMP/api.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" --wait
+            # Notarize and require an explicit Accepted verdict; --wait exit status
+            # alone is not sufficient, so parse the JSON status.
+            out="$(xcrun notarytool submit "$RUNNER_TEMP/$asset.zip" \
+              --key "$RUNNER_TEMP/api.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
+              --wait --output-format json)"
+            echo "$out"
+            status="$(printf '%s' "$out" | jq -r '.status // empty')"
+            if [ "$status" != "Accepted" ]; then
+              echo "::error::notarization not accepted for $asset (status='${status:-none}')"; exit 1
+            fi
             cp "$bin" "dist/$asset"
           done
           security delete-keychain "$keychain" || true
@@ -91,6 +123,7 @@ jobs:
           path: dist/*
 
   linux:
+    needs: prepare
     strategy:
       matrix:
         include:
@@ -103,6 +136,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
@@ -118,9 +153,12 @@ jobs:
           path: dist/*
 
   windows:
+    needs: prepare
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -151,7 +189,7 @@ jobs:
           path: dist/*
 
   release:
-    needs: [macos, linux, windows]
+    needs: [prepare, macos, linux, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -159,19 +197,37 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: staging
+      - name: Guard against clobbering a published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          if draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' 2>/dev/null)"; then
+            if [ "$draft" != "true" ]; then
+              echo "::error::release $TAG is already published; bump the version instead of re-signing"; exit 1
+            fi
+          fi
       - name: Assemble assets and checksums
         run: |
           set -euo pipefail
           mkdir -p release
           find staging -type f -name 'omgs-*' -exec cp {} release/ \;
           cd release
-          ls -1
-          sha256sum omgs-* > SHA256SUMS
+          # Every expected asset must be present before we publish; a missing
+          # platform must fail, not ship a partial release.
+          expected="omgs-aarch64-apple-darwin omgs-x86_64-apple-darwin omgs-x86_64-unknown-linux-gnu omgs-aarch64-unknown-linux-gnu omgs-x86_64-pc-windows-msvc.exe"
+          for a in $expected; do
+            if [ ! -f "$a" ]; then echo "::error::missing release asset $a"; exit 1; fi
+          done
+          sha256sum $expected > SHA256SUMS
           cat SHA256SUMS
       - name: Publish release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.prepare.outputs.version }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          make_latest: ${{ needs.prepare.outputs.prerelease == 'true' && 'false' || 'true' }}
           files: |
             release/omgs-*
             release/SHA256SUMS
