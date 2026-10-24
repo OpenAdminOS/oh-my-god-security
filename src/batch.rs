@@ -136,9 +136,23 @@ pub struct RunSummary {
     pub reroutes: usize,
 }
 
-/// Summarize one run directory. Missing files leave their fields empty and
-/// say so in `blockers`, so a half-finished run is visible, not hidden.
-pub fn summarize(run: &BatchRun, index_dir: &Path) -> RunSummary {
+/// Contents of `path`, `None` only when no entry exists. Anything present
+/// but unreadable (a dangling link, a directory, bad permissions) is an error.
+fn read_present(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("inspect {}: {e}", path.display())),
+        Ok(_) => std::fs::read_to_string(path)
+            .map(Some)
+            .map_err(|e| format!("read {}: {e}", path.display())),
+    }
+}
+
+/// Summarize one run directory. A file that is absent leaves its fields
+/// empty and says so in `blockers`, so a half-finished run is visible; a file
+/// that exists but is malformed is an error, so the index never shows a
+/// clean row for a run whose evidence could not be read.
+pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String> {
     let mut s = RunSummary {
         url: run.url.clone(),
         state: run.status.clone(),
@@ -148,14 +162,13 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> RunSummary {
         s.blockers.push(format!("init failed: {e}"));
     }
     let Some(dir) = run.run_dir.as_deref().map(Path::new) else {
-        return s;
+        return Ok(s);
     };
-    match std::fs::read_to_string(dir.join("findings.json"))
-        .ok()
-        .and_then(|t| crate::shape::findings(&t).ok())
-    {
-        Some(f) => {
+    let at = |name: &str, e: String| format!("{}: {name}: {e}", dir.display());
+    match read_present(&dir.join("findings.json"))? {
+        Some(text) => {
             use crate::model::Verdict;
+            let f = crate::shape::findings(&text).map_err(|e| at("findings.json", e))?;
             for x in &f.findings {
                 match x.verdict {
                     Verdict::Confirmed => s.confirmed += 1,
@@ -164,11 +177,10 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> RunSummary {
                 }
             }
         }
-        None => s
-            .blockers
-            .push("findings.json missing or unreadable".into()),
+        None => s.blockers.push("findings.json missing".into()),
     }
-    if let Ok(meta) = crate::runmeta::read(dir) {
+    if read_present(&dir.join(crate::runmeta::FILE))?.is_some() {
+        let meta = crate::runmeta::read(dir)?;
         if let Some(st) = meta.get("run_status").and_then(|v| v.as_str()) {
             s.state = st.to_string();
         }
@@ -182,21 +194,17 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> RunSummary {
                 .extend(blocked.iter().filter_map(|b| b.as_str()).map(String::from));
         }
     }
-    if let Ok(text) = std::fs::read_to_string(dir.join("coverage-ledger.json")) {
-        match crate::shape::ledger(&text) {
-            Ok(ledger) => {
-                for u in ledger.units.iter().filter(|u| u.status == "blocked") {
-                    s.blockers.push(format!("blocked unit {}", u.id));
-                }
-            }
-            Err(_) => s.blockers.push("coverage-ledger.json is malformed".into()),
+    if let Some(text) = read_present(&dir.join("coverage-ledger.json"))? {
+        let ledger = crate::shape::ledger(&text).map_err(|e| at("coverage-ledger.json", e))?;
+        for u in ledger.units.iter().filter(|u| u.status == "blocked") {
+            s.blockers.push(format!("blocked unit {}", u.id));
         }
-    }
-    match crate::critic::critique_run(dir) {
-        Ok(c) if !c.passed() => s.blockers.push(format!("critic: {}", c.summary())),
-        Ok(_) => {}
-        Err(_) if run.status == "failed" => {}
-        Err(e) => s.blockers.push(format!("critic not run: {e}")),
+        let c = crate::critic::critique_run(dir)?;
+        if !c.passed() {
+            s.blockers.push(format!("critic: {}", c.summary()));
+        }
+    } else {
+        s.blockers.push("coverage-ledger.json missing".into());
     }
     if dir.join("REPORT.html").is_file() {
         s.report_href = dir
@@ -204,7 +212,7 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> RunSummary {
             .ok()
             .map(|rel| format!("{}/REPORT.html", rel.to_string_lossy()));
     }
-    s
+    Ok(s)
 }
 
 pub fn render_index_markdown(runs: &[RunSummary]) -> String {

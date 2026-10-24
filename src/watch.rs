@@ -77,13 +77,8 @@ pub fn respond(raw: &str, port: u16, run_dir: &Path) -> Response {
             body: DASHBOARD.as_bytes().to_vec(),
         },
         "/pipeline-status.json" => {
-            let path = run_dir.join(crate::status::FILE);
-            let too_big = std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_STATUS);
-            let body = if too_big {
-                EMPTY_STATUS.as_bytes().to_vec()
-            } else {
-                std::fs::read(&path).unwrap_or_else(|_| EMPTY_STATUS.as_bytes().to_vec())
-            };
+            let body = read_status(&run_dir.join(crate::status::FILE))
+                .unwrap_or_else(|| EMPTY_STATUS.as_bytes().to_vec());
             Response {
                 status: 200,
                 content_type: "application/json",
@@ -111,6 +106,39 @@ fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> b
         }
     }
     true
+}
+
+/// The status file, only when it is a regular file with a single link that
+/// is opened without following a symlink and without blocking (a FIFO cannot
+/// stall the server), read up to the size cap. Anything else serves the
+/// empty status: a planted link must never expose another run file.
+fn read_status(path: &Path) -> Option<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > MAX_STATUS {
+        return None;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = opts.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 {
+            return None;
+        }
+    }
+    if !meta.is_file() {
+        return None;
+    }
+    let mut body = Vec::new();
+    file.take(MAX_STATUS + 1).read_to_end(&mut body).ok()?;
+    (body.len() as u64 <= MAX_STATUS).then_some(body)
 }
 
 fn write_response(stream: &mut TcpStream, r: &Response, deadline: Instant) {

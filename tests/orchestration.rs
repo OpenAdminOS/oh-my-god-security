@@ -140,7 +140,8 @@ fn batch_summary_reads_a_run_directory() {
             ..Default::default()
         },
         &index,
-    );
+    )
+    .unwrap();
     assert_eq!(s.state, "complete");
     assert_eq!(s.agent_calls, Some(12));
     assert_eq!(s.reroutes, 1);
@@ -1240,4 +1241,55 @@ fn duplicate_keys_in_run_metadata_and_batch_files_are_errors() {
     )
     .is_err());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn watch_never_serves_a_linked_or_special_status_file() {
+    let dir = scratch("watch-links");
+    std::fs::write(dir.join("findings.json"), "SECRET FINDING").unwrap();
+    std::os::unix::fs::symlink(dir.join("findings.json"), dir.join("pipeline-status.json"))
+        .unwrap();
+    let req = "GET /pipeline-status.json HTTP/1.1\r\nHost: 127.0.0.1:4000\r\n\r\n";
+    let r = omgs::watch::respond(req, 4000, &dir);
+    assert!(!String::from_utf8_lossy(&r.body).contains("SECRET"));
+    std::fs::remove_file(dir.join("pipeline-status.json")).unwrap();
+    std::fs::hard_link(dir.join("findings.json"), dir.join("pipeline-status.json")).unwrap();
+    let r = omgs::watch::respond(req, 4000, &dir);
+    assert!(
+        !String::from_utf8_lossy(&r.body).contains("SECRET"),
+        "hardlink"
+    );
+    std::fs::remove_file(dir.join("pipeline-status.json")).unwrap();
+    let fifo = std::ffi::CString::new(dir.join("pipeline-status.json").to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let start = std::time::Instant::now();
+    let r = omgs::watch::respond(req, 4000, &dir);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(1),
+        "FIFO must not block"
+    );
+    assert_eq!(r.status, 200);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_index_fails_on_malformed_run_metadata() {
+    let index = scratch("index-malformed");
+    let run = index.join("r");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    std::fs::write(
+        run.join("run-metadata.json"),
+        r#"{"blockers":["x"],"blockers":[]}"#,
+    )
+    .unwrap();
+    let r = BatchRun {
+        url: "https://github.com/a/b".into(),
+        run_dir: Some(run.to_string_lossy().to_string()),
+        status: "initialized".into(),
+        ..Default::default()
+    };
+    assert!(summarize(&r, &index).is_err());
+    let _ = std::fs::remove_dir_all(&index);
 }

@@ -1148,12 +1148,25 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o700));
             }
             let out = std::fs::canonicalize(&out).map_err(|e| e.to_string())?;
+            // Claim the batch directory exclusively before any work, so two
+            // concurrent batch inits sharing --out cannot both proceed and
+            // overwrite each other's batch.json.
             if out.join("batch.json").exists() {
                 return Err(format!(
                     "{} already holds a batch; choose a new --out",
                     out.display()
                 ));
             }
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(out.join(".omgs-batch-claim"))
+                .map_err(|e| {
+                    format!(
+                        "{} is already claimed by another batch ({e}); choose a new --out",
+                        out.display()
+                    )
+                })?;
             let mut batch = omgs::batch::BatchFile {
                 created_unix: omgs::runmeta::now_unix(),
                 runs: Vec::new(),
@@ -1249,11 +1262,11 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             // Recheck the directory as it now exists, before writing anything.
             let out = std::fs::canonicalize(&out).map_err(|e| e.to_string())?;
             inside(&out)?;
-            let runs: Vec<_> = batch
+            let runs = batch
                 .runs
                 .iter()
                 .map(|r| omgs::batch::summarize(r, &out))
-                .collect();
+                .collect::<Result<Vec<_>, String>>()?;
             write_out(out.join("INDEX.md"), omgs::batch::render_index_markdown(&runs))
                 .map_err(|e| e.to_string())?;
             write_out(out.join("INDEX.html"), omgs::batch::render_index_html(&runs))
