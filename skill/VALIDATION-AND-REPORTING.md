@@ -58,7 +58,7 @@ Serialize the following semantic fields using the installed CLI schema. Fields u
 | `locations` | Further locations of the same root cause, each with `path` and `line`. One defect copied into several places stays one record and counts once; do not emit one record per copy. |
 | `hunted_by` | Identity of the hunter whose candidate produced the record, matching that candidate's `hunter`. Required. |
 | `verified_by` | Identity of the independent verifier that decided the record. Required, and `omgs validate` rejects it when it equals `hunted_by`. |
-| `candidates` | Fingerprints of further candidates merged into this record when several hunters raised one root cause under different identities. The record's own fingerprint is implicit. |
+| `candidates` | Fingerprints of further candidates merged into this record: several hunters raising one root cause under different identities, or the original candidate fingerprint when verification changed an identity input. The record's own fingerprint is implicit. |
 | `evidence` | Source trace, attacker prerequisites, concrete result, controls/counterevidence, external artifact references and runner evidence. For pending records include the exact missing fact and blocker; for rejection include the decisive refutation. |
 | `fix_brief` | Confirmed: invariant, narrowest effective change, proof test acceptance check. Otherwise null or absent per schema. |
 | `intent_question` | Unresolved plain language intent question with scope, otherwise null or absent per schema. |

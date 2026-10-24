@@ -1,7 +1,7 @@
 use omgs::architecture::{
     render_architecture_html, render_architecture_markdown, validate_architecture, ArchitectureFile,
 };
-use omgs::critic::critique_run;
+use omgs::critic::{critique_dir, critique_run};
 use omgs::ledger::{add_unit, coverage_lines, set_status, validate_ledger, Ledger, Unit, STATUSES};
 use omgs::model::{identity, validate, FindingsFile};
 use omgs::report::{render_html, render_markdown, render_sarif, ReportMeta};
@@ -211,7 +211,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             if let Ok(ledger) = serde_json::from_str::<Ledger>(&text) {
                 coverage = coverage_lines(&ledger);
             }
-            match critique_run(dir) {
+            match critique_dir(dir, &file) {
                 Ok(c) => {
                     if !c.passed() {
                         eprintln!(
