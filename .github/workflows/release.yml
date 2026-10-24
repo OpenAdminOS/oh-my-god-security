@@ -1,0 +1,381 @@
+name: release
+
+# Build, sign, and publish the per-platform omgs binaries that the skill's
+# first-run bootstrap (skill/scripts/install.sh and install.ps1) downloads and
+# verifies against SHA256SUMS. Triggered by pushing a version tag, for example
+# `git tag v0.1.0 && git push origin v0.1.0`.
+#
+# The prepare job resolves the version to an immutable commit SHA from its git
+# TAG ref (not a same-named branch) and every build job checks out that SHA, so
+# a manual run cannot attach binaries built from a different ref to the tag. The
+# release job re-verifies the tag still points at that commit, uploads to a
+# draft, confirms the draft's exact asset set, then flips it to published.
+#
+# Required one-time setup (operator-owned, not verified at release time): the
+# repository must be public (the install scripts download anonymously) and should
+# carry an active ruleset making version tags immutable, so a tag cannot be moved
+# after its binaries are built. Create it with:
+#   gh api -X POST repos/OpenAdminOS/oh-my-god-security/rulesets \
+#     -f name='Protect version tags' -f target=tag -f enforcement=active \
+#     -F 'conditions[ref_name][include][]=refs/tags/v*' \
+#     -F 'conditions[ref_name][exclude][]' \
+#     -F 'rules[][type]=update' -F 'rules[][type]=deletion'
+# and leave its bypass list empty. The release job does not inspect the ruleset
+# (that would require an admin-write token in CI, a larger risk than it removes);
+# instead it re-verifies the tag still points at the built commit just before
+# publishing. If a prior run left a draft release for the tag, the job fails
+# closed and the operator deletes that draft by hand before re-running (the job
+# never auto-deletes a release, since it could be published concurrently).
+#
+# Required secrets (same names as the proven TenuVault pipeline):
+#   macOS: MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER
+#   Windows (Azure Trusted Signing, app openadminos-signing):
+#     AZURE_SIGNING_TENANT_ID, AZURE_SIGNING_CLIENT_ID, AZURE_SIGNING_CLIENT_SECRET,
+#     AZURE_TRUSTED_SIGNING_ENDPOINT, AZURE_TRUSTED_SIGNING_ACCOUNT_NAME,
+#     AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to build and publish (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+
+# Serialize all runs for the same tag so two runs cannot both pass the
+# published-release guard and then race to upload mismatched assets.
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Validate the tag is a semantic version (prerelease suffix allowed).
+          if ! printf '%s' "$VERSION" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$VERSION' is not a vMAJOR.MINOR.PATCH[-prerelease] tag"; exit 1
+          fi
+          # Resolve the git TAG ref specifically; a branch of the same name must
+          # not qualify, and a missing tag must fail closed (git/ref/tags is an
+          # exact lookup that 404s when the tag is absent).
+          ref="$(gh api "repos/${REPO}/git/ref/tags/${VERSION}")"
+          objtype="$(printf '%s' "$ref" | jq -r '.object.type')"
+          objsha="$(printf '%s' "$ref" | jq -r '.object.sha')"
+          if [ "$objtype" = "tag" ]; then
+            # Annotated tag: peel to the commit it points at.
+            sha="$(gh api "repos/${REPO}/git/tags/${objsha}" --jq '.object.sha')"
+          else
+            sha="$objsha"
+          fi
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::tag $VERSION did not resolve to a commit SHA"; exit 1
+          fi
+          # A hyphen in the version marks a prerelease (v0.2.0-rc.1).
+          case "$VERSION" in *-*) pre=true ;; *) pre=false ;; esac
+          {
+            echo "version=$VERSION"
+            echo "sha=$sha"
+            echo "prerelease=$pre"
+          } >> "$GITHUB_OUTPUT"
+          echo "resolved tag $VERSION -> $sha (prerelease=$pre)"
+
+  macos:
+    needs: prepare
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build both arches
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Sign and notarize
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          for v in MAC_CSC_LINK MAC_CSC_KEY_PASSWORD APPLE_API_KEY APPLE_API_KEY_ID APPLE_API_ISSUER; do
+            if [ -z "${!v:-}" ]; then echo "::error::missing signing secret $v"; exit 1; fi
+          done
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          # Always remove the keychain and secret material, even on failure.
+          cleanup() { security delete-keychain "$keychain" 2>/dev/null || true; rm -f "$RUNNER_TEMP/api.p8" "$RUNNER_TEMP/cert.p12"; }
+          trap cleanup EXIT
+          kpw="$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')"
+          security create-keychain -p "$kpw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kpw" "$keychain"
+          printf '%s' "$MAC_CSC_LINK" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MAC_CSC_KEY_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kpw" "$keychain" >/dev/null
+          # shellcheck disable=SC2046  # intentional: re-add the existing user keychains as separate args
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk '/Developer ID Application/ {print $2; exit}')"
+          if [ -z "$identity" ]; then echo "::error::no Developer ID Application identity in the imported cert"; exit 1; fi
+          printf '%s' "$APPLE_API_KEY" > "$RUNNER_TEMP/api.p8"
+          mkdir -p dist
+          for pair in "aarch64-apple-darwin:omgs-aarch64-apple-darwin" "x86_64-apple-darwin:omgs-x86_64-apple-darwin"; do
+            target="${pair%%:*}"; asset="${pair##*:}"
+            bin="target/$target/release/omgs"
+            codesign --force --timestamp --options runtime --keychain "$keychain" --sign "$identity" "$bin"
+            codesign --verify --strict --verbose=2 "$bin"
+            ( cd "$(dirname "$bin")" && /usr/bin/ditto -c -k "omgs" "$RUNNER_TEMP/$asset.zip" )
+            # Notarize and require an explicit Accepted verdict; --wait exit status
+            # alone is not sufficient, so parse the JSON status.
+            out="$(xcrun notarytool submit "$RUNNER_TEMP/$asset.zip" \
+              --key "$RUNNER_TEMP/api.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
+              --wait --output-format json)"
+            echo "$out"
+            status="$(printf '%s' "$out" | jq -r '.status // empty')"
+            if [ "$status" != "Accepted" ]; then
+              echo "::error::notarization not accepted for $asset (status='${status:-none}')"; exit 1
+            fi
+            cp "$bin" "dist/$asset"
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos
+          path: dist/*
+
+  linux:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: omgs-x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: omgs-aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: |
+          set -euo pipefail
+          cargo build --release --locked --target ${{ matrix.target }}
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/omgs" "dist/${{ matrix.asset }}"
+          strip "dist/${{ matrix.asset }}" || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: dist/*
+
+  windows:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          mkdir -p dist
+          cp "target/x86_64-pc-windows-msvc/release/omgs.exe" "dist/omgs-x86_64-pc-windows-msvc.exe"
+      - name: Sign with Azure Trusted Signing
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_SIGNING_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files-folder: ${{ github.workspace }}\dist
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows
+          path: dist/*
+
+  release:
+    needs: [prepare, macos, linux, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: staging
+      - name: Re-verify the tag still points at the built commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.version }}
+          EXPECTED: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          ref="$(gh api "repos/${REPO}/git/ref/tags/${TAG}")"
+          objtype="$(printf '%s' "$ref" | jq -r '.object.type')"
+          objsha="$(printf '%s' "$ref" | jq -r '.object.sha')"
+          if [ "$objtype" = "tag" ]; then
+            cur="$(gh api "repos/${REPO}/git/tags/${objsha}" --jq '.object.sha')"
+          else
+            cur="$objsha"
+          fi
+          if [ "$cur" != "$EXPECTED" ]; then
+            echo "::error::tag $TAG now points at $cur but binaries were built from $EXPECTED; aborting"; exit 1
+          fi
+          echo "tag $TAG still at $EXPECTED"
+      - name: Fail closed if any release exists for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Match by tag_name over all releases (GET /releases/tags/{tag} returns
+          # only published releases, so a draft would escape it). Any existing
+          # release, draft or published, stops the run: we never auto-delete,
+          # because a draft could be published by someone else between listing and
+          # deletion, which would destroy a public release. The operator removes a
+          # stale release by hand before retrying. Fail closed on any listing error.
+          if ! rels="$(gh api --paginate "repos/${REPO}/releases" 2>"$RUNNER_TEMP/rel.err")"; then
+            echo "::error::cannot list releases for $TAG; failing closed"; cat "$RUNNER_TEMP/rel.err" || true; exit 1
+          fi
+          # gh --paginate emits one JSON array per page; slurp (-s) and double-
+          # flatten so the count spans all pages instead of being per-page.
+          match="$(printf '%s' "$rels" | jq -sr --arg t "$TAG" '[.[][] | select(.tag_name==$t)] | length')"
+          if [ "$match" != "0" ]; then
+            echo "::error::a release already exists for $TAG (draft or published); delete it manually and re-run, or bump the version"; exit 1
+          fi
+          echo "no existing release for $TAG"
+      - name: Assemble assets and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find staging -type f -name 'omgs-*' -exec cp {} release/ \;
+          cd release
+          # Publish exactly this set: every expected asset must be present, and no
+          # unexpected omgs-* binary may be shipped (keeps SHA256SUMS authoritative).
+          expected="omgs-aarch64-apple-darwin omgs-x86_64-apple-darwin omgs-x86_64-unknown-linux-gnu omgs-aarch64-unknown-linux-gnu omgs-x86_64-pc-windows-msvc.exe"
+          for a in $expected; do
+            if [ ! -f "$a" ]; then echo "::error::missing release asset $a"; exit 1; fi
+          done
+          for f in omgs-*; do
+            case " $expected " in *" $f "*) ;; *) echo "::error::unexpected asset $f"; exit 1 ;; esac
+          done
+          # shellcheck disable=SC2086
+          sha256sum $expected > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create a fresh draft release (create-only)
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.version }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # Create-only: if a published release for this tag already exists (for
+          # example a racing external publisher after the guard), POST returns 422
+          # and we fail closed instead of adopting and overwriting it. A duplicate
+          # draft is prevented by the preceding guard and the concurrency group.
+          id="$(gh api -X POST "repos/${REPO}/releases" \
+            -f tag_name="$TAG" -f target_commitish="$SHA" \
+            -F draft=true -F prerelease="$PRERELEASE" --jq '.id')"
+          if ! printf '%s' "$id" | grep -Eq '^[0-9]+$'; then
+            echo "::error::could not create a fresh draft release for $TAG"; exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "created draft release id $id"
+      - name: Upload assets to our draft by id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+        run: |
+          set -euo pipefail
+          # Upload only to the release we just created, addressed by its id, so a
+          # concurrently created release for the same tag can never receive our
+          # assets.
+          for f in release/omgs-* release/SHA256SUMS; do
+            name="$(basename "$f")"
+            curl -fsS -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              --data-binary @"$f" \
+              "https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${name}" >/dev/null
+            echo "uploaded $name"
+          done
+      - name: Verify the draft's remote assets, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.version }}
+          EXPECTED: ${{ needs.prepare.outputs.sha }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # Nothing is public until the draft's remote asset set is exactly the six
+          # we uploaded; a failed upload leaves an unpublished draft, not a broken
+          # public release.
+          remote="$(gh api --paginate "repos/${REPO}/releases/${RELEASE_ID}/assets" --jq '.[].name' | sort)"
+          expected="$(printf '%s\n' omgs-aarch64-apple-darwin omgs-x86_64-apple-darwin omgs-x86_64-unknown-linux-gnu omgs-aarch64-unknown-linux-gnu omgs-x86_64-pc-windows-msvc.exe SHA256SUMS | sort)"
+          if [ "$remote" != "$expected" ]; then
+            echo "::error::draft asset set does not match expected; refusing to publish"
+            printf 'remote:\n%s\nexpected:\n%s\n' "$remote" "$expected"; exit 1
+          fi
+          # Final tag/commit recheck immediately before flipping to published, to
+          # shrink the window after the earlier re-verify (belt and suspenders on
+          # top of the operator's immutable-tag prerequisite).
+          r="$(gh api "repos/${REPO}/git/ref/tags/${TAG}")"
+          ot="$(printf '%s' "$r" | jq -r '.object.type')"
+          os="$(printf '%s' "$r" | jq -r '.object.sha')"
+          if [ "$ot" = "tag" ]; then os="$(gh api "repos/${REPO}/git/tags/${os}" --jq '.object.sha')"; fi
+          if [ "$os" != "$EXPECTED" ]; then
+            echo "::error::tag $TAG moved to $os (built from $EXPECTED) before publish; aborting"; exit 1
+          fi
+          make_latest=true
+          [ "$PRERELEASE" = "true" ] && make_latest=false
+          gh api -X PATCH "repos/${REPO}/releases/${RELEASE_ID}" \
+            -F draft=false -f make_latest="$make_latest" >/dev/null
+          echo "published release $RELEASE_ID (make_latest=$make_latest)"
