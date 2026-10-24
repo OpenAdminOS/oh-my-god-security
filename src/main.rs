@@ -236,14 +236,22 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         return;
     };
     for entry in entries.flatten() {
+        // Use the directory entry's own type so a symlink is never followed out
+        // of the target tree (is_dir() would resolve the link target).
+        let Ok(ftype) = entry.file_type() else {
+            continue;
+        };
+        if ftype.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if path.is_dir() {
+        if ftype.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
             if ["node_modules", ".git", ".next", "target", "dist"].contains(&name.as_str()) {
                 continue;
             }
             walk(&path, depth + 1, out);
-        } else {
+        } else if ftype.is_file() {
             out.push(path);
         }
     }

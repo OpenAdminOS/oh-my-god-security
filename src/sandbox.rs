@@ -95,6 +95,23 @@ fn request_json(req: &ProveRequest) -> String {
     .unwrap_or_default()
 }
 
+/// Terminate the sandboxed command and any descendants. The command is its own
+/// process-group leader (see base_env), so signalling the negative pid reaches
+/// grandchildren a bare child.kill() would leave running and holding the pipes.
+#[cfg(unix)]
+fn kill_group(child: &mut Child) {
+    let group = format!("-{}", child.id());
+    let _ = Command::new("/bin/kill").arg("-TERM").arg(&group).status();
+    std::thread::sleep(Duration::from_millis(200));
+    let _ = Command::new("/bin/kill").arg("-KILL").arg(&group).status();
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_group(child: &mut Child) {
+    let _ = child.kill();
+}
+
 fn run_with_timeout(mut child: Child, timeout_ms: u64) -> (bool, bool, String) {
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
@@ -120,7 +137,7 @@ fn run_with_timeout(mut child: Child, timeout_ms: u64) -> (bool, bool, String) {
             Ok(None) => {
                 if start.elapsed() > Duration::from_millis(timeout_ms) {
                     timed_out = true;
-                    let _ = child.kill();
+                    kill_group(&mut child);
                     let _ = child.wait();
                     break false;
                 }
@@ -146,6 +163,13 @@ fn base_env(cmd: &mut Command, scratch: &Path) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Run the sandboxed command as its own process-group leader so a timeout
+    // can signal the whole group, not just the immediate child.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 }
 
 /// MXC 1.0.0 one-shot config for wxc-exec style executors. Verified live
@@ -251,8 +275,15 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         }
         Backend::Seatbelt => {
             let scratch_str = scratch.to_string_lossy().replace('"', "");
+            // Seatbelt is last-match-wins. Target build and test tooling needs
+            // broad file-read and process-exec, so those stay open, but network
+            // is denied, writes are confined to scratch, and the daemons that
+            // let sandboxed code mutate the host out of band are denied by name:
+            // cfprefsd (preferences), LaunchServices/coreservicesd, distributed
+            // and local notifications, mDNSResponder, and AppleEvents. This
+            // closes the observed cfprefsd write escape without breaking builds.
             let profile = format!(
-                "(version 1)(allow default)(deny network*)(deny file-write*)(allow file-write* (subpath \"{scratch_str}\") (literal \"/dev/null\") (literal \"/dev/tty\"))"
+                "(version 1)(allow default)(deny network*)(deny mach-register)(deny mach-lookup (global-name \"com.apple.cfprefsd.daemon\") (global-name \"com.apple.cfprefsd.agent\") (global-name \"com.apple.launchservicesd\") (global-name \"com.apple.coreservices.launchservicesd\") (global-name \"com.apple.CoreServices.coreservicesd\") (global-name \"com.apple.distributed_notifications@1v3\") (global-name \"com.apple.system.notification_center\") (global-name \"com.apple.mDNSResponder\") (global-name \"com.apple.coreservices.appleevents\"))(deny file-write*)(allow file-write* (subpath \"{scratch_str}\") (literal \"/dev/null\") (literal \"/dev/tty\"))"
             );
             let mut c = Command::new("/usr/bin/sandbox-exec");
             c.args(["-p", &profile, "/bin/sh", "-c", &req.command]);
@@ -261,9 +292,14 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             c
         }
         Backend::Bubblewrap(bwrap) => {
+            // Isolate namespaces and mask the writable host dirs. The root bind
+            // stays read-only and broad so arbitrary toolchains still resolve;
+            // narrowing it to an explicit path set needs validation on a real
+            // Linux host and is deferred. Network is off via --unshare-all.
             let mut c = Command::new(bwrap);
             c.args([
-                "--unshare-net",
+                "--unshare-all",
+                "--new-session",
                 "--die-with-parent",
                 "--ro-bind",
                 "/",
@@ -272,6 +308,12 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
                 "/dev",
                 "--proc",
                 "/proc",
+                "--tmpfs",
+                "/tmp",
+                "--tmpfs",
+                "/run",
+                "--tmpfs",
+                "/var/run",
                 "--bind",
                 &scratch.to_string_lossy(),
                 &scratch.to_string_lossy(),
