@@ -186,3 +186,21 @@ pub fn candidates(text: &str) -> Result<crate::critic::CandidatesFile, String> {
         Ok(())
     })
 }
+
+/// Parse a sensors summary (`{"tools_run": [...], "tools_unavailable": [...], "hits": [...]}`).
+pub fn sensors(text: &str) -> Result<crate::sensors::SensorsReport, String> {
+    parse(text, "sensors", |v| {
+        let top = object(v, "document")?;
+        for key in ["tools_run", "tools_unavailable"] {
+            let ok = top
+                .get(key)
+                .and_then(|l| l.as_array())
+                .is_some_and(|l| l.iter().all(|t| t.is_string()));
+            if !ok {
+                return Err(format!("{key} must be an array of strings"));
+            }
+        }
+        objects(top.get("hits").ok_or("hits is required")?, "hits")?;
+        Ok(())
+    })
+}

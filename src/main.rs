@@ -281,7 +281,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         };
         if let Some(text) = text {
             {
-                let rep = serde_json::from_str::<omgs::sensors::SensorsReport>(&text)
+                let rep = omgs::shape::sensors(&text)
                     .map_err(|e| format!("parse {}: {e}", path.display()))?;
                 let vendored = rep.hits.iter().filter(|h| h.vendored).count();
                 sensors_summary = Some(format!(
