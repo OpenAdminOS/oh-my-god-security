@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OMGS coverage ledger",
+  "type": "object",
+  "required": ["units"],
+  "properties": {
+    "units": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "surface", "attack_classes", "status"],
+        "properties": {
+          "id": { "type": "string" },
+          "surface": { "type": "string" },
+          "attack_classes": { "type": "array", "items": { "type": "string" } },
+          "status": { "enum": ["planned", "candidate", "covered", "deferred", "blocked", "out_of_scope"] }
+        }
+      }
+    }
+  }
+}

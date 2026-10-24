@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OMGS hunter candidates",
+  "description": "Machine-readable hunter handoff contract. Candidates are hypotheses, not confirmed findings, and never carry severity. This is the agent handoff shape, not the CLI findings schema.",
+  "type": "object",
+  "required": ["candidates"],
+  "properties": {
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "unit_ids",
+          "source_ref",
+          "title",
+          "attack_class",
+          "entry_point",
+          "sink",
+          "boundary",
+          "location",
+          "attacker_capability",
+          "trace",
+          "concrete_result",
+          "counterevidence",
+          "proof_plan",
+          "fingerprint"
+        ],
+        "properties": {
+          "unit_ids": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1,
+            "description": "Ledger units this candidate answers."
+          },
+          "source_ref": { "type": "string", "description": "Exact reviewed source identity." },
+          "title": { "type": "string", "description": "Concrete claimed unauthorized result." },
+          "attack_class": { "type": "string", "description": "Stable class identifier, reused across runs." },
+          "entry_point": { "type": "string", "description": "Repo-relative path plus HTTP method/route or exported action symbol." },
+          "sink": { "type": "string", "description": "Repo-relative module and stable effect-producing symbol." },
+          "boundary": { "type": "string", "description": "Principal/resource boundary and invariant allegedly violated." },
+          "location": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path"],
+            "properties": {
+              "path": { "type": "string" },
+              "line": { "type": "integer", "minimum": 1 }
+            }
+          },
+          "attacker_capability": { "type": "string", "description": "Lowest privilege, controlled inputs, required state." },
+          "trace": { "type": "string", "description": "Ordered input, enforcement checks, sink, and returned data or mutation, with source references." },
+          "concrete_result": { "type": "string", "description": "Specific disclosure, state change, or privileged local effect; distinguish predicted from observed." },
+          "counterevidence": { "type": "string", "description": "Shared guards, backend policy, middleware, wrappers, and legitimate intent already checked." },
+          "missing_fact": {
+            "type": ["string", "null"],
+            "description": "Exact undecided fact; null when none."
+          },
+          "intent_question": {
+            "type": ["string", "null"],
+            "description": "Plain-language question when intent matters; null when none."
+          },
+          "proof_plan": { "type": "string", "description": "Minimum synthetic fixture, safe invariant assertion, expected vulnerable failure and control success, local prerequisites, and stop condition." },
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^omgs-[0-9a-f]{16}$",
+            "description": "Output of omgs fingerprint over attack_class, entry_point, sink, boundary."
+          }
+        }
+      }
+    }
+  }
+}

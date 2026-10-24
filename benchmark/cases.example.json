@@ -1,0 +1,227 @@
+{
+  "format_version": 1,
+  "examples_only": true,
+  "cases": [
+    {
+      "id": "example-project-ownership-pair",
+      "example_only": true,
+      "kind": "real_fix_pair",
+      "description": "Fictional example of a post-cutoff vulnerability fix pair. No actual repository, advisory, or measured result is represented.",
+      "source": {
+        "repository_url": "https://example.invalid/omgs-fixtures/project-app.git",
+        "authorization_basis": "Illustrative owner-approved local fixture only.",
+        "license": {
+          "spdx_id": "MIT",
+          "redistribution_status": "unresolved",
+          "note": "Example identifier only. Corpus licensing remains an open decision."
+        }
+      },
+      "stack": {
+        "language": "typescript",
+        "nextjs_version": "15.5.4",
+        "database": "postgres"
+      },
+      "provenance": {
+        "advisory_id": "EXAMPLE-NOT-A-REAL-CVE-0001",
+        "advisory_url": "https://example.invalid/advisories/example-0001",
+        "first_public_disclosure_at": "2026-03-02T00:00:00Z",
+        "first_public_fix_at": "2026-03-03T00:00:00Z",
+        "timeline_evidence_urls": [
+          "https://example.invalid/advisories/example-0001/timeline"
+        ],
+        "generator": null,
+        "human_confirmation": {
+          "reviewer": "fictional-reviewer-a",
+          "reviewed_at": "2026-10-01T10:00:00Z",
+          "evidence_path": "truth/example-project-ownership-pair/review.json"
+        }
+      },
+      "cutoff": {
+        "latest_model_knowledge_cutoff": "2026-01-01",
+        "eligibility": "eligible",
+        "reason": "Illustrative dates place disclosure and public fix after the fictional configuration's latest cutoff. This example is never scored."
+      },
+      "split": {
+        "cohort_id": "example-project-app-family",
+        "partition": "development",
+        "rotation_id": "example-rotation-01"
+      },
+      "snapshots": [
+        {
+          "id": "project-vulnerable",
+          "role": "vulnerable",
+          "source_ref": "1111111111111111111111111111111111111111",
+          "fixture_path": "sources/project-vulnerable",
+          "toolchain_manifest_path": "toolchains/project-app.json"
+        },
+        {
+          "id": "project-fixed",
+          "role": "fixed",
+          "source_ref": "2222222222222222222222222222222222222222",
+          "fixture_path": "sources/project-fixed",
+          "toolchain_manifest_path": "toolchains/project-app.json"
+        }
+      ],
+      "fixtures": {
+        "policy_path": "policies/project-app.json",
+        "setup_manifest_path": "fixtures/project-app-synthetic.json",
+        "dependency_snapshot_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "network": "denied",
+        "data": "synthetic_only",
+        "tier2_first_run_approval_required": true
+      },
+      "expected_findings": [
+        {
+          "id": "example-private-project-read",
+          "attack_class": "idor",
+          "entry_point": "app/api/projects/[id]/route.ts:GET /api/projects/[id]",
+          "sink": "lib/projects.ts:loadProject",
+          "boundary": "non-owner member to another owner's private project",
+          "location": {
+            "path": "lib/projects.ts",
+            "line": 18
+          },
+          "invariant": "Only the owner or an explicitly authorized member may read a private project.",
+          "positive_snapshot_ids": [
+            "project-vulnerable"
+          ],
+          "negative_snapshot_ids": [
+            "project-fixed"
+          ],
+          "minimum_proof_tier": "test_proven",
+          "proof_test_path": "truth/example-project-ownership-pair/project-ownership.test.ts"
+        }
+      ],
+      "known_clean_units": [
+        {
+          "snapshot_ids": [
+            "project-fixed"
+          ],
+          "surface": "GET /api/projects/[id]",
+          "boundary": "non-owner member to another owner's private project",
+          "attack_class": "idor",
+          "invariant": "The repaired loader denies non-owner access and still permits the owner's read."
+        }
+      ],
+      "budget": {
+        "max_agent_calls": 12,
+        "max_model_tokens": 60000,
+        "max_cost_usd": 5.0,
+        "max_wall_seconds": 900,
+        "max_proof_runs": 4
+      }
+    },
+    {
+      "id": "example-generated-workspace-app",
+      "example_only": true,
+      "kind": "generated_app",
+      "description": "Fictional generated app with a human-confirmed tenant isolation defect and a repaired negative snapshot. No actual review is claimed.",
+      "source": {
+        "repository_url": "https://example.invalid/omgs-fixtures/workspace-app.git",
+        "authorization_basis": "Illustrative maintainer-owned synthetic application only.",
+        "license": {
+          "spdx_id": "Apache-2.0",
+          "redistribution_status": "unresolved",
+          "note": "Illustrative app license only. Dependency rights and corpus license are not decided."
+        }
+      },
+      "stack": {
+        "language": "typescript",
+        "nextjs_version": "15.5.4",
+        "database": "supabase"
+      },
+      "provenance": {
+        "advisory_id": null,
+        "advisory_url": null,
+        "first_public_disclosure_at": null,
+        "first_public_fix_at": null,
+        "timeline_evidence_urls": null,
+        "generator": {
+          "agent": "example-agent",
+          "model": "example-model",
+          "prompt_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "seed": 17
+        },
+        "human_confirmation": {
+          "reviewer": "fictional-reviewer-b",
+          "reviewed_at": "2026-10-02T10:00:00Z",
+          "evidence_path": "truth/example-generated-workspace-app/review.json"
+        }
+      },
+      "cutoff": {
+        "latest_model_knowledge_cutoff": null,
+        "eligibility": "not_applicable",
+        "reason": "Generated app cohort, not evidence for a real post-cutoff vulnerability claim."
+      },
+      "split": {
+        "cohort_id": "example-workspace-template-family",
+        "partition": "held_out",
+        "rotation_id": "example-rotation-01"
+      },
+      "snapshots": [
+        {
+          "id": "workspace-vulnerable",
+          "role": "vulnerable",
+          "source_ref": "3333333333333333333333333333333333333333",
+          "fixture_path": "sources/workspace-vulnerable",
+          "toolchain_manifest_path": "toolchains/workspace-app.json"
+        },
+        {
+          "id": "workspace-fixed",
+          "role": "fixed",
+          "source_ref": "4444444444444444444444444444444444444444",
+          "fixture_path": "sources/workspace-fixed",
+          "toolchain_manifest_path": "toolchains/workspace-app.json"
+        }
+      ],
+      "fixtures": {
+        "policy_path": "policies/workspace-app.json",
+        "setup_manifest_path": "fixtures/workspace-app-synthetic.json",
+        "dependency_snapshot_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "network": "denied",
+        "data": "synthetic_only",
+        "tier2_first_run_approval_required": true
+      },
+      "expected_findings": [
+        {
+          "id": "example-cross-workspace-note-read",
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/notes/[id]/route.ts:GET /api/notes/[id]",
+          "sink": "lib/notes.ts:loadWorkspaceNote",
+          "boundary": "workspace A member to workspace B private note",
+          "location": {
+            "path": "lib/notes.ts",
+            "line": 27
+          },
+          "invariant": "A member reads private notes only in a workspace where they have verified membership.",
+          "positive_snapshot_ids": [
+            "workspace-vulnerable"
+          ],
+          "negative_snapshot_ids": [
+            "workspace-fixed"
+          ],
+          "minimum_proof_tier": "test_proven",
+          "proof_test_path": "truth/example-generated-workspace-app/workspace-isolation.test.ts"
+        }
+      ],
+      "known_clean_units": [
+        {
+          "snapshot_ids": [
+            "workspace-fixed"
+          ],
+          "surface": "GET /api/notes/[id]",
+          "boundary": "workspace A member to workspace B private note",
+          "attack_class": "tenant_isolation",
+          "invariant": "The repaired local RLS policy filters cross-workspace rows under the effective application role."
+        }
+      ],
+      "budget": {
+        "max_agent_calls": 12,
+        "max_model_tokens": 60000,
+        "max_cost_usd": 5.0,
+        "max_wall_seconds": 900,
+        "max_proof_runs": 4
+      }
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+Oh My God Security (OMGS)
+Copyright 2026 The OMGS Contributors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+Third party notices
+-------------------
+
+This project pins and may redistribute material from cloudflare/security-audit-skill,
+licensed under the MIT License. Its copyright and permission notices are preserved
+with that material wherever it is included.
+
+This project integrates with the Microsoft eXecution Container (MXC) SDK and
+executor as a sandbox backend. MXC is a dependency referenced by name in build
+files and documentation of the sandbox interface. Use of MXC is subject to its
+own license terms as published with that project.
+
+Deterministic sensor tools invoked by the CLI, when present on the user system,
+remain under their own licenses and are not redistributed by this project unless
+a future release notes file states otherwise for a specific artifact.

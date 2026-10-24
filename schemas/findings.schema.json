@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OMGS findings",
+  "type": "object",
+  "required": ["findings"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["fingerprint", "title", "verdict", "proof_tier", "attack_class", "entry_point", "sink", "boundary", "location"],
+        "properties": {
+          "fingerprint": { "type": "string", "pattern": "^omgs-[0-9a-f]{16}$" },
+          "title": { "type": "string" },
+          "verdict": { "enum": ["confirmed", "needs_validation", "rejected"] },
+          "severity": { "enum": ["critical", "high", "medium", "low", "informational"] },
+          "proof_tier": { "enum": ["traced", "test_proven", "sandbox_exploited"] },
+          "attack_class": { "type": "string" },
+          "entry_point": { "type": "string" },
+          "sink": { "type": "string" },
+          "boundary": { "type": "string" },
+          "location": {
+            "type": "object",
+            "required": ["path"],
+            "properties": { "path": { "type": "string" }, "line": { "type": "integer" } }
+          },
+          "evidence": { "type": "string" },
+          "fix_brief": { "type": "string" },
+          "intent_question": { "type": "string" },
+          "family": { "type": "string" },
+          "prerequisites": { "type": "string" },
+          "verified_by": { "type": "string" }
+        }
+      }
+    }
+  }
+}
