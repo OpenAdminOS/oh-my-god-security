@@ -45,7 +45,7 @@
     <rect x="28" y="150" width="196" height="128" rx="12" fill="#171a21" stroke="#272b35"/>
     <rect x="28" y="150" width="5" height="128" rx="2.5" fill="#ff6b6b"/>
     <rect x="28" y="150" width="196" height="128" rx="12" fill="none" stroke="#ff6b6b" stroke-width="2" opacity="0">
-      <animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.12;0.33" dur="4.8s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0;0.9;0;0" keyTimes="0;0.12;0.33;1" dur="4.8s" repeatCount="indefinite"/>
     </rect>
     <circle cx="52" cy="176" r="5" fill="#ff6b6b"/>
     <text x="68" y="181" fill="#ff8a8a" font-size="12" font-weight="700" letter-spacing="1.2">RED &#183; HUNT</text>
@@ -59,7 +59,7 @@
     <rect x="268" y="150" width="196" height="128" rx="12" fill="#171a21" stroke="#272b35"/>
     <rect x="268" y="150" width="5" height="128" rx="2.5" fill="#5b9dff"/>
     <rect x="268" y="150" width="196" height="128" rx="12" fill="none" stroke="#5b9dff" stroke-width="2" opacity="0">
-      <animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.12;0.33" dur="4.8s" begin="1.2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0;0.9;0;0" keyTimes="0;0.12;0.33;1" dur="4.8s" begin="1.2s" repeatCount="indefinite"/>
     </rect>
     <circle cx="292" cy="176" r="5" fill="#5b9dff"/>
     <text x="308" y="181" fill="#8bb8ff" font-size="12" font-weight="700" letter-spacing="1.2">BLUE &#183; VERIFY</text>
@@ -73,7 +73,7 @@
     <rect x="508" y="150" width="196" height="128" rx="12" fill="#171a21" stroke="#272b35"/>
     <rect x="508" y="150" width="5" height="128" rx="2.5" fill="#b69bff"/>
     <rect x="508" y="150" width="196" height="128" rx="12" fill="none" stroke="#b69bff" stroke-width="2" opacity="0">
-      <animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.12;0.33" dur="4.8s" begin="2.4s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0;0.9;0;0" keyTimes="0;0.12;0.33;1" dur="4.8s" begin="2.4s" repeatCount="indefinite"/>
     </rect>
     <circle cx="532" cy="176" r="5" fill="#b69bff"/>
     <text x="548" y="181" fill="#c9b6ff" font-size="12" font-weight="700" letter-spacing="1.2">ADJUDICATE</text>
@@ -87,7 +87,7 @@
     <rect x="748" y="150" width="196" height="128" rx="12" fill="#171a21" stroke="#272b35"/>
     <rect x="748" y="150" width="5" height="128" rx="2.5" fill="#51d08a"/>
     <rect x="748" y="150" width="196" height="128" rx="12" fill="none" stroke="#51d08a" stroke-width="2" opacity="0">
-      <animate attributeName="opacity" values="0;0.9;0" keyTimes="0;0.12;0.33" dur="4.8s" begin="3.6s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0;0.9;0;0" keyTimes="0;0.12;0.33;1" dur="4.8s" begin="3.6s" repeatCount="indefinite"/>
     </rect>
     <circle cx="772" cy="176" r="5" fill="#51d08a"/>
     <text x="788" y="181" fill="#79e0a8" font-size="12" font-weight="700" letter-spacing="1.2">GREEN &#183; GUARD</text>
@@ -98,5 +98,5 @@
 
   <!-- footer -->
   <text x="34" y="346" fill="#6b7280" font-size="12.5">Each stage runs in its own fresh context, so no agent certifies its own work.</text>
-  <text x="34" y="366" fill="#6b7280" font-size="12.5">No cloud. No telemetry. Confirmed means traced, test-proven, or sandbox-exploited.</text>
+  <text x="34" y="366" fill="#6b7280" font-size="12.5">No cloud. No telemetry. Only test-proven or sandbox-exploited is confirmed; traced stays a candidate.</text>
 </svg>

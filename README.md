@@ -23,11 +23,13 @@ Three steps. You do not install a binary by hand.
 
 You read the report it produces (a self contained `REPORT.html`, plus `REPORT.md` and SARIF) in a run directory that lives outside your code. OMGS changes nothing in your repository and applies no fixes unless you explicitly ask.
 
-> Early v0 status: the first public signed release is not published yet, so the automatic download cannot resolve today. Until it is, build the binary from source once and the same flow works:
+> Early v0 status: the first public signed release is not published yet, so the automatic download cannot resolve today. Until it is, build the binary once and place it where the skill looks for it, then the agent flow above works:
 > ```sh
 > git clone https://github.com/OpenAdminOS/oh-my-god-security
-> cd oh-my-god-security && cargo build --release && ./target/release/omgs setup
+> cd oh-my-god-security && cargo build --release
+> mkdir -p ~/.local/share/omgs/bin && cp target/release/omgs ~/.local/share/omgs/bin/omgs
 > ```
+> On Windows, copy `target\release\omgs.exe` to `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`.
 
 ## How it works
 
@@ -83,7 +85,7 @@ Asking your coding agent is the intended experience. Driving the CLI yourself wo
 
 ```sh
 cargo build --release
-./target/release/omgs setup
+./target/release/omgs setup --yes                      # install the skill into your agents (omit --yes for a dry run)
 ./target/release/omgs audit init --target /path/to/your/repo
 ./target/release/omgs check --target /path/to/your/repo
 ```
