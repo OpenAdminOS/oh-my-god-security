@@ -232,6 +232,37 @@ fn ledger_rejects_duplicate_ids_and_bad_status() {
     assert!(has(&errors, "status 'examined' is not one of"));
 }
 
+/// The prose fields every candidate must carry, filled with placeholders.
+fn filled() -> Candidate {
+    Candidate {
+        source_ref: "abc123".into(),
+        location: omgs::critic::CandidateLocation {
+            path: "app/api/x/route.ts".into(),
+            line: Some(3),
+        },
+        attacker_capability: "signed-in member of tenant A".into(),
+        trace: "route reads id, no tenant check, returns row".into(),
+        concrete_result: "tenant B row returned".into(),
+        counterevidence: "no middleware or RLS applies".into(),
+        proof_plan: "two tenants, assert 404 for the foreign row".into(),
+        ..Candidate::default()
+    }
+}
+
+/// A candidate as a hunter writes it to a candidates file.
+fn candidate_json(c: &Candidate) -> serde_json::Value {
+    serde_json::json!({
+        "hunter": c.hunter, "unit_ids": c.unit_ids, "source_ref": c.source_ref,
+        "title": c.title, "attack_class": c.attack_class, "entry_point": c.entry_point,
+        "sink": c.sink, "boundary": c.boundary,
+        "location": { "path": c.location.path, "line": c.location.line },
+        "attacker_capability": c.attacker_capability, "trace": c.trace,
+        "concrete_result": c.concrete_result, "counterevidence": c.counterevidence,
+        "missing_fact": null, "intent_question": null, "proof_plan": c.proof_plan,
+        "fingerprint": c.fingerprint
+    })
+}
+
 /// A complete run: one unit covered by one verified finding from one candidate.
 fn complete_run() -> (Ledger, Vec<SourcedCandidate>, FindingsFile) {
     let f = record("a");
@@ -248,6 +279,7 @@ fn complete_run() -> (Ledger, Vec<SourcedCandidate>, FindingsFile) {
         entry_point: f.entry_point.clone(),
         sink: f.sink.clone(),
         boundary: f.boundary.clone(),
+        ..filled()
     };
     let sc = SourcedCandidate {
         file: "candidates-red-1.json".into(),
@@ -328,6 +360,7 @@ fn critic_reports_each_gap_class() {
             entry_point: orphan.entry_point,
             sink: orphan.sink,
             boundary: orphan.boundary,
+            ..filled()
         },
     });
     assert!(has(
@@ -357,6 +390,7 @@ fn critic_reports_each_gap_class() {
             entry_point: merged.entry_point,
             sink: merged.sink,
             boundary: merged.boundary,
+            ..filled()
         },
     });
     findings.findings[0].candidates = vec![merged.fingerprint];
@@ -424,12 +458,7 @@ fn cli_ledger_and_critic_end_to_end() {
     let c = &cands[0].candidate;
     w(
         "candidates-red-1.json",
-        serde_json::json!({"candidates": [{
-            "fingerprint": c.fingerprint, "hunter": "red-1", "unit_ids": ["route:x"],
-            "title": c.title, "attack_class": c.attack_class, "entry_point": c.entry_point,
-            "sink": c.sink, "boundary": c.boundary
-        }]})
-        .to_string(),
+        serde_json::json!({"candidates": [candidate_json(c)]}).to_string(),
     );
     let run = dir.to_str().unwrap();
     let ledger_path = dir.join("coverage-ledger.json");
@@ -539,12 +568,7 @@ fn report_critic_describes_the_rendered_findings() {
     let c = &cands[0].candidate;
     std::fs::write(
         dir.join("candidates-red-1.json"),
-        serde_json::json!({"candidates": [{
-            "fingerprint": c.fingerprint, "hunter": "red-1", "unit_ids": ["route:x"],
-            "title": c.title, "attack_class": c.attack_class, "entry_point": c.entry_point,
-            "sink": c.sink, "boundary": c.boundary
-        }]})
-        .to_string(),
+        serde_json::json!({"candidates": [candidate_json(c)]}).to_string(),
     )
     .unwrap();
     // A stale sibling findings.json must not be what the critic checks.
@@ -676,21 +700,26 @@ fn ledger_units_require_every_schema_field() {
 }
 
 #[test]
-fn candidates_require_every_identity_field() {
-    let full = serde_json::json!({
-        "fingerprint": "omgs-0123456789abcdef", "hunter": "red-1", "unit_ids": ["u"],
-        "title": "t", "attack_class": "a", "entry_point": "e", "sink": "s", "boundary": "b"
-    });
+fn candidates_require_every_schema_field() {
+    let (_, cands, _) = complete_run();
+    let full = candidate_json(&cands[0].candidate);
     assert!(serde_json::from_value::<Candidate>(full.clone()).is_ok());
     for key in [
-        "fingerprint",
         "hunter",
         "unit_ids",
+        "source_ref",
         "title",
         "attack_class",
         "entry_point",
         "sink",
         "boundary",
+        "location",
+        "attacker_capability",
+        "trace",
+        "concrete_result",
+        "counterevidence",
+        "proof_plan",
+        "fingerprint",
     ] {
         let mut v = full.clone();
         v.as_object_mut().unwrap().remove(key);
@@ -699,6 +728,36 @@ fn candidates_require_every_identity_field() {
             "accepted a candidate without {key}"
         );
     }
+    for (key, wrong) in [
+        ("trace", serde_json::json!(7)),
+        ("location", serde_json::json!("app/x.ts")),
+        ("unit_ids", serde_json::json!("route:x")),
+    ] {
+        let mut v = full.clone();
+        v[key] = wrong;
+        assert!(
+            serde_json::from_value::<Candidate>(v).is_err(),
+            "accepted a wrong type for {key}"
+        );
+    }
+    let mut v = full.clone();
+    v["severity"] = serde_json::json!("high");
+    assert!(
+        serde_json::from_value::<Candidate>(v).is_err(),
+        "candidates never carry severity"
+    );
+    let mut v = full;
+    v["trace"] = serde_json::json!(" ");
+    let blank: Candidate = serde_json::from_value(v).unwrap();
+    let (ledger, _, findings) = complete_run();
+    let sc = SourcedCandidate {
+        file: "c.json".into(),
+        candidate: blank,
+    };
+    assert!(has(
+        &critique(&ledger, 1, &[sc], &findings).gaps,
+        "trace is empty"
+    ));
 }
 
 #[test]
@@ -713,6 +772,7 @@ fn critic_flags_blank_identity_inputs_on_merged_candidates() {
         entry_point: "GET /api/x".into(),
         sink: "".into(),
         boundary: "tenant".into(),
+        ..filled()
     };
     findings.findings[0].candidates = vec![blank.fingerprint.clone()];
     cands.push(SourcedCandidate {
@@ -721,4 +781,34 @@ fn critic_flags_blank_identity_inputs_on_merged_candidates() {
     });
     let gaps = critique(&ledger, 1, &cands, &findings).gaps;
     assert!(has(&gaps, "'Copy': sink is empty"), "{gaps:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn critic_refuses_symlinked_candidate_files() {
+    let dir = scratch("symlinked-candidates");
+    let (ledger, cands, findings) = complete_run();
+    std::fs::write(
+        dir.join("coverage-ledger.json"),
+        serde_json::to_string(&ledger).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("findings.json"),
+        serde_json::to_string(&findings).unwrap(),
+    )
+    .unwrap();
+    let real = dir.join("elsewhere.json");
+    std::fs::write(
+        &real,
+        serde_json::json!({"candidates": [candidate_json(&cands[0].candidate)]}).to_string(),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&real, dir.join("candidates-other.json")).unwrap();
+    let err = omgs::critic::critique_run(&dir).unwrap_err();
+    assert!(
+        err.contains("candidates-other.json is not a regular file"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

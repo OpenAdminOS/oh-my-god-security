@@ -8,20 +8,40 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// The fields of a hunter candidate the critic reads. Everything else in the
-/// candidates schema is prose for the verifier. Every field is required, so a
-/// candidate with a dropped identity input fails to parse instead of being
-/// fingerprinted over a default.
+/// One hunter candidate, matching `skill/schemas/candidates.schema.json`:
+/// every required field is required here too, unknown fields are rejected,
+/// and wrong types fail to parse, so a malformed handoff is an error rather
+/// than a candidate the critic could pass.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Candidate {
-    pub fingerprint: String,
     pub hunter: String,
     pub unit_ids: Vec<String>,
+    pub source_ref: String,
     pub title: String,
     pub attack_class: String,
     pub entry_point: String,
     pub sink: String,
     pub boundary: String,
+    pub location: CandidateLocation,
+    pub attacker_capability: String,
+    pub trace: String,
+    pub concrete_result: String,
+    pub counterevidence: String,
+    #[serde(default)]
+    pub missing_fact: Option<String>,
+    #[serde(default)]
+    pub intent_question: Option<String>,
+    pub proof_plan: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateLocation {
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u32>,
 }
 
 /// A hunter's handoff file. `candidates` is required, so a misspelled key
@@ -106,15 +126,25 @@ pub fn critique(
         let at = format!("{} candidate '{}'", sc.file, c.title);
         let expected = crate::fingerprint(&c.attack_class, &c.entry_point, &c.sink, &c.boundary);
         for (name, value) in [
+            ("source_ref", &c.source_ref),
             ("title", &c.title),
             ("attack_class", &c.attack_class),
             ("entry_point", &c.entry_point),
             ("sink", &c.sink),
             ("boundary", &c.boundary),
+            ("location.path", &c.location.path),
+            ("attacker_capability", &c.attacker_capability),
+            ("trace", &c.trace),
+            ("concrete_result", &c.concrete_result),
+            ("counterevidence", &c.counterevidence),
+            ("proof_plan", &c.proof_plan),
         ] {
             if value.trim().is_empty() {
                 gaps.push(format!("{at}: {name} is empty"));
             }
+        }
+        if c.location.line == Some(0) {
+            gaps.push(format!("{at}: location.line must be one-based"));
         }
         if !is_fingerprint(&c.fingerprint) {
             gaps.push(format!(
@@ -236,13 +266,26 @@ pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport,
     let read = |name: &str| read_in(dir, name);
     let ledger: Ledger = serde_json::from_str(&read("coverage-ledger.json")?)
         .map_err(|e| format!("parse coverage-ledger.json: {e}"))?;
-    let mut names: Vec<String> = std::fs::read_dir(dir)
-        .map_err(|e| format!("read {}: {e}", dir.display()))?
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.starts_with("candidates") && n.ends_with(".json"))
-        .collect();
+    // Every candidates*.json must be a readable regular file: a symlink, a
+    // directory, or an unreadable entry is an error, never silently skipped,
+    // so no hunter handoff can disappear from reconciliation.
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !(name.starts_with("candidates") && name.ends_with(".json")) {
+            continue;
+        }
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("inspect {name}: {e}"))?;
+        if !kind.is_file() {
+            return Err(format!(
+                "{name} is not a regular file (symlinks and directories are refused)"
+            ));
+        }
+        names.push(name);
+    }
     names.sort();
     let mut candidates = Vec::new();
     for name in &names {
