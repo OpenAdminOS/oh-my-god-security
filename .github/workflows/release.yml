@@ -8,8 +8,18 @@ name: release
 # The prepare job resolves the version to an immutable commit SHA from its git
 # TAG ref (not a same-named branch) and every build job checks out that SHA, so
 # a manual run cannot attach binaries built from a different ref to the tag. The
-# release job re-verifies the tag still points at that commit and pins the
-# release to it with target_commitish before publishing.
+# release job re-verifies the tag still points at that commit, uploads to a
+# draft, confirms the draft's exact asset set, then flips it to published.
+#
+# Prerequisite (one-time, enforced by the release job): the repository must be
+# public and carry an active ruleset that protects version tags from update and
+# deletion, so a tag cannot be moved after its binaries are built. Create it with:
+#   gh api -X POST repos/OpenAdminOS/oh-my-god-security/rulesets \
+#     -f name='Protect version tags' -f target=tag -f enforcement=active \
+#     -F 'conditions[ref_name][include][]=refs/tags/v*' \
+#     -F 'conditions[ref_name][exclude][]' \
+#     -F 'rules[][type]=update' -F 'rules[][type]=deletion'
+# The release job fails closed if this protection is absent.
 #
 # Required secrets (same names as the proven TenuVault pipeline):
 #   macOS: MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER
@@ -117,6 +127,7 @@ jobs:
           printf '%s' "$MAC_CSC_LINK" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MAC_CSC_KEY_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kpw" "$keychain" >/dev/null
+          # shellcheck disable=SC2046  # intentional: re-add the existing user keychains as separate args
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
           identity="$(security find-identity -v -p codesigning "$keychain" | awk '/Developer ID Application/ {print $2; exit}')"
           if [ -z "$identity" ]; then echo "::error::no Developer ID Application identity in the imported cert"; exit 1; fi
@@ -220,6 +231,48 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: staging
+      - name: Require enforced immutable tag protection
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # target_commitish is ignored once a tag exists, so a tag moved by an
+          # external force-push after our verification could still be published
+          # against binaries built from the old commit. The only full fix is a
+          # repository that forbids updating or deleting version tags. Require an
+          # active ruleset that does so and fail closed otherwise. Rulesets are
+          # free on public repositories, which this must be for the anonymous
+          # release downloads in install.sh/install.ps1 to work.
+          if ! sets="$(gh api "repos/${REPO}/rulesets" 2>"$RUNNER_TEMP/rs.err")"; then
+            echo "::error::cannot read rulesets; make the repo public and add a tag ruleset protecting '${TAG}' from update and deletion"
+            cat "$RUNNER_TEMP/rs.err" || true; exit 1
+          fi
+          ref="refs/tags/${TAG}"; ok=false
+          for id in $(printf '%s' "$sets" | jq -r '.[] | select(.target=="tag" and .enforcement=="active") | .id'); do
+            rule="$(gh api "repos/${REPO}/rulesets/${id}")"
+            types=",$(printf '%s' "$rule" | jq -r '[.rules[].type] | join(",")'),"
+            case "$types" in *",update,"*) : ;; *) continue ;; esac
+            case "$types" in *",deletion,"*) : ;; *) continue ;; esac
+            covered=no
+            while IFS= read -r p; do
+              [ -z "$p" ] && continue
+              [ "$p" = "~ALL" ] && covered=yes
+              # shellcheck disable=SC2254
+              case "$ref" in $p) covered=yes ;; esac
+            done < <(printf '%s' "$rule" | jq -r '.conditions.ref_name.include[]?')
+            while IFS= read -r p; do
+              [ -z "$p" ] && continue
+              # shellcheck disable=SC2254
+              case "$ref" in $p) covered=no ;; esac
+            done < <(printf '%s' "$rule" | jq -r '.conditions.ref_name.exclude[]?')
+            if [ "$covered" = yes ]; then ok=true; break; fi
+          done
+          if [ "$ok" != true ]; then
+            echo "::error::no active ruleset protects tag '${TAG}' from update and deletion; add one before releasing"; exit 1
+          fi
+          echo "immutable tag protection verified for ${TAG}"
       - name: Re-verify the tag still points at the built commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -240,32 +293,32 @@ jobs:
             echo "::error::tag $TAG now points at $cur but binaries were built from $EXPECTED; aborting"; exit 1
           fi
           echo "tag $TAG still at $EXPECTED"
-      - name: Guard the target release
+      - name: Guard and clear any existing release for this tag
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TAG: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          body="$RUNNER_TEMP/rel.json"; err="$RUNNER_TEMP/rel.err"
-          if gh api "repos/${REPO}/releases/tags/${TAG}" > "$body" 2>"$err"; then
-            draft="$(jq -r '.draft' "$body")"
-            if [ "$draft" != "true" ]; then
-              echo "::error::release $TAG is already published; bump the version instead of re-signing"; exit 1
-            fi
-            # A leftover draft may hold stale assets not covered by our SHA256SUMS;
-            # delete it so the published release contains exactly our binaries.
-            echo "deleting existing draft release $TAG for a clean slate"
-            gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag=false
+          # Match by tag_name over all releases: GET /releases/tags/{tag} returns
+          # only published releases, so an existing draft would 404 and escape the
+          # clean-slate deletion. Fail closed on any listing error.
+          if ! rels="$(gh api --paginate "repos/${REPO}/releases" 2>"$RUNNER_TEMP/rel.err")"; then
+            echo "::error::cannot list releases for $TAG; failing closed"; cat "$RUNNER_TEMP/rel.err" || true; exit 1
+          fi
+          printf '%s' "$rels" | jq -c --arg t "$TAG" '.[] | select(.tag_name==$t) | {id, draft}' > "$RUNNER_TEMP/match.jsonl"
+          if [ -s "$RUNNER_TEMP/match.jsonl" ]; then
+            while IFS= read -r m; do
+              id="$(printf '%s' "$m" | jq -r '.id')"
+              draft="$(printf '%s' "$m" | jq -r '.draft')"
+              if [ "$draft" != "true" ]; then
+                echo "::error::release $TAG is already published; bump the version instead of re-signing"; exit 1
+              fi
+              echo "deleting stale draft release id $id for $TAG"
+              gh api -X DELETE "repos/${REPO}/releases/${id}"
+            done < "$RUNNER_TEMP/match.jsonl"
           else
-            # Distinguish an explicit absence (fine) from any other API error
-            # (fail closed so a transient failure never bypasses this guard).
-            if grep -q 'HTTP 404' "$err"; then
-              echo "no existing release for $TAG; proceeding"
-            else
-              echo "::error::could not determine release state for $TAG; failing closed"
-              cat "$err" || true; exit 1
-            fi
+            echo "no existing release for $TAG"
           fi
       - name: Assemble assets and checksums
         run: |
@@ -282,16 +335,40 @@ jobs:
           for f in omgs-*; do
             case " $expected " in *" $f "*) ;; *) echo "::error::unexpected asset $f"; exit 1 ;; esac
           done
+          # shellcheck disable=SC2086
           sha256sum $expected > SHA256SUMS
           cat SHA256SUMS
-      - name: Publish release
+      - name: Create draft release with assets
+        id: draft
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ needs.prepare.outputs.version }}
           target_commitish: ${{ needs.prepare.outputs.sha }}
+          draft: true
           prerelease: ${{ needs.prepare.outputs.prerelease }}
-          make_latest: ${{ needs.prepare.outputs.prerelease == 'true' && 'false' || 'true' }}
           files: |
             release/omgs-*
             release/SHA256SUMS
           fail_on_unmatched_files: true
+      - name: Verify the draft's remote assets, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # Nothing is public until the draft's remote asset set is exactly the six
+          # we uploaded; a failed upload leaves an unpublished draft, not a broken
+          # public release.
+          remote="$(gh api --paginate "repos/${REPO}/releases/${RELEASE_ID}/assets" --jq '.[].name' | sort)"
+          expected="$(printf '%s\n' omgs-aarch64-apple-darwin omgs-x86_64-apple-darwin omgs-x86_64-unknown-linux-gnu omgs-aarch64-unknown-linux-gnu omgs-x86_64-pc-windows-msvc.exe SHA256SUMS | sort)"
+          if [ "$remote" != "$expected" ]; then
+            echo "::error::draft asset set does not match expected; refusing to publish"
+            printf 'remote:\n%s\nexpected:\n%s\n' "$remote" "$expected"; exit 1
+          fi
+          make_latest=true
+          [ "$PRERELEASE" = "true" ] && make_latest=false
+          gh api -X PATCH "repos/${REPO}/releases/${RELEASE_ID}" \
+            -F draft=false -f make_latest="$make_latest" >/dev/null
+          echo "published release $RELEASE_ID (make_latest=$make_latest)"
