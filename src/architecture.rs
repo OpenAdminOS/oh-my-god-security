@@ -118,7 +118,7 @@ pub struct Boundary {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
-    pub between: Vec<String>,
+    pub between: Option<Vec<String>>,
     #[serde(default)]
     pub enforcement: Vec<String>,
     #[serde(default)]
@@ -207,6 +207,7 @@ pub fn validate_architecture(a: &ArchitectureFile) -> Vec<String> {
         "input_surface",
         a.input_surfaces.iter().map(|s| s.id.as_str()),
     );
+    dup_check(&mut errs, "flow", a.flows.iter().map(|f| f.id.as_str()));
 
     let zone_ids: std::collections::HashSet<&str> = a.zones.iter().map(|z| z.id.as_str()).collect();
     let comp_ids: std::collections::HashSet<&str> =
@@ -218,7 +219,9 @@ pub fn validate_architecture(a: &ArchitectureFile) -> Vec<String> {
         if c.id.trim().is_empty() {
             errs.push("a component has an empty id".to_string());
         }
-        if !c.zone.is_empty() && !zone_ids.contains(c.zone.as_str()) {
+        if c.zone.trim().is_empty() {
+            errs.push(format!("component '{}': zone is empty", c.id));
+        } else if !zone_ids.contains(c.zone.as_str()) {
             errs.push(format!(
                 "component '{}': zone '{}' is not defined",
                 c.id, c.zone
@@ -245,14 +248,14 @@ pub fn validate_architecture(a: &ArchitectureFile) -> Vec<String> {
         }
     }
     for b in &a.boundaries {
-        if !b.between.is_empty() {
-            if b.between.len() != 2 {
+        if let Some(bt) = &b.between {
+            if bt.len() != 2 {
                 errs.push(format!(
                     "boundary '{}': between must name exactly two zones",
                     b.id
                 ));
             }
-            for z in &b.between {
+            for z in bt {
                 if !zone_ids.contains(z.as_str()) {
                     errs.push(format!("boundary '{}': zone '{}' is not defined", b.id, z));
                 }
@@ -502,6 +505,48 @@ fn is_surface(a: &ArchitectureFile, comp_id: &str) -> bool {
     a.input_surfaces.iter().any(|s| s.component == comp_id)
 }
 
+/// HTML-escape, then neutralise the byte sequences the offline-output contract
+/// forbids (`://`, `src=`, `url(`). Target-derived text that contains them
+/// renders identically but never appears as those literal bytes in the page.
+fn esc(s: &str) -> String {
+    let he: fn(&str) -> String = html_escape;
+    he(s)
+        .replace("://", "&#58;//")
+        .replace("src=", "src&#61;")
+        .replace("url(", "url&#40;")
+}
+
+/// An SVG `<text>` whose rendered width is bounded: it truncates by character
+/// count, and when the estimate still exceeds `budget` it adds `textLength` so a
+/// pathological label is compressed to fit its box instead of overflowing.
+#[allow(clippy::too_many_arguments)]
+fn svg_text(
+    x: i64,
+    y: i64,
+    class: &str,
+    anchor: &str,
+    text: &str,
+    max_chars: usize,
+    budget: i64,
+    px: i64,
+) -> String {
+    let t = trunc(text, max_chars);
+    let len = if t.chars().count() as i64 * px > budget {
+        format!(" textLength=\"{budget}\" lengthAdjust=\"spacingAndGlyphs\"")
+    } else {
+        String::new()
+    };
+    let anc = if anchor.is_empty() {
+        String::new()
+    } else {
+        format!(" text-anchor=\"{anchor}\"")
+    };
+    format!(
+        "<text x=\"{x}\" y=\"{y}\" class=\"{class}\"{anc}{len}>{}</text>",
+        esc(&t)
+    )
+}
+
 fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
     let mut s = String::new();
     s.push_str(&format!(
@@ -521,70 +566,113 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
             bh = d.height - (MARGIN_TOP - 36) - 16
         ));
         let cx = MARGIN_X + c as i64 * COL_PITCH + NODE_W / 2;
-        s.push_str(&format!(
-            "<text x=\"{cx}\" y=\"{y}\" text-anchor=\"middle\" class=\"arch-zone\">{name}</text>",
-            cx = cx,
-            y = MARGIN_TOP - 44,
-            name = html_escape(&trunc(zone_label(z), 26))
+        s.push_str(&svg_text(
+            cx,
+            MARGIN_TOP - 44,
+            "arch-zone",
+            "middle",
+            zone_label(z),
+            26,
+            200,
+            7,
         ));
     }
 
-    // edges first (under nodes)
+    // edges first (under nodes). Routing avoids drawing through node boxes:
+    // adjacent columns get a smooth S curve through the gap, multi-column spans
+    // and backward edges ride a lane above or below all nodes, and same-column
+    // edges run down the left gutter. All integer, so the output is stable.
     for e in &d.edges {
-        let (fx2, fcy) = (d.nodes[e.from].x + NODE_W, d.nodes[e.from].y + NODE_H / 2);
-        let (bx, bcy) = (d.nodes[e.to].x, d.nodes[e.to].y + NODE_H / 2);
+        let nf = &d.nodes[e.from];
+        let nt = &d.nodes[e.to];
+        let fcy = nf.y + NODE_H / 2;
+        let tcy = nt.y + NODE_H / 2;
         let class = if e.crossing {
             "arch-edge crossing"
         } else {
             "arch-edge"
         };
-        if bx >= fx2 {
-            // forward: smooth S curve with horizontal tangents
-            let dx = ((bx - fx2) / 2).clamp(40, 160);
-            s.push_str(&format!(
-                "<path d=\"M{fx2} {fcy} C {c1x} {fcy} {c2x} {bcy} {bx} {bcy}\" class=\"{class}\" fill=\"none\"/>",
-                fx2 = fx2,
-                fcy = fcy,
-                c1x = fx2 + dx,
-                c2x = bx - dx,
-                bcy = bcy,
-                bx = bx,
-                class = class
-            ));
-        } else {
-            // same column or backward: arc out to the right and back, bowed
-            // away from the midline so it clears the nodes.
-            let bow = 54;
-            let out = 70;
-            let dir = if bcy <= fcy { -1 } else { 1 };
-            s.push_str(&format!(
-                "<path d=\"M{fx2} {fcy} C {c1x} {c1y} {c2x} {c2y} {bx} {bcy}\" class=\"{class}\" fill=\"none\"/>",
-                fx2 = fx2,
-                fcy = fcy,
-                c1x = fx2 + out,
-                c1y = fcy + dir * bow,
-                c2x = bx - out,
-                c2y = bcy + dir * bow,
-                bx = bx,
-                bcy = bcy,
-                class = class
-            ));
-        }
-        // arrowhead (polygon) pointing into the target's left edge
         let color = if e.crossing {
             "var(--amber)"
         } else {
             "var(--faint)"
         };
+        let lane = if (fcy + tcy) / 2 <= d.height / 2 {
+            22
+        } else {
+            d.height - 22
+        };
+        let arrow_right = |x: i64, y: i64| {
+            format!(
+                "<polygon points=\"{},{} {},{} {},{}\" fill=\"{}\"/>",
+                x - 10,
+                y - 5,
+                x,
+                y,
+                x - 10,
+                y + 5,
+                color
+            )
+        };
+        let arrow_left = |x: i64, y: i64| {
+            format!(
+                "<polygon points=\"{},{} {},{} {},{}\" fill=\"{}\"/>",
+                x + 10,
+                y - 5,
+                x,
+                y,
+                x + 10,
+                y + 5,
+                color
+            )
+        };
+        let (path, arrow) = if nt.x > nf.x {
+            let fx2 = nf.x + NODE_W;
+            let bx = nt.x;
+            let p = if bx - fx2 <= COL_GAP + 20 {
+                let dx = ((bx - fx2) / 2).clamp(40, 160);
+                format!(
+                    "M{fx2} {fcy} C {} {fcy} {} {tcy} {bx} {tcy}",
+                    fx2 + dx,
+                    bx - dx
+                )
+            } else {
+                format!(
+                    "M{fx2} {fcy} C {a} {fcy} {a} {lane} {b} {lane} L {c} {lane} C {d2} {lane} {d2} {tcy} {bx} {tcy}",
+                    a = fx2 + 50,
+                    b = fx2 + 90,
+                    c = bx - 90,
+                    d2 = bx - 50
+                )
+            };
+            (p, arrow_right(bx, tcy))
+        } else if nt.x == nf.x {
+            let x = nf.x;
+            let p = if x - 70 >= 8 {
+                let g = x - 70;
+                format!("M{x} {fcy} C {g} {fcy} {g} {tcy} {x} {tcy}")
+            } else {
+                let fx2 = nf.x + NODE_W;
+                let o = fx2 + 60;
+                format!("M{fx2} {fcy} C {o} {fcy} {o} {tcy} {x} {tcy}")
+            };
+            (p, arrow_right(x, tcy))
+        } else {
+            let sx = nf.x;
+            let brx = nt.x + NODE_W;
+            let p = format!(
+                "M{sx} {fcy} C {a} {fcy} {a} {lane} {b} {lane} L {c} {lane} C {d2} {lane} {d2} {tcy} {brx} {tcy}",
+                a = sx - 50,
+                b = sx - 90,
+                c = brx + 90,
+                d2 = brx + 50
+            );
+            (p, arrow_left(brx, tcy))
+        };
         s.push_str(&format!(
-            "<polygon points=\"{ax},{ay1} {bx},{bcy} {ax},{ay2}\" fill=\"{color}\"/>",
-            ax = bx - 10,
-            ay1 = bcy - 5,
-            bx = bx,
-            bcy = bcy,
-            ay2 = bcy + 5,
-            color = color
+            "<path d=\"{path}\" class=\"{class}\" fill=\"none\"/>"
         ));
+        s.push_str(&arrow);
     }
 
     // nodes
@@ -613,19 +701,27 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
                 cy = n.y + 14
             ));
         }
-        s.push_str(&format!(
-            "<text x=\"{tx}\" y=\"{y}\" class=\"arch-name\">{name}</text>",
-            tx = n.x + 18,
-            y = n.y + 28,
-            name = html_escape(&trunc(&c.name, 24))
+        s.push_str(&svg_text(
+            n.x + 18,
+            n.y + 28,
+            "arch-name",
+            "",
+            &c.name,
+            24,
+            180,
+            8,
         ));
         let kind = c.kind.as_deref().unwrap_or("");
         if !kind.is_empty() {
-            s.push_str(&format!(
-                "<text x=\"{tx}\" y=\"{y}\" class=\"arch-kind\">{k}</text>",
-                tx = n.x + 18,
-                y = n.y + 46,
-                k = html_escape(&trunc(kind, 26))
+            s.push_str(&svg_text(
+                n.x + 18,
+                n.y + 46,
+                "arch-kind",
+                "",
+                kind,
+                26,
+                180,
+                6,
             ));
         }
         let sub = if !c.tech.is_empty() {
@@ -634,11 +730,15 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
             c.path.as_str()
         };
         if !sub.is_empty() {
-            s.push_str(&format!(
-                "<text x=\"{tx}\" y=\"{y}\" class=\"arch-sub\">{t}</text>",
-                tx = n.x + 18,
-                y = n.y + 64,
-                t = html_escape(&trunc(sub, 28))
+            s.push_str(&svg_text(
+                n.x + 18,
+                n.y + 64,
+                "arch-sub",
+                "",
+                sub,
+                28,
+                180,
+                6,
             ));
         }
     }
@@ -777,12 +877,14 @@ pub fn render_architecture_markdown(a: &ArchitectureFile) -> String {
         m.push_str("## Trust boundaries\n\n");
         for b in &a.boundaries {
             m.push_str(&format!("- **{}**", md_inline(&b.name)));
-            if b.between.len() == 2 {
-                m.push_str(&format!(
-                    " ({} to {})",
-                    md_inline(zone_name(a, &b.between[0])),
-                    md_inline(zone_name(a, &b.between[1]))
-                ));
+            if let Some(bt) = &b.between {
+                if bt.len() == 2 {
+                    m.push_str(&format!(
+                        " ({} to {})",
+                        md_inline(zone_name(a, &bt[0])),
+                        md_inline(zone_name(a, &bt[1]))
+                    ));
+                }
             }
             if !b.enforcement.is_empty() {
                 m.push_str(&format!(" enforced by {}", join_list(&b.enforcement)));
@@ -889,10 +991,7 @@ pub fn render_architecture_html(a: &ArchitectureFile) -> String {
     stack_row(&mut body, "Datastores", &a.stack.datastores);
     body.push_str("</dl>");
     if !a.stack.notes.is_empty() {
-        body.push_str(&format!(
-            "<p class=\"note\">{}</p>",
-            html_escape(&a.stack.notes)
-        ));
+        body.push_str(&format!("<p class=\"note\">{}</p>", esc(&a.stack.notes)));
     }
     body.push_str("</section>");
 
@@ -904,9 +1003,9 @@ pub fn render_architecture_html(a: &ArchitectureFile) -> String {
         for s in &a.input_surfaces {
             body.push_str(&format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-                html_escape(if !s.name.is_empty() { &s.name } else { &s.id }),
-                html_escape(comp_name(a, &s.component)),
-                html_escape(&s.attacker)
+                esc(if !s.name.is_empty() { &s.name } else { &s.id }),
+                esc(comp_name(a, &s.component)),
+                esc(&s.attacker)
             ));
         }
         body.push_str("</tbody></table></section>");
@@ -919,10 +1018,10 @@ pub fn render_architecture_html(a: &ArchitectureFile) -> String {
         let members: Vec<&Component> = a.components.iter().filter(|c| c.zone == z.id).collect();
         body.push_str(&format!(
             "<h3>{}{}</h3>",
-            html_escape(zone_label(z)),
+            esc(zone_label(z)),
             z.trust
                 .as_deref()
-                .map(|t| format!(" <span class=\"muted\">({})</span>", html_escape(t)))
+                .map(|t| format!(" <span class=\"muted\">({})</span>", esc(t)))
                 .unwrap_or_default()
         ));
         if members.is_empty() {
@@ -933,9 +1032,9 @@ pub fn render_architecture_html(a: &ArchitectureFile) -> String {
         for c in members {
             body.push_str(&format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                html_escape(&c.name),
-                html_escape(c.kind.as_deref().unwrap_or("")),
-                html_escape(if !c.tech.is_empty() { &c.tech } else { &c.path }),
+                esc(&c.name),
+                esc(c.kind.as_deref().unwrap_or("")),
+                esc(if !c.tech.is_empty() { &c.tech } else { &c.path }),
                 if c.entry_point || is_surface(a, &c.id) {
                     "yes"
                 } else {
@@ -952,23 +1051,22 @@ pub fn render_architecture_html(a: &ArchitectureFile) -> String {
         body.push_str("<section class=\"sec\" id=\"boundaries\" aria-labelledby=\"boundaries-h\">");
         body.push_str("<h2 id=\"boundaries-h\">Trust boundaries</h2><ul class=\"stack-list\">");
         for b in &a.boundaries {
-            let between = if b.between.len() == 2 {
-                format!(
+            let between = match &b.between {
+                Some(bt) if bt.len() == 2 => format!(
                     " <span class=\"muted\">({} to {})</span>",
-                    html_escape(zone_name(a, &b.between[0])),
-                    html_escape(zone_name(a, &b.between[1]))
-                )
-            } else {
-                String::new()
+                    esc(zone_name(a, &bt[0])),
+                    esc(zone_name(a, &bt[1]))
+                ),
+                _ => String::new(),
             };
             let enf = if b.enforcement.is_empty() {
                 String::new()
             } else {
-                format!(" enforced by {}", html_escape(&b.enforcement.join(", ")))
+                format!(" enforced by {}", esc(&b.enforcement.join(", ")))
             };
             body.push_str(&format!(
                 "<li><strong>{}</strong>{}{}</li>",
-                html_escape(&b.name),
+                esc(&b.name),
                 between,
                 enf
             ));
@@ -984,16 +1082,35 @@ pub fn render_architecture_html(a: &ArchitectureFile) -> String {
         for f in &a.flows {
             body.push_str(&format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                html_escape(comp_name(a, &f.from)),
-                html_escape(comp_name(a, &f.to)),
-                html_escape(&f.data),
-                html_escape(&f.protocol),
-                html_escape(&f.authn),
-                html_escape(&f.authz),
-                html_escape(&f.crosses)
+                esc(comp_name(a, &f.from)),
+                esc(comp_name(a, &f.to)),
+                esc(&f.data),
+                esc(&f.protocol),
+                esc(&f.authn),
+                esc(&f.authz),
+                esc(&f.crosses)
             ));
         }
         body.push_str("</tbody></table></section>");
+    }
+
+    // principals
+    if !a.principals.is_empty() {
+        body.push_str("<section class=\"sec\" id=\"principals\" aria-labelledby=\"principals-h\">");
+        body.push_str("<h2 id=\"principals-h\">Principals</h2><ul class=\"stack-list\">");
+        for p in &a.principals {
+            let kind = p
+                .kind
+                .as_deref()
+                .map(|k| format!(" <span class=\"muted\">({})</span>", esc(k)))
+                .unwrap_or_default();
+            body.push_str(&format!(
+                "<li><strong>{}</strong>{}</li>",
+                esc(&p.name),
+                kind
+            ));
+        }
+        body.push_str("</ul></section>");
     }
 
     // not examined
@@ -1004,28 +1121,36 @@ pub fn render_architecture_html(a: &ArchitectureFile) -> String {
     } else {
         body.push_str("<ul class=\"stack-list\">");
         for u in &a.unexamined {
-            body.push_str(&format!("<li>{}</li>", html_escape(u)));
+            body.push_str(&format!("<li>{}</li>", esc(u)));
         }
         body.push_str("</ul>");
     }
     body.push_str("</section>");
 
+    // notes
+    if !a.notes.is_empty() {
+        body.push_str("<section class=\"sec\" id=\"notes\" aria-labelledby=\"notes-h\">");
+        body.push_str("<h2 id=\"notes-h\">Notes</h2>");
+        body.push_str(&format!("<p class=\"intro\">{}</p>", esc(&a.notes)));
+        body.push_str("</section>");
+    }
+
     let masthead = format!(
         "<header class=\"masthead\"><div class=\"wrap\"><p class=\"eyebrow\">OMGS architecture map</p><h1>{target}</h1><dl class=\"meta\"><div><dt>Source</dt><dd>{src}</dd></div><div><dt>Zones</dt><dd>{zones}</dd></div><div><dt>Components</dt><dd>{comps}</dd></div><div><dt>Data flows</dt><dd>{flows}</dd></div></dl></div></header>",
-        target = html_escape(if a.target.is_empty() { "application" } else { &a.target }),
-        src = html_escape(if a.source_ref.is_empty() { "not recorded" } else { &a.source_ref }),
+        target = esc(if a.target.is_empty() { "application" } else { &a.target }),
+        src = esc(if a.source_ref.is_empty() { "not recorded" } else { &a.source_ref }),
         zones = a.zones.len(),
         comps = a.components.len(),
         flows = a.flows.len(),
     );
     let footer = format!(
         "<footer class=\"colophon\"><div class=\"wrap\"><p>Generated by omgs {version} from architecture.json. The same input renders the same page. This is a descriptive map, not a finding.</p><p>No OMGS cloud. No telemetry. This page loads no external resources and runs no scripts.</p></div></footer>",
-        version = html_escape(env!("CARGO_PKG_VERSION"))
+        version = esc(env!("CARGO_PKG_VERSION"))
     );
 
     format!(
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><title>OMGS architecture map: {repo}</title><style>{css}</style></head><body><a class=\"skip\" href=\"#main\">Skip to map</a>{masthead}<main id=\"main\"><div class=\"wrap\">{body}</div></main>{footer}</body></html>\n",
-        repo = html_escape(if a.target.is_empty() { "application" } else { &a.target }),
+        repo = esc(if a.target.is_empty() { "application" } else { &a.target }),
         css = CSS,
         masthead = masthead,
         body = body,
@@ -1037,11 +1162,7 @@ fn stack_row(body: &mut String, label: &str, items: &[String]) {
     let val = if items.is_empty() {
         "none detected".to_string()
     } else {
-        items
-            .iter()
-            .map(|i| html_escape(i))
-            .collect::<Vec<_>>()
-            .join(", ")
+        items.iter().map(|i| esc(i)).collect::<Vec<_>>().join(", ")
     };
     body.push_str(&format!("<div><dt>{label}</dt><dd>{val}</dd></div>"));
 }

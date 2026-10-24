@@ -535,7 +535,7 @@ fn semgrep_parser_keeps_only_metadata() {
 
 use omgs::architecture::{
     from_json, render_architecture_html, render_architecture_markdown, validate_architecture,
-    ArchitectureFile, Boundary, Component, Flow, InputSurface, Zone,
+    ArchitectureFile, Boundary, Component, Flow, InputSurface, Principal, Zone,
 };
 
 fn arch() -> ArchitectureFile {
@@ -589,7 +589,7 @@ fn arch() -> ArchitectureFile {
         boundaries: vec![Boundary {
             id: "bd".into(),
             name: "edge".into(),
-            between: vec!["z1".into(), "z2".into()],
+            between: Some(vec!["z1".into(), "z2".into()]),
             ..Default::default()
         }],
         flows: vec![
@@ -754,4 +754,64 @@ fn architecture_markdown_neutralizes_link_injection() {
         md.contains("\\!\\[x\\]"),
         "payload should appear backslash-escaped"
     );
+}
+
+#[test]
+fn architecture_validate_catches_structural_gaps() {
+    // empty/missing component zone must fail, not hide the component
+    let mut a = arch();
+    a.components[0].zone = String::new();
+    assert!(validate_architecture(&a)
+        .iter()
+        .any(|e| e.contains("zone is empty")));
+
+    // explicit empty boundary.between is invalid (schema needs exactly two)
+    a = arch();
+    a.boundaries[0].between = Some(vec![]);
+    assert!(validate_architecture(&a)
+        .iter()
+        .any(|e| e.contains("must name exactly two zones")));
+
+    // absent between (None) is allowed
+    a = arch();
+    a.boundaries[0].between = None;
+    assert!(validate_architecture(&a).is_empty());
+
+    // duplicate flow ids are rejected
+    a = arch();
+    a.flows[0].id = "dup".into();
+    a.flows[1].id = "dup".into();
+    assert!(validate_architecture(&a)
+        .iter()
+        .any(|e| e.contains("duplicate flow id 'dup'")));
+}
+
+#[test]
+fn architecture_html_includes_notes_and_principals() {
+    let mut a = arch();
+    a.notes = "Mapped the web app only".into();
+    a.principals = vec![Principal {
+        id: "p".into(),
+        name: "Admin".into(),
+        kind: Some("admin".into()),
+        ..Default::default()
+    }];
+    let html = render_architecture_html(&a);
+    assert!(html.contains("id=\"notes\""));
+    assert!(html.contains("Mapped the web app only"));
+    assert!(html.contains("id=\"principals\""));
+    assert!(html.contains("Admin"));
+}
+
+#[test]
+fn architecture_html_neutralizes_banned_byte_sequences() {
+    let mut a = arch();
+    a.stack.notes = "see https://service.example/api with src= and url( here".into();
+    let html = render_architecture_html(&a);
+    // the invariant bans survive as inert entities, not literal bytes
+    assert!(!html.contains("https://"));
+    assert!(!html.contains("src="));
+    assert!(!html.contains("url("));
+    // but the text is still readable
+    assert!(html.contains("service.example"));
 }
