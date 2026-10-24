@@ -245,32 +245,42 @@ jobs:
           # active ruleset that does so and fail closed otherwise. Rulesets are
           # free on public repositories, which this must be for the anonymous
           # release downloads in install.sh/install.ps1 to work.
-          if ! sets="$(gh api "repos/${REPO}/rulesets" 2>"$RUNNER_TEMP/rs.err")"; then
+          if ! sets="$(gh api --paginate "repos/${REPO}/rulesets" 2>"$RUNNER_TEMP/rs.err")"; then
             echo "::error::cannot read rulesets; make the repo public and add a tag ruleset protecting '${TAG}' from update and deletion"
             cat "$RUNNER_TEMP/rs.err" || true; exit 1
           fi
-          ref="refs/tags/${TAG}"; ok=false
+          ref="refs/tags/${TAG}"
+          ok=false
           for id in $(printf '%s' "$sets" | jq -r '.[] | select(.target=="tag" and .enforcement=="active") | .id'); do
             rule="$(gh api "repos/${REPO}/rulesets/${id}")"
             types=",$(printf '%s' "$rule" | jq -r '[.rules[].type] | join(",")'),"
             case "$types" in *",update,"*) : ;; *) continue ;; esac
             case "$types" in *",deletion,"*) : ;; *) continue ;; esac
+            # Any bypass actor (or a bypass list hidden by insufficient access)
+            # means the tag is not truly immutable; require a provably empty list.
+            nbypass="$(printf '%s' "$rule" | jq -r 'if (.bypass_actors|type)=="array" then (.bypass_actors|length|tostring) else "unknown" end')"
+            [ "$nbypass" = "0" ] || { echo "ruleset $id has/hides bypass actors ($nbypass); not immutable, skipping"; continue; }
+            # Certify only coverage we can evaluate exactly: no exclusions (GitHub
+            # File.fnmatch semantics differ from shell globbing, so an exclusion we
+            # cannot faithfully evaluate must not be trusted), and include patterns
+            # restricted to ~ALL, an exact ref, or a single trailing-'*' prefix.
+            nexc="$(printf '%s' "$rule" | jq -r '(.conditions.ref_name.exclude // []) | length')"
+            [ "$nexc" = "0" ] || { echo "ruleset $id uses exclusions; cannot prove coverage, skipping"; continue; }
             covered=no
+            inc="$(printf '%s' "$rule" | jq -r '.conditions.ref_name.include[]?')"
             while IFS= read -r p; do
               [ -z "$p" ] && continue
-              [ "$p" = "~ALL" ] && covered=yes
-              # shellcheck disable=SC2254
-              case "$ref" in $p) covered=yes ;; esac
-            done < <(printf '%s' "$rule" | jq -r '.conditions.ref_name.include[]?')
-            while IFS= read -r p; do
-              [ -z "$p" ] && continue
-              # shellcheck disable=SC2254
-              case "$ref" in $p) covered=no ;; esac
-            done < <(printf '%s' "$rule" | jq -r '.conditions.ref_name.exclude[]?')
+              case "$p" in
+                '~ALL') covered=yes ;;
+                *'**'*|*'?'*|*'['*|*']'*|*'{'*|*'}'*) : ;;   # unsupported metachars: do not certify
+                *'*') pre="${p%\*}"; case "$ref" in "$pre"*) covered=yes ;; esac ;;
+                *) [ "$p" = "$ref" ] && covered=yes ;;
+              esac
+            done < <(printf '%s\n' "$inc")
             if [ "$covered" = yes ]; then ok=true; break; fi
           done
           if [ "$ok" != true ]; then
-            echo "::error::no active ruleset protects tag '${TAG}' from update and deletion; add one before releasing"; exit 1
+            echo "::error::no active ruleset provably protects '${TAG}' from update/deletion with no bypass actors; add a simple tag ruleset (include refs/tags/v*, no exclusions, no bypass actors)"; exit 1
           fi
           echo "immutable tag protection verified for ${TAG}"
       - name: Re-verify the tag still points at the built commit
@@ -338,18 +348,47 @@ jobs:
           # shellcheck disable=SC2086
           sha256sum $expected > SHA256SUMS
           cat SHA256SUMS
-      - name: Create draft release with assets
+      - name: Create a fresh draft release (create-only)
         id: draft
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          tag_name: ${{ needs.prepare.outputs.version }}
-          target_commitish: ${{ needs.prepare.outputs.sha }}
-          draft: true
-          prerelease: ${{ needs.prepare.outputs.prerelease }}
-          files: |
-            release/omgs-*
-            release/SHA256SUMS
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.version }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # Create-only: if a release for this tag already exists (for example a
+          # racing external publisher that appeared after the guard), POST returns
+          # 422 and we fail closed instead of adopting and overwriting it.
+          id="$(gh api -X POST "repos/${REPO}/releases" \
+            -f tag_name="$TAG" -f target_commitish="$SHA" \
+            -F draft=true -F prerelease="$PRERELEASE" --jq '.id')"
+          if ! printf '%s' "$id" | grep -Eq '^[0-9]+$'; then
+            echo "::error::could not create a fresh draft release for $TAG"; exit 1
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "created draft release id $id"
+      - name: Upload assets to our draft by id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+        run: |
+          set -euo pipefail
+          # Upload only to the release we just created, addressed by its id, so a
+          # concurrently created release for the same tag can never receive our
+          # assets.
+          for f in release/omgs-* release/SHA256SUMS; do
+            name="$(basename "$f")"
+            curl -fsS -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              --data-binary @"$f" \
+              "https://uploads.github.com/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${name}" >/dev/null
+            echo "uploaded $name"
+          done
       - name: Verify the draft's remote assets, then publish
         env:
           GH_TOKEN: ${{ github.token }}
