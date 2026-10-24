@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OMGS pipeline progress status",
+  "description": "Optional live-progress state the orchestrator writes at each pipeline milestone; dashboard.html polls it. Never changes a verdict; the deterministic findings.json and REPORT.html remain the record.",
+  "type": "object",
+  "required": ["stages"],
+  "properties": {
+    "run": { "type": "string" },
+    "target": { "type": "string" },
+    "updated_ms": { "type": "integer", "description": "epoch milliseconds of last update" },
+    "counters": {
+      "type": "object",
+      "properties": {
+        "candidates": { "type": "integer" },
+        "confirmed": { "type": "integer" },
+        "needs_validation": { "type": "integer" },
+        "rejected": { "type": "integer" }
+      }
+    },
+    "stages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label", "status"],
+        "properties": {
+          "id": { "type": "string" },
+          "label": { "type": "string" },
+          "status": { "enum": ["pending", "active", "done", "failed"] },
+          "detail": { "type": "string" },
+          "started_ms": { "type": "integer" },
+          "ended_ms": { "type": "integer" },
+          "children": {
+            "type": "array",
+            "description": "Parallel sub-agents of a stage, for example the isolated hunters.",
+            "items": {
+              "type": "object",
+              "required": ["id", "label", "status"],
+              "properties": {
+                "id": { "type": "string" },
+                "label": { "type": "string" },
+                "status": { "enum": ["pending", "active", "done", "failed"] },
+                "detail": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "log": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "ts": { "type": "string" },
+          "kind": { "type": "string" },
+          "m": { "type": "string" }
+        }
+      }
+    }
+  }
+}
