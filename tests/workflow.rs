@@ -613,3 +613,42 @@ fn ledger_requires_the_units_key() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn findings_file_requires_the_findings_key() {
+    assert!(serde_json::from_str::<FindingsFile>(r#"{"finding": [{"title": "x"}]}"#).is_err());
+    assert!(serde_json::from_str::<FindingsFile>(r#"{"findings": []}"#).is_ok());
+    let dir = scratch("findings-key");
+    let mut ledger = Ledger::default();
+    let mut unit = Unit::new("u", ".", &[], "covered");
+    unit.evidence = vec!["path/a.ts".into()];
+    ledger.units.push(unit);
+    std::fs::write(
+        dir.join("coverage-ledger.json"),
+        serde_json::to_string(&ledger).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("findings.json"),
+        r#"{"finding": [{"title": "dropped"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("candidates-red-1.json"), r#"{"candidates": []}"#).unwrap();
+    assert_eq!(
+        omgs(&["critic", "--run", dir.to_str().unwrap()])
+            .status
+            .code(),
+        Some(2)
+    );
+    assert_eq!(
+        omgs(&[
+            "validate",
+            "--findings",
+            dir.join("findings.json").to_str().unwrap()
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
