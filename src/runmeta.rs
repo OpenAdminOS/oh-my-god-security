@@ -20,25 +20,49 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Write `text` to `path` through a sibling temporary file and a rename.
-pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+/// Write `bytes` to `path` through an exclusively created sibling temporary
+/// file and a rename. The rename replaces the directory entry itself, so an
+/// existing symlink or hardlink at `path` is replaced, never written through,
+/// and a pre-planted temporary name is never followed either.
+pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".into());
-    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, text).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+    let mut n = 0u32;
+    let (tmp, mut file) = loop {
+        let tmp = path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => n += 1,
+            Err(e) => return Err(e),
+        }
+    };
+    if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
         let _ = std::fs::remove_file(&tmp);
-        format!("rename {}: {e}", path.display())
+        return Err(e);
+    }
+    drop(file);
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// `write_atomic_bytes` for text, with the error as a message.
+pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    write_atomic_bytes(path, text.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 pub fn read(dir: &Path) -> Result<Map<String, Value>, String> {
     let path = dir.join(FILE);
     let text =
         std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    match serde_json::from_str(&text) {
+    match crate::shape::strict_json(&text) {
         Ok(Value::Object(m)) => Ok(m),
         Ok(_) => Err(format!("{} is not a JSON object", path.display())),
         Err(e) => Err(format!("parse {}: {e}", path.display())),

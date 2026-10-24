@@ -134,12 +134,12 @@ fn cmd_architecture(args: &[String]) -> Result<(), String> {
     }
     let dir = Path::new(&out);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    std::fs::write(
+    write_out(
         dir.join("ARCHITECTURE.md"),
         render_architecture_markdown(&file),
     )
     .map_err(|e| e.to_string())?;
-    std::fs::write(
+    write_out(
         dir.join("ARCHITECTURE.html"),
         render_architecture_html(&file),
     )
@@ -340,11 +340,9 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     };
     let dir = Path::new(&out);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("REPORT.md"), render_markdown(&file, &meta))
-        .map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("REPORT.html"), render_html(&file, &meta))
-        .map_err(|e| e.to_string())?;
-    std::fs::write(dir.join("findings.sarif.json"), render_sarif(&file, &meta))
+    write_out(dir.join("REPORT.md"), render_markdown(&file, &meta)).map_err(|e| e.to_string())?;
+    write_out(dir.join("REPORT.html"), render_html(&file, &meta)).map_err(|e| e.to_string())?;
+    write_out(dir.join("findings.sarif.json"), render_sarif(&file, &meta))
         .map_err(|e| e.to_string())?;
     println!(
         "wrote {}, {}, {}",
@@ -471,6 +469,13 @@ fn run_reroutes(dir: Option<&Path>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Every file OMGS writes into a run or output directory goes through an
+/// atomic replace, so a planted symlink or hardlink at the destination is
+/// replaced rather than written through into another location.
+fn write_out(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
+    omgs::runmeta::write_atomic_bytes(path.as_ref(), contents.as_ref())
 }
 
 fn home() -> PathBuf {
@@ -726,17 +731,17 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         "hunter": flag(rest, "--hunter"),
         "verifier": flag(rest, "--verifier")
     });
-    std::fs::write(
+    write_out(
         out_abs.join("run-metadata.json"),
         serde_json::to_string_pretty(&meta).unwrap(),
     )
     .map_err(|e| e.to_string())?;
-    std::fs::write(
+    write_out(
         out_abs.join("coverage-ledger.json"),
         serde_json::to_string_pretty(&ledger).unwrap(),
     )
     .map_err(|e| e.to_string())?;
-    std::fs::write(out_abs.join("findings.json"), "{\n  \"findings\": []\n}\n")
+    write_out(out_abs.join("findings.json"), "{\n  \"findings\": []\n}\n")
         .map_err(|e| e.to_string())?;
     let arch_seed = serde_json::json!({
         "target": target.to_string_lossy(),
@@ -754,14 +759,14 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         "components": [],
         "notes": "Seeded by omgs audit. The reconnaissance agent fills zones, components, principals, boundaries, flows, and input_surfaces, records what was not examined in 'unexamined', then renders the map with: omgs architecture --in architecture.json --out <run-dir>."
     });
-    std::fs::write(
+    write_out(
         out_abs.join("architecture.json"),
         format!("{}\n", serde_json::to_string_pretty(&arch_seed).unwrap()),
     )
     .map_err(|e| e.to_string())?;
     if !has(rest, "--no-sensors") {
         let sensors = run_sensors(&target, &out_abs);
-        std::fs::write(
+        write_out(
             out_abs.join("sensors.json"),
             serde_json::to_string_pretty(&sensors).unwrap_or_default(),
         )
@@ -774,7 +779,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         let answers = omgs::intent::load_answers(&answers_src)?;
         if Path::new(&answers.target) == target {
             let text = serde_json::to_string_pretty(&answers).map_err(|e| e.to_string())?;
-            std::fs::write(out_abs.join("intent-answers.json"), format!("{text}\n"))
+            write_out(out_abs.join("intent-answers.json"), format!("{text}\n"))
                 .map_err(|e| format!("copy intent answers: {e}"))?;
         } else {
             eprintln!(
@@ -908,7 +913,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     if let Some(out) = flag(args, "--out") {
         let dir = PathBuf::from(out);
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        std::fs::write(
+        write_out(
             dir.join("sensors.json"),
             serde_json::to_string_pretty(&sensors).unwrap_or_default(),
         )
@@ -1249,9 +1254,9 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 .iter()
                 .map(|r| omgs::batch::summarize(r, &out))
                 .collect();
-            std::fs::write(out.join("INDEX.md"), omgs::batch::render_index_markdown(&runs))
+            write_out(out.join("INDEX.md"), omgs::batch::render_index_markdown(&runs))
                 .map_err(|e| e.to_string())?;
-            std::fs::write(out.join("INDEX.html"), omgs::batch::render_index_html(&runs))
+            write_out(out.join("INDEX.html"), omgs::batch::render_index_html(&runs))
                 .map_err(|e| e.to_string())?;
             println!(
                 "wrote {}, {}",

@@ -1152,3 +1152,92 @@ fn report_shows_only_reviewer_recorded_answers() {
     assert!(!md.contains("FORGED"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn index_writes_replace_links_instead_of_following_them() {
+    let dir = scratch("index-links");
+    let target = dir.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("sentinel.html"), "original").unwrap();
+    std::fs::write(target.join("hard.md"), "original").unwrap();
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::os::unix::fs::symlink(target.join("sentinel.html"), out.join("INDEX.html")).unwrap();
+    std::fs::hard_link(target.join("hard.md"), out.join("INDEX.md")).unwrap();
+    std::fs::write(out.join("batch.json"), r#"{"runs": []}"#).unwrap();
+    let res = omgs(&[
+        "batch",
+        "index",
+        "--batch",
+        out.join("batch.json").to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert!(
+        res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("sentinel.html")).unwrap(),
+        "original"
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("hard.md")).unwrap(),
+        "original"
+    );
+    assert!(!std::fs::symlink_metadata(out.join("INDEX.html"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(std::fs::read_to_string(out.join("INDEX.md"))
+        .unwrap()
+        .contains("OMGS batch index"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn duplicate_keys_in_run_metadata_and_batch_files_are_errors() {
+    let dir = scratch("dup-meta");
+    let models = dir.join("models.json");
+    std::fs::write(&models, r#"{"roles":{"hunter":["m1","m2"]}}"#).unwrap();
+    let bad = r#"{"reroutes":[{"role":"hunter","from":"m1"}],"reroutes":[]}"#;
+    std::fs::write(dir.join("run-metadata.json"), bad).unwrap();
+    let out = omgs(&[
+        "route",
+        "--run",
+        dir.to_str().unwrap(),
+        "--role",
+        "hunter",
+        "--models",
+        models.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("run-metadata.json")).unwrap(),
+        bad
+    );
+    assert!(
+        omgs::batch::parse_batch(r#"{"runs":[{"url":"u","status":"failed"}],"runs":[]}"#).is_err()
+    );
+    std::fs::write(
+        dir.join("pipeline-status.json"),
+        r#"{"stages":[],"stages":[]}"#,
+    )
+    .unwrap();
+    assert!(omgs::status::apply(
+        &dir,
+        &omgs::status::Update {
+            stage: "map",
+            label: None,
+            parent: None,
+            state: "active",
+            detail: None,
+            counters: &[],
+            log: None,
+        }
+    )
+    .is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

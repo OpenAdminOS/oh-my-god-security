@@ -86,7 +86,7 @@ fn apply_locked(dir: &Path, u: &Update) -> Result<(), String> {
     }
     let path = dir.join(FILE);
     let mut doc: Map<String, Value> = match std::fs::read_to_string(&path) {
-        Ok(text) => match serde_json::from_str(&text) {
+        Ok(text) => match crate::shape::strict_json(&text) {
             Ok(Value::Object(m)) => m,
             _ => return Err(format!("{} is not a status object", path.display())),
         },

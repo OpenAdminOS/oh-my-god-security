@@ -108,7 +108,7 @@ pub struct BatchRun {
 /// Parse `batch.json`, requiring a JSON object with a `runs` array of
 /// objects, so a positional or misshapen file is an error.
 pub fn parse_batch(text: &str) -> Result<BatchFile, String> {
-    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let v = crate::shape::strict_json(text)?;
     let runs = v
         .as_object()
         .and_then(|o| o.get("runs"))
