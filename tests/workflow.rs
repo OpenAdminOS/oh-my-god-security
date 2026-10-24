@@ -589,3 +589,27 @@ fn critic_gaps_are_escaped_in_html() {
     assert!(!html.contains("<img src=x"));
     assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
 }
+
+#[test]
+fn ledger_requires_the_units_key() {
+    assert!(
+        serde_json::from_str::<Ledger>(r#"{"unit": [{"id": "u", "status": "planned"}]}"#).is_err()
+    );
+    let empty: Ledger = serde_json::from_str(r#"{"units": []}"#).unwrap();
+    assert!(empty.units.is_empty());
+    let dir = scratch("units-key");
+    std::fs::write(
+        dir.join("coverage-ledger.json"),
+        r#"{"unit": [{"id": "sensitive-route", "status": "planned"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    std::fs::write(dir.join("candidates-red-1.json"), r#"{"candidates": []}"#).unwrap();
+    let out = omgs(&["critic", "--run", dir.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a malformed ledger is an error, never a pass"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
