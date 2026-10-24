@@ -254,7 +254,7 @@ fn read_in(dir: &Path, name: &str) -> Result<String, String> {
 /// Load a run directory's `findings.json` and critique it together with the
 /// ledger and candidates beside it.
 pub fn critique_run(dir: &Path) -> Result<CriticReport, String> {
-    let findings: FindingsFile = serde_json::from_str(&read_in(dir, "findings.json")?)
+    let findings = crate::shape::findings(&read_in(dir, "findings.json")?)
         .map_err(|e| format!("parse findings.json: {e}"))?;
     critique_dir(dir, &findings)
 }
@@ -264,7 +264,7 @@ pub fn critique_run(dir: &Path) -> Result<CriticReport, String> {
 /// always describes the exact findings being rendered.
 pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport, String> {
     let read = |name: &str| read_in(dir, name);
-    let ledger: Ledger = serde_json::from_str(&read("coverage-ledger.json")?)
+    let ledger: Ledger = crate::shape::ledger(&read("coverage-ledger.json")?)
         .map_err(|e| format!("parse coverage-ledger.json: {e}"))?;
     // Every candidates*.json must be a readable regular file: a symlink, a
     // directory, or an unreadable entry is an error, never silently skipped,
@@ -290,7 +290,7 @@ pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport,
     let mut candidates = Vec::new();
     for name in &names {
         let file: CandidatesFile =
-            serde_json::from_str(&read(name)?).map_err(|e| format!("parse {name}: {e}"))?;
+            crate::shape::candidates(&read(name)?).map_err(|e| format!("parse {name}: {e}"))?;
         candidates.extend(
             file.candidates
                 .into_iter()
