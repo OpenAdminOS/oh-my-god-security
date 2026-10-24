@@ -1,5 +1,6 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
 <title>OMGS pipeline live</title>
 <style>
 :root{color-scheme:light dark;--bg:#0e0e11;--surface:#17171b;--sunk:#1f1f25;--text:#ececef;--muted:#a0a0aa;--faint:#71717a;--line:#2a2a31;--red:#ff8a80;--amber:#f5c451;--green:#7ee0a0;--blue:#8fb4ff;--violet:#c3b2ff;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
@@ -72,7 +73,13 @@ h2{font-size:13px;text-transform:uppercase;letter-spacing:.07em;color:var(--fain
 <script>
 function fmtDur(ms){if(ms<0)ms=0;const s=Math.floor(ms/1000);if(s<60)return s+"s";const m=Math.floor(s/60);return m+"m "+(s%60)+"s";}
 function now(){return Date.now();}
-function stateClass(s){return s||"pending";}
+// Escape every value interpolated into innerHTML. The status file is written by
+// the orchestrator, but its detail/label/log fields carry target-derived text
+// (candidate titles, file paths), so treat all of it as untrusted.
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];});}
+const STATES={pending:1,active:1,done:1,failed:1};
+function stateClass(s){return STATES[s]?s:"pending";}
+function kindClass(k){return /^[a-z]+$/.test(k||"")?k:"";}
 function icon(s){if(s==="active")return '<span class="spin"></span>';if(s==="done")return '<span class="tick">✓</span>';if(s==="failed")return '<span>✗</span>';return '<span class="pend">○</span>';}
 function elapsed(st){if(!st.started_ms)return "";const end=st.ended_ms||now();let t=fmtDur(end-st.started_ms);return st.status==="active"?t+" elapsed":(st.ended_ms?t:"");}
 
@@ -80,13 +87,13 @@ function renderNode(st,extraClass){
   let kids="";
   if(st.children&&st.children.length){
     kids='<div class="children">'+st.children.map(c=>
-      '<div class="child '+stateClass(c.status)+'"><div class="cn">'+icon(c.status)+' '+c.label+'</div><div class="cs">'+(c.detail||"")+'</div></div>').join("")+'</div>';
+      '<div class="child '+stateClass(c.status)+'"><div class="cn">'+icon(c.status)+' '+esc(c.label)+'</div><div class="cs">'+esc(c.detail||"")+'</div></div>').join("")+'</div>';
   }
   return '<div class="node '+stateClass(st.status)+' '+(extraClass||"")+'">'
-    +'<div class="st">'+icon(st.status)+' '+(st.status||"pending")+'</div>'
-    +'<div class="nm">'+st.label+'</div>'
-    +'<div class="dt">'+(st.detail||"")+'</div>'
-    +'<div class="tm">'+elapsed(st)+'</div>'+kids+'</div>';
+    +'<div class="st">'+icon(st.status)+' '+esc(stateClass(st.status))+'</div>'
+    +'<div class="nm">'+esc(st.label)+'</div>'
+    +'<div class="dt">'+esc(st.detail||"")+'</div>'
+    +'<div class="tm">'+esc(elapsed(st))+'</div>'+kids+'</div>';
 }
 
 function render(d){
@@ -106,7 +113,7 @@ function render(d){
   }).join("");
   const log=document.getElementById("log");
   log.innerHTML=(d.log||[]).slice().reverse().map(e=>
-    '<div class="e k-'+(e.kind||"")+'"><span class="t">'+(e.ts||"")+'</span><span class="m">'+e.m+'</span></div>').join("")||'<div class="e"><span class="m">no events yet</span></div>';
+    '<div class="e k-'+kindClass(e.kind)+'"><span class="t">'+esc(e.ts||"")+'</span><span class="m">'+esc(e.m||"")+'</span></div>').join("")||'<div class="e"><span class="m">no events yet</span></div>';
   const upd=document.getElementById("upd"),dot=document.getElementById("dot");
   if(d.updated_ms){const age=now()-d.updated_ms;upd.textContent="updated "+fmtDur(age)+" ago";dot.classList.toggle("stale",age>120000);}
   document.getElementById("foot").textContent="Local dashboard. Polls pipeline-status.json every 2s. No external resources.";
