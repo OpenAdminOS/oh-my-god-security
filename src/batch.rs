@@ -150,7 +150,7 @@ fn read_present(path: &Path) -> Result<Option<String>, String> {
 
 /// The run metadata fields the index reads must have their documented
 /// types; a wrong type is an error, never a silently empty value.
-fn check_meta_types(meta: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+pub fn check_meta_types(meta: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
     use serde_json::Value;
     let wrong = |k: &str| Err(format!("{k} has the wrong type"));
     match meta.get("run_status") {
@@ -171,6 +171,27 @@ fn check_meta_types(meta: &serde_json::Map<String, serde_json::Value>) -> Result
         None => {}
         Some(Value::Array(a)) if a.iter().all(|b| b.is_string()) => {}
         _ => return wrong("blockers"),
+    }
+    match meta.get("models") {
+        None => {}
+        Some(Value::Object(m)) if m.values().all(|v| v.is_string()) => {}
+        _ => return wrong("models"),
+    }
+    if let Some(Value::Array(list)) = meta.get("reroutes") {
+        for r in list {
+            let field_ok = |k: &str, null_ok: bool| match r.get(k) {
+                Some(Value::String(_)) => true,
+                Some(Value::Null) | None => null_ok,
+                _ => false,
+            };
+            if !(field_ok("role", false)
+                && field_ok("from", false)
+                && field_ok("to", true)
+                && field_ok("reason", true))
+            {
+                return wrong("reroutes entry");
+            }
+        }
     }
     Ok(())
 }

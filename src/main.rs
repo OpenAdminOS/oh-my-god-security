@@ -323,6 +323,14 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             "warning: run metadata incomplete; pass --hunters <n>, --verifier <id>, and --agent-calls <n>. Unrecorded values render as \"not recorded\"."
         );
     }
+    if let Some(dir) = findings_dir
+        .as_deref()
+        .filter(|d| std::fs::symlink_metadata(d.join(omgs::runmeta::FILE)).is_ok())
+    {
+        let m = omgs::runmeta::read(dir)?;
+        omgs::batch::check_meta_types(&m)
+            .map_err(|e| format!("{}: {e}", dir.join(omgs::runmeta::FILE).display()))?;
+    }
     let meta = ReportMeta {
         repo: flag(args, "--repo").unwrap_or_else(|| "target".into()),
         source_ref: flag(args, "--ref").unwrap_or_else(|| "working tree".into()),
@@ -414,6 +422,9 @@ fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
         &home().join(".local/share/omgs"),
         &target,
     ))?;
+    if Path::new(&store.target) != target {
+        return refuse("the reviewer's store for this path belongs to another target");
+    }
     let total = answers.answers.len();
     let kept: Vec<_> = answers
         .answers
@@ -1038,23 +1049,6 @@ fn clone_target(raw_url: &str) -> Result<PathBuf, String> {
         ]);
         c
     };
-    if dest.exists() {
-        let origin = git()
-            .args(["-C", &dest.to_string_lossy(), "remote", "get-url", "origin"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        if origin.as_deref() != Some(repo.url.as_str()) {
-            return Err(format!(
-                "{} exists but its origin is {}, not {}; remove it or review that URL",
-                dest.display(),
-                origin.as_deref().unwrap_or("unknown"),
-                repo.url
-            ));
-        }
-        return Ok(dest);
-    }
     let parent = dest.parent().ok_or("invalid clone destination")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     #[cfg(unix)]
@@ -1062,17 +1056,40 @@ fn clone_target(raw_url: &str) -> Result<PathBuf, String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&targets, std::fs::Permissions::from_mode(0o700));
     }
-    let status = git()
-        .args(["clone", "--depth", "1", "--no-recurse-submodules", "--"])
-        .arg(&repo.url)
-        .arg(&dest)
-        .status()
-        .map_err(|e| e.to_string())?;
-    if !status.success() {
-        let _ = std::fs::remove_dir_all(&dest);
-        return Err(format!("git clone failed for {}", repo.url));
-    }
-    Ok(dest)
+    // One lock per destination covers the existence check, the clone, and
+    // any cleanup, so a concurrent review of the same URL can never delete a
+    // clone another process just created.
+    let lock = parent.join(format!(".{}.lock", repo.name));
+    omgs::runmeta::with_lock_file(&lock, || {
+        if dest.exists() {
+            let origin = git()
+                .args(["-C", &dest.to_string_lossy(), "remote", "get-url", "origin"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+            if origin.as_deref() != Some(repo.url.as_str()) {
+                return Err(format!(
+                    "{} exists but its origin is {}, not {}; remove it or review that URL",
+                    dest.display(),
+                    origin.as_deref().unwrap_or("unknown"),
+                    repo.url
+                ));
+            }
+            return Ok(dest.clone());
+        }
+        let status = git()
+            .args(["clone", "--depth", "1", "--no-recurse-submodules", "--"])
+            .arg(&repo.url)
+            .arg(&dest)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&dest);
+            return Err(format!("git clone failed for {}", repo.url));
+        }
+        Ok(dest.clone())
+    })
 }
 
 fn init_args(dest: &Path, args: &[String], out: Option<&Path>) -> Vec<String> {

@@ -72,6 +72,87 @@ pub fn apply(dir: &Path, u: &Update) -> Result<(), String> {
     with_lock(dir, || apply_locked(dir, u))
 }
 
+/// Check an existing status document against the status schema before it is
+/// updated, so a malformed file is refused rather than carried forward.
+fn check_document(doc: &Map<String, Value>) -> Result<(), String> {
+    fn stage(v: &Value, at: &str, nested: bool) -> Result<(), String> {
+        let o = v.as_object().ok_or(format!("{at} must be an object"))?;
+        for key in ["id", "label"] {
+            if !o.get(key).is_some_and(|x| x.is_string()) {
+                return Err(format!("{at}.{key} must be a string"));
+            }
+        }
+        if !o
+            .get("status")
+            .and_then(|s| s.as_str())
+            .is_some_and(|s| STATES.contains(&s))
+        {
+            return Err(format!("{at}.status must be one of {}", STATES.join(", ")));
+        }
+        if o.get("detail").is_some_and(|d| !d.is_string()) {
+            return Err(format!("{at}.detail must be a string"));
+        }
+        for key in ["started_ms", "ended_ms"] {
+            if o.get(key).is_some_and(|t| !t.is_u64()) {
+                return Err(format!("{at}.{key} must be an integer"));
+            }
+        }
+        match (o.get("children"), nested) {
+            (None, _) => Ok(()),
+            (Some(_), true) => Err(format!("{at} cannot have children")),
+            (Some(Value::Array(list)), false) => {
+                for (i, c) in list.iter().enumerate() {
+                    stage(c, &format!("{at}.children[{i}]"), true)?;
+                }
+                Ok(())
+            }
+            (Some(_), false) => Err(format!("{at}.children must be an array")),
+        }
+    }
+    if let Some(stages) = doc.get("stages") {
+        let list = stages.as_array().ok_or("stages must be an array")?;
+        for (i, s) in list.iter().enumerate() {
+            stage(s, &format!("stages[{i}]"), false)?;
+        }
+    }
+    if let Some(c) = doc.get("counters") {
+        let c = c.as_object().ok_or("counters must be an object")?;
+        for (k, v) in c {
+            if !COUNTERS.contains(&k.as_str()) || !v.is_u64() {
+                return Err(format!(
+                    "counters.{k} must be a known counter with an integer"
+                ));
+            }
+        }
+    }
+    if let Some(log) = doc.get("log") {
+        let log = log.as_array().ok_or("log must be an array")?;
+        for (i, e) in log.iter().enumerate() {
+            let ok = e.as_object().is_some_and(|o| {
+                ["ts", "kind", "m"]
+                    .iter()
+                    .all(|k| o.get(*k).is_some_and(|x| x.is_string()))
+            });
+            if !ok {
+                return Err(format!("log[{i}] needs string ts, kind and m"));
+            }
+        }
+    }
+    for (key, ok) in [
+        (
+            "updated_ms",
+            doc.get("updated_ms").is_none_or(|v| v.is_u64()),
+        ),
+        ("run", doc.get("run").is_none_or(|v| v.is_string())),
+        ("target", doc.get("target").is_none_or(|v| v.is_string())),
+    ] {
+        if !ok {
+            return Err(format!("{key} has the wrong type"));
+        }
+    }
+    Ok(())
+}
+
 fn apply_locked(dir: &Path, u: &Update) -> Result<(), String> {
     if !STATES.contains(&u.state) {
         return Err(format!("--state must be one of {}", STATES.join(", ")));
@@ -93,6 +174,7 @@ fn apply_locked(dir: &Path, u: &Update) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Map::new(),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
+    check_document(&doc).map_err(|e| format!("{}: {e}", path.display()))?;
     let now = now_ms();
     if !doc.contains_key("run") {
         if let Some(name) = dir.file_name() {

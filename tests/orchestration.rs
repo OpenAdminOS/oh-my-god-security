@@ -123,7 +123,7 @@ fn batch_summary_reads_a_run_directory() {
     std::fs::write(run.join("findings.json"), r#"{"findings": []}"#).unwrap();
     std::fs::write(
         run.join("run-metadata.json"),
-        r#"{"run_status":"complete","agent_calls_used":12,"reroutes":[{"role":"hunter"}],"blockers":["route exhausted"]}"#,
+        r#"{"run_status":"complete","agent_calls_used":12,"reroutes":[{"role":"hunter","from":"m1","to":"m2","reason":"declined"}],"blockers":["route exhausted"]}"#,
     )
     .unwrap();
     std::fs::write(
@@ -1340,5 +1340,117 @@ fn batch_init_needs_an_empty_output_directory() {
         .unwrap();
     assert_eq!(res.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&res.stderr).contains("not empty"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn similar_paths_never_share_an_answer_store() {
+    let home = std::path::Path::new("/h");
+    let a = omgs::intent::answers_file(home, std::path::Path::new("/x/shop"));
+    let b = omgs::intent::answers_file(home, std::path::Path::new("/x/shop "));
+    let c = omgs::intent::answers_file(home, std::path::Path::new("/x/Shop"));
+    assert_ne!(a, b);
+    assert_ne!(a, c);
+}
+
+#[test]
+fn report_rejects_malformed_routing_metadata() {
+    let dir = scratch("report-routing");
+    std::fs::write(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    for bad in [
+        r#"{"reroutes": false}"#,
+        r#"{"models": {"hunter": 42}}"#,
+        r#"{"reroutes": [{"role": "hunter", "from": 3}]}"#,
+    ] {
+        std::fs::write(dir.join("run-metadata.json"), bad).unwrap();
+        let out = omgs(&[
+            "report",
+            "--findings",
+            dir.join("findings.json").to_str().unwrap(),
+            "--out",
+            dir.join("out").to_str().unwrap(),
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{bad}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("run-metadata.json")).unwrap(),
+            bad
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn status_refuses_a_malformed_document_without_rewriting_it() {
+    let dir = scratch("status-malformed");
+    for bad in [
+        r#"{"stages":[17]}"#,
+        r#"{"stages":[{"id":"a","label":"A","status":"weird"}]}"#,
+        r#"{"counters":{"confirmed":"oops"}}"#,
+        r#"{"log":[false]}"#,
+        r#"{"updated_ms":"now"}"#,
+    ] {
+        std::fs::write(dir.join("pipeline-status.json"), bad).unwrap();
+        let r = omgs::status::apply(
+            &dir,
+            &omgs::status::Update {
+                stage: "map",
+                label: None,
+                parent: None,
+                state: "active",
+                detail: None,
+                counters: &[],
+                log: None,
+            },
+        );
+        assert!(r.is_err(), "{bad}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("pipeline-status.json")).unwrap(),
+            bad
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_reviews_of_one_url_never_delete_each_others_clone() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("clone-race");
+    let home = dir.join("home");
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    // A stub git: clone sleeps, then succeeds for the first caller and fails
+    // for any later one, as a real clone into an existing path would.
+    let stub = format!(
+        "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\ncase \" $* \" in\n  *' clone '*) sleep 1; if mkdir \"{m}\" 2>/dev/null; then mkdir -p \"$last\"; exit 0; else exit 1; fi ;;\n  *' get-url '*) echo https://github.com/a/b ;;\n  *) exit 1 ;;\nesac\n",
+        m = dir.join("cloned-once").display()
+    );
+    std::fs::write(bin.join("git"), stub).unwrap();
+    std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let spawn = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .env("HOME", &home)
+            .env("PATH", &path)
+            .args([
+                "review",
+                "--repo-url",
+                "https://github.com/a/b",
+                "--no-sensors",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let (mut a, mut b) = (spawn(), spawn());
+    let (ra, rb) = (a.wait().unwrap(), b.wait().unwrap());
+    let dest = home.join(".local/share/omgs/targets/github.com/a/b");
+    assert!(dest.is_dir(), "the clone survives");
+    assert!(
+        ra.success() && rb.success(),
+        "the second review reuses the first clone"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

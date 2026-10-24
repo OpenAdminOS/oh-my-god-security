@@ -75,13 +75,16 @@ pub struct Answers {
 /// Where the answers for a canonical target path are stored: one file per
 /// target, named by a stable hash of the full path.
 pub fn answers_file(omgs_home: &Path, canonical_target: &Path) -> std::path::PathBuf {
-    let key = crate::fingerprint(
-        "intent-answers",
-        &canonical_target.to_string_lossy(),
-        "",
-        "",
-    );
-    omgs_home.join("intent").join(format!("{key}.json"))
+    // FNV-1a over the exact path bytes: no trimming or case folding, so two
+    // distinct paths never share a store.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in canonical_target.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    omgs_home
+        .join("intent")
+        .join(format!("target-{hash:016x}.json"))
 }
 
 pub fn load_answers(path: &Path) -> Result<Answers, String> {
