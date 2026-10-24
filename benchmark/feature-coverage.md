@@ -9,13 +9,15 @@ Status after rounds on 2026-10-16: the first six projects, the next twenty proje
 | setup dry run and --yes | Tested | Installed into three agent skill directories, byte identical, idempotent on rerun. |
 | review --repo-url | Tested | Cloned a GitHub repo, initialized a run, reused the clone on a second call and created run-2. |
 | audit init | Tested | 26 field targets plus reruns. Stack detection, sensors, outside-tree enforcement, owner-only permissions, shared-temp warning, gate and advisory metadata. |
-| validate | Tested | 26 report sets accepted; deliberately invalid records rejected for fingerprint, severity, proof tier, and evidence violations with exit 1. |
+| validate | Tested | 26 report sets accepted; deliberately invalid records rejected for fingerprint, severity, proof tier, and evidence violations with exit 1. Since 2026-10-24 also rejects missing or equal `hunted_by` and `verified_by`, repeated locations, and invalid or doubly merged `candidates` (unit tests). |
 | fingerprint | Tested | Stable across repeated and case-variant inputs. Used by every hunter record. |
 | prove, Seatbelt backend | Tested | Scratch write allowed, outside write denied, network denied, timeout enforced. Full target template executed in sandbox and produced the first confirmed finding. Seatbelt does not isolate the process list, observed when a proof ran pgrep. |
 | prove, MXC backend | Partial | Real MXC v1.0.0 executor on the Windows mini PC: config-based backend in OMGS, dry-run validation passes, cmd workloads contained (scratch write allowed, outside write denied, network denied). PowerShell hosts fail DLL initialization from an SSH session despite desktop UI isolation; see multi-machine results. |
 | prove, bubblewrap backend | Tested | Linux NUC: scratch write allowed, outside write denied on a read-only root, network denied, timeout enforced. |
 | report (Markdown, HTML, SARIF) | Tested | 26 targets rendered; HTML escaping and zero external requests covered by unit tests; SARIF emitted one result for the single confirmed finding and parses as JSON. |
-| ledger set | Tested | Valid transitions applied, unknown unit rejected with exit 2. |
+| ledger set | Tested | Valid transitions applied, unknown unit rejected with exit 2. Since 2026-10-24 `covered` requires `--evidence` and `deferred`, `blocked`, `out_of_scope` require `--note` (unit and end-to-end tests). |
+| ledger add, ledger list | Unit tested | Duplicate ids and unknown statuses refused; list exits 1 on rule violations. No field run yet. |
+| critic | Unit tested | Every gap class covered by tests and one end-to-end CLI run; report embeds the result. No field run yet. |
 | check | Partial | Sensor execution and proof-test counting verified. Trufflehog, osv-scanner, and semgrep paths are detection only in code and were unavailable on the test machine. |
 | Gate enforcement | Untested by design gap | Mode is recorded in metadata and reports, but no CLI command fails a build in gate mode. Locked design says deterministic proof tests gate in the target CI, which no field target has exercised yet. |
 

@@ -1,4 +1,6 @@
 pub mod architecture;
+pub mod critic;
+pub mod ledger;
 pub mod model;
 pub mod report;
 pub mod sandbox;

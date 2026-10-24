@@ -1,7 +1,9 @@
 use omgs::architecture::{
     render_architecture_html, render_architecture_markdown, validate_architecture, ArchitectureFile,
 };
-use omgs::model::{validate, FindingsFile};
+use omgs::critic::critique_run;
+use omgs::ledger::{add_unit, coverage_lines, set_status, validate_ledger, Ledger, Unit, STATUSES};
+use omgs::model::{identity, validate, FindingsFile};
 use omgs::report::{render_html, render_markdown, render_sarif, ReportMeta};
 use omgs::sandbox::{prove, ProveOutcome, ProveRequest};
 use omgs::sensors::run_sensors;
@@ -17,7 +19,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <url> [--mode gate|advisory] [--budget <n>]\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--cwd <dir>] [--scratch <dir>] [--timeout-ms <n>]\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status>\n  omgs check --target <repo> [--out <run-dir>]\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <url> [--mode gate|advisory] [--budget <n>]\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--cwd <dir>] [--scratch <dir>] [--timeout-ms <n>]\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs check --target <repo> [--out <run-dir>]\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -51,6 +53,7 @@ fn main() -> ExitCode {
         "report" => cmd_report(rest),
         "architecture" => cmd_architecture(rest),
         "ledger" => cmd_ledger(rest),
+        "critic" => cmd_critic(rest),
         "check" => cmd_check(rest),
         other => Err(format!("unknown command '{other}'")),
     };
@@ -191,22 +194,35 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         }
         return Err("__EXIT1__".into());
     }
-    let findings_dir = Path::new(&path).parent().map(|p| p.to_path_buf());
+    let findings_dir = Path::new(&path)
+        .parent()
+        .map(|p| {
+            if p.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                p
+            }
+        })
+        .map(|p| p.to_path_buf());
     let mut coverage: Vec<String> = Vec::new();
+    let mut critic = None;
     if let Some(dir) = &findings_dir {
         if let Ok(text) = std::fs::read_to_string(dir.join("coverage-ledger.json")) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(units) = v.get("units").and_then(|u| u.as_array()) {
-                    for u in units {
-                        coverage.push(format!(
-                            "{}: {}",
-                            u.get("status")
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("planned"),
-                            u.get("id").and_then(|s| s.as_str()).unwrap_or("unit")
-                        ));
+            if let Ok(ledger) = serde_json::from_str::<Ledger>(&text) {
+                coverage = coverage_lines(&ledger);
+            }
+            match critique_run(dir) {
+                Ok(c) => {
+                    if !c.passed() {
+                        eprintln!(
+                            "warning: coverage critic found {} gap(s); they are listed in the report. Run omgs critic --run {} for detail.",
+                            c.gaps.len(),
+                            dir.display()
+                        );
                     }
+                    critic = Some(c);
                 }
+                Err(e) => eprintln!("warning: coverage critic not run: {e}"),
             }
         }
     }
@@ -228,8 +244,24 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             }
         }
     }
-    let hunters = flag(args, "--hunters").and_then(|s| s.parse::<u32>().ok());
-    let verifier = flag(args, "--verifier").filter(|s| !s.trim().is_empty());
+    // Identities recorded on the findings stand in for unpassed flags.
+    let recorded = |pick: fn(&omgs::model::Finding) -> &Option<String>| {
+        file.findings
+            .iter()
+            .filter_map(|f| identity(pick(f)))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let hunter_ids = recorded(|f| &f.hunted_by);
+    let verifier_ids = recorded(|f| &f.verified_by);
+    let hunters = flag(args, "--hunters")
+        .and_then(|s| s.parse::<u32>().ok())
+        .or_else(|| (!hunter_ids.is_empty()).then_some(hunter_ids.len() as u32));
+    let verifier = flag(args, "--verifier")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            (!verifier_ids.is_empty())
+                .then(|| verifier_ids.into_iter().collect::<Vec<_>>().join(", "))
+        });
     let agent_calls = flag(args, "--agent-calls").and_then(|s| s.parse::<u32>().ok());
     if hunters.is_none() || verifier.is_none() || agent_calls.is_none() {
         eprintln!(
@@ -246,6 +278,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         hunters,
         verifier,
         agent_calls,
+        critic,
     };
     let dir = Path::new(&out);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -391,38 +424,44 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
             || rel.ends_with("/route.tsx")
             || rel.contains("/pages/api/");
         if is_route {
-            units.push(serde_json::json!({
-                "id": format!("route:{}", rel),
-                "surface": rel,
-                "attack_classes": ["missing_authz", "idor_tenant_isolation", "client_only_auth"],
-                "status": "planned"
-            }));
+            units.push(Unit::new(
+                &format!("route:{rel}"),
+                rel,
+                &["missing_authz", "idor_tenant_isolation", "client_only_auth"],
+                "planned",
+            ));
         }
     }
     for stack in &stacks {
-        units.push(serde_json::json!({
-            "id": format!("stack:{}", stack),
-            "surface": ".",
-            "attack_classes": omgs::stack_attack_classes(stack),
-            "status": "planned"
-        }));
+        units.push(Unit::new(
+            &format!("stack:{stack}"),
+            ".",
+            &omgs::stack_attack_classes(stack),
+            "planned",
+        ));
     }
     if vendored_count > 0 {
-        units.push(serde_json::json!({
-            "id": "vendored:excluded",
-            "surface": format!("{} vendored or generated file(s)", vendored_count),
-            "attack_classes": [],
-            "status": "out_of_scope"
-        }));
+        let mut unit = Unit::new(
+            "vendored:excluded",
+            &format!("{vendored_count} vendored or generated file(s)"),
+            &[],
+            "out_of_scope",
+        );
+        unit.note = Some("vendored or generated code is excluded from hunting by default".into());
+        units.push(unit);
     }
     if units.is_empty() {
-        units.push(serde_json::json!({
-            "id": "surface:whole-repo",
-            "surface": ".",
-            "attack_classes": ["missing_authz", "input_validation"],
-            "status": "planned"
-        }));
+        units.push(Unit::new(
+            "surface:whole-repo",
+            ".",
+            &["missing_authz", "input_validation"],
+            "planned",
+        ));
     }
+    let ledger = Ledger {
+        units,
+        ..Ledger::default()
+    };
     let started_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -447,7 +486,7 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     std::fs::write(
         out_abs.join("coverage-ledger.json"),
-        serde_json::to_string_pretty(&serde_json::json!({ "units": units })).unwrap(),
+        serde_json::to_string_pretty(&ledger).unwrap(),
     )
     .map_err(|e| e.to_string())?;
     std::fs::write(out_abs.join("findings.json"), "{\n  \"findings\": []\n}\n")
@@ -615,49 +654,91 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn read_ledger(path: &str) -> Result<Ledger, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))
+}
+
+fn write_ledger(path: &str, ledger: &Ledger) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(ledger).map_err(|e| e.to_string())?;
+    std::fs::write(path, format!("{text}\n")).map_err(|e| format!("write {path}: {e}"))
+}
+
+/// Every value given for a repeatable flag, in order.
+fn flags(args: &[String], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|w| w[0] == name)
+        .map(|w| w[1].clone())
+        .collect()
+}
+
 fn cmd_ledger(args: &[String]) -> Result<(), String> {
-    if args.first().map(|s| s.as_str()) != Some("set") {
-        return Err("usage: omgs ledger set --ledger <file> --unit <id> --status <status>".into());
-    }
+    let usage = "usage: omgs ledger list|add|set --ledger <file> ...";
+    let sub = args.first().map(|s| s.as_str()).ok_or(usage)?;
     let rest = &args[1..];
-    let path = flag(rest, "--ledger").ok_or("ledger set requires --ledger <file>")?;
-    let unit = flag(rest, "--unit").ok_or("ledger set requires --unit <id>")?;
-    let status = flag(rest, "--status").ok_or("ledger set requires --status <status>")?;
-    let valid = [
-        "planned",
-        "candidate",
-        "covered",
-        "deferred",
-        "blocked",
-        "out_of_scope",
-    ];
-    if !valid.contains(&status.as_str()) {
-        return Err(format!("--status must be one of {}", valid.join(", ")));
-    }
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("read {path}: {e}"))?;
-    let mut value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))?;
-    let units = value
-        .get_mut("units")
-        .and_then(|u| u.as_array_mut())
-        .ok_or("ledger has no units array")?;
-    let mut found = false;
-    for u in units.iter_mut() {
-        if u.get("id").and_then(|v| v.as_str()) == Some(unit.as_str()) {
-            u["status"] = serde_json::json!(status);
-            found = true;
+    let path = flag(rest, "--ledger").ok_or("ledger requires --ledger <file>")?;
+    let mut ledger = read_ledger(&path)?;
+    match sub {
+        "list" => {
+            for line in coverage_lines(&ledger) {
+                println!("{line}");
+            }
+            let errors = validate_ledger(&ledger);
+            for e in &errors {
+                eprintln!("invalid: {e}");
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err("__EXIT1__".into())
+            }
         }
+        "add" => {
+            let unit = flag(rest, "--unit").ok_or("ledger add requires --unit <id>")?;
+            let surface = flag(rest, "--surface").ok_or("ledger add requires --surface <s>")?;
+            let classes = flag(rest, "--classes").unwrap_or_default();
+            let classes: Vec<&str> = classes
+                .split(',')
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .collect();
+            let status = flag(rest, "--status").unwrap_or_else(|| "planned".into());
+            let mut new = Unit::new(&unit, &surface, &classes, &status);
+            new.note = flag(rest, "--note").filter(|n| !n.trim().is_empty());
+            add_unit(&mut ledger, new)?;
+            write_ledger(&path, &ledger)?;
+            println!("{unit}: {status}");
+            Ok(())
+        }
+        "set" => {
+            let unit = flag(rest, "--unit").ok_or("ledger set requires --unit <id>")?;
+            let status = flag(rest, "--status").ok_or("ledger set requires --status <status>")?;
+            if !STATUSES.contains(&status.as_str()) {
+                return Err(format!("--status must be one of {}", STATUSES.join(", ")));
+            }
+            let evidence = flags(rest, "--evidence");
+            let note = flag(rest, "--note");
+            set_status(&mut ledger, &unit, &status, &evidence, note.as_deref())?;
+            write_ledger(&path, &ledger)?;
+            println!("{unit}: {status}");
+            Ok(())
+        }
+        _ => Err(usage.into()),
     }
-    if !found {
-        return Err(format!("ledger unit not found: {unit}"));
+}
+
+fn cmd_critic(args: &[String]) -> Result<(), String> {
+    let run = flag(args, "--run").ok_or("critic requires --run <run-dir>")?;
+    let report = critique_run(Path::new(&run))?;
+    for gap in &report.gaps {
+        eprintln!("gap: {gap}");
     }
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&value).unwrap_or_default(),
-    )
-    .map_err(|e| e.to_string())?;
-    println!("{unit}: {status}");
-    Ok(())
+    println!("critic: {}", report.summary());
+    if report.passed() {
+        Ok(())
+    } else {
+        Err("__EXIT1__".into())
+    }
 }
 
 fn cmd_review(args: &[String]) -> Result<(), String> {
