@@ -870,3 +870,68 @@ fn array_shaped_and_null_inputs_are_errors() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn duplicate_keys_and_enum_objects_are_errors() {
+    use omgs::shape;
+    assert!(shape::findings(r#"{"findings":[{}],"findings":[]}"#).is_err());
+    assert!(shape::ledger(r#"{"units":[],"units":[]}"#).is_err());
+    assert!(shape::candidates(r#"{"candidates":[],"candidates":[]}"#).is_err());
+    let (_, cands, findings) = complete_run();
+    let mut c = candidate_json(&cands[0].candidate).to_string();
+    c = c.replacen(
+        "\"hunter\":\"red-1\"",
+        "\"hunter\":\"red-1\",\"hunter\":\"blue-1\"",
+        1,
+    );
+    assert!(c.contains("\"hunter\":\"blue-1\""), "test setup");
+    assert!(shape::candidates(&format!("{{\"candidates\":[{c}]}}")).is_err());
+    for (key, form) in [
+        ("verdict", serde_json::json!({"confirmed": null})),
+        ("proof_tier", serde_json::json!({"test_proven": null})),
+        ("severity", serde_json::json!({"high": null})),
+    ] {
+        let mut f = serde_json::to_value(&findings).unwrap();
+        f["findings"][0][key] = form;
+        assert!(
+            shape::findings(&f.to_string()).is_err(),
+            "{key} object form accepted"
+        );
+    }
+    assert!(shape::ledger(
+        r#"{"units":[{"id":"u","surface":".","attack_classes":[],"status":{"covered":null}}]}"#
+    )
+    .is_err());
+    assert!(shape::findings(&serde_json::to_string(&findings).unwrap()).is_ok());
+}
+
+#[test]
+fn report_fails_on_malformed_companion_files() {
+    let dir = scratch("report-malformed");
+    let (ledger, _, findings) = complete_run();
+    std::fs::write(
+        dir.join("findings.json"),
+        serde_json::to_string(&findings).unwrap(),
+    )
+    .unwrap();
+    let report = |dir: &std::path::Path| {
+        omgs(&[
+            "report",
+            "--findings",
+            dir.join("findings.json").to_str().unwrap(),
+            "--out",
+            dir.join("out").to_str().unwrap(),
+        ])
+    };
+    std::fs::write(dir.join("coverage-ledger.json"), "{").unwrap();
+    assert_eq!(report(&dir).status.code(), Some(2), "malformed ledger");
+    std::fs::write(
+        dir.join("coverage-ledger.json"),
+        serde_json::to_string(&ledger).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("candidates-red-1.json"), "[[]]").unwrap();
+    assert_eq!(report(&dir).status.code(), Some(2), "malformed candidates");
+    assert!(!dir.join("out/REPORT.html").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
