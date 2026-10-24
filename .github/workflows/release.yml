@@ -32,14 +32,14 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   macos:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Build both arches
@@ -85,7 +85,7 @@ jobs:
           done
           security delete-keychain "$keychain" || true
           rm -f "$RUNNER_TEMP/api.p8" "$RUNNER_TEMP/cert.p12"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos
           path: dist/*
@@ -102,8 +102,8 @@ jobs:
             asset: omgs-aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
       - run: |
@@ -112,7 +112,7 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/omgs" "dist/${{ matrix.asset }}"
           strip "dist/${{ matrix.asset }}" || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-${{ matrix.target }}
           path: dist/*
@@ -120,8 +120,8 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: x86_64-pc-windows-msvc
       - name: Build
@@ -132,7 +132,7 @@ jobs:
           mkdir -p dist
           cp "target/x86_64-pc-windows-msvc/release/omgs.exe" "dist/omgs-x86_64-pc-windows-msvc.exe"
       - name: Sign with Azure Trusted Signing
-        uses: azure/trusted-signing-action@v0.5.9
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
@@ -145,7 +145,7 @@ jobs:
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows
           path: dist/*
@@ -153,8 +153,10 @@ jobs:
   release:
     needs: [macos, linux, windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: staging
       - name: Assemble assets and checksums
@@ -167,7 +169,7 @@ jobs:
           sha256sum omgs-* > SHA256SUMS
           cat SHA256SUMS
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
