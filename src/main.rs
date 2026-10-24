@@ -74,7 +74,7 @@ fn main() -> ExitCode {
 
 fn read_findings(path: &str) -> Result<FindingsFile, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))
+    omgs::shape::findings(&text).map_err(|e| format!("parse {path}: {e}"))
 }
 
 fn cmd_validate(args: &[String]) -> Result<(), String> {
@@ -208,7 +208,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     let mut critic = None;
     if let Some(dir) = &findings_dir {
         if let Ok(text) = std::fs::read_to_string(dir.join("coverage-ledger.json")) {
-            if let Ok(ledger) = serde_json::from_str::<Ledger>(&text) {
+            if let Ok(ledger) = omgs::shape::ledger(&text) {
                 coverage = coverage_lines(&ledger);
             }
             match critique_dir(dir, &file) {
@@ -653,7 +653,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
 
 fn read_ledger(path: &str) -> Result<Ledger, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))
+    omgs::shape::ledger(&text).map_err(|e| format!("parse {path}: {e}"))
 }
 
 fn write_ledger(path: &str, ledger: &Ledger) -> Result<(), String> {

@@ -812,3 +812,61 @@ fn critic_refuses_symlinked_candidate_files() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn array_shaped_and_null_inputs_are_errors() {
+    use omgs::shape;
+    assert!(shape::candidates("[[]]").is_err());
+    assert!(shape::candidates(r#"{"candidates": [[]]}"#).is_err());
+    assert!(shape::findings("[[]]").is_err());
+    assert!(shape::ledger("[[]]").is_err());
+    assert!(shape::ledger(r#"{"units": [["u", ".", [], "planned"]]}"#).is_err());
+    let (_, cands, findings) = complete_run();
+    let mut c = candidate_json(&cands[0].candidate);
+    c["location"] = serde_json::json!(["app/x.ts", 3]);
+    assert!(
+        shape::candidates(&serde_json::json!({"candidates": [c.clone()]}).to_string()).is_err()
+    );
+    c["location"] = serde_json::json!({"path": "app/x.ts", "line": null});
+    assert!(
+        shape::candidates(&serde_json::json!({"candidates": [c.clone()]}).to_string()).is_err()
+    );
+    c["location"] = serde_json::json!({"path": "app/x.ts"});
+    assert!(shape::candidates(&serde_json::json!({"candidates": [c]}).to_string()).is_ok());
+    let mut f = serde_json::to_value(&findings).unwrap();
+    f["findings"][0]["location"]["line"] = serde_json::json!(null);
+    assert!(shape::findings(&f.to_string()).is_err());
+
+    // End to end: an otherwise complete run with a positional candidates file fails.
+    let dir = scratch("array-shapes");
+    let (ledger, _, findings) = complete_run();
+    std::fs::write(
+        dir.join("coverage-ledger.json"),
+        serde_json::to_string(&ledger).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("findings.json"),
+        serde_json::to_string(&findings).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("candidates-red-1.json"), "[[]]").unwrap();
+    assert_eq!(
+        omgs(&["critic", "--run", dir.to_str().unwrap()])
+            .status
+            .code(),
+        Some(2)
+    );
+    std::fs::write(dir.join("findings.json"), "[[]]").unwrap();
+    assert_eq!(
+        omgs(&[
+            "validate",
+            "--findings",
+            dir.join("findings.json").to_str().unwrap()
+        ])
+        .status
+        .code(),
+        Some(2)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
