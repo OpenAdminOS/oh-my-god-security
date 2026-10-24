@@ -98,9 +98,10 @@ pub struct Finding {
     pub candidates: Vec<String>,
 }
 
+/// `findings` is required, so a misspelled key fails to parse instead of
+/// reading as an empty, trivially valid findings file.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FindingsFile {
-    #[serde(default)]
     pub findings: Vec<Finding>,
 }
 
