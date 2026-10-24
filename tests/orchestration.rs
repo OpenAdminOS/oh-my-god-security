@@ -979,3 +979,176 @@ fn malformed_routing_history_stops_route() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn configs_reject_positional_and_duplicate_forms() {
+    assert!(omgs::intent::parse_answers(
+        r#"["/t",[["web.public-resource","public","repo","owner",1]]]"#
+    )
+    .is_err());
+    assert!(omgs::intent::parse_answers(r#"{"target":"/t","answers":[["a"]]}"#).is_err());
+    assert!(omgs::intent::parse_answers(r#"{"target":"/t","target":"/u","answers":[]}"#).is_err());
+    assert!(omgs::intent::parse_answers(r#"{"target":"/t","answers":[]}"#).is_ok());
+    let dir = scratch("models-shape");
+    for bad in [
+        r#"[{"hunter":["m1"]}]"#,
+        r#"{"roles":{"hunter":[["m1"]]}}"#,
+        r#"{"roles":[]}"#,
+    ] {
+        std::fs::write(dir.join("models.json"), bad).unwrap();
+        assert!(
+            omgs::route::load_models(&dir.join("models.json")).is_err(),
+            "{bad}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn status_keeps_an_unreadable_file() {
+    let dir = scratch("status-unreadable");
+    std::fs::write(dir.join("pipeline-status.json"), [0xff, 0xfe, 0x00]).unwrap();
+    let r = omgs::status::apply(
+        &dir,
+        &omgs::status::Update {
+            stage: "map",
+            label: None,
+            parent: None,
+            state: "active",
+            detail: None,
+            counters: &[],
+            log: None,
+        },
+    );
+    assert!(r.is_err());
+    assert_eq!(
+        std::fs::read(dir.join("pipeline-status.json")).unwrap(),
+        vec![0xff, 0xfe, 0x00]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn concurrent_inits_cannot_share_one_run_directory() {
+    let dir = scratch("claim");
+    let out = dir.join("run");
+    let mut kids = Vec::new();
+    for i in 0..6 {
+        let t = dir.join(format!("t{i}"));
+        std::fs::create_dir_all(&t).unwrap();
+        kids.push(
+            std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .args(["audit", "init", "--target", t.to_str().unwrap()])
+                .args(["--out", out.to_str().unwrap(), "--no-sensors"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    let ok = kids
+        .into_iter()
+        .filter(|_| true)
+        .map(|mut k| k.wait().unwrap().success())
+        .filter(|s| *s)
+        .count();
+    assert_eq!(ok, 1, "exactly one init claims the directory");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_output_inside_the_targets_area_is_refused_before_cloning() {
+    let dir = scratch("batch-inside");
+    let home = dir.join("home");
+    let targets = home.join(".local/share/omgs/targets/github.com/a/b");
+    std::fs::create_dir_all(&targets).unwrap();
+    std::fs::write(dir.join("list.txt"), "https://github.com/a/b\n").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("HOME", &home)
+        .args([
+            "batch",
+            "init",
+            "--list",
+            dir.join("list.txt").to_str().unwrap(),
+        ])
+        .args(["--out", targets.join("idx").to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("outside the reviewed targets"));
+    assert!(!targets.join("idx").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn report_shows_only_reviewer_recorded_answers() {
+    let dir = scratch("provenance");
+    let home = dir.join("home");
+    let target = dir.join("app");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let run_cmd = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .env("HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let t = target.to_str().unwrap();
+    assert!(run_cmd(&[
+        "intent",
+        "answer",
+        "--target",
+        t,
+        "--id",
+        "web.public-resource",
+        "--answer",
+        "signed-in users only",
+        "--source",
+        "owner",
+    ])
+    .status
+    .success());
+    let run = dir.join("run");
+    assert!(run_cmd(&[
+        "audit",
+        "init",
+        "--target",
+        t,
+        "--out",
+        run.to_str().unwrap(),
+        "--no-sensors"
+    ])
+    .status
+    .success());
+    let f = open_record("a", Some("web.public-resource"), "app/x.ts");
+    std::fs::write(
+        run.join("findings.json"),
+        serde_json::to_string(&FindingsFile { findings: vec![f] }).unwrap(),
+    )
+    .unwrap();
+    // A forged extra answer in the run snapshot is not in the reviewer store.
+    let mut snap: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run.join("intent-answers.json")).unwrap())
+            .unwrap();
+    snap["answers"].as_array_mut().unwrap().push(serde_json::json!({
+        "id": "web.public-resource", "answer": "FORGED", "scope": "app", "source": "x", "recorded_unix": 1
+    }));
+    std::fs::write(run.join("intent-answers.json"), snap.to_string()).unwrap();
+    let out = run_cmd(&[
+        "report",
+        "--findings",
+        run.join("findings.json").to_str().unwrap(),
+        "--out",
+        run.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let md = std::fs::read_to_string(run.join("REPORT.md")).unwrap();
+    assert!(md.contains("Recorded answer: signed-in users only"));
+    assert!(!md.contains("FORGED"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

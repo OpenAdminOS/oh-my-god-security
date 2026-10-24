@@ -90,7 +90,8 @@ fn apply_locked(dir: &Path, u: &Update) -> Result<(), String> {
             Ok(Value::Object(m)) => m,
             _ => return Err(format!("{} is not a status object", path.display())),
         },
-        Err(_) => Map::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Map::new(),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
     let now = now_ms();
     if !doc.contains_key("run") {

@@ -389,18 +389,49 @@ fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
     if answers.answers.is_empty() {
         return Ok(answers);
     }
+    // Provenance: answers render only when the run directory sits outside the
+    // target it names, and each answer also exists in the reviewer's own
+    // store for that target. Files next to the findings could have been
+    // written by the target itself, so matching them to each other proves
+    // nothing.
+    let refuse = |why: &str| {
+        eprintln!("warning: intent answers not shown: {why}");
+        Ok(Default::default())
+    };
     let target = omgs::runmeta::read(dir)
         .ok()
-        .and_then(|m| m.get("target").and_then(|t| t.as_str()).map(String::from));
-    if target.as_deref() == Some(answers.target.as_str()) {
-        Ok(answers)
-    } else {
-        eprintln!(
-            "warning: intent-answers.json belongs to {}, not this run's target; answers not shown",
-            answers.target
-        );
-        Ok(Default::default())
+        .and_then(|m| m.get("target").and_then(|t| t.as_str()).map(PathBuf::from))
+        .and_then(|t| std::fs::canonicalize(t).ok());
+    let Some(target) = target else {
+        return refuse("run metadata names no existing target");
+    };
+    let run = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+    if run.starts_with(&target) {
+        return refuse("the run directory is inside the target");
     }
+    if Path::new(&answers.target) != target {
+        return refuse("they belong to a different target");
+    }
+    let store = omgs::intent::load_answers(&omgs::intent::answers_file(
+        &home().join(".local/share/omgs"),
+        &target,
+    ))?;
+    let total = answers.answers.len();
+    let kept: Vec<_> = answers
+        .answers
+        .into_iter()
+        .filter(|a| store.answers.contains(a))
+        .collect();
+    if kept.len() < total {
+        eprintln!(
+            "warning: {} intent answer(s) not in the reviewer's store were not shown",
+            total - kept.len()
+        );
+    }
+    Ok(omgs::intent::Answers {
+        target: answers.target,
+        answers: kept,
+    })
 }
 
 /// "role: model" lines from run metadata `models`, sorted by role.
@@ -574,6 +605,18 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     // The check above ran before creation; recheck the created directory in
     // case a link was swapped in between.
     outside(&std::fs::canonicalize(&out_abs).map_err(|e| e.to_string())?)?;
+    // Claim the directory exclusively, so two concurrent inits given the same
+    // --out cannot both pass the emptiness check and overwrite each other.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(out_abs.join(".omgs-claim"))
+        .map_err(|e| {
+            format!(
+                "{} is already claimed by another run ({e}); choose a new run directory",
+                out_abs.display()
+            )
+        })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1070,6 +1113,29 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             if urls.is_empty() {
                 return Err(format!("{list} lists no repository URLs"));
             }
+            // The batch output must sit outside the targets area and every
+            // target in the list, including ones that later fail to clone.
+            let targets_root = home().join(".local/share/omgs/targets");
+            let dests: Vec<PathBuf> = urls
+                .iter()
+                .filter_map(|u| omgs::batch::parse_repo_url(u).ok())
+                .map(|r| targets_root.join(&r.host).join(&r.owner).join(&r.name))
+                .collect();
+            let out_abs = if out.is_absolute() {
+                out.clone()
+            } else {
+                std::env::current_dir().map_err(|e| e.to_string())?.join(&out)
+            };
+            let resolved = resolve_existing_prefix(&out_abs)?;
+            for t in std::iter::once(&targets_root).chain(&dests) {
+                if resolved.starts_with(resolve_existing_prefix(t)?) {
+                    return Err(format!(
+                        "batch output must live outside the reviewed targets, and {} is inside {}",
+                        out_abs.display(),
+                        t.display()
+                    ));
+                }
+            }
             std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
             #[cfg(unix)]
             {
@@ -1109,8 +1175,19 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                     }
                     Err(e) => {
                         eprintln!("failed: {url}: {e}");
+                        // Keep the target path a valid URL maps to, so later
+                        // containment checks still know it.
+                        let target = omgs::batch::parse_repo_url(&url).ok().map(|r| {
+                            targets_root
+                                .join(&r.host)
+                                .join(&r.owner)
+                                .join(&r.name)
+                                .to_string_lossy()
+                                .to_string()
+                        });
                         batch.runs.push(omgs::batch::BatchRun {
                             url,
+                            target,
                             status: "failed".into(),
                             error: Some(e),
                             ..Default::default()
@@ -1144,11 +1221,14 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             } else {
                 std::env::current_dir().map_err(|e| e.to_string())?.join(&out)
             };
-            let targets: Vec<PathBuf> = batch
-                .runs
-                .iter()
-                .filter_map(|r| r.target.as_deref().and_then(|t| std::fs::canonicalize(t).ok()))
-                .collect();
+            let mut targets: Vec<PathBuf> = vec![resolve_existing_prefix(
+                &home().join(".local/share/omgs/targets"),
+            )?];
+            for r in &batch.runs {
+                if let Some(t) = r.target.as_deref() {
+                    targets.push(resolve_existing_prefix(Path::new(t))?);
+                }
+            }
             let inside = |p: &Path| -> Result<(), String> {
                 match targets.iter().find(|t| p.starts_with(t)) {
                     Some(t) => Err(format!(

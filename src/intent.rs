@@ -86,12 +86,28 @@ pub fn answers_file(omgs_home: &Path, canonical_target: &Path) -> std::path::Pat
 
 pub fn load_answers(path: &Path) -> Result<Answers, String> {
     match std::fs::read_to_string(path) {
-        Ok(text) => {
-            serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
-        }
+        Ok(text) => parse_answers(&text).map_err(|e| format!("parse {}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Answers::default()),
         Err(e) => Err(format!("read {}: {e}", path.display())),
     }
+}
+
+/// Strictly parse an answers file: an object with a string `target` and an
+/// `answers` array of objects, no duplicate keys, no positional arrays.
+pub fn parse_answers(text: &str) -> Result<Answers, String> {
+    let v = crate::shape::strict_json(text)?;
+    let top = v.as_object().ok_or("answers file must be a JSON object")?;
+    if !top.get("target").is_some_and(|t| t.is_string()) {
+        return Err("answers file needs a string target".into());
+    }
+    let list = top
+        .get("answers")
+        .and_then(|a| a.as_array())
+        .ok_or("answers file needs an answers array")?;
+    if list.iter().any(|a| !a.is_object()) {
+        return Err("every answer must be a JSON object".into());
+    }
+    serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
 /// Record an answer, replacing any earlier answer for the same id and scope.

@@ -19,8 +19,24 @@ pub struct Models {
 pub fn load_models(path: &Path) -> Result<Models, String> {
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let models: Models =
-        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let parse = || -> Result<Models, String> {
+        let v = crate::shape::strict_json(&text)?;
+        let roles = v
+            .as_object()
+            .and_then(|o| o.get("roles"))
+            .and_then(|r| r.as_object())
+            .ok_or("models.json must be an object with a roles object")?;
+        for (role, list) in roles {
+            let ok = list
+                .as_array()
+                .is_some_and(|l| l.iter().all(|m| m.is_string()));
+            if !ok {
+                return Err(format!("role '{role}' must list model names as strings"));
+            }
+        }
+        serde_json::from_value(v).map_err(|e| e.to_string())
+    };
+    let models = parse().map_err(|e| format!("parse {}: {e}", path.display()))?;
     for (role, list) in &models.roles {
         if !ROLES.contains(&role.as_str()) {
             return Err(format!(
