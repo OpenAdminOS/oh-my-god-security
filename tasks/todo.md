@@ -7,7 +7,7 @@ separate Claude evaluator; merge only when both are green and the user says so.
 
 - [x] `.github/workflows/ci.yml`: fmt, clippy `-D warnings`, `cargo test` on macos-14 and
       ubuntu-24.04 (bubblewrap installed), checksum-verified actionlint
-- [ ] PR opened, CI green, reviews green, merged
+- [x] PR opened, CI green, reviews green, merged (#6)
 
 ## PR B: finding model, verifier separation, ledger, coverage critic (`feat/verifier-ledger-critic`)
 
@@ -17,7 +17,7 @@ separate Claude evaluator; merge only when both are green and the user says so.
 - [x] typed ledger (`src/ledger.rs`), `ledger add/set/list`, evidence + note, transition rules
 - [x] `omgs critic --run <dir>`; report renders the critic result
 - [x] fixtures, schemas, skill docs, README, usage(), IMPROVEMENTS.md updated
-- [ ] tests; reviews green; merged
+- [x] tests; reviews green; merged (#9, reopened from #7)
 
 ## PR C: run orchestration (`feat/run-orchestration`)
 
@@ -26,18 +26,12 @@ separate Claude evaluator; merge only when both are green and the user says so.
 - [x] `omgs status` + `omgs watch` (loopback only, two routes, Host check)
 - [x] `omgs route` model fallbacks recorded in run metadata
 - [x] intent library (`skill/intent/library.json`), `omgs intent list/answer`, `intent_id`
-- [ ] tests; docs; reviews green; merged
+- [x] tests; docs; reviews green; merged (#8)
 
 ## PR D: sandbox hardening (`feat/sandbox-hardening`)
 
-- [ ] spike: `sandbox_check` nonce identification of survivors (fallback: kqueue tracking)
-- [ ] deny-by-default Seatbelt with measured allow set, params instead of interpolation,
-      setsid/setpgid syscall deny, survivor sweep
-- [ ] waitid WNOWAIT peek before group signal
-- [ ] narrowed bubblewrap binds, guarded scratch bind, absolute bwrap path; validated on a
-      throwaway Lima Ubuntu VM (deleted afterwards) and CI
-- [ ] `tests/sandbox.rs` platform-gated; Swift fixture regression
-- [ ] IMPROVEMENTS.md residuals closed or restated; reviews green; merged
+Dropped from the 0.1 scope by decision on 2026-10-24. Spike results and the three open residuals are
+recorded in IMPROVEMENTS.md under "Deferred past 0.1".
 
 ## Acceptance criteria
 
@@ -49,4 +43,18 @@ fixture behaviour; setsid and posix_spawn survivors killed and reported; no `--r
 
 ## Review
 
-(filled per PR)
+- #6 CI: one GPT-6.1-Sol round, no findings; Claude evaluator pass.
+- #9 (was #7) verifier separation, grouped locations, ledger, critic, strict parsing: 13 GPT-6.1-Sol
+  rounds. Rounds 1 to 12 found blocking issues that were almost all one class: malformed input
+  (missing or misspelled keys, defaulted fields, arrays for objects, null, duplicate keys, enum
+  objects, wrong types, dangling links) parsing into a silent pass. That class is now closed at the
+  parser (src/shape.rs). Round 13 was clean; a fresh Claude evaluator passed it and its five minor
+  items were fixed. GitHub closed #7 when its stacked base branch was deleted, so it merged as #9
+  with an identical tree.
+- #8 orchestration: 12 GPT-6.1-Sol rounds, hardening containment (symlinks, hardlinks, FIFOs,
+  nested links, target-planted answer stores), concurrency (OS file locks, exclusive claims, clone
+  races), and strict parsing of every run file. Rounds 11 and 12 had no blocking findings; a fresh
+  Claude evaluator passed it and its three items were fixed before merge. The one remaining
+  non-blocking item (Markdown intent answers only on pending records) is fixed in the wrap-up PR.
+- Lesson recorded in tasks/lessons.md: never default a required field in a security input, and
+  sweep every struct on the same input path before asking for re-review.
