@@ -5,7 +5,7 @@
 # ${OMGS_HOME:-$HOME/.local/share/omgs}/bin. Prints the installed path.
 set -eu
 
-BASE="${OMGS_RELEASE_BASE:-https://github.com/OpenAdminOS/OMGSecurity/releases/latest/download}"
+BASE="${OMGS_RELEASE_BASE:-https://github.com/OpenAdminOS/oh-my-god-security/releases/latest/download}"
 DEST_ROOT="${OMGS_HOME:-$HOME/.local/share/omgs}"
 DEST="$DEST_ROOT/bin"
 

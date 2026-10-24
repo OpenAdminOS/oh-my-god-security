@@ -13,7 +13,7 @@ Status: early v0. The deterministic CLI, schemas, skill pack and benchmark desig
 Install the skill with the Skills CLI (add `--global` for a user level install):
 
 ```bash
-npx skills add https://github.com/OpenAdminOS/OMGSecurity --skill omgs-security-review
+npx skills add https://github.com/OpenAdminOS/oh-my-god-security --skill omgs-security-review
 ```
 
 Then ask your coding agent: run an OMGS security review on this project. On first run the skill downloads the OMGS binary for your platform from the project releases, verifies it against the published SHA-256 checksums, installs it without elevation into a per-user directory, and continues into the audit. You never install an executable by hand in the primary flow. Direct binary installation stays available for humans and enterprises that prefer it: download the release binary for your platform, verify it, and run `omgs setup` to install the skill into your agents.

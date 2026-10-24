@@ -2,7 +2,7 @@
 # Downloads the platform binary from a release base, verifies SHA-256,
 # installs without elevation, and prints the installed path.
 $ErrorActionPreference = 'Stop'
-$Base = if ($env:OMGS_RELEASE_BASE) { $env:OMGS_RELEASE_BASE } else { 'https://github.com/OpenAdminOS/OMGSecurity/releases/latest/download' }
+$Base = if ($env:OMGS_RELEASE_BASE) { $env:OMGS_RELEASE_BASE } else { 'https://github.com/OpenAdminOS/oh-my-god-security/releases/latest/download' }
 $DestRoot = if ($env:OMGS_HOME) { $env:OMGS_HOME } else { Join-Path $env:USERPROFILE '.local\share\omgs' }
 $Dest = Join-Path $DestRoot 'bin'
 $asset = 'omgs-x86_64-pc-windows-gnu.exe'
