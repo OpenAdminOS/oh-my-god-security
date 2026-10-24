@@ -465,7 +465,14 @@ fn layout(a: &ArchitectureFile) -> Diagram {
     }
 
     let cols = col_count.max(1) as i64;
-    let width = MARGIN_X * 2 + cols * NODE_W + (cols - 1).max(0) * COL_GAP;
+    // A single-column map has no inter-column gap, so a same-column edge has
+    // nowhere to route; reserve a right gutter in that case. Multi-column maps
+    // already have gaps the routing uses.
+    let needs_gutter = col_count <= 1 && edges.iter().any(|e| nodes[e.to].col == nodes[e.from].col);
+    let width = MARGIN_X * 2
+        + cols * NODE_W
+        + (cols - 1).max(0) * COL_GAP
+        + if needs_gutter { COL_GAP } else { 0 };
     let height = MARGIN_TOP + max_h + MARGIN_BOTTOM;
     Diagram {
         nodes,
@@ -549,9 +556,18 @@ fn svg_text(
     max_chars: usize,
     budget: i64,
     font_px: i64,
+    uppercased: bool,
 ) -> String {
     let t = trunc(text, max_chars);
-    let len = if est_width(&t, font_px) > budget {
+    // Some labels are uppercased by CSS (zone, kind); measure the uppercased
+    // form so wider caps and expansions such as the German sharp s to "SS" are
+    // counted before deciding whether to clamp.
+    let measured = if uppercased {
+        std::borrow::Cow::Owned(t.to_uppercase())
+    } else {
+        std::borrow::Cow::Borrowed(t.as_str())
+    };
+    let len = if est_width(&measured, font_px) > budget {
         format!(" textLength=\"{budget}\" lengthAdjust=\"spacingAndGlyphs\"")
     } else {
         String::new()
@@ -577,11 +593,14 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
 
     // zone bands + headers (background)
     for (c, z) in a.zones.iter().enumerate() {
-        let x = MARGIN_X + c as i64 * COL_PITCH - COL_GAP / 2;
-        let bw = NODE_W + COL_GAP;
+        // Clamp the band to the canvas so outer columns do not bleed past the
+        // viewBox edges.
+        let left = (MARGIN_X + c as i64 * COL_PITCH - COL_GAP / 2).max(8);
+        let right = (MARGIN_X + c as i64 * COL_PITCH + NODE_W + COL_GAP / 2).min(d.width - 8);
+        let bw = (right - left).max(0);
         s.push_str(&format!(
             "<rect x=\"{x}\" y=\"{y}\" width=\"{bw}\" height=\"{bh}\" rx=\"14\" class=\"arch-band\"/>",
-            x = x,
+            x = left,
             y = MARGIN_TOP - 36,
             bh = d.height - (MARGIN_TOP - 36) - 16
         ));
@@ -595,6 +614,7 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
             26,
             290,
             12,
+            true,
         ));
     }
 
@@ -668,15 +688,23 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
             (p, arrow_right(bx, tcy))
         } else if nt.x == nf.x {
             let x = nf.x;
-            let p = if x - 70 >= 8 {
+            if x - 70 >= 8 {
+                // left gutter: down the gap, into the target's left edge
                 let g = x - 70;
-                format!("M{x} {fcy} C {g} {fcy} {g} {tcy} {x} {tcy}")
+                (
+                    format!("M{x} {fcy} C {g} {fcy} {g} {tcy} {x} {tcy}"),
+                    arrow_right(x, tcy),
+                )
             } else {
+                // leftmost column has no left gutter: run the reserved right
+                // gutter and approach the target's right edge, clear of nodes
                 let fx2 = nf.x + NODE_W;
-                let o = fx2 + 60;
-                format!("M{fx2} {fcy} C {o} {fcy} {o} {tcy} {x} {tcy}")
-            };
-            (p, arrow_right(x, tcy))
+                let g = fx2 + 52;
+                (
+                    format!("M{fx2} {fcy} C {g} {fcy} {g} {tcy} {fx2} {tcy}"),
+                    arrow_left(fx2, tcy),
+                )
+            }
         } else {
             let sx = nf.x;
             let brx = nt.x + NODE_W;
@@ -730,6 +758,7 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
             24,
             180,
             14,
+            false,
         ));
         let kind = c.kind.as_deref().unwrap_or("");
         if !kind.is_empty() {
@@ -742,6 +771,7 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
                 26,
                 180,
                 11,
+                true,
             ));
         }
         let sub = if !c.tech.is_empty() {
@@ -759,6 +789,7 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
                 28,
                 180,
                 12,
+                false,
             ));
         }
     }

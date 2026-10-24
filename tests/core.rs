@@ -829,3 +829,62 @@ fn architecture_clamps_wide_labels_only_when_needed() {
     assert!(html.contains("class=\"arch-zone\" text-anchor=\"middle\" textLength=\"290\""));
     assert!(html.contains("class=\"arch-name\" textLength=\"180\""));
 }
+
+#[test]
+fn architecture_clamps_css_uppercased_labels() {
+    // ß uppercases to "SS" in CSS; the width estimate must account for it
+    let mut a = arch();
+    a.zones[0].name = "\u{00df}".repeat(24);
+    let html = render_architecture_html(&a);
+    assert!(html.contains("class=\"arch-zone\" text-anchor=\"middle\" textLength=\"290\""));
+
+    // kind is uppercased by CSS, so a long lowercase kind must still clamp
+    let mut b = arch();
+    b.components[0].kind = Some("a".repeat(26));
+    assert!(render_architecture_html(&b).contains("class=\"arch-kind\" textLength=\"180\""));
+}
+
+#[test]
+fn architecture_single_column_reserves_a_gutter() {
+    // one zone, three components, a -> c skipping b: a same-column flow needs a
+    // reserved right gutter so it does not cross node b.
+    let a = ArchitectureFile {
+        target: "one".into(),
+        zones: vec![Zone {
+            id: "z".into(),
+            name: "App".into(),
+            ..Default::default()
+        }],
+        components: vec![
+            Component {
+                id: "a".into(),
+                name: "A".into(),
+                zone: "z".into(),
+                ..Default::default()
+            },
+            Component {
+                id: "b".into(),
+                name: "B".into(),
+                zone: "z".into(),
+                ..Default::default()
+            },
+            Component {
+                id: "c".into(),
+                name: "C".into(),
+                zone: "z".into(),
+                ..Default::default()
+            },
+        ],
+        flows: vec![Flow {
+            from: "a".into(),
+            to: "c".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(validate_architecture(&a).is_empty());
+    let html = render_architecture_html(&a);
+    // base single-column width is 292; the reserved gutter widens it to 396
+    assert!(html.contains("viewBox=\"0 0 396"));
+    assert_eq!(html.matches("<svg").count(), 1);
+}
