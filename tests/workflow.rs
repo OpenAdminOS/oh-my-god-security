@@ -224,7 +224,7 @@ fn ledger_round_trip_keeps_unknown_fields() {
 #[test]
 fn ledger_rejects_duplicate_ids_and_bad_status() {
     let ledger: Ledger = serde_json::from_str(
-        r#"{"units":[{"id":"u","status":"planned"},{"id":"u","status":"examined"}]}"#,
+        r#"{"units":[{"id":"u","surface":".","attack_classes":[],"status":"planned"},{"id":"u","surface":".","attack_classes":[],"status":"examined"}]}"#,
     )
     .unwrap();
     let errors = validate_ledger(&ledger);
@@ -241,7 +241,7 @@ fn complete_run() -> (Ledger, Vec<SourcedCandidate>, FindingsFile) {
     ledger.units.push(unit);
     let c = Candidate {
         fingerprint: f.fingerprint.clone(),
-        hunter: Some("red-1".into()),
+        hunter: "red-1".into(),
         unit_ids: vec!["route:x".into()],
         title: f.title.clone(),
         attack_class: f.attack_class.clone(),
@@ -302,7 +302,7 @@ fn critic_reports_each_gap_class() {
     ));
 
     let (ledger, mut cands, findings) = complete_run();
-    cands[0].candidate.hunter = None;
+    cands[0].candidate.hunter = " ".into();
     assert!(has(
         &gaps(&ledger, 1, &cands, &findings),
         "hunter is not recorded"
@@ -321,7 +321,7 @@ fn critic_reports_each_gap_class() {
         file: "candidates-red-2.json".into(),
         candidate: Candidate {
             fingerprint: orphan.fingerprint.clone(),
-            hunter: Some("red-2".into()),
+            hunter: "red-2".into(),
             unit_ids: vec!["route:x".into()],
             title: "Orphan".into(),
             attack_class: orphan.attack_class,
@@ -350,7 +350,7 @@ fn critic_reports_each_gap_class() {
         file: "candidates-blue.json".into(),
         candidate: Candidate {
             fingerprint: merged.fingerprint.clone(),
-            hunter: Some("Blue-1".into()),
+            hunter: "Blue-1".into(),
             unit_ids: vec!["route:x".into()],
             title: "Copy".into(),
             attack_class: merged.attack_class,
@@ -651,4 +651,74 @@ fn findings_file_requires_the_findings_key() {
         Some(2)
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ledger_units_require_every_schema_field() {
+    let full = r#"{"id":"u","surface":".","attack_classes":[],"status":"planned"}"#;
+    assert!(serde_json::from_str::<Unit>(full).is_ok());
+    for drop in [
+        "\"surface\":\".\",",
+        "\"attack_classes\":[],",
+        ",\"status\":\"planned\"",
+    ] {
+        let text = full.replace(drop, "");
+        assert!(
+            serde_json::from_str::<Unit>(&text).is_err(),
+            "accepted {text}"
+        );
+    }
+    let mut ledger = Ledger::default();
+    ledger.units.push(Unit::new("u", " ", &[], "planned"));
+    assert!(validate_ledger(&ledger)
+        .iter()
+        .any(|e| e.contains("surface is empty")));
+}
+
+#[test]
+fn candidates_require_every_identity_field() {
+    let full = serde_json::json!({
+        "fingerprint": "omgs-0123456789abcdef", "hunter": "red-1", "unit_ids": ["u"],
+        "title": "t", "attack_class": "a", "entry_point": "e", "sink": "s", "boundary": "b"
+    });
+    assert!(serde_json::from_value::<Candidate>(full.clone()).is_ok());
+    for key in [
+        "fingerprint",
+        "hunter",
+        "unit_ids",
+        "title",
+        "attack_class",
+        "entry_point",
+        "sink",
+        "boundary",
+    ] {
+        let mut v = full.clone();
+        v.as_object_mut().unwrap().remove(key);
+        assert!(
+            serde_json::from_value::<Candidate>(v).is_err(),
+            "accepted a candidate without {key}"
+        );
+    }
+}
+
+#[test]
+fn critic_flags_blank_identity_inputs_on_merged_candidates() {
+    let (ledger, mut cands, mut findings) = complete_run();
+    let blank = Candidate {
+        fingerprint: omgs::fingerprint("class_m", "GET /api/x", "", "tenant"),
+        hunter: "red-1".into(),
+        unit_ids: vec!["route:x".into()],
+        title: "Copy".into(),
+        attack_class: "class_m".into(),
+        entry_point: "GET /api/x".into(),
+        sink: "".into(),
+        boundary: "tenant".into(),
+    };
+    findings.findings[0].candidates = vec![blank.fingerprint.clone()];
+    cands.push(SourcedCandidate {
+        file: "candidates-red-1.json".into(),
+        candidate: blank,
+    });
+    let gaps = critique(&ledger, 1, &cands, &findings).gaps;
+    assert!(has(&gaps, "'Copy': sink is empty"), "{gaps:?}");
 }
