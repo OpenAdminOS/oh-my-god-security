@@ -95,31 +95,45 @@ fn request_json(req: &ProveRequest) -> String {
     .unwrap_or_default()
 }
 
-/// Wait for the command, then terminate it and any descendants, and reap.
-/// Returns (success, timed_out).
+/// Signal the whole process group the command leads, using `kill` with a
+/// negative pid (the group). Reaches background descendants a bare
+/// `child.kill()` would leave running and holding the pipes.
 ///
-/// When `group_leader` is true the command is its own process-group leader (see
-/// base_env), so the whole group is signalled: a command that backgrounds a
-/// child and exits (for example `sleep 60 & exit 0`) cannot leave code running
-/// or holding the pipes. The leader is detected with `WNOWAIT`, which leaves it
-/// a zombie so its pid and pgid cannot be reused before the group is signalled,
-/// then reaped. Backends that did not create a group (MXC) kill only the child.
-/// Signal the whole process group the command leads. Reaches background
-/// descendants a bare `child.kill()` would leave running and holding the pipes.
-/// Known limitation: on the normal-exit path the leader has already been reaped
-/// by `try_wait`, so there is a microsecond window in which its pid/pgid could
-/// be reused before this signal lands; closing it needs a peek-without-reap
-/// (`waitid` with `WNOWAIT`), whose cross-platform wiring is tracked separately.
+/// Limits (tracked in IMPROVEMENTS.md): on macOS there is no PID namespace, so a
+/// descendant that calls `setsid()` leaves this group and survives the signal.
+/// It stays confined by the sandbox profile (writes only to scratch, network
+/// denied), but can outlive the proof. The Linux backend runs under
+/// `--unshare-pid`, where the kernel reaps every descendant when the namespace
+/// init exits. There is also a microsecond pid/pgid-reuse window on the
+/// normal-exit path, since the leader is reaped before the signal lands.
 #[cfg(unix)]
 fn kill_group(pid: u32) {
-    let group = format!("-{pid}");
-    let _ = Command::new("/bin/kill").arg("-TERM").arg(&group).status();
+    let group = -(pid as i32);
+    unsafe {
+        libc::kill(group, libc::SIGTERM);
+    }
     std::thread::sleep(Duration::from_millis(200));
-    let _ = Command::new("/bin/kill").arg("-KILL").arg(&group).status();
+    unsafe {
+        libc::kill(group, libc::SIGKILL);
+    }
 }
 
 #[cfg(not(unix))]
 fn kill_group(_pid: u32) {}
+
+/// Reap the child, bounded so a wedged leader cannot block the caller forever.
+fn reap_bounded(child: &mut Child) {
+    let start = Instant::now();
+    loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        if start.elapsed() > Duration::from_millis(1_000) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 fn supervise(child: &mut Child, timeout_ms: u64, group_leader: bool) -> (bool, bool) {
     let pid = child.id();
@@ -140,14 +154,12 @@ fn supervise(child: &mut Child, timeout_ms: u64, group_leader: bool) -> (bool, b
     };
     // Terminate descendants on every path, not only timeout: a command that
     // backgrounds a child and exits (`sleep 60 & exit 0`) must not leave code
-    // running or holding the pipes. Only when the command led its own group;
-    // backends that did not set one (MXC) kill just the child.
+    // running or holding the pipes.
     if group_leader {
         kill_group(pid);
-    } else {
-        let _ = child.kill();
     }
-    let _ = child.wait();
+    let _ = child.kill(); // fallback: always signal the leader directly too
+    reap_bounded(child);
     (success, timed_out)
 }
 
@@ -174,24 +186,40 @@ fn run_with_timeout(mut child: Child, timeout_ms: u64, group_leader: bool) -> (b
         let _ = tx.send((1, s));
     });
 
-    let (success, timed_out) = supervise(&mut child, timeout_ms, group_leader);
+    let (mut success, timed_out) = supervise(&mut child, timeout_ms, group_leader);
 
-    // Drain the readers, bounded by a deadline so a surviving writer cannot stall
-    // the result past the timeout. The group kill above closes inherited pipes.
+    // Drain the readers, bounded so a surviving writer cannot stall the result.
+    // If both pipe ends do not close within the deadline, a descendant kept them
+    // open: the capture is incomplete, so the run is not a clean success. (On
+    // macOS a setsid-detached child that redirects the pipes can still survive;
+    // it stays sandbox-confined and is a documented limitation.)
     let mut out = String::new();
     let mut err = String::new();
+    let mut received = 0;
     let drain = Duration::from_millis(2_000);
     let drain_start = Instant::now();
     for _ in 0..2 {
         let remaining = drain.checked_sub(drain_start.elapsed()).unwrap_or_default();
         match rx.recv_timeout(remaining) {
-            Ok((0, s)) => out = s,
-            Ok((1, s)) => err = s,
+            Ok((0, s)) => {
+                out = s;
+                received += 1;
+            }
+            Ok((1, s)) => {
+                err = s;
+                received += 1;
+            }
             Ok(_) => {}
             Err(_) => break,
         }
     }
     out.push_str(&err);
+    if received < 2 {
+        success = false;
+        out.push_str(
+            "\n[omgs] output capture did not complete before the deadline; a descendant may have retained the pipes. Not reported as success.",
+        );
+    }
     (success, timed_out, out)
 }
 
