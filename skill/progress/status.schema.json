@@ -3,11 +3,11 @@
   "title": "OMGS pipeline progress status",
   "description": "Optional live-progress state the orchestrator writes at each pipeline milestone; dashboard.html polls it. Never changes a verdict; the deterministic findings.json and REPORT.html remain the record.",
   "type": "object",
-  "required": ["stages"],
+  "required": ["stages", "updated_ms"],
   "properties": {
     "run": { "type": "string" },
     "target": { "type": "string" },
-    "updated_ms": { "type": "integer", "description": "epoch milliseconds of last update" },
+    "updated_ms": { "type": "integer", "description": "epoch milliseconds of last update; required so the view can show staleness" },
     "counters": {
       "type": "object",
       "properties": {

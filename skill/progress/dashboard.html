@@ -78,7 +78,7 @@ function now(){return Date.now();}
 // (candidate titles, file paths), so treat all of it as untrusted.
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];});}
 const STATES={pending:1,active:1,done:1,failed:1};
-function stateClass(s){return STATES[s]?s:"pending";}
+function stateClass(s){return Object.prototype.hasOwnProperty.call(STATES,s)?s:"pending";}
 function kindClass(k){return /^[a-z]+$/.test(k||"")?k:"";}
 function icon(s){if(s==="active")return '<span class="spin"></span>';if(s==="done")return '<span class="tick">✓</span>';if(s==="failed")return '<span>✗</span>';return '<span class="pend">○</span>';}
 function elapsed(st){if(!st.started_ms)return "";const end=st.ended_ms||now();let t=fmtDur(end-st.started_ms);return st.status==="active"?t+" elapsed":(st.ended_ms?t:"");}
@@ -115,7 +115,8 @@ function render(d){
   log.innerHTML=(d.log||[]).slice().reverse().map(e=>
     '<div class="e k-'+kindClass(e.kind)+'"><span class="t">'+esc(e.ts||"")+'</span><span class="m">'+esc(e.m||"")+'</span></div>').join("")||'<div class="e"><span class="m">no events yet</span></div>';
   const upd=document.getElementById("upd"),dot=document.getElementById("dot");
-  if(d.updated_ms){const age=now()-d.updated_ms;upd.textContent="updated "+fmtDur(age)+" ago";dot.classList.toggle("stale",age>120000);}
+  if(typeof d.updated_ms==="number"&&isFinite(d.updated_ms)){const age=now()-d.updated_ms;upd.textContent="updated "+fmtDur(age)+" ago";dot.classList.toggle("stale",age>120000);}
+  else{upd.textContent="no timestamp";dot.classList.add("stale");}
   document.getElementById("foot").textContent="Local dashboard. Polls pipeline-status.json every 2s. No external resources.";
 }
 async function tick(){
