@@ -10,8 +10,13 @@ use omgs::sensors::run_sensors;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+/// The value after `name`. A following token that is itself an option means
+/// the value is missing, never that the option name is the value.
 fn flag(args: &[String], name: &str) -> Option<String> {
-    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+    args.windows(2)
+        .find(|w| w[0] == name)
+        .map(|w| w[1].clone())
+        .filter(|v| !v.starts_with("--"))
 }
 fn has(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
@@ -34,6 +39,20 @@ fn main() -> ExitCode {
     if rest.iter().any(|a| a == "--help" || a == "-h") {
         usage();
         return ExitCode::SUCCESS;
+    }
+    // Every option except the switches takes a value; a missing one is an
+    // error rather than being skipped or taking the next option's name.
+    const SWITCHES: [&str; 2] = ["--yes", "--no-sensors"];
+    for (i, a) in rest.iter().enumerate() {
+        if a.starts_with("--") && !SWITCHES.contains(&a.as_str()) {
+            match rest.get(i + 1) {
+                Some(v) if !v.starts_with("--") => {}
+                _ => {
+                    eprintln!("error: {a} requires a value");
+                    return ExitCode::from(2);
+                }
+            }
+        }
     }
     let result: Result<(), String> = match cmd {
         "--help" | "-h" | "help" => {
@@ -218,6 +237,20 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => return Err(format!("inspect {}: {e}", ledger_path.display())),
         };
+        if !present {
+            // Without a ledger the critic does not apply, but candidate files
+            // mean a pipeline ran: refuse rather than report over them.
+            let has_candidates = std::fs::read_dir(dir)
+                .map_err(|e| format!("read {}: {e}", dir.display()))?
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("candidates"));
+            if has_candidates {
+                return Err(format!(
+                    "{} has candidates files but no coverage-ledger.json; restore the ledger so the critic can run",
+                    dir.display()
+                ));
+            }
+        }
         if present {
             let text = std::fs::read_to_string(&ledger_path)
                 .map_err(|e| format!("read {}: {e}", ledger_path.display()))?;
@@ -673,7 +706,7 @@ fn write_ledger(path: &str, ledger: &Ledger) -> Result<(), String> {
 /// Every value given for a repeatable flag, in order.
 fn flags(args: &[String], name: &str) -> Vec<String> {
     args.windows(2)
-        .filter(|w| w[0] == name)
+        .filter(|w| w[0] == name && !w[1].starts_with("--"))
         .map(|w| w[1].clone())
         .collect()
 }
