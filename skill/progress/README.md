@@ -15,5 +15,7 @@ It binds 127.0.0.1 on an ephemeral port and prints the URL, serves only this pag
 `pipeline-status.json` (never findings, reports, or anything else in the run directory), rejects
 foreign Host headers, and exits shortly after `omgs report` marks the run complete. Update the status
 file with `omgs status --run <run-dir> --stage <id> --state active` rather than writing it by hand.
+Live status is served on Unix (macOS, Linux) only, where the file can be opened without following
+links and its link count checked; on other platforms watch fails closed and shows an empty status.
 Do not serve the run directory with a generic file server: that would expose the findings. Never
 auto-open a browser and never bind a non-loopback interface: the page describes vulnerabilities.

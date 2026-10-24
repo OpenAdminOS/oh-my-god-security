@@ -1293,3 +1293,52 @@ fn batch_index_fails_on_malformed_run_metadata() {
     assert!(summarize(&r, &index).is_err());
     let _ = std::fs::remove_dir_all(&index);
 }
+
+#[test]
+fn batch_index_rejects_wrong_metadata_types() {
+    let index = scratch("index-types");
+    let run = index.join("r");
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    let r = BatchRun {
+        url: "https://github.com/a/b".into(),
+        run_dir: Some(run.to_string_lossy().to_string()),
+        status: "initialized".into(),
+        ..Default::default()
+    };
+    for bad in [
+        r#"{"blockers":"route exhausted"}"#,
+        r#"{"reroutes":{}}"#,
+        r#"{"blockers":[7]}"#,
+        r#"{"agent_calls_used":"12"}"#,
+        r#"{"run_status":1}"#,
+    ] {
+        std::fs::write(run.join("run-metadata.json"), bad).unwrap();
+        assert!(summarize(&r, &index).is_err(), "{bad}");
+    }
+    let _ = std::fs::remove_dir_all(&index);
+}
+
+#[test]
+fn batch_init_needs_an_empty_output_directory() {
+    let dir = scratch("batch-nonempty");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let out = dir.join("out");
+    std::fs::create_dir_all(out.join("github.com")).unwrap();
+    std::fs::write(dir.join("list.txt"), "https://github.com/a/b\n").unwrap();
+    let res = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("HOME", &home)
+        .args([
+            "batch",
+            "init",
+            "--list",
+            dir.join("list.txt").to_str().unwrap(),
+        ])
+        .args(["--out", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(res.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&res.stderr).contains("not empty"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

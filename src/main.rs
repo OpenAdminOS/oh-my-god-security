@@ -1141,6 +1141,15 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                     ));
                 }
             }
+            // The batch directory must be new or empty: anything already in it
+            // (a planted symlink at <host>/<owner> for example) could redirect
+            // a run into a target.
+            if std::fs::read_dir(&out).is_ok_and(|mut d| d.next().is_some()) {
+                return Err(format!(
+                    "{} is not empty; batch init needs a new or empty --out",
+                    out.display()
+                ));
+            }
             std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
             #[cfg(unix)]
             {
@@ -1148,6 +1157,21 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o700));
             }
             let out = std::fs::canonicalize(&out).map_err(|e| e.to_string())?;
+            let resolved_targets = std::iter::once(&targets_root)
+                .chain(&dests)
+                .map(|t| resolve_existing_prefix(t))
+                .collect::<Result<Vec<_>, String>>()?;
+            let contained = |p: &Path| -> Result<(), String> {
+                let p = resolve_existing_prefix(p)?;
+                match resolved_targets.iter().find(|t| p.starts_with(t)) {
+                    Some(t) => Err(format!(
+                        "run directory {} resolves inside {}",
+                        p.display(),
+                        t.display()
+                    )),
+                    None => Ok(()),
+                }
+            };
             // Claim the batch directory exclusively before any work, so two
             // concurrent batch inits sharing --out cannot both proceed and
             // overwrite each other's batch.json.
@@ -1176,8 +1200,13 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                     // One path component per part keeps runs distinct: no
                     // separator inside a part can make two URLs collide.
                     let run_dir = out.join(&r.host).join(&r.owner).join(&r.name);
+                    // Every run path is checked against every listed target,
+                    // before the run is created and again after.
+                    contained(&run_dir)?;
                     let dest = clone_target(&url)?;
+                    contained(&run_dir)?;
                     let run = audit_init(&init_args(&dest, rest, Some(&run_dir)))?;
+                    contained(&run)?;
                     Ok((dest, run))
                 });
                 match attempt {

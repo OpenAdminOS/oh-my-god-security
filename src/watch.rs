@@ -113,6 +113,11 @@ fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> b
 /// stall the server), read up to the size cap. Anything else serves the
 /// empty status: a planted link must never expose another run file.
 fn read_status(path: &Path) -> Option<Vec<u8>> {
+    // Without a stable way to check the link count and open without
+    // following links, other platforms fail closed and serve the empty status.
+    if !cfg!(unix) {
+        return None;
+    }
     let meta = std::fs::symlink_metadata(path).ok()?;
     if !meta.file_type().is_file() || meta.len() > MAX_STATUS {
         return None;

@@ -148,6 +148,33 @@ fn read_present(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// The run metadata fields the index reads must have their documented
+/// types; a wrong type is an error, never a silently empty value.
+fn check_meta_types(meta: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    use serde_json::Value;
+    let wrong = |k: &str| Err(format!("{k} has the wrong type"));
+    match meta.get("run_status") {
+        None | Some(Value::String(_)) => {}
+        _ => return wrong("run_status"),
+    }
+    match meta.get("agent_calls_used") {
+        None | Some(Value::Null) => {}
+        Some(v) if v.is_u64() => {}
+        _ => return wrong("agent_calls_used"),
+    }
+    match meta.get("reroutes") {
+        None => {}
+        Some(Value::Array(a)) if a.iter().all(|r| r.is_object()) => {}
+        _ => return wrong("reroutes"),
+    }
+    match meta.get("blockers") {
+        None => {}
+        Some(Value::Array(a)) if a.iter().all(|b| b.is_string()) => {}
+        _ => return wrong("blockers"),
+    }
+    Ok(())
+}
+
 /// Summarize one run directory. A file that is absent leaves its fields
 /// empty and says so in `blockers`, so a half-finished run is visible; a file
 /// that exists but is malformed is an error, so the index never shows a
@@ -181,6 +208,7 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
     }
     if read_present(&dir.join(crate::runmeta::FILE))?.is_some() {
         let meta = crate::runmeta::read(dir)?;
+        check_meta_types(&meta).map_err(|e| at(crate::runmeta::FILE, e))?;
         if let Some(st) = meta.get("run_status").and_then(|v| v.as_str()) {
             s.state = st.to_string();
         }
