@@ -1719,3 +1719,38 @@ fn a_reused_clone_matches_by_repository_identity_not_spelling() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn markdown_shows_intent_answers_for_every_verdict() {
+    let mut confirmed = open_record("c", Some("web.public-resource"), "app/c.ts");
+    confirmed.verdict = Verdict::Confirmed;
+    confirmed.severity = Some(omgs::model::Severity::High);
+    confirmed.proof_tier = ProofTier::TestProven;
+    confirmed.evidence = "Trace: x. Sandbox evidence: y.".into();
+    let mut rejected = open_record("r", Some("web.public-resource"), "app/r.ts");
+    rejected.verdict = Verdict::Rejected;
+    rejected.evidence = "Counterevidence: guarded.".into();
+    let file = FindingsFile {
+        findings: vec![confirmed, rejected],
+    };
+    let meta = ReportMeta {
+        intent_answers: omgs::intent::Answers {
+            target: "/x".into(),
+            answers: vec![omgs::intent::Answer {
+                id: "web.public-resource".into(),
+                answer: "signed-in users only".into(),
+                scope: "repo".into(),
+                source: "owner".into(),
+                recorded_unix: 1,
+            }],
+        },
+        ..ReportMeta::default()
+    };
+    let md = render_markdown(&file, &meta);
+    assert_eq!(
+        md.matches("Recorded answer: signed-in users only").count(),
+        2,
+        "{md}"
+    );
+    assert_eq!(md.matches("Intent question:").count(), 2);
+}

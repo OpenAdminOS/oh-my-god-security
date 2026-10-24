@@ -56,6 +56,17 @@ fn answers_for(meta: &ReportMeta, f: &Finding) -> Vec<String> {
     lines
 }
 
+/// A record's intent question and any recorded answers, for every verdict,
+/// matching what the HTML card shows.
+fn push_intent(out: &mut String, meta: &ReportMeta, f: &Finding) {
+    if let Some(q) = question_of(f) {
+        out.push_str(&format!("Intent question: {q}\n\n"));
+    }
+    for a in answers_for(meta, f) {
+        out.push_str(&format!("Recorded answer: {a}\n\n"));
+    }
+}
+
 fn models_text(meta: &ReportMeta) -> Option<String> {
     let mut parts = Vec::new();
     if !meta.models.is_empty() {
@@ -148,6 +159,7 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         if let Some(brief) = &f.fix_brief {
             out.push_str(&format!("Fix brief: {brief}\n\n"));
         }
+        push_intent(&mut out, meta, f);
     }
     let intent: Vec<_> = file
         .findings
@@ -166,12 +178,7 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
             if let Some(p) = &f.prerequisites {
                 out.push_str(&format!("Prerequisites: {p}\n\n"));
             }
-            if let Some(q) = question_of(f) {
-                out.push_str(&format!("Intent question: {q}\n\n"));
-            }
-            for a in answers_for(meta, f) {
-                out.push_str(&format!("Recorded answer: {a}\n\n"));
-            }
+            push_intent(&mut out, meta, f);
         }
     }
     if !rejected.is_empty() {
@@ -183,6 +190,7 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
                 location_line(f),
                 f.evidence
             ));
+            push_intent(&mut out, meta, f);
         }
     }
     if !meta.coverage.is_empty() {
