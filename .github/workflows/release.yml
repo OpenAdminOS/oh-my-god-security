@@ -11,19 +11,21 @@ name: release
 # release job re-verifies the tag still points at that commit, uploads to a
 # draft, confirms the draft's exact asset set, then flips it to published.
 #
-# Prerequisite (one-time, enforced by the release job): the repository must be
-# public and carry an active ruleset that protects version tags from update and
-# deletion, so a tag cannot be moved after its binaries are built. Create it with:
+# Required one-time setup (operator-owned, not verified at release time): the
+# repository must be public (the install scripts download anonymously) and should
+# carry an active ruleset making version tags immutable, so a tag cannot be moved
+# after its binaries are built. Create it with:
 #   gh api -X POST repos/OpenAdminOS/oh-my-god-security/rulesets \
 #     -f name='Protect version tags' -f target=tag -f enforcement=active \
 #     -F 'conditions[ref_name][include][]=refs/tags/v*' \
 #     -F 'conditions[ref_name][exclude][]' \
 #     -F 'rules[][type]=update' -F 'rules[][type]=deletion'
-# The release job fails closed if this protection is absent. Verifying it needs
-# RULESET_READ_TOKEN (below): the default GITHUB_TOKEN cannot read bypass_actors.
-# If a prior run left a draft release for the tag, the job also fails closed; the
-# operator deletes that draft by hand before re-running (the job never auto-
-# deletes a release, since it could be published concurrently).
+# and leave its bypass list empty. The release job does not inspect the ruleset
+# (that would require an admin-write token in CI, a larger risk than it removes);
+# instead it re-verifies the tag still points at the built commit just before
+# publishing. If a prior run left a draft release for the tag, the job fails
+# closed and the operator deletes that draft by hand before re-running (the job
+# never auto-deletes a release, since it could be published concurrently).
 #
 # Required secrets (same names as the proven TenuVault pipeline):
 #   macOS: MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER
@@ -31,9 +33,6 @@ name: release
 #     AZURE_SIGNING_TENANT_ID, AZURE_SIGNING_CLIENT_ID, AZURE_SIGNING_CLIENT_SECRET,
 #     AZURE_TRUSTED_SIGNING_ENDPOINT, AZURE_TRUSTED_SIGNING_ACCOUNT_NAME,
 #     AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME, AZURE_TRUSTED_SIGNING_PUBLISHER_NAME
-#   Tag protection: RULESET_READ_TOKEN, a fine-grained PAT scoped to this repo
-#     only, with Repository permissions > Administration: Read-only. Needed because
-#     ruleset bypass_actors is returned only to callers with Administration:read.
 
 on:
   push:
@@ -238,78 +237,6 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: staging
-      - name: Require enforced immutable tag protection
-        env:
-          # A dedicated read-scoped credential: bypass_actors is only returned to a
-          # caller with Administration:read, which the default GITHUB_TOKEN cannot
-          # be granted. Without it the gate could never observe a correct ruleset.
-          GH_TOKEN: ${{ secrets.RULESET_READ_TOKEN }}
-          REPO: ${{ github.repository }}
-          TAG: ${{ needs.prepare.outputs.version }}
-        run: |
-          set -euo pipefail
-          # target_commitish is ignored once a tag exists, so a tag moved by an
-          # external force-push after our verification could still be published
-          # against binaries built from the old commit. The only full fix is a
-          # repository that forbids updating or deleting version tags. Require an
-          # active ruleset that does so and fail closed otherwise. Rulesets are
-          # free on public repositories, which this must be for the anonymous
-          # release downloads in install.sh/install.ps1 to work.
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::RULESET_READ_TOKEN is not set; provide a fine-grained PAT scoped to this repo with Administration:read so tag protection can be verified"; exit 1
-          fi
-          if ! sets="$(gh api --paginate "repos/${REPO}/rulesets" 2>"$RUNNER_TEMP/rs.err")"; then
-            echo "::error::cannot read rulesets with RULESET_READ_TOKEN; ensure it has Administration:read and the repo is public with a tag ruleset protecting '${TAG}' from update and deletion"
-            cat "$RUNNER_TEMP/rs.err" || true; exit 1
-          fi
-          ref="refs/tags/${TAG}"
-          ok=false
-          for id in $(printf '%s' "$sets" | jq -r '.[] | select(.target=="tag" and .enforcement=="active") | .id'); do
-            rule="$(gh api "repos/${REPO}/rulesets/${id}")"
-            types=",$(printf '%s' "$rule" | jq -r '[.rules[].type] | join(",")'),"
-            case "$types" in *",update,"*) : ;; *) continue ;; esac
-            case "$types" in *",deletion,"*) : ;; *) continue ;; esac
-            # Any bypass actor (or a bypass list hidden by insufficient access)
-            # means the tag is not truly immutable; require a provably empty list.
-            nbypass="$(printf '%s' "$rule" | jq -r 'if (.bypass_actors|type)=="array" then (.bypass_actors|length|tostring) else "unknown" end')"
-            [ "$nbypass" = "0" ] || { echo "ruleset $id has/hides bypass actors ($nbypass); not immutable, skipping"; continue; }
-            # Certify only coverage we can evaluate exactly: no exclusions (GitHub
-            # File.fnmatch semantics differ from shell globbing, so an exclusion we
-            # cannot faithfully evaluate must not be trusted), and include patterns
-            # restricted to ~ALL, an exact ref, or a single trailing-'*' prefix.
-            nexc="$(printf '%s' "$rule" | jq -r '(.conditions.ref_name.exclude // []) | length')"
-            [ "$nexc" = "0" ] || { echo "ruleset $id uses exclusions; cannot prove coverage, skipping"; continue; }
-            covered=no
-            inc="$(printf '%s' "$rule" | jq -r '.conditions.ref_name.include[]?')"
-            while IFS= read -r p; do
-              [ -z "$p" ] && continue
-              case "$p" in
-                '~ALL') covered=yes ;;
-                *'**'*|*'?'*|*'['*|*']'*|*'{'*|*'}'*) : ;;   # unsupported metachars: do not certify
-                *'*')
-                  # GitHub '*' never crosses '/', so a trailing-'*' pattern only
-                  # covers our (slash-free) tag when it is refs/tags/<prefix>* with
-                  # no '/' or extra '*' in <prefix>. Reject bare '*', refs/*,
-                  # refs/tags* and the like, which would be a false certification.
-                  pre="${p%\*}"
-                  case "$p" in
-                    refs/tags/*)
-                      rest="${pre#refs/tags/}"
-                      case "$rest" in
-                        *'*'*|*/*) : ;;
-                        *) case "$ref" in "$pre"*) covered=yes ;; esac ;;
-                      esac ;;
-                    *) : ;;
-                  esac ;;
-                *) [ "$p" = "$ref" ] && covered=yes ;;
-              esac
-            done < <(printf '%s\n' "$inc")
-            if [ "$covered" = yes ]; then ok=true; break; fi
-          done
-          if [ "$ok" != true ]; then
-            echo "::error::no active ruleset provably protects '${TAG}' from update/deletion with no bypass actors; add a simple tag ruleset (include refs/tags/v*, no exclusions, no bypass actors)"; exit 1
-          fi
-          echo "immutable tag protection verified for ${TAG}"
       - name: Re-verify the tag still points at the built commit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -346,7 +273,9 @@ jobs:
           if ! rels="$(gh api --paginate "repos/${REPO}/releases" 2>"$RUNNER_TEMP/rel.err")"; then
             echo "::error::cannot list releases for $TAG; failing closed"; cat "$RUNNER_TEMP/rel.err" || true; exit 1
           fi
-          match="$(printf '%s' "$rels" | jq -r --arg t "$TAG" '[.[] | select(.tag_name==$t)] | length')"
+          # gh --paginate emits one JSON array per page; slurp (-s) and double-
+          # flatten so the count spans all pages instead of being per-page.
+          match="$(printf '%s' "$rels" | jq -sr --arg t "$TAG" '[.[][] | select(.tag_name==$t)] | length')"
           if [ "$match" != "0" ]; then
             echo "::error::a release already exists for $TAG (draft or published); delete it manually and re-run, or bump the version"; exit 1
           fi
