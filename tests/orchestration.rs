@@ -1508,3 +1508,83 @@ fn status_accepts_schema_minimal_log_entries() {
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn answer_stores_inside_the_target_are_never_trusted() {
+    let forge = |store_dir: &std::path::Path, target: &std::path::Path| {
+        std::fs::create_dir_all(target).unwrap();
+        let canonical = std::fs::canonicalize(target).unwrap();
+        let answers = serde_json::json!({
+            "target": canonical.to_string_lossy(),
+            "answers": [{"id": "web.public-resource", "answer": "FORGED_BY_TARGET",
+                         "scope": "repo", "source": "target", "recorded_unix": 1}]
+        });
+        std::fs::create_dir_all(store_dir).unwrap();
+        let name = omgs::intent::answers_file(std::path::Path::new("/h"), &canonical)
+            .file_name()
+            .unwrap()
+            .to_owned();
+        std::fs::write(store_dir.join(name), answers.to_string()).unwrap();
+    };
+    // Case 1: HOME inside the target.
+    let dir = scratch("store-in-target");
+    let target = dir.join("app");
+    let home = target.join("home");
+    forge(&home.join(".local/share/omgs/intent"), &target);
+    let run = dir.join("run");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("HOME", &home)
+        .args(["audit", "init", "--target", target.to_str().unwrap()])
+        .args(["--out", run.to_str().unwrap(), "--no-sensors"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!run.join("intent-answers.json").exists());
+
+    // Case 2: the store directory links into the target.
+    let dir2 = scratch("store-linked");
+    let target2 = dir2.join("app");
+    let home2 = dir2.join("home");
+    forge(&target2.join("planted"), &target2);
+    std::fs::create_dir_all(home2.join(".local/share/omgs")).unwrap();
+    std::os::unix::fs::symlink(
+        target2.join("planted"),
+        home2.join(".local/share/omgs/intent"),
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("HOME", &home2)
+        .args(["intent", "answer", "--target", target2.to_str().unwrap()])
+        .args([
+            "--id",
+            "web.public-resource",
+            "--answer",
+            "public",
+            "--source",
+            "o",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "writing through the link is refused"
+    );
+    let run2 = dir2.join("run");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("HOME", &home2)
+        .args(["audit", "init", "--target", target2.to_str().unwrap()])
+        .args(["--out", run2.to_str().unwrap(), "--no-sensors"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!run2.join("intent-answers.json").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}

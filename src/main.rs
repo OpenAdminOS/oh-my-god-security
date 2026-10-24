@@ -385,6 +385,28 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The reviewer's answer store for `target`, only when it physically lives
+/// outside the target: HOME, the store directory, or any parent resolving
+/// into the target (or the store file being a link) would let the target
+/// author "recorded" answers.
+fn trusted_store(target: &Path) -> Result<PathBuf, String> {
+    let path = omgs::intent::answers_file(&home().join(".local/share/omgs"), target);
+    if resolve_existing_prefix(&path)?.starts_with(target) {
+        return Err(format!(
+            "the intent answer store {} resolves inside the target {}; refusing to use it",
+            path.display(),
+            target.display()
+        ));
+    }
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.file_type().is_file()) {
+        return Err(format!(
+            "the intent answer store {} is not a regular file; refusing to use it",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
 /// The run's intent answers, only when they belong to the run's target as
 /// recorded in run metadata; anything else is ignored with a warning.
 fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
@@ -418,10 +440,11 @@ fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
     if Path::new(&answers.target) != target {
         return refuse("they belong to a different target");
     }
-    let store = omgs::intent::load_answers(&omgs::intent::answers_file(
-        &home().join(".local/share/omgs"),
-        &target,
-    ))?;
+    let store_path = match trusted_store(&target) {
+        Ok(p) => p,
+        Err(e) => return refuse(&e),
+    };
+    let store = omgs::intent::load_answers(&store_path)?;
     if Path::new(&store.target) != target {
         return refuse("the reviewer's store for this path belongs to another target");
     }
@@ -785,7 +808,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     }
     // Bring the reviewer's recorded intent answers for this exact target into
     // the run, so earlier answers resolve matching questions in the report.
-    let answers_src = omgs::intent::answers_file(&home().join(".local/share/omgs"), &target);
+    let answers_src = trusted_store(&target)?;
     if answers_src.is_file() {
         let answers = omgs::intent::load_answers(&answers_src)?;
         if Path::new(&answers.target) == target {
@@ -1528,10 +1551,13 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
                 source: get("--source")?,
                 recorded_unix: omgs::runmeta::now_unix(),
             };
-            let path = omgs::intent::answers_file(&home().join(".local/share/omgs"), &target);
+            let path = trusted_store(&target)?;
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             }
+            // Recheck after creating the directories, in case a parent link
+            // appeared in between.
+            let path = trusted_store(&target)?;
             let id = answer.id.clone();
             // The whole load, merge, and replace runs under a per-target lock
             // so concurrent answers are never lost.
