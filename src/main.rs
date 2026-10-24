@@ -336,11 +336,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         critic,
         models: run_models(findings_dir.as_deref()),
         reroutes: run_reroutes(findings_dir.as_deref()),
-        intent_answers: findings_dir
-            .as_deref()
-            .map(|d| omgs::intent::load_answers(&d.join("intent-answers.json")))
-            .transpose()?
-            .unwrap_or_default(),
+        intent_answers: run_answers(findings_dir.as_deref())?,
     };
     let dir = Path::new(&out);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -377,9 +373,34 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 "completed_unix".into(),
                 serde_json::json!(omgs::runmeta::now_unix()),
             );
+            Ok(())
         })?;
     }
     Ok(())
+}
+
+/// The run's intent answers, only when they belong to the run's target as
+/// recorded in run metadata; anything else is ignored with a warning.
+fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
+    let Some(dir) = dir else {
+        return Ok(Default::default());
+    };
+    let answers = omgs::intent::load_answers(&dir.join("intent-answers.json"))?;
+    if answers.answers.is_empty() {
+        return Ok(answers);
+    }
+    let target = omgs::runmeta::read(dir)
+        .ok()
+        .and_then(|m| m.get("target").and_then(|t| t.as_str()).map(String::from));
+    if target.as_deref() == Some(answers.target.as_str()) {
+        Ok(answers)
+    } else {
+        eprintln!(
+            "warning: intent-answers.json belongs to {}, not this run's target; answers not shown",
+            answers.target
+        );
+        Ok(Default::default())
+    }
 }
 
 /// "role: model" lines from run metadata `models`, sorted by role.
@@ -466,6 +487,7 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
 /// Resolve `p` through its nearest existing ancestor, so a symlink anywhere
 /// in an output path is followed before the outside-the-target check.
 fn resolve_existing_prefix(p: &Path) -> PathBuf {
+    let p = &omgs::runmeta::normalize(p);
     let mut existing = p.to_path_buf();
     let mut rest = Vec::new();
     while !existing.exists() {
@@ -513,7 +535,16 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
                     .map_err(|e| e.to_string())?
                     .join(&out)
             };
+            let out_abs = omgs::runmeta::normalize(&out_abs);
             outside(&out_abs)?;
+            // A run directory is always fresh: reusing one would overwrite a
+            // finished run or mix two targets' evidence and answers.
+            if std::fs::read_dir(&out_abs).is_ok_and(|mut d| d.next().is_some()) {
+                return Err(format!(
+                    "{} already exists and is not empty; choose a new run directory",
+                    out_abs.display()
+                ));
+            }
             std::fs::create_dir_all(&out_abs).map_err(|e| e.to_string())?;
             out_abs
         }
@@ -1029,13 +1060,21 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o700));
             }
             let out = std::fs::canonicalize(&out).map_err(|e| e.to_string())?;
+            if out.join("batch.json").exists() {
+                return Err(format!(
+                    "{} already holds a batch; choose a new --out",
+                    out.display()
+                ));
+            }
             let mut batch = omgs::batch::BatchFile {
                 created_unix: omgs::runmeta::now_unix(),
                 runs: Vec::new(),
             };
             for url in urls {
                 let attempt = omgs::batch::parse_repo_url(&url).and_then(|r| {
-                    let run_dir = out.join(format!("{}__{}__{}", r.host, r.owner, r.name));
+                    // One path component per part keeps runs distinct: no
+                    // separator inside a part can make two URLs collide.
+                    let run_dir = out.join(&r.host).join(&r.owner).join(&r.name);
                     let dest = clone_target(&url)?;
                     let run = audit_init(&init_args(&dest, rest, Some(&run_dir)))?;
                     Ok((dest, run))
@@ -1071,7 +1110,11 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 path.display(),
                 batch.runs.len() - failed
             );
-            Ok(())
+            if failed > 0 {
+                Err("__EXIT1__".into())
+            } else {
+                Ok(())
+            }
         }
         Some("index") => {
             let path = flag(rest, "--batch").ok_or("batch index requires --batch <batch.json>")?;
@@ -1079,6 +1122,25 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             let batch: omgs::batch::BatchFile =
                 serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))?;
             let out = PathBuf::from(flag(rest, "--out").ok_or("batch index requires --out <dir>")?);
+            let out_abs = if out.is_absolute() {
+                out.clone()
+            } else {
+                std::env::current_dir().map_err(|e| e.to_string())?.join(&out)
+            };
+            let resolved = resolve_existing_prefix(&out_abs);
+            for run in &batch.runs {
+                let Some(t) = run.target.as_deref().and_then(|t| std::fs::canonicalize(t).ok())
+                else {
+                    continue;
+                };
+                if resolved.starts_with(&t) {
+                    return Err(format!(
+                        "index output must live outside every reviewed target, and {} is inside {}",
+                        out_abs.display(),
+                        t.display()
+                    ));
+                }
+            }
             std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
             let out = std::fs::canonicalize(&out).map_err(|e| e.to_string())?;
             let runs: Vec<_> = batch
@@ -1175,29 +1237,30 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
         ));
     }
     let models = omgs::route::load_models(&models_path(args))?;
-    let meta = omgs::runmeta::read(&run)?;
-    let mut refused: Vec<String> = meta
-        .get("reroutes")
-        .and_then(|r| r.as_array())
-        .map(|list| {
-            list.iter()
-                .filter(|r| r.get("role").and_then(|v| v.as_str()) == Some(role.as_str()))
-                .filter_map(|r| r.get("from").and_then(|v| v.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
     let newly = flag(args, "--refused");
-    if newly.is_some() && flag(args, "--reason").is_none_or(|r| r.trim().is_empty()) {
+    let reason = flag(args, "--reason").unwrap_or_default();
+    if newly.is_some() && reason.trim().is_empty() {
         return Err("--refused requires --reason <text>".into());
     }
-    if let Some(m) = &newly {
-        if !refused.contains(m) {
-            refused.push(m.clone());
+    // Read the refusal history, pick the next model, and record the result in
+    // one locked transaction, so concurrent reroutes never lose an entry.
+    let next = omgs::runmeta::update(&run, |m| {
+        let mut refused: Vec<String> = m
+            .get("reroutes")
+            .and_then(|r| r.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter(|r| r.get("role").and_then(|v| v.as_str()) == Some(role.as_str()))
+                    .filter_map(|r| r.get("from").and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(model) = &newly {
+            if !refused.contains(model) {
+                refused.push(model.clone());
+            }
         }
-    }
-    let next = omgs::route::next_model(&models, &role, &refused);
-    let reason = flag(args, "--reason").unwrap_or_default();
-    omgs::runmeta::update(&run, |m| {
+        let next = omgs::route::next_model(&models, &role, &refused);
         if let Some(from) = &newly {
             let entry = serde_json::json!({
                 "role": role,
@@ -1216,8 +1279,11 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
         }
         match &next {
             Ok(model) => {
-                let models = m.entry("models").or_insert_with(|| serde_json::json!({}));
-                if let Some(obj) = models.as_object_mut() {
+                if let Some(obj) = m
+                    .entry("models")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                {
                     obj.insert(role.clone(), serde_json::json!(model));
                 }
             }
@@ -1227,10 +1293,14 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
                     .or_insert_with(|| serde_json::json!([]))
                     .as_array_mut()
                 {
-                    list.push(serde_json::json!(e));
+                    let e = serde_json::json!(e);
+                    if !list.contains(&e) {
+                        list.push(e);
+                    }
                 }
             }
         }
+        Ok(next)
     })?;
     match next {
         Ok(model) => {

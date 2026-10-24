@@ -1,7 +1,7 @@
 //! `pipeline-status.json`, the optional live progress file the dashboard polls.
 //! `omgs status` updates it so orchestrators never hand-write the JSON.
 
-use crate::runmeta::{now_ms, write_atomic};
+use crate::runmeta::{clock, now_ms, with_lock, write_atomic};
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
@@ -66,8 +66,13 @@ fn set_state(entry: &mut Map<String, Value>, state: &str, detail: Option<&str>, 
     }
 }
 
-/// Apply one update to the status file in `dir`, creating it when absent.
+/// Apply one update to the status file in `dir`, creating it when absent,
+/// under the run lock so parallel hunters never drop each other's updates.
 pub fn apply(dir: &Path, u: &Update) -> Result<(), String> {
+    with_lock(dir, || apply_locked(dir, u))
+}
+
+fn apply_locked(dir: &Path, u: &Update) -> Result<(), String> {
     if !STATES.contains(&u.state) {
         return Err(format!("--state must be one of {}", STATES.join(", ")));
     }
@@ -126,7 +131,7 @@ pub fn apply(dir: &Path, u: &Update) -> Result<(), String> {
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or("log is not an array")?;
-        log.push(json!({ "ts": now, "kind": u.state, "m": m }));
+        log.push(json!({ "ts": clock(now), "kind": u.state, "m": m }));
         let excess = log.len().saturating_sub(LOG_LIMIT);
         log.drain(..excess);
     }

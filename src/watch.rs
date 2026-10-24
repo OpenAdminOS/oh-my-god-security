@@ -101,12 +101,23 @@ fn write_response(stream: &mut TcpStream, r: &Response) {
     let _ = stream.write_all(&r.body);
 }
 
+/// Total time one connection may take to send its request, so a client that
+/// trickles bytes cannot hold the single server thread.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
+
 fn handle(mut stream: TcpStream, port: u16, run_dir: &Path) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let deadline = Instant::now() + REQUEST_DEADLINE;
+    let _ = stream.set_write_timeout(Some(REQUEST_DEADLINE));
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        let Some(left) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+        else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(left));
         match stream.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
@@ -142,7 +153,6 @@ pub fn serve(listener: TcpListener, port: u16, run_dir: &Path, max: Duration) {
             Ok((stream, _)) => {
                 let _ = stream.set_nonblocking(false);
                 handle(stream, port, run_dir);
-                continue;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => {}
@@ -156,6 +166,6 @@ pub fn serve(listener: TcpListener, port: u16, run_dir: &Path, max: Duration) {
         if completed_at.is_some_and(|t| t.elapsed() >= COMPLETE_GRACE) || start.elapsed() >= max {
             return;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(Duration::from_millis(10));
     }
 }

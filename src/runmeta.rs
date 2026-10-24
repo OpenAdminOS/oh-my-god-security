@@ -45,12 +45,87 @@ pub fn read(dir: &Path) -> Result<Map<String, Value>, String> {
     }
 }
 
-/// Apply `change` to the run metadata in `dir` and write it back atomically.
-pub fn update(dir: &Path, change: impl FnOnce(&mut Map<String, Value>)) -> Result<(), String> {
-    let mut meta = read(dir)?;
-    change(&mut meta);
-    let text = serde_json::to_string_pretty(&Value::Object(meta)).map_err(|e| e.to_string())?;
-    write_atomic(&dir.join(FILE), &format!("{text}\n"))
+const LOCK: &str = ".omgs-run.lock";
+/// A lock older than this is from a crashed process and is broken.
+const STALE_LOCK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run `f` while holding the run directory's lock, so concurrent omgs
+/// processes (parallel hunters updating status, route, report) serialize
+/// their read-modify-write cycles instead of losing each other's changes.
+pub fn with_lock<T>(dir: &Path, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let lock = dir.join(LOCK);
+    let start = std::time::Instant::now();
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&lock)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > STALE_LOCK);
+                if stale {
+                    let _ = std::fs::remove_file(&lock);
+                    continue;
+                }
+                if start.elapsed() > std::time::Duration::from_secs(10) {
+                    return Err(format!("timed out waiting for {}", lock.display()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(format!("lock {}: {e}", lock.display())),
+        }
+    }
+    let result = f();
+    let _ = std::fs::remove_file(&lock);
+    result
+}
+
+/// Apply `change` to the run metadata in `dir` under the run lock and write
+/// it back atomically. `change` may fail, in which case nothing is written.
+pub fn update<T>(
+    dir: &Path,
+    change: impl FnOnce(&mut Map<String, Value>) -> Result<T, String>,
+) -> Result<T, String> {
+    with_lock(dir, || {
+        let mut meta = read(dir)?;
+        let out = change(&mut meta)?;
+        let text = serde_json::to_string_pretty(&Value::Object(meta)).map_err(|e| e.to_string())?;
+        write_atomic(&dir.join(FILE), &format!("{text}\n"))?;
+        Ok(out)
+    })
+}
+
+/// Clock time of day in UTC for log lines, for example "14:03:09".
+pub fn clock(ms: u64) -> String {
+    let secs = ms / 1000;
+    format!(
+        "{:02}:{:02}:{:02}",
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60
+    )
+}
+
+/// Remove `.` and resolve `..` lexically, so a later existence walk never
+/// stops on a `..` after a missing component.
+pub fn normalize(p: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 pub fn is_complete(dir: &Path) -> bool {

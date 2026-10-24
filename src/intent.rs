@@ -61,14 +61,14 @@ pub struct Answer {
     pub recorded_unix: u64,
 }
 
+/// Both fields are required in a file that exists; only an absent file
+/// means "no answers yet".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Answers {
     /// Canonical path of the target these answers belong to. Checked before
-    /// answers are copied into a run, so two repositories that share a
-    /// directory name never share answers.
-    #[serde(default)]
+    /// answers are copied into a run or rendered, so two repositories never
+    /// share answers.
     pub target: String,
-    #[serde(default)]
     pub answers: Vec<Answer>,
 }
 

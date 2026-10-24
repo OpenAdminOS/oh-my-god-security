@@ -618,3 +618,216 @@ fn batch_file_requires_runs() {
     assert!(serde_json::from_str::<omgs::batch::BatchFile>(r#"{"run": []}"#).is_err());
     assert!(serde_json::from_str::<omgs::batch::BatchFile>(r#"{"runs": []}"#).is_ok());
 }
+
+#[test]
+fn concurrent_route_and_status_updates_are_not_lost() {
+    let dir = scratch("concurrent");
+    std::fs::write(
+        dir.join("run-metadata.json"),
+        r#"{"run_status":"in_progress"}"#,
+    )
+    .unwrap();
+    let models = dir.join("models.json");
+    std::fs::write(
+        &models,
+        r#"{"roles":{"hunter":["m1","m2","m3","m4","m5","m6"]}}"#,
+    )
+    .unwrap();
+    let run = dir.to_str().unwrap().to_string();
+    let m = models.to_str().unwrap().to_string();
+    let mut kids = Vec::new();
+    for i in 1..=4 {
+        kids.push(
+            std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .args(["route", "--run", &run, "--role", "hunter", "--models", &m])
+                .args(["--refused", &format!("m{i}"), "--reason", "declined"])
+                .spawn()
+                .unwrap(),
+        );
+        kids.push(
+            std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .args(["status", "--run", &run, "--parent", "hunt", "--stage"])
+                .args([&format!("red-{i}"), "--state", "active"])
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for mut k in kids {
+        assert!(k.wait().unwrap().success());
+    }
+    let meta = omgs::runmeta::read(&dir).unwrap();
+    assert_eq!(meta["reroutes"].as_array().unwrap().len(), 4);
+    let status: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("pipeline-status.json")).unwrap())
+            .unwrap();
+    assert_eq!(status["stages"][0]["children"].as_array().unwrap().len(), 4);
+    assert!(!dir.join(".omgs-run.lock").exists(), "lock released");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn status_log_timestamps_are_strings_per_schema() {
+    let dir = scratch("ts");
+    omgs::status::apply(
+        &dir,
+        &omgs::status::Update {
+            stage: "map",
+            label: None,
+            parent: None,
+            state: "active",
+            detail: None,
+            counters: &[],
+            log: Some("mapping"),
+        },
+    )
+    .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("pipeline-status.json")).unwrap())
+            .unwrap();
+    let ts = v["log"][0]["ts"].as_str().expect("ts is a string");
+    assert_eq!(ts.len(), 8);
+    assert_eq!(omgs::runmeta::clock(3_723_000), "01:02:03");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_trickling_client_cannot_hold_the_watch_server() {
+    use std::io::Write;
+    let dir = scratch("slow");
+    std::fs::write(
+        dir.join("run-metadata.json"),
+        r#"{"run_status":"in_progress"}"#,
+    )
+    .unwrap();
+    let (listener, port) = omgs::watch::bind().unwrap();
+    let d = dir.clone();
+    let start = std::time::Instant::now();
+    let server = std::thread::spawn(move || {
+        omgs::watch::serve(listener, port, &d, std::time::Duration::from_millis(300))
+    });
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let writer = std::thread::spawn(move || {
+        for _ in 0..20 {
+            if s.write_all(b"G").is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        }
+    });
+    server.join().unwrap();
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(4),
+        "max deadline held despite a slow client: {:?}",
+        start.elapsed()
+    );
+    let _ = writer.join();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn run_directories_are_always_fresh() {
+    let dir = scratch("fresh");
+    let target = dir.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let out = dir.join("run");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("findings.json"), "keep me").unwrap();
+    let res = omgs(&[
+        "audit",
+        "init",
+        "--target",
+        target.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--no-sensors",
+    ]);
+    assert_eq!(res.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&res.stderr).contains("not empty"));
+    assert_eq!(
+        std::fs::read_to_string(out.join("findings.json")).unwrap(),
+        "keep me"
+    );
+    // A `..` after a missing component cannot smuggle the output into the target.
+    let sneaky = dir.join("missing/../target/runs");
+    let res = omgs(&[
+        "audit",
+        "init",
+        "--target",
+        target.to_str().unwrap(),
+        "--out",
+        sneaky.to_str().unwrap(),
+        "--no-sensors",
+    ]);
+    assert_eq!(res.status.code(), Some(2));
+    assert!(!target.join("runs").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn batch_index_refuses_output_inside_a_target() {
+    let dir = scratch("index-target");
+    let target = dir.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let batch = serde_json::json!({"runs": [{"url": "https://github.com/a/b",
+        "target": target.to_string_lossy(), "run_dir": null, "status": "failed", "error": "x"}]});
+    std::fs::write(dir.join("batch.json"), batch.to_string()).unwrap();
+    let res = omgs(&[
+        "batch",
+        "index",
+        "--batch",
+        dir.join("batch.json").to_str().unwrap(),
+        "--out",
+        target.join("idx").to_str().unwrap(),
+    ]);
+    assert_eq!(res.status.code(), Some(2));
+    assert!(!target.join("idx").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn answers_files_are_strict_and_bound_to_the_run_target() {
+    let dir = scratch("answers");
+    std::fs::write(
+        dir.join("intent-answers.json"),
+        r#"{"target":"/x","answer":[]}"#,
+    )
+    .unwrap();
+    assert!(omgs::intent::load_answers(&dir.join("intent-answers.json")).is_err());
+    assert!(omgs::intent::load_answers(&dir.join("absent.json"))
+        .unwrap()
+        .answers
+        .is_empty());
+    std::fs::write(
+        dir.join("intent-answers.json"),
+        r#"{"target":"/somewhere/else","answers":[{"id":"web.public-resource","answer":"public","scope":"repo","source":"o","recorded_unix":1}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("run-metadata.json"),
+        r#"{"target":"/this/target"}"#,
+    )
+    .unwrap();
+    let mut f = open_record("a", Some("web.public-resource"), "a.ts");
+    f.title = "Shared question".into();
+    std::fs::write(
+        dir.join("findings.json"),
+        serde_json::to_string(&FindingsFile { findings: vec![f] }).unwrap(),
+    )
+    .unwrap();
+    let res = omgs(&[
+        "report",
+        "--findings",
+        dir.join("findings.json").to_str().unwrap(),
+        "--out",
+        dir.to_str().unwrap(),
+    ]);
+    assert!(
+        res.status.success(),
+        "{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert!(String::from_utf8_lossy(&res.stderr).contains("answers not shown"));
+    let md = std::fs::read_to_string(dir.join("REPORT.md")).unwrap();
+    assert!(!md.contains("Recorded answer"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
