@@ -272,7 +272,13 @@ pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport,
     let mut names: Vec<String> = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
         let entry = entry.map_err(|e| format!("read {}: {e}", dir.display()))?;
-        let name = entry.file_name().to_string_lossy().to_string();
+        let Ok(name) = entry.file_name().into_string() else {
+            let lossy = entry.file_name().to_string_lossy().to_string();
+            if lossy.starts_with("candidates") {
+                return Err(format!("{lossy} has a non-UTF-8 name; rename it"));
+            }
+            continue;
+        };
         if !(name.starts_with("candidates") && name.ends_with(".json")) {
             continue;
         }

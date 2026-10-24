@@ -935,3 +935,47 @@ fn report_fails_on_malformed_companion_files() {
     assert!(!dir.join("out/REPORT.html").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn zero_lines_and_dangling_ledgers_are_errors() {
+    let mut f = record("a");
+    f.locations = vec![copy_at("copied.swift", 0)];
+    assert!(has(
+        &validate(&file(vec![f.clone()])),
+        "line must be one-based"
+    ));
+    let mut v = serde_json::to_value(file(vec![f])).unwrap();
+    assert!(omgs::shape::findings(&v.to_string()).is_err());
+    v["findings"][0]["locations"] = serde_json::json!([]);
+    v["findings"][0]["severity"] = serde_json::json!("high");
+    assert!(omgs::shape::findings(&v.to_string()).is_ok());
+    let mut open = record("b");
+    open.verdict = Verdict::NeedsValidation;
+    open.severity = None;
+    open.proof_tier = ProofTier::Traced;
+    assert!(
+        omgs::shape::findings(&serde_json::to_string(&file(vec![open])).unwrap()).is_ok(),
+        "a serialized absent severity (null) parses"
+    );
+    #[cfg(unix)]
+    {
+        let dir = scratch("dangling-ledger");
+        let (_, _, findings) = complete_run();
+        std::fs::write(
+            dir.join("findings.json"),
+            serde_json::to_string(&findings).unwrap(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.join("nowhere.json"), dir.join("coverage-ledger.json"))
+            .unwrap();
+        let out = omgs(&[
+            "report",
+            "--findings",
+            dir.join("findings.json").to_str().unwrap(),
+            "--out",
+            dir.join("out").to_str().unwrap(),
+        ]);
+        assert_eq!(out.status.code(), Some(2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

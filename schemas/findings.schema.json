@@ -22,7 +22,7 @@
           "location": {
             "type": "object",
             "required": ["path"],
-            "properties": { "path": { "type": "string" }, "line": { "type": "integer" } }
+            "properties": { "path": { "type": "string" }, "line": { "type": "integer", "minimum": 1 } }
           },
           "locations": {
             "type": "array",
@@ -30,7 +30,7 @@
             "items": {
               "type": "object",
               "required": ["path"],
-              "properties": { "path": { "type": "string" }, "line": { "type": "integer" } }
+              "properties": { "path": { "type": "string" }, "line": { "type": "integer", "minimum": 1 } }
             }
           },
           "evidence": { "type": "string" },

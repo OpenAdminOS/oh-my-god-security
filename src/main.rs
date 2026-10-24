@@ -211,7 +211,14 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         // candidates file that exists but does not parse is an error, so a
         // malformed run can never render as a clean report.
         let ledger_path = dir.join("coverage-ledger.json");
-        if ledger_path.exists() {
+        // symlink_metadata sees a dangling link that exists() reports as
+        // absent; only a genuinely missing entry skips the critic.
+        let present = match std::fs::symlink_metadata(&ledger_path) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(format!("inspect {}: {e}", ledger_path.display())),
+        };
+        if present {
             let text = std::fs::read_to_string(&ledger_path)
                 .map_err(|e| format!("read {}: {e}", ledger_path.display()))?;
             let ledger = omgs::shape::ledger(&text)
