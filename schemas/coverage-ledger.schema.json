@@ -13,8 +13,24 @@
           "id": { "type": "string" },
           "surface": { "type": "string" },
           "attack_classes": { "type": "array", "items": { "type": "string" } },
-          "status": { "enum": ["planned", "candidate", "covered", "deferred", "blocked", "out_of_scope"] }
-        }
+          "status": { "enum": ["planned", "candidate", "covered", "deferred", "blocked", "out_of_scope"] },
+          "evidence": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "What shows the unit was examined: finding fingerprints, candidate files, or repo paths."
+          },
+          "note": { "type": "string", "description": "Why the unit was deferred, blocked, or put out of scope." }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "status": { "const": "covered" } } },
+            "then": { "required": ["evidence"], "properties": { "evidence": { "minItems": 1 } } }
+          },
+          {
+            "if": { "properties": { "status": { "enum": ["deferred", "blocked", "out_of_scope"] } } },
+            "then": { "required": ["note"], "properties": { "note": { "minLength": 1 } } }
+          }
+        ]
       }
     }
   }

@@ -29,3 +29,16 @@ Rules for next time:
   build failure) must fail loudly and distinctly. Never read a harness abort as the target refusing
   the operation; on the first field run a bare-leaf dylib load silently aborted every case and
   produced false "refused" results.
+
+## 2026-10-24: never default a required field in a security input
+
+What happened: in the coverage critic PR, four review rounds in a row found the same defect one
+level deeper each time: a `#[serde(default)]` on a required container or field (`candidates`,
+`units`, `findings`, then unit `surface`/`attack_classes` and candidate identity fields) let a
+misspelled or dropped key parse as empty, which the critic then certified as a pass.
+
+Rules for next time:
+- A field the schema marks required has no serde default. Missing input must be a parse error,
+  never an empty value a checker can pass.
+- When fixing one instance of a bug class, sweep every struct the same input flows through
+  before asking for re-review.

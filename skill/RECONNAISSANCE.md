@@ -30,7 +30,7 @@ Each unit records:
 - Suspected sink and enforcement chain, including backend delegations and evidence locations.
 - Assignment owner, call/time budget, status, candidate fingerprints, and reason for the status.
 
-Use statuses `unexamined`, `assigned`, `examined`, `blocked`, and `out_of_scope`. An examined unit has a trace and disposition even when it yielded no candidate. A blocked unit names its exact missing evidence or capability. Out of scope needs a reason; it never means safe.
+The ledger file stores each unit as `id`, `surface`, `attack_classes`, `status`, plus `evidence` (finding fingerprints, candidate files, or paths) and `note`; keep the richer planning detail above in the unit's surface text or the architecture map. Use statuses `planned`, `candidate`, `covered`, `deferred`, `blocked`, and `out_of_scope`. A covered unit has a trace and disposition even when it yielded no candidate, and `omgs ledger set` refuses `covered` without at least one `--evidence` reference. A blocked or deferred unit names its exact missing evidence or capability, and out of scope needs a reason; the CLI requires `--note` for all three. Out of scope never means safe. Add units discovered during the run with `omgs ledger add --ledger <run-dir>/coverage-ledger.json --unit <id> --surface <s> --classes <a,b>`.
 
 Example unit: `GET /api/projects/[id]` by a member of tenant A, tenant A to tenant B project rows, `tenant_isolation`, sink `loadProject`, invariant that only current-tenant rows can be returned. Check both the application predicate and the effective database role before proposing a violation.
 

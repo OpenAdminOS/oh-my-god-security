@@ -88,3 +88,10 @@ Still planned (tracked, not yet done):
 - Fold a pipeline and coverage timeline into `REPORT.html` so the methodology (which agents ran, timings, what was examined) is preserved in the deterministic artifact, not only in the ephemeral progress view.
 - Populate the benchmark corpus with real post-cutoff CVE pairs and publish recall, false positives, cost, and variance, so "best in class" rests on numbers rather than description.
 - Consider a `--watch` convenience in the skill that stands up the loopback progress server and tears it down with the run.
+
+## Pre 0.1 workflow gaps (2026-10-24)
+
+Closed before the first release:
+- Item 5, full form: a finding carries `locations` for further copies of one root cause, so a copied defect is one record that counts once; Markdown, HTML, and SARIF list every location.
+- Item 12: verifier separation is enforced by the CLI. Every record needs `hunted_by` and `verified_by`, and `omgs validate` rejects them when equal. Candidates carry `hunter`, a record lists any further merged candidates in `candidates`, and `omgs critic` rejects a record whose verifier hunted any candidate it absorbed.
+- Item 13: the ledger is typed (`src/ledger.rs`) with `evidence` and `note` per unit and enforced transitions (`covered` needs evidence; `deferred`, `blocked`, `out_of_scope` need a reason). `omgs ledger add`, `set`, and `list` manage it, and `omgs critic --run <dir>` is the mechanical coverage critic: unreconciled units, candidates no finding accounts for, records no unit cites, and broken hunter or verifier provenance all fail it. `omgs report` embeds the critic result.

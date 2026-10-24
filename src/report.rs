@@ -1,6 +1,8 @@
+use crate::critic::CriticReport;
 use crate::html_escape;
-use crate::model::{Finding, FindingsFile, Verdict};
+use crate::model::{Finding, FindingsFile, Location, Verdict};
 
+#[derive(Default)]
 pub struct ReportMeta {
     pub repo: String,
     pub source_ref: String,
@@ -16,6 +18,15 @@ pub struct ReportMeta {
     pub verifier: Option<String>,
     /// Total agent/model calls across hunt, challenge and verify, when recorded.
     pub agent_calls: Option<u32>,
+    /// Coverage critic result, when the run files were available to check.
+    pub critic: Option<CriticReport>,
+}
+
+fn critic_text(meta: &ReportMeta) -> String {
+    meta.critic
+        .as_ref()
+        .map(|c| c.summary())
+        .unwrap_or_else(|| "not run".into())
 }
 
 /// One line describing who ran the review and at what cost. Each unrecorded
@@ -76,14 +87,14 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         out.push_str(&format!("Sensors: {sensors}\n\n"));
     }
     out.push_str(&format!("Run: {}\n\n", run_meta_text(meta)));
+    out.push_str(&format!("Coverage critic: {}\n\n", critic_text(meta)));
     for f in &conf {
         out.push_str(&format!(
-            "## {} ({}, {})\n\nLocation: {}{}\n\n{}\n\n",
+            "## {} ({}, {})\n\n{}\n\n{}\n\n",
             f.title,
             f.severity.map(|s| s.label()).unwrap_or("none"),
             f.proof_tier.label(),
-            f.location.path,
-            f.location.line.map(|l| format!(":{l}")).unwrap_or_default(),
+            location_line(f),
             f.evidence
         ));
         if let Some(brief) = &f.fix_brief {
@@ -99,10 +110,9 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         out.push_str("## Needs validation\n\n");
         for f in intent {
             out.push_str(&format!(
-                "### {}\n\nLocation: {}{}\n\n{}\n\n",
+                "### {}\n\n{}\n\n{}\n\n",
                 f.title,
-                f.location.path,
-                f.location.line.map(|l| format!(":{l}")).unwrap_or_default(),
+                location_line(f),
                 f.evidence
             ));
             if let Some(p) = &f.prerequisites {
@@ -117,10 +127,9 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         out.push_str("## Rejected after verification\n\n");
         for f in rejected {
             out.push_str(&format!(
-                "### {}\n\nLocation: {}{}\n\n{}\n\n",
+                "### {}\n\n{}\n\n{}\n\n",
                 f.title,
-                f.location.path,
-                f.location.line.map(|l| format!(":{l}")).unwrap_or_default(),
+                location_line(f),
                 f.evidence
             ));
         }
@@ -129,6 +138,13 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         out.push_str("## Coverage\n\n");
         for line in &meta.coverage {
             out.push_str(&format!("- {line}\n"));
+        }
+        out.push('\n');
+    }
+    if let Some(critic) = meta.critic.as_ref().filter(|c| !c.passed()) {
+        out.push_str("## Coverage critic gaps\n\n");
+        for gap in &critic.gaps {
+            out.push_str(&format!("- {gap}\n"));
         }
         out.push('\n');
     }
@@ -404,12 +420,29 @@ fn nonblank(value: &Option<String>) -> Option<&str> {
     value.as_deref().map(str::trim).filter(|v| !v.is_empty())
 }
 
-fn location(f: &Finding) -> String {
+fn place(l: &Location) -> String {
     format!(
         "{}{}",
-        f.location.path,
-        f.location.line.map(|l| format!(":{l}")).unwrap_or_default()
+        l.path,
+        l.line.map(|n| format!(":{n}")).unwrap_or_default()
     )
+}
+
+fn location(f: &Finding) -> String {
+    place(&f.location)
+}
+
+/// Markdown location line: the primary location, then any further copies.
+fn location_line(f: &Finding) -> String {
+    if f.locations.is_empty() {
+        format!("Location: {}", location(f))
+    } else {
+        let all: Vec<String> = std::iter::once(&f.location)
+            .chain(&f.locations)
+            .map(place)
+            .collect();
+        format!("Locations: {}", all.join(", "))
+    }
 }
 
 fn verdict_label(verdict: Verdict) -> (&'static str, &'static str) {
@@ -463,9 +496,18 @@ fn render_facts(f: &Finding) -> String {
             format!("<code>{}</code>", html_escape(&f.attack_class)),
         ));
     }
+    if !f.locations.is_empty() {
+        let also: Vec<String> = f
+            .locations
+            .iter()
+            .map(|l| format!("<code>{}</code>", html_escape(&place(l))))
+            .collect();
+        rows.push(("Also at", also.join(" ")));
+    }
     for (name, value) in [
         ("Family", &f.family),
         ("Prerequisites", &f.prerequisites),
+        ("Hunted by", &f.hunted_by),
         ("Verified by", &f.verified_by),
     ] {
         if let Some(v) = nonblank(value) {
@@ -658,13 +700,21 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
             Some(sev) => format!("{text}, {}", html_escape(sev.label())),
             None => text.to_string(),
         };
+        let more = if r.f.locations.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<span class=\"more\">and {}</span>",
+                plural(r.f.locations.len(), "more location", "more locations")
+            )
+        };
         let question = if nonblank(&r.f.intent_question).is_some() {
             "<span class=\"q\">Has a question</span>"
         } else {
             ""
         };
         rows.push_str(&format!(
-            "<tr class=\"v-{class}\"><td>{reference}</td><td><a href=\"#{id}\">{title}</a><code class=\"loc\">{loc}</code></td><td class=\"out\">{outcome}{question}</td><td class=\"out\">{tier}</td></tr>",
+            "<tr class=\"v-{class}\"><td>{reference}</td><td><a href=\"#{id}\">{title}</a><code class=\"loc\">{loc}</code>{more}</td><td class=\"out\">{outcome}{question}</td><td class=\"out\">{tier}</td></tr>",
             reference = html_escape(&r.reference),
             id = html_escape(&r.anchor),
             title = html_escape(&r.f.title),
@@ -754,11 +804,29 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
         items.push_str("</ul>");
         items
     };
+    let critic_body = match &meta.critic {
+        None => "<p class=\"note\">Coverage critic: not run for this report.</p>".to_string(),
+        Some(c) if c.passed() => format!(
+            "<p class=\"note\">Coverage critic: {}. Every candidate was verified by someone other than its hunter, and every unit was examined or closed with a reason.</p>",
+            html_escape(&c.summary())
+        ),
+        Some(c) => {
+            let mut items = format!(
+                "<div class=\"callout c-missing\"><h4>Coverage critic: {}</h4><ul class=\"gaps\">",
+                html_escape(&c.summary())
+            );
+            for gap in &c.gaps {
+                items.push_str(&format!("<li>{}</li>", html_escape(gap)));
+            }
+            items.push_str("</ul></div>");
+            items
+        }
+    };
     let coverage_html = render_section(
         "coverage",
         "Coverage",
         "Anything not listed here was not examined.",
-        &coverage_body,
+        &format!("{coverage_body}{critic_body}"),
     );
 
     let reading_html = render_section(
@@ -835,6 +903,7 @@ table.index{width:100%;border-collapse:collapse;background:var(--surface);border
 .index tr.v-rejected td:first-child{border-left-color:var(--green)}
 .index .loc{display:block;margin-top:2px;font-size:12px;color:var(--faint)}
 .index .out{white-space:nowrap;color:var(--muted)}
+.index .more{display:block;font-size:12px;color:var(--faint)}
 .index .q{display:block;font-size:12.5px;color:var(--violet)}
 .finding{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--line);border-radius:8px;padding:18px 20px;margin:0 0 16px;scroll-margin-top:56px}
 .finding.v-confirmed{border-left-color:var(--red)}
@@ -886,6 +955,7 @@ table.index{width:100%;border-collapse:collapse;background:var(--surface);border
 .question{margin:4px 0 8px;max-width:70ch;font-size:16.5px;line-height:1.5;font-weight:500}
 .about{margin:0;font-size:13.5px;color:var(--muted)}
 .sec-rejected>.intro{padding:10px 14px;border-left:3px solid var(--green);border-radius:6px;background:var(--green-bg);color:var(--text)}
+.gaps{margin:4px 0 0;padding-left:20px;font-size:13.5px}
 .coverage{margin:0;padding:12px 18px 12px 36px;background:var(--surface);border:1px solid var(--line);border-radius:8px;font-family:var(--mono);font-size:13px}
 .reading{display:grid;grid-template-columns:max-content 1fr;gap:8px 18px;margin:0;font-size:14px}
 .reading div{display:contents}
@@ -922,10 +992,13 @@ pub fn render_sarif(file: &FindingsFile, meta: &ReportMeta) -> String {
                 "level": "error",
                 "message": { "text": format!("{}: {}", f.title, f.evidence) },
                 "fingerprints": { "omgs/v1": f.fingerprint },
-                "locations": [{ "physicalLocation": {
-                    "artifactLocation": { "uri": f.location.path },
-                    "region": { "startLine": f.location.line.unwrap_or(1) }
-                }}]
+                "locations": std::iter::once(&f.location)
+                    .chain(&f.locations)
+                    .map(|l| serde_json::json!({ "physicalLocation": {
+                        "artifactLocation": { "uri": l.path },
+                        "region": { "startLine": l.line.unwrap_or(1) }
+                    }}))
+                    .collect::<Vec<_>>()
             })
         })
         .collect();

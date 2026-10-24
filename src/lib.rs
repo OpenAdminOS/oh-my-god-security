@@ -1,8 +1,11 @@
 pub mod architecture;
+pub mod critic;
+pub mod ledger;
 pub mod model;
 pub mod report;
 pub mod sandbox;
 pub mod sensors;
+pub mod shape;
 
 /// Stable, non cryptographic fingerprint for finding identity across runs.
 /// Inputs are the semantic identity of a finding, never prose or line numbers.

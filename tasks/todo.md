@@ -11,12 +11,12 @@ separate Claude evaluator; merge only when both are green and the user says so.
 
 ## PR B: finding model, verifier separation, ledger, coverage critic (`feat/verifier-ledger-critic`)
 
-- [ ] `Finding.locations` (grouped root cause), rendered in MD/HTML/SARIF, validated
-- [ ] `hunted_by` + `verified_by` required and distinct; `candidates` list on findings;
+- [x] `Finding.locations` (grouped root cause), rendered in MD/HTML/SARIF, validated
+- [x] `hunted_by` + `verified_by` required and distinct; `candidates` list on findings;
       `hunter` required in candidates schema
-- [ ] typed ledger (`src/ledger.rs`), `ledger add/set/list`, evidence + note, transition rules
-- [ ] `omgs critic --run <dir>`; report renders the critic result
-- [ ] fixtures, schemas, skill docs, README, usage(), IMPROVEMENTS.md updated
+- [x] typed ledger (`src/ledger.rs`), `ledger add/set/list`, evidence + note, transition rules
+- [x] `omgs critic --run <dir>`; report renders the critic result
+- [x] fixtures, schemas, skill docs, README, usage(), IMPROVEMENTS.md updated
 - [ ] tests; reviews green; merged
 
 ## PR C: run orchestration (`feat/run-orchestration`)
