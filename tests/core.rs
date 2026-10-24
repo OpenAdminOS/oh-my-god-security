@@ -530,3 +530,397 @@ fn semgrep_parser_keeps_only_metadata() {
     let dump = format!("{report:?}");
     assert!(!dump.contains("supersecret"), "matched source text leaked");
 }
+
+// --- architecture map ---------------------------------------------------------
+
+use omgs::architecture::{
+    from_json, render_architecture_html, render_architecture_markdown, validate_architecture,
+    ArchitectureFile, Boundary, Component, Flow, InputSurface, Principal, Zone,
+};
+
+fn arch() -> ArchitectureFile {
+    ArchitectureFile {
+        target: "demo-app".into(),
+        zones: vec![
+            Zone {
+                id: "z1".into(),
+                name: "Internet".into(),
+                trust: Some("untrusted".into()),
+                ..Default::default()
+            },
+            Zone {
+                id: "z2".into(),
+                name: "Application".into(),
+                trust: Some("application".into()),
+                ..Default::default()
+            },
+            Zone {
+                id: "z3".into(),
+                name: "Data".into(),
+                trust: Some("data".into()),
+                ..Default::default()
+            },
+        ],
+        components: vec![
+            Component {
+                id: "c".into(),
+                name: "Browser".into(),
+                zone: "z1".into(),
+                kind: Some("client".into()),
+                ..Default::default()
+            },
+            Component {
+                id: "r".into(),
+                name: "GET /x".into(),
+                zone: "z2".into(),
+                kind: Some("route".into()),
+                entry_point: true,
+                path: "app/x/route.ts".into(),
+                ..Default::default()
+            },
+            Component {
+                id: "d".into(),
+                name: "Postgres".into(),
+                zone: "z3".into(),
+                kind: Some("datastore".into()),
+                ..Default::default()
+            },
+        ],
+        boundaries: vec![Boundary {
+            id: "bd".into(),
+            name: "edge".into(),
+            between: Some(vec!["z1".into(), "z2".into()]),
+            ..Default::default()
+        }],
+        flows: vec![
+            Flow {
+                from: "c".into(),
+                to: "r".into(),
+                crosses: "bd".into(),
+                ..Default::default()
+            },
+            Flow {
+                from: "r".into(),
+                to: "d".into(),
+                ..Default::default()
+            },
+        ],
+        input_surfaces: vec![InputSurface {
+            id: "s".into(),
+            component: "r".into(),
+            attacker: "anon".into(),
+            ..Default::default()
+        }],
+        unexamined: vec!["admin console not mapped".into()],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn architecture_validate_accepts_and_rejects() {
+    assert!(validate_architecture(&arch()).is_empty());
+
+    let mut empty = ArchitectureFile {
+        target: "t".into(),
+        ..Default::default()
+    };
+    let errs = validate_architecture(&empty);
+    assert!(errs.iter().any(|e| e.contains("zones is empty")));
+    assert!(errs.iter().any(|e| e.contains("components is empty")));
+
+    // dangling flow and unknown zone
+    empty = arch();
+    empty.flows.push(Flow {
+        from: "nope".into(),
+        to: "r".into(),
+        ..Default::default()
+    });
+    empty.components.push(Component {
+        id: "x".into(),
+        name: "X".into(),
+        zone: "ghost".into(),
+        ..Default::default()
+    });
+    let errs = validate_architecture(&empty);
+    assert!(errs
+        .iter()
+        .any(|e| e.contains("from 'nope' is not a component")));
+    assert!(errs
+        .iter()
+        .any(|e| e.contains("zone 'ghost' is not defined")));
+}
+
+#[test]
+fn architecture_render_is_deterministic() {
+    let a = arch();
+    assert_eq!(render_architecture_html(&a), render_architecture_html(&a));
+    assert_eq!(
+        render_architecture_markdown(&a),
+        render_architecture_markdown(&a)
+    );
+    let html = render_architecture_html(&a);
+    assert!(html.contains("Architecture"));
+    assert!(html.contains("<svg"));
+    assert!(html.contains("Postgres"));
+}
+
+#[test]
+fn architecture_html_loads_nothing_external() {
+    let html = render_architecture_html(&arch());
+    assert!(!html.contains("http://") && !html.contains("https://"));
+    assert!(!html.contains("src=") && !html.contains("url("));
+    assert!(!html.to_lowercase().contains("<script"));
+    assert_eq!(
+        html.matches("<svg").count(),
+        1,
+        "exactly one trusted diagram"
+    );
+    for (i, _) in html.match_indices("href=\"") {
+        assert!(html[i + 6..].starts_with('#'), "non-anchor link at {i}");
+    }
+    assert!(html.contains("http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'"));
+}
+
+#[test]
+fn architecture_escapes_hostile_fields() {
+    let payload = "<script>alert(1)</script>\" onmouseover=\"alert(2)";
+    let mut a = arch();
+    a.target = payload.into();
+    a.components[1].name = payload.into();
+    a.components[1].tech = payload.into();
+    a.zones[1].name = payload.into();
+    let html = render_architecture_html(&a).to_lowercase();
+    assert!(!html.contains("<script"));
+    assert!(!html.contains("onmouseover=\""));
+    assert!(!html.contains("<img"));
+    assert!(render_architecture_html(&a).contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+
+    let md = render_architecture_markdown(&a);
+    assert!(!md.contains("<script>"));
+    assert!(md.contains("&lt;script&gt;"));
+}
+
+#[test]
+fn architecture_renders_minimal_and_skips_empty_sections() {
+    let a = ArchitectureFile {
+        target: "tiny".into(),
+        zones: vec![Zone {
+            id: "z".into(),
+            name: "App".into(),
+            ..Default::default()
+        }],
+        components: vec![Component {
+            id: "only".into(),
+            name: "App".into(),
+            zone: "z".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(validate_architecture(&a).is_empty());
+    let html = render_architecture_html(&a);
+    assert!(!html.contains("id=\"flows\""));
+    assert!(!html.contains("id=\"boundaries\""));
+    assert!(!html.contains("id=\"surface\""));
+    assert!(html.contains("Nothing recorded as unexamined"));
+}
+
+#[test]
+fn architecture_from_json_is_lenient() {
+    // unknown kind value and an unknown top-level field must not fail parsing
+    let a = from_json(
+        r#"{ "target":"j", "surprise": true,
+             "zones":[{"id":"z","name":"App"}],
+             "components":[{"id":"c","name":"C","zone":"z","kind":"frobnicator"}] }"#,
+    )
+    .expect("lenient parse");
+    assert_eq!(a.components[0].kind.as_deref(), Some("frobnicator"));
+    assert!(validate_architecture(&a).is_empty());
+    let _ = render_architecture_html(&a);
+}
+
+#[test]
+fn architecture_markdown_neutralizes_link_injection() {
+    let mut a = arch();
+    a.components[1].name = "![x](http://evil)".into();
+    a.components[1].tech = "[click](javascript:alert(1))".into();
+    let md = render_architecture_markdown(&a);
+    assert!(
+        !md.contains("]("),
+        "link/image target syntax must be escaped"
+    );
+    assert!(!md.contains("!["), "image syntax must be escaped");
+    assert!(
+        md.contains("\\!\\[x\\]"),
+        "payload should appear backslash-escaped"
+    );
+}
+
+#[test]
+fn architecture_validate_catches_structural_gaps() {
+    // empty/missing component zone must fail, not hide the component
+    let mut a = arch();
+    a.components[0].zone = String::new();
+    assert!(validate_architecture(&a)
+        .iter()
+        .any(|e| e.contains("zone is empty")));
+
+    // explicit empty boundary.between is invalid (schema needs exactly two)
+    a = arch();
+    a.boundaries[0].between = Some(vec![]);
+    assert!(validate_architecture(&a)
+        .iter()
+        .any(|e| e.contains("must name exactly two zones")));
+
+    // absent between (None) is allowed
+    a = arch();
+    a.boundaries[0].between = None;
+    assert!(validate_architecture(&a).is_empty());
+
+    // duplicate flow ids are rejected
+    a = arch();
+    a.flows[0].id = "dup".into();
+    a.flows[1].id = "dup".into();
+    assert!(validate_architecture(&a)
+        .iter()
+        .any(|e| e.contains("duplicate flow id 'dup'")));
+}
+
+#[test]
+fn architecture_html_includes_notes_and_principals() {
+    let mut a = arch();
+    a.notes = "Mapped the web app only".into();
+    a.principals = vec![Principal {
+        id: "p".into(),
+        name: "Admin".into(),
+        kind: Some("admin".into()),
+        ..Default::default()
+    }];
+    let html = render_architecture_html(&a);
+    assert!(html.contains("id=\"notes\""));
+    assert!(html.contains("Mapped the web app only"));
+    assert!(html.contains("id=\"principals\""));
+    assert!(html.contains("Admin"));
+}
+
+#[test]
+fn architecture_html_neutralizes_banned_byte_sequences() {
+    let mut a = arch();
+    a.stack.notes = "see https://service.example/api with src= and url( here".into();
+    let html = render_architecture_html(&a);
+    // the invariant bans survive as inert entities, not literal bytes
+    assert!(!html.contains("https://"));
+    assert!(!html.contains("src="));
+    assert!(!html.contains("url("));
+    // but the text is still readable
+    assert!(html.contains("service.example"));
+}
+
+#[test]
+fn architecture_clamps_wide_labels_only_when_needed() {
+    // normal labels must not be width-clamped (clamping would stretch them)
+    assert!(!render_architecture_html(&arch()).contains("textLength"));
+
+    // pathological wide labels get a width clamp so they stay inside their box
+    let mut a = arch();
+    a.zones[0].name = "W".repeat(300);
+    a.components[0].name = "W".repeat(20);
+    let html = render_architecture_html(&a);
+    assert!(html.contains("class=\"arch-zone\" text-anchor=\"middle\" textLength=\"290\""));
+    assert!(html.contains("class=\"arch-name\" textLength=\"180\""));
+}
+
+#[test]
+fn architecture_clamps_css_uppercased_labels() {
+    // ß uppercases to "SS" in CSS; the width estimate must account for it
+    let mut a = arch();
+    a.zones[0].name = "\u{00df}".repeat(24);
+    let html = render_architecture_html(&a);
+    assert!(html.contains("class=\"arch-zone\" text-anchor=\"middle\" textLength=\"290\""));
+
+    // kind is uppercased by CSS, so a long lowercase kind must still clamp
+    let mut b = arch();
+    b.components[0].kind = Some("a".repeat(26));
+    assert!(render_architecture_html(&b).contains("class=\"arch-kind\" textLength=\"180\""));
+}
+
+#[test]
+fn architecture_single_column_reserves_a_gutter() {
+    // one zone, three components, a -> c skipping b: a same-column flow needs a
+    // reserved right gutter so it does not cross node b.
+    let a = ArchitectureFile {
+        target: "one".into(),
+        zones: vec![Zone {
+            id: "z".into(),
+            name: "App".into(),
+            ..Default::default()
+        }],
+        components: vec![
+            Component {
+                id: "a".into(),
+                name: "A".into(),
+                zone: "z".into(),
+                ..Default::default()
+            },
+            Component {
+                id: "b".into(),
+                name: "B".into(),
+                zone: "z".into(),
+                ..Default::default()
+            },
+            Component {
+                id: "c".into(),
+                name: "C".into(),
+                zone: "z".into(),
+                ..Default::default()
+            },
+        ],
+        flows: vec![Flow {
+            from: "a".into(),
+            to: "c".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(validate_architecture(&a).is_empty());
+    let html = render_architecture_html(&a);
+    // base single-column width is 292; the reserved gutter widens it to 396
+    assert!(html.contains("viewBox=\"0 0 396"));
+    assert_eq!(html.matches("<svg").count(), 1);
+}
+
+#[test]
+fn architecture_sample_fixture_is_valid() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/architecture.sample.json"
+    );
+    let txt = std::fs::read_to_string(path).expect("read sample");
+    let a = from_json(&txt).expect("parse sample");
+    assert!(
+        validate_architecture(&a).is_empty(),
+        "sample must validate: {:?}",
+        validate_architecture(&a)
+    );
+    assert_eq!(render_architecture_html(&a).matches("<svg").count(), 1);
+    let _ = render_architecture_markdown(&a);
+}
+
+#[test]
+fn architecture_renders_cyclic_flows_without_panic() {
+    let mut a = arch();
+    a.flows.push(Flow {
+        from: "r".into(),
+        to: "c".into(),
+        ..Default::default()
+    });
+    a.flows.push(Flow {
+        from: "c".into(),
+        to: "r".into(),
+        ..Default::default()
+    });
+    assert!(validate_architecture(&a).is_empty());
+    let first = render_architecture_html(&a);
+    assert_eq!(first, render_architecture_html(&a));
+    assert!(first.contains("<svg"));
+}

@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OMGS target architecture map",
+  "description": "A descriptive architecture map of the reviewed target application, produced by the Map phase of an OMGS review. It is descriptive only and never changes a verdict. The omgs CLI renders it deterministically to ARCHITECTURE.md and a self-contained ARCHITECTURE.html. All free-text fields are target-derived and must be treated as untrusted when rendered.",
+  "type": "object",
+  "required": ["target", "zones", "components"],
+  "additionalProperties": false,
+  "properties": {
+    "target": { "type": "string", "description": "Canonical path or name of the reviewed repository." },
+    "source_ref": { "type": "string", "description": "Exact source commit or worktree identity the map was built from." },
+    "generated": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "run": { "type": "string" },
+        "by": { "type": "string", "description": "Which agent or phase produced the map." },
+        "updated_ms": { "type": "integer", "description": "Epoch milliseconds; rendering must not embed this in deterministic output." }
+      }
+    },
+    "stack": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Detected technology stack (deterministic sensors plus agent confirmation).",
+      "properties": {
+        "languages": { "type": "array", "items": { "type": "string" } },
+        "frameworks": { "type": "array", "items": { "type": "string" } },
+        "package_managers": { "type": "array", "items": { "type": "string" } },
+        "runtimes": { "type": "array", "items": { "type": "string" } },
+        "datastores": { "type": "array", "items": { "type": "string" } },
+        "notes": { "type": "string" }
+      }
+    },
+    "zones": {
+      "type": "array",
+      "description": "Trust zones, ordered from least to most trusted (external to core). Layout columns derive from this order.",
+      "items": {
+        "type": "object",
+        "required": ["id", "name"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "trust": { "type": "string", "enum": ["untrusted", "edge", "application", "data", "external_service", "admin"] },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "principals": {
+      "type": "array",
+      "description": "Actors that interact with the system.",
+      "items": {
+        "type": "object",
+        "required": ["id", "name"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "kind": { "type": "string", "enum": ["anonymous", "user", "authenticated", "service", "admin", "external", "system"] },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "components": {
+      "type": "array",
+      "description": "Nodes of the architecture graph.",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "zone"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "zone": { "type": "string", "description": "A zone id." },
+          "kind": { "type": "string", "enum": ["client", "ui", "route", "action", "api", "middleware", "service", "worker", "job", "datastore", "cache", "queue", "external_service", "config", "auth", "file"] },
+          "tech": { "type": "string" },
+          "path": { "type": "string", "description": "Repo-relative path, when one applies." },
+          "entry_point": { "type": "boolean", "description": "True if an external attacker can reach this component directly." },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "boundaries": {
+      "type": "array",
+      "description": "Trust boundaries between zones, with the controls that enforce them.",
+      "items": {
+        "type": "object",
+        "required": ["id", "name"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "between": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2, "description": "Two zone ids." },
+          "enforcement": { "type": "array", "items": { "type": "string" } },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "flows": {
+      "type": "array",
+      "description": "Directed data flows between components (the graph edges).",
+      "items": {
+        "type": "object",
+        "required": ["from", "to"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "from": { "type": "string", "description": "Source component id." },
+          "to": { "type": "string", "description": "Destination component id." },
+          "data": { "type": "string" },
+          "protocol": { "type": "string" },
+          "authn": { "type": "string", "description": "How the flow is authenticated, if at all." },
+          "authz": { "type": "string", "description": "How the flow is authorized, if at all." },
+          "crosses": { "type": "string", "description": "Id of a boundary this flow crosses, if any." },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "input_surfaces": {
+      "type": "array",
+      "description": "Externally reachable entry points: the attack surface.",
+      "items": {
+        "type": "object",
+        "required": ["id", "component"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "component": { "type": "string", "description": "Component id that receives the input." },
+          "attacker": { "type": "string", "description": "Attacker capability or principal that can reach it." },
+          "notes": { "type": "string" }
+        }
+      }
+    },
+    "unexamined": {
+      "type": "array",
+      "description": "Areas not mapped or not reviewed, stated plainly so the map never implies more coverage than was achieved.",
+      "items": { "type": "string" }
+    },
+    "notes": { "type": "string" }
+  }
+}

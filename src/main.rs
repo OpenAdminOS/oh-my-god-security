@@ -1,3 +1,6 @@
+use omgs::architecture::{
+    render_architecture_html, render_architecture_markdown, validate_architecture, ArchitectureFile,
+};
 use omgs::model::{validate, FindingsFile};
 use omgs::report::{render_html, render_markdown, render_sarif, ReportMeta};
 use omgs::sandbox::{prove, ProveOutcome, ProveRequest};
@@ -14,7 +17,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <url> [--mode gate|advisory] [--budget <n>]\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--cwd <dir>] [--scratch <dir>] [--timeout-ms <n>]\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status>\n  omgs check --target <repo> [--out <run-dir>]\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <url> [--mode gate|advisory] [--budget <n>]\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--cwd <dir>] [--scratch <dir>] [--timeout-ms <n>]\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status>\n  omgs check --target <repo> [--out <run-dir>]\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -46,6 +49,7 @@ fn main() -> ExitCode {
         "fingerprint" => cmd_fingerprint(rest),
         "prove" => cmd_prove(rest),
         "report" => cmd_report(rest),
+        "architecture" => cmd_architecture(rest),
         "ledger" => cmd_ledger(rest),
         "check" => cmd_check(rest),
         other => Err(format!("unknown command '{other}'")),
@@ -83,6 +87,42 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
         }
         Err("__EXIT1__".into())
     }
+}
+
+fn read_architecture(path: &str) -> Result<ArchitectureFile, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("parse {path}: {e}"))
+}
+
+fn cmd_architecture(args: &[String]) -> Result<(), String> {
+    let inp = flag(args, "--in").ok_or("architecture requires --in <architecture.json>")?;
+    let out = flag(args, "--out").ok_or("architecture requires --out <dir>")?;
+    let file = read_architecture(&inp)?;
+    let errors = validate_architecture(&file);
+    if !errors.is_empty() {
+        for e in &errors {
+            eprintln!("invalid: {e}");
+        }
+        return Err("__EXIT1__".into());
+    }
+    let dir = Path::new(&out);
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    std::fs::write(
+        dir.join("ARCHITECTURE.md"),
+        render_architecture_markdown(&file),
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        dir.join("ARCHITECTURE.html"),
+        render_architecture_html(&file),
+    )
+    .map_err(|e| e.to_string())?;
+    println!(
+        "wrote {}, {}",
+        dir.join("ARCHITECTURE.md").display(),
+        dir.join("ARCHITECTURE.html").display()
+    );
+    Ok(())
 }
 
 fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
@@ -412,15 +452,25 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     std::fs::write(out_abs.join("findings.json"), "{\n  \"findings\": []\n}\n")
         .map_err(|e| e.to_string())?;
+    let arch_seed = serde_json::json!({
+        "target": target.to_string_lossy(),
+        "source_ref": source_ref,
+        "stack": {
+            "notes": format!(
+                "Detected stacks: {}. Files: {} total, {} first party, {} vendored excluded.",
+                if stacks.is_empty() { "none recognized".to_string() } else { stacks.join(", ") },
+                rel_paths.len(),
+                first_party.len(),
+                vendored_count
+            )
+        },
+        "zones": [],
+        "components": [],
+        "notes": "Seeded by omgs audit. The reconnaissance agent fills zones, components, principals, boundaries, flows, and input_surfaces, records what was not examined in 'unexamined', then renders the map with: omgs architecture --in architecture.json --out <run-dir>."
+    });
     std::fs::write(
-        out_abs.join("architecture.md"),
-        format!(
-            "# Architecture\n\nSeeded deterministically by omgs. Detected stacks: {}. Files: {} total, {} first party, {} vendored excluded. The auditing agent completes trust boundaries, input surfaces and data flows here during reconnaissance, and states what was not examined.\n",
-            if stacks.is_empty() { "none recognized".to_string() } else { stacks.join(", ") },
-            rel_paths.len(),
-            first_party.len(),
-            vendored_count
-        ),
+        out_abs.join("architecture.json"),
+        format!("{}\n", serde_json::to_string_pretty(&arch_seed).unwrap()),
     )
     .map_err(|e| e.to_string())?;
     if !has(rest, "--no-sensors") {
