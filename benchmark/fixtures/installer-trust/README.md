@@ -44,8 +44,15 @@ swiftc: error: couldn't create cache file '/var/folders/.../T/xcrun_db-...' (err
 That is the sandbox denying `xcrun` a write to the real per-user temp dir, outside scratch. The
 compile and the proof still complete; it is the containment working, not a failure.
 
-## Relationship to the dedicated_host tier
+## Scope of this proof
 
-A live demonstration that the vulnerable logic really runs as root belongs to the optional
-`dedicated_host` tier and requires a disposable VM, never a productive machine. It is not needed to
-establish the finding: this sandboxed logic proof is sufficient and is the path OMGS expects.
+This fixture proves the defect class and its fix: it models the install-decision logic rather than
+compiling any specific vendor build, so it is evidence about the class and the recipe, not about a
+particular target. Promoting a real target finding needs separate evidence against that target's own
+unmodified code.
+
+Actually running the installer as root to show live impact has no OMGS proof tier and is never run
+unsandboxed as a fallback; such a record stays `needs_validation` with a manual plan. A person may
+demonstrate live impact on a throwaway, network-isolated, snapshot-and-discard VM to inform severity,
+but that is a manual step outside OMGS and is never required. This sandboxed logic proof is the path
+OMGS expects.

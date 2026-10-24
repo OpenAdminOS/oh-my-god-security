@@ -34,9 +34,10 @@ signed fixtures, which stay in the private run directory pending maintainer disc
 A separate live run did execute the real helper's code paths as root against synthetic signed
 payloads, which first established these as real. It ran on a machine that turned out to be
 productive, not disposable; that was a mistake, the machine was restored afterward (Gatekeeper
-re-enabled, passwordless sudo and test artifacts removed), and that kind of live run is now the
-optional `dedicated_host` tier, for impact only, on a throwaway VM, never required to establish
-a finding. The historical `Proof (2026-10-23)` notes below record what that run observed.
+re-enabled, passwordless sudo and test artifacts removed). A live run of that kind is a manual
+step outside OMGS, for impact only, on a throwaway network-isolated VM, and is never an OMGS
+proof tier and never required to establish a finding. The historical `Proof (2026-10-23)` notes
+below record what that run observed.
 
 ## Candidate 4: nil expected signer must not disable code-signature verification
 
@@ -48,7 +49,7 @@ Proof test idea: test the decision function directly in the sandbox. Assert that
 with a nil expected team and a mismatched, unnotarized signer is refused, alongside a control
 that a matching signer is accepted. The vulnerable logic authorizes the nil case and fails the
 invariant; this is tier 1 with no root, as in `benchmark/fixtures/installer-trust`. An optional
-dedicated-host run can additionally show the real helper running a signed package's postinstall
+live VM run (outside OMGS) can additionally show the real helper running a signed package's postinstall
 as root, for impact only.
 Proof (2026-10-23): wrong team was refused ("Team ID mismatch"), nil team succeeded and the
 postinstall executed as uid 0, dropping the sentinel. Observed in the live run (machine since restored).
@@ -63,7 +64,7 @@ contains. With the expected signer nil (candidate 4), an unrelated bundle id and
 version are accepted and the package's own scripts run as root.
 Proof test idea: in the sandbox, assert the decision function refuses a request whose bundle
 identity or version does not match the payload under a nil expected team. A fixed helper binds
-the payload's real identity to the request. Tier 1, no root; the live dedicated-host run is
+the payload's real identity to the request. Tier 1, no root; the live live VM run (outside OMGS) is
 optional and only adds impact.
 Proof (2026-10-23): the call succeeded with an unrelated bundle id and a bogus version and
 the probe postinstall ran as root. Observed in the live run (machine since restored); same root cause as
@@ -79,7 +80,7 @@ version actually written. Coarse or claimed versions are trusted over the real p
 Proof test idea: in the sandbox, assert the decision function refuses an older payload over a
 newer installed version, and refuses when the expected version does not match the payload. A
 fixed helper never silently lowers the installed version. Tier 1, no root; the destination
-read-back in the live dedicated-host run is optional confirmation of real effect.
+read-back in the live live VM run (outside OMGS) is optional confirmation of real effect.
 Proof (2026-10-23): destination moved from the newer installed version down to the older
 payload version, expected version never matched the payload, and the call still reported
 success with no error. Observed in the live run (machine since restored).

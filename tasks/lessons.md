@@ -15,13 +15,13 @@ no credentials, no Keychain), snapshotted and discarded. Weakening a real machin
 passwordless sudo) exposes it for as long as the change stands.
 
 Rules for next time:
-- Before any elevated or installer proof, confirm the host is disposable. If it has real data,
-  credentials, or Keychain secrets, stop. Stand up a throwaway VM instead.
-- Record the disposable-host attestation and every host-weakening step in `prerequisites`, and
-  revert each one when done (verify `spctl --status` = assessments enabled, remove NOPASSWD
-  sudoers, delete root-owned test artifacts and package receipts).
-- A tier-3 `dedicated_host` record without a disposable-host attestation now fails `omgs validate`;
-  do not work around that check, satisfy it.
+- An effect the sandbox cannot contain (real root, Gatekeeper, a root helper) has no proof tier
+  and is never run unsandboxed as a fallback. Leave the record `needs_validation` with a manual
+  plan. There is no `dedicated_host` tier: a tier whose decisive step runs outside `omgs prove`
+  cannot satisfy the sandbox-only invariant (removed after the second review).
+- If a person does a live demonstration for severity, it is a manual step outside OMGS on a
+  throwaway, network-isolated, snapshot-and-discard VM with no real data, credentials, or Keychain,
+  and the host and every weakening step (and its reversal) are recorded. Never a productive machine.
 - A proof harness that crashes before reaching the code under test (missing dylib, load error,
   build failure) must fail loudly and distinctly. Never read a harness abort as the target refusing
   the operation; on the first field run a bare-leaf dylib load silently aborted every case and

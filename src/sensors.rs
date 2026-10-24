@@ -121,9 +121,16 @@ fn run_semgrep(target: &Path, scratch_dir: &Path, report: &mut SensorsReport) {
             let raw = c.trim();
             let path = Path::new(raw);
             if path.exists() {
-                std::fs::canonicalize(path)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| raw.to_string())
+                // Fail closed: if the path cannot be canonicalized (for example it
+                // vanished after the exists() check), do not fall back to the raw
+                // string, which semgrep could still read as a registry shorthand.
+                match std::fs::canonicalize(path) {
+                    Ok(p) => p.to_string_lossy().to_string(),
+                    Err(_) => {
+                        report.tools_unavailable.push("semgrep".into());
+                        return;
+                    }
+                }
             } else if registry_ok {
                 raw.to_string()
             } else {
@@ -146,6 +153,7 @@ fn run_semgrep(target: &Path, scratch_dir: &Path, report: &mut SensorsReport) {
         .args([
             "scan",
             "--json",
+            "--strict",
             "--quiet",
             "--metrics=off",
             "--disable-version-check",
@@ -162,12 +170,28 @@ fn run_semgrep(target: &Path, scratch_dir: &Path, report: &mut SensorsReport) {
     // scan. Any other code (bad rules, invalid YAML, internal error) or a
     // signal is a failed scan and must not look like a clean, zero-hit run.
     match status.as_ref().map(|s| s.code()) {
-        Ok(Some(0)) | Ok(Some(1)) => {
-            report.tools_run.push("semgrep".into());
-            if let Ok(text) = std::fs::read_to_string(&raw) {
-                parse_semgrep(&text, target, report);
+        Ok(Some(0)) | Ok(Some(1)) => match std::fs::read_to_string(&raw) {
+            Ok(text) => {
+                // A nonempty `errors` array means target files or rules failed to
+                // parse: the scan is incomplete and must not read as a clean run.
+                // Unparseable output is treated the same way.
+                let incomplete = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("errors")
+                            .and_then(|e| e.as_array())
+                            .map(|a| !a.is_empty())
+                    })
+                    .unwrap_or(true);
+                if incomplete {
+                    report.tools_unavailable.push("semgrep".into());
+                } else {
+                    report.tools_run.push("semgrep".into());
+                    parse_semgrep(&text, target, report);
+                }
             }
-        }
+            Err(_) => report.tools_unavailable.push("semgrep".into()),
+        },
         _ => report.tools_unavailable.push("semgrep".into()),
     }
     let _ = std::fs::remove_file(&raw);

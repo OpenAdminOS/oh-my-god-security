@@ -40,7 +40,7 @@ The runner must attest an OS enforced sandbox with external network denied, isol
 
 Store draft tests outside the target. The runner must stage them and any writable build workspace in its assigned scratch while preserving the read only target. If it cannot do so, stop execution. If any sandbox control, dependency, runtime, or needed local service is unavailable, retain the highest earned tier, record the exact blocker and a safe local manual validation plan. Never run an unsandboxed fallback. Stop immediately on an unexpected external destination, real secret, or effect outside the synthetic fixture.
 
-The one case that executes a capability the process sandbox cannot grant (real root, Gatekeeper) is the optional tier 3 `dedicated_host` path in [VALIDATION-AND-REPORTING.md](VALIDATION-AND-REPORTING.md). It does not relax this rule: containment moves to a dedicated, network-isolated, disposable VM that is itself the boundary, and the step runs through `omgs prove` wherever it still fits. It is never a fallback to unprotected execution on the review host or any machine with real data, is never required, and if a disposable isolated host cannot be guaranteed the record stays `needs_validation`.
+An effect the process sandbox cannot grant (real root, Gatekeeper, a root helper) has no proof tier and is never run unsandboxed as a fallback. Such a record stays `needs_validation` with a manual plan, as described in [VALIDATION-AND-REPORTING.md](VALIDATION-AND-REPORTING.md). OMGS never requires a user to stand up a VM.
 
 ## Six phases
 

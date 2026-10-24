@@ -14,11 +14,6 @@ pub enum ProofTier {
     Traced,
     TestProven,
     SandboxExploited,
-    /// A real exploit run on a dedicated disposable host, for targets whose
-    /// decisive proof cannot execute inside the OS sandbox (privileged
-    /// installers, root helpers). Lower portability than `sandbox_exploited`;
-    /// requires a disposable-host attestation in `prerequisites`.
-    DedicatedHost,
 }
 
 impl ProofTier {
@@ -27,7 +22,6 @@ impl ProofTier {
             ProofTier::Traced => "traced",
             ProofTier::TestProven => "test proven",
             ProofTier::SandboxExploited => "sandbox exploited",
-            ProofTier::DedicatedHost => "dedicated host",
         }
     }
 }
@@ -149,20 +143,6 @@ pub fn validate(file: &FindingsFile) -> Vec<String> {
                 if f.severity.is_some() {
                     errors.push(format!("{at}: rejected findings must not carry severity"));
                 }
-            }
-        }
-        // A dedicated-host proof asserts a real run on a disposable machine. It
-        // must record that attestation so a productive host is never implied.
-        if f.proof_tier == ProofTier::DedicatedHost {
-            let has_attestation = f
-                .prerequisites
-                .as_deref()
-                .map(|p| !p.trim().is_empty())
-                .unwrap_or(false);
-            if !has_attestation {
-                errors.push(format!(
-                    "{at}: dedicated_host proof must record a disposable-host attestation in prerequisites"
-                ));
             }
         }
     }

@@ -14,7 +14,7 @@
           "title": { "type": "string" },
           "verdict": { "enum": ["confirmed", "needs_validation", "rejected"] },
           "severity": { "enum": ["critical", "high", "medium", "low", "informational"] },
-          "proof_tier": { "enum": ["traced", "test_proven", "sandbox_exploited", "dedicated_host"] },
+          "proof_tier": { "enum": ["traced", "test_proven", "sandbox_exploited"] },
           "attack_class": { "type": "string" },
           "entry_point": { "type": "string" },
           "sink": { "type": "string" },

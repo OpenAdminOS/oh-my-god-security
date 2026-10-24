@@ -475,37 +475,6 @@ fn evidence_and_anchors_survive_awkward_input() {
 }
 
 #[test]
-fn dedicated_host_confirmed_requires_attestation() {
-    // Confirmed at the dedicated_host tier with no attestation is rejected:
-    // the tier asserts a real run and must never imply a productive host.
-    let mut without = finding(
-        Verdict::Confirmed,
-        ProofTier::DedicatedHost,
-        Some(Severity::High),
-    );
-    without.prerequisites = None;
-    let file = FindingsFile {
-        findings: vec![without],
-    };
-    assert!(validate(&file)
-        .iter()
-        .any(|e| e.contains("disposable-host attestation")));
-
-    // With the disposable-host attestation recorded it is valid.
-    let mut with = finding(
-        Verdict::Confirmed,
-        ProofTier::DedicatedHost,
-        Some(Severity::High),
-    );
-    with.prerequisites =
-        Some("Throwaway macOS VM, no real data or credentials; snapshot discarded after.".into());
-    let ok = FindingsFile {
-        findings: vec![with],
-    };
-    assert!(validate(&ok).is_empty(), "{:?}", validate(&ok));
-}
-
-#[test]
 fn report_shows_run_metadata_or_not_recorded() {
     use omgs::report::render_markdown;
     let file = FindingsFile {
