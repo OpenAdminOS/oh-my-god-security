@@ -612,3 +612,9 @@ fn intent_answers_are_keyed_by_the_full_target_path() {
         omgs::intent::answers_file(home, std::path::Path::new("/x/acme/shop"))
     );
 }
+
+#[test]
+fn batch_file_requires_runs() {
+    assert!(serde_json::from_str::<omgs::batch::BatchFile>(r#"{"run": []}"#).is_err());
+    assert!(serde_json::from_str::<omgs::batch::BatchFile>(r#"{"runs": []}"#).is_ok());
+}

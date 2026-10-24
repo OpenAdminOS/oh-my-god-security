@@ -88,7 +88,7 @@ pub fn read_list(text: &str) -> Vec<String> {
 pub struct BatchFile {
     #[serde(default)]
     pub created_unix: u64,
-    #[serde(default)]
+    /// Required, so a misspelled key fails instead of indexing nothing.
     pub runs: Vec<BatchRun>,
 }
 
