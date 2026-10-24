@@ -163,7 +163,11 @@ pub fn ledger(text: &str) -> Result<crate::ledger::Ledger, String> {
             .into_iter()
             .enumerate()
         {
-            enum_string(u, "status", &format!("units[{i}]"))?;
+            let at = format!("units[{i}]");
+            enum_string(u, "status", &at)?;
+            if u.get("note").is_some_and(|n| !n.is_string()) {
+                return Err(format!("{at}.note must be a string when present"));
+            }
         }
         Ok(())
     })

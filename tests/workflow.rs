@@ -1037,3 +1037,15 @@ fn round_trips_flag_values_and_ledgerless_candidates() {
     assert!(!dir.join("out/REPORT.html").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn ledger_notes_must_be_strings() {
+    let unit = |note: &str| {
+        format!(
+            r#"{{"units":[{{"id":"u","surface":".","attack_classes":[],"status":"planned","note":{note}}}]}}"#
+        )
+    };
+    assert!(omgs::shape::ledger(&unit("null")).is_err());
+    assert!(omgs::shape::ledger(&unit("7")).is_err());
+    assert!(omgs::shape::ledger(&unit(r#""why""#)).is_ok());
+}
