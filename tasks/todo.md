@@ -21,11 +21,11 @@ separate Claude evaluator; merge only when both are green and the user says so.
 
 ## PR C: run orchestration (`feat/run-orchestration`)
 
-- [ ] report writes run metadata back and marks the run complete
-- [ ] hardened `review` clone; `omgs batch init` + `omgs batch index`
-- [ ] `omgs status` + `omgs watch` (loopback only, two routes, Host check)
-- [ ] `omgs route` model fallbacks recorded in run metadata
-- [ ] intent library (`skill/intent/library.json`), `omgs intent list/answer`, `intent_id`
+- [x] report writes run metadata back and marks the run complete
+- [x] hardened `review` clone; `omgs batch init` + `omgs batch index`
+- [x] `omgs status` + `omgs watch` (loopback only, two routes, Host check)
+- [x] `omgs route` model fallbacks recorded in run metadata
+- [x] intent library (`skill/intent/library.json`), `omgs intent list/answer`, `intent_id`
 - [ ] tests; docs; reviews green; merged
 
 ## PR D: sandbox hardening (`feat/sandbox-hardening`)

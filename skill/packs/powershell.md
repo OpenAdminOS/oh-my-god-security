@@ -27,3 +27,11 @@ Use the project's Pester tests or a new test file where one exists, run inside `
 - `Invoke-Expression` over text the operator just authored in the same session with no import or sharing boundary.
 - Serializer-built request bodies where feed text cannot add fields.
 - Broad scopes that are documented, least-privilege-reviewed requirements of the single task, recorded as intent.
+
+## Intent questions
+
+When a record turns on intent, set its `intent_id` to one of these library questions instead of writing a new one, so one recorded answer resolves every record that asks it (`omgs intent list` shows them all):
+
+- `script.manifest-supplier`: Who is allowed to supply the manifest, project, or configuration file whose values reach a generated script?
+- `feed.lower-security-minimum`: May an external feed lower a security minimum (for example an OS version floor) automatically, or only raise it?
+- `feed.unsupported-filter`: When an imported rule uses a filter the tool does not support, should the rule be dropped (fail closed) or applied without the filter?

@@ -7,9 +7,13 @@ report) with live states, timers, counters, and an activity log. It loads no ext
 runs no scripts beyond its own inline polling.
 
 This view is optional and never changes a verdict. The deterministic `findings.json`, SARIF, and
-`REPORT.html` remain the record. If you serve it over HTTP, bind loopback only and shut it down when
-the run ends:
+`REPORT.html` remain the record. Serve it with:
 
-    python3 -m http.server 0 --bind 127.0.0.1 --directory <run-dir>
+    omgs watch --run <run-dir>
 
-Never auto-open a browser and never bind a non-loopback interface: the page describes vulnerabilities.
+It binds 127.0.0.1 on an ephemeral port and prints the URL, serves only this page and
+`pipeline-status.json` (never findings, reports, or anything else in the run directory), rejects
+foreign Host headers, and exits shortly after `omgs report` marks the run complete. Update the status
+file with `omgs status --run <run-dir> --stage <id> --state active` rather than writing it by hand.
+Do not serve the run directory with a generic file server: that would expose the findings. Never
+auto-open a browser and never bind a non-loopback interface: the page describes vulnerabilities.

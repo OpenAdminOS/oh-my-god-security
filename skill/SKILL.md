@@ -56,7 +56,15 @@ OMGS is a multi-agent pipeline by default, not a single review pass. Red hunts i
 
 ### Live progress (optional)
 
-For a long run, the orchestrator may expose a progress view of the pipeline (which hunters are running, what the verifier decided, the proof outcomes). It is optional and never changes a verdict. If served over HTTP it must bind loopback only (`127.0.0.1`), use no external resources, and shut down when the run ends; never auto-open a browser and never bind a non-loopback interface, because the page describes vulnerabilities. A reference progress page and its status schema live in [progress/](progress/). Prefer printing a link the user opens over launching anything.
+For a long run, the orchestrator may expose a progress view of the pipeline (which hunters are running, what the verifier decided, the proof outcomes). It is optional and never changes a verdict. Start `omgs watch --run OUTPUT_DIR` in the background at Initialize and print the URL it reports for the user; do not open a browser. It binds `127.0.0.1` only, serves just the dashboard and `pipeline-status.json` (never findings or reports), rejects foreign Host headers, and exits on its own shortly after `omgs report` marks the run complete. Update progress at each milestone with `omgs status --run OUTPUT_DIR --stage <id> --state active|done|failed` (add `--parent hunt` for each hunter, `--counter candidates=N`, `--log <message>`) instead of writing the JSON by hand. The page and its status schema live in [progress/](progress/).
+
+### Model routing on refusal
+
+A model may refuse security review work mid-task. Configure an ordered model list per role in `~/.local/share/omgs/models.json` (`{"roles": {"hunter": ["primary", "fallback"], "verifier": [...], "evaluator": [...], "guard": [...]}}`), ask `omgs route --run OUTPUT_DIR --role <role>` which model to start each role with, and on a refusal run `omgs route --run OUTPUT_DIR --role <role> --refused <model> --reason <what happened>`. Relaunch the same role, in a fresh context and with the same brief, on the model it prints. Every reroute is recorded in the run metadata and the report. A reroute never merges roles: a hunter rerouted to the verifier's model still runs as a separate agent from the verifier. When `omgs route` exits 1 every fallback has refused; record the blocker and stop that role instead of stalling.
+
+### Batch reviews
+
+To review many repositories, write their https URLs one per line to a file and run `omgs batch init --list <file> --out <batch-dir>`. It clones each repository (https only, validated), initializes one run directory per repository under `<batch-dir>`, records failures in `batch.json` without stopping, and prints one agent brief per run. Run the full pipeline above in each run directory separately; never share hunters, verifiers, or findings across repositories. Finish with `omgs batch index --batch <batch-dir>/batch.json --out <batch-dir>` for an offline `INDEX.md` and `INDEX.html` with per-repository counts, blockers, agent calls, and reroutes.
 
 ## Agent budgets
 

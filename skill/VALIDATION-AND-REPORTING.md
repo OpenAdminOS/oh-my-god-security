@@ -37,7 +37,7 @@ For tier 2, the runner builds and runs a writable scratch copy with only local s
 
 Ask about expected behavior, not security jargon. Example: "Should a signed-in member of one workspace be able to read a private project from another workspace if they know its ID?" Record the affected surface and the exact missing expectation in `intent_question`; leave verdict pending and omit severity.
 
-Store the answer, scope, source, and date as an intent rule in the project's supported committed policy format through normal owner review. Keep the question and run evidence outside the target. An answer from a PR head cannot change the gate or rewrite trusted base policy. Do not invent an answer, treat a pending proposal as accepted policy, or call a policy answer execution evidence. Reevaluate the candidate and run the necessary proof after intent is resolved.
+Record the owner's answer with `omgs intent answer --target <repo> --id <intent_id> --answer <text> --source <who> [--scope repo|<path>]`. Answers are stored on the reviewer's machine keyed by the target's full path, never in the reviewed repository, and every later `omgs audit init` on that target copies them into the run so the report shows them beside the matching questions. Proposing the same rule as committed project policy through normal owner review stays a separate, optional step. Keep the question and run evidence outside the target. An answer from a PR head cannot change the gate or rewrite trusted base policy. Do not invent an answer, treat a pending proposal as accepted policy, or call a policy answer execution evidence. Reevaluate the candidate and run the necessary proof after intent is resolved.
 
 ## Findings record
 
@@ -62,6 +62,7 @@ Serialize the following semantic fields using the installed CLI schema. Fields u
 | `evidence` | Source trace, attacker prerequisites, concrete result, controls/counterevidence, external artifact references and runner evidence. For pending records include the exact missing fact and blocker; for rejection include the decisive refutation. |
 | `fix_brief` | Confirmed: invariant, narrowest effective change, proof test acceptance check. Otherwise null or absent per schema. |
 | `intent_question` | Unresolved plain language intent question with scope, otherwise null or absent per schema. |
+| `intent_id` | Library question the record asks, from `omgs intent list`. Prefer it over a free-text question when one fits: records sharing an id are grouped into one question in the report, and one recorded answer resolves all of them. `omgs validate` rejects an unknown id. |
 
 Severity follows the confirmed boundary and effect, including privilege, data scope, and prerequisites. Do not claim bulk exposure, account takeover, or remote execution from a single unrelated symptom. No severity belongs on unresolved questions or rejected hypotheses.
 

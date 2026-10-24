@@ -37,3 +37,10 @@ If backend enforcement is the question, a mocked query or owner-only database co
 - A publishable or anonymous client key is classified as a secret without any unauthorized result.
 
 Missing external evidence stays pending. Never "fix" unknown delegation by disabling RLS, testing a remote endpoint, or broadly replacing backend policy with duplicated application checks.
+
+## Intent questions
+
+When a record turns on intent, set its `intent_id` to one of these library questions instead of writing a new one, so one recorded answer resolves every record that asks it (`omgs intent list` shows them all):
+
+- `web.cross-tenant-read`: May a member of one workspace or tenant ever read another workspace's records through this route?
+- `web.public-resource`: Is this resource meant to be readable without signing in?

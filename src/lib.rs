@@ -1,11 +1,17 @@
 pub mod architecture;
+pub mod batch;
 pub mod critic;
+pub mod intent;
 pub mod ledger;
 pub mod model;
 pub mod report;
+pub mod route;
+pub mod runmeta;
 pub mod sandbox;
 pub mod sensors;
 pub mod shape;
+pub mod status;
+pub mod watch;
 
 /// Stable, non cryptographic fingerprint for finding identity across runs.
 /// Inputs are the semantic identity of a finding, never prose or line numbers.

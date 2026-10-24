@@ -31,3 +31,11 @@ Keep real authz and query predicates in the path. A fixture may provide validate
 - Only an identifier is exposed, without a private read or unauthorized effect.
 
 Unclear sharing rules or missing external policies are exact `needs_validation` facts, not grounds for rejection or severity. Identity uses attack class, entry point, sink symbol, and boundary through `omgs fingerprint`.
+
+## Intent questions
+
+When a record turns on intent, set its `intent_id` to one of these library questions instead of writing a new one, so one recorded answer resolves every record that asks it (`omgs intent list` shows them all):
+
+- `web.public-resource`: Is this resource meant to be readable without signing in?
+- `web.admin-only-action`: Which roles are allowed to perform this action?
+- `web.cross-tenant-read`: May a member of one workspace or tenant ever read another workspace's records through this route?

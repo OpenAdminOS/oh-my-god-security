@@ -31,3 +31,10 @@ For prop/serialized-data exposure, assert that the unauthorized server response 
 - The test bypasses a control that the real request must traverse.
 
 Ask whether the resource is intended to be public if intent is missing. Preserve the exact unknown hosting or routing fact as `needs_validation`, without severity. Reuse identity inputs through `omgs fingerprint`; do not report the same boundary twice merely because both a hidden button and a missing server check appear in its trace.
+
+## Intent questions
+
+When a record turns on intent, set its `intent_id` to one of these library questions instead of writing a new one, so one recorded answer resolves every record that asks it (`omgs intent list` shows them all):
+
+- `web.client-gate-only`: Is hiding this screen in the browser meant to be the only control, or must the server refuse the request too?
+- `web.public-resource`: Is this resource meant to be readable without signing in?

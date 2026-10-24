@@ -25,3 +25,11 @@ Feed the updater a fixture feed whose newest entry is older than the current pol
 - A monotonic guard implemented in a shared helper the hunter did not follow.
 - Intentional rollback support behind an explicit operator flag, recorded as intent.
 - Feed data that only ever tightens policy because the platform rejects weaker values, demonstrated from platform behavior in source or tests, not assumed.
+
+## Intent questions
+
+When a record turns on intent, set its `intent_id` to one of these library questions instead of writing a new one, so one recorded answer resolves every record that asks it (`omgs intent list` shows them all):
+
+- `feed.lower-security-minimum`: May an external feed lower a security minimum (for example an OS version floor) automatically, or only raise it?
+- `feed.unsupported-filter`: When an imported rule uses a filter the tool does not support, should the rule be dropped (fail closed) or applied without the filter?
+- `local.downgrade`: May an older version ever replace a newer installed version?

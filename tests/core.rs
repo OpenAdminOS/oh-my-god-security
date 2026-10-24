@@ -25,6 +25,7 @@ fn finding(verdict: Verdict, tier: ProofTier, severity: Option<Severity>) -> Fin
         evidence: "dummy tenant B order returned to tenant A".into(),
         fix_brief: None,
         intent_question: None,
+        intent_id: None,
         family: None,
         prerequisites: None,
         hunted_by: Some("red-1".into()),
@@ -104,6 +105,9 @@ fn html_report_escapes_target_content() {
             verifier: None,
             agent_calls: None,
             critic: None,
+            models: vec![],
+            reroutes: vec![],
+            intent_answers: Default::default(),
         },
     );
     assert!(!html.contains("<script>alert"));
@@ -199,6 +203,9 @@ fn markdown_report_shows_rejected_and_pending_evidence() {
             verifier: None,
             agent_calls: None,
             critic: None,
+            models: vec![],
+            reroutes: vec![],
+            intent_answers: Default::default(),
         },
     );
     assert!(md.contains("Rejected after verification"));
@@ -218,6 +225,9 @@ fn meta() -> ReportMeta {
         verifier: Some("blue-1".into()),
         agent_calls: Some(37),
         critic: None,
+        models: vec![],
+        reroutes: vec![],
+        intent_answers: Default::default(),
     }
 }
 
@@ -338,6 +348,9 @@ fn html_escapes_hostile_strings_end_to_end() {
         verifier: Some("<script>alert(11)</script>".into()),
         agent_calls: None,
         critic: None,
+        models: vec![],
+        reroutes: vec![],
+        intent_answers: Default::default(),
     };
     let html = render_html(&file, &hostile_meta);
     let lower = html.to_lowercase();
@@ -505,6 +518,9 @@ fn report_shows_run_metadata_or_not_recorded() {
         verifier: None,
         agent_calls: None,
         critic: None,
+        models: vec![],
+        reroutes: vec![],
+        intent_answers: Default::default(),
     };
     let md2 = render_markdown(&file, &bare);
     assert!(

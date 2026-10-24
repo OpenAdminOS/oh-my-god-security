@@ -1,0 +1,287 @@
+//! Batch reviews of many repositories: strict repository URL parsing for the
+//! clone step, and a deterministic offline index across the runs.
+
+use crate::html_escape;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+/// A repository URL that passed validation, split into its safe parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoUrl {
+    pub url: String,
+    pub host: String,
+    pub owner: String,
+    pub name: String,
+}
+
+fn safe_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.starts_with('-')
+        && !s.starts_with('.')
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// Accept only `https://<host>/<owner>/<name>[.git][/]`. Everything that
+/// could reach git as an option, a local path, another transport, embedded
+/// credentials, or a path traversal is refused.
+pub fn parse_repo_url(raw: &str) -> Result<RepoUrl, String> {
+    let url = raw.trim();
+    let bad = |why: &str| Err(format!("refusing repository URL '{url}': {why}"));
+    let Some(rest) = url.strip_prefix("https://") else {
+        return bad("only https:// URLs are accepted");
+    };
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return bad("whitespace or control characters");
+    }
+    if rest.contains(['?', '#', '@', '%', '\\']) {
+        return bad("credentials, queries, fragments, and escapes are not accepted");
+    }
+    let mut parts = rest.trim_end_matches('/').split('/');
+    let host = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let owner = parts.next().unwrap_or_default().to_string();
+    let name = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
+        return bad("expected https://<host>/<owner>/<name>");
+    }
+    // A domain name with an alphabetic top-level label: this rejects IP
+    // literals (no reaching an internal address by number), bare hostnames
+    // such as localhost, and ports.
+    let labels: Vec<&str> = host.split('.').collect();
+    let host_ok = labels.len() >= 2
+        && labels.iter().all(|l| {
+            !l.is_empty()
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        && labels
+            .last()
+            .is_some_and(|tld| tld.len() >= 2 && tld.bytes().all(|b| b.is_ascii_alphabetic()));
+    if !host_ok {
+        return bad("host must be a domain name, not an IP address or bare hostname");
+    }
+    let name = name.strip_suffix(".git").unwrap_or(name).to_string();
+    if !safe_segment(&owner) || !safe_segment(&name) {
+        return bad("owner and name may use letters, digits, '.', '_', '-' only");
+    }
+    Ok(RepoUrl {
+        url: url.to_string(),
+        host,
+        owner,
+        name,
+    })
+}
+
+/// Repository URLs from a list file: one per line, `#` starts a comment.
+pub fn read_list(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or_default().trim())
+        .filter(|l| !l.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BatchFile {
+    #[serde(default)]
+    pub created_unix: u64,
+    #[serde(default)]
+    pub runs: Vec<BatchRun>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BatchRun {
+    pub url: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub run_dir: Option<String>,
+    /// `initialized` or `failed`.
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// What the index shows for one run, gathered from its run directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunSummary {
+    pub url: String,
+    /// Link to the run's REPORT.html relative to the index, when it exists.
+    pub report_href: Option<String>,
+    pub state: String,
+    pub confirmed: usize,
+    pub needs_validation: usize,
+    pub rejected: usize,
+    /// Critic gaps, blocked units, init errors, and exhausted model routes.
+    pub blockers: Vec<String>,
+    pub agent_calls: Option<u64>,
+    pub reroutes: usize,
+}
+
+/// Summarize one run directory. Missing files leave their fields empty and
+/// say so in `blockers`, so a half-finished run is visible, not hidden.
+pub fn summarize(run: &BatchRun, index_dir: &Path) -> RunSummary {
+    let mut s = RunSummary {
+        url: run.url.clone(),
+        state: run.status.clone(),
+        ..RunSummary::default()
+    };
+    if let Some(e) = &run.error {
+        s.blockers.push(format!("init failed: {e}"));
+    }
+    let Some(dir) = run.run_dir.as_deref().map(Path::new) else {
+        return s;
+    };
+    match std::fs::read_to_string(dir.join("findings.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<crate::model::FindingsFile>(&t).ok())
+    {
+        Some(f) => {
+            use crate::model::Verdict;
+            for x in &f.findings {
+                match x.verdict {
+                    Verdict::Confirmed => s.confirmed += 1,
+                    Verdict::NeedsValidation => s.needs_validation += 1,
+                    Verdict::Rejected => s.rejected += 1,
+                }
+            }
+        }
+        None => s
+            .blockers
+            .push("findings.json missing or unreadable".into()),
+    }
+    if let Ok(meta) = crate::runmeta::read(dir) {
+        if let Some(st) = meta.get("run_status").and_then(|v| v.as_str()) {
+            s.state = st.to_string();
+        }
+        s.agent_calls = meta.get("agent_calls_used").and_then(|v| v.as_u64());
+        s.reroutes = meta
+            .get("reroutes")
+            .and_then(|v| v.as_array())
+            .map_or(0, |a| a.len());
+        if let Some(blocked) = meta.get("blockers").and_then(|v| v.as_array()) {
+            s.blockers
+                .extend(blocked.iter().filter_map(|b| b.as_str()).map(String::from));
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(dir.join("coverage-ledger.json")) {
+        if let Ok(ledger) = serde_json::from_str::<crate::ledger::Ledger>(&text) {
+            for u in ledger.units.iter().filter(|u| u.status == "blocked") {
+                s.blockers.push(format!("blocked unit {}", u.id));
+            }
+        }
+    }
+    match crate::critic::critique_run(dir) {
+        Ok(c) if !c.passed() => s.blockers.push(format!("critic: {}", c.summary())),
+        Ok(_) => {}
+        Err(_) if run.status == "failed" => {}
+        Err(e) => s.blockers.push(format!("critic not run: {e}")),
+    }
+    if dir.join("REPORT.html").is_file() {
+        s.report_href = dir
+            .strip_prefix(index_dir)
+            .ok()
+            .map(|rel| format!("{}/REPORT.html", rel.to_string_lossy()));
+    }
+    s
+}
+
+pub fn render_index_markdown(runs: &[RunSummary]) -> String {
+    let mut out = String::from("# OMGS batch index\n\n");
+    let total = |f: fn(&RunSummary) -> usize| runs.iter().map(f).sum::<usize>();
+    out.push_str(&format!(
+        "Repositories: {}\nConfirmed: {}\nNeeds validation: {}\nRejected: {}\nAgent calls: {}\n\n",
+        runs.len(),
+        total(|r| r.confirmed),
+        total(|r| r.needs_validation),
+        total(|r| r.rejected),
+        agent_total(runs)
+    ));
+    out.push_str("| Repository | State | Confirmed | Needs validation | Rejected | Agent calls | Reroutes | Blockers |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    for r in runs {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            md_cell(&r.url),
+            md_cell(&r.state),
+            r.confirmed,
+            r.needs_validation,
+            r.rejected,
+            r.agent_calls
+                .map_or("not recorded".into(), |n| n.to_string()),
+            r.reroutes,
+            if r.blockers.is_empty() {
+                "none".to_string()
+            } else {
+                md_cell(&r.blockers.join("; "))
+            }
+        ));
+    }
+    out
+}
+
+fn agent_total(runs: &[RunSummary]) -> String {
+    if runs.iter().any(|r| r.agent_calls.is_none()) {
+        let known: u64 = runs.iter().filter_map(|r| r.agent_calls).sum();
+        format!("{known} recorded, some runs not recorded")
+    } else {
+        runs.iter()
+            .filter_map(|r| r.agent_calls)
+            .sum::<u64>()
+            .to_string()
+    }
+}
+
+/// A Markdown table cell: escaped so target-derived text cannot break the
+/// row or inject a link.
+fn md_cell(s: &str) -> String {
+    crate::architecture::md_inline(s)
+}
+
+pub fn render_index_html(runs: &[RunSummary]) -> String {
+    let mut rows = String::new();
+    for r in runs {
+        let repo = match &r.report_href {
+            Some(href) => format!(
+                "<a href=\"{}\">{}</a>",
+                html_escape(href),
+                html_escape(&r.url)
+            ),
+            None => html_escape(&r.url),
+        };
+        let blockers = if r.blockers.is_empty() {
+            "none".to_string()
+        } else {
+            let items: String = r
+                .blockers
+                .iter()
+                .map(|b| format!("<li>{}</li>", html_escape(b)))
+                .collect();
+            format!("<ul>{items}</ul>")
+        };
+        rows.push_str(&format!(
+            "<tr><td>{repo}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{blockers}</td></tr>",
+            html_escape(&r.state),
+            r.confirmed,
+            r.needs_validation,
+            r.rejected,
+            r.agent_calls
+                .map_or("not recorded".into(), |n| n.to_string()),
+            r.reroutes,
+        ));
+    }
+    let total = |f: fn(&RunSummary) -> usize| runs.iter().map(f).sum::<usize>();
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><title>OMGS batch index</title><style>{CSS}</style></head><body><main><h1>OMGS batch index</h1><p class=\"lede\">{} repositories: {} confirmed, {} needs validation, {} rejected. Agent calls: {}.</p><table><thead><tr><th scope=\"col\">Repository</th><th scope=\"col\">State</th><th scope=\"col\">Confirmed</th><th scope=\"col\">Needs validation</th><th scope=\"col\">Rejected</th><th scope=\"col\">Agent calls</th><th scope=\"col\">Reroutes</th><th scope=\"col\">Blockers</th></tr></thead><tbody>{rows}</tbody></table><p class=\"note\">Generated by omgs {} from each run directory. This page loads no external resources and runs no scripts.</p></main></body></html>\n",
+        runs.len(),
+        total(|r| r.confirmed),
+        total(|r| r.needs_validation),
+        total(|r| r.rejected),
+        html_escape(&agent_total(runs)),
+        html_escape(env!("CARGO_PKG_VERSION")),
+    )
+}
+
+const CSS: &str = ":root{color-scheme:light dark;--bg:#f6f6f4;--surface:#fff;--text:#18181b;--muted:#4f4f57;--line:#deded9;--link:#1d4ed8}@media (prefers-color-scheme:dark){:root{--bg:#111113;--surface:#18181b;--text:#ececef;--muted:#b4b4bc;--line:#2e2e34;--link:#9ab8ff}}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 system-ui,-apple-system,\"Segoe UI\",Roboto,sans-serif}main{max-width:1100px;margin:0 auto;padding:32px 24px}h1{margin:0 0 8px;font-size:24px}a{color:var(--link)}.lede{color:var(--muted)}table{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--line);font-size:14px}th,td{text-align:left;vertical-align:top;padding:8px 10px;border-top:1px solid var(--line);overflow-wrap:anywhere}th{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted)}td ul{margin:0;padding-left:18px}.note{margin-top:16px;font-size:13px;color:var(--muted)}";
