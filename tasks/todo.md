@@ -37,22 +37,23 @@ never changes a verdict.
 
 - [x] schemas/architecture.schema.json
 - [ ] sample fixture architecture.json (for tests/examples)
-- [ ] src/arch.rs: model structs (serde), loader, deterministic layout, MD + HTML render
-- [ ] wire `omgs architecture` into main.rs (match existing subcommand pattern)
-- [ ] extend `omgs validate` to accept architecture.json
-- [ ] tests/core.rs: schema-valid fixture renders; HTML has zero external URLs;
-      byte-deterministic across two renders; validate accepts/rejects
-- [ ] skill/RECONNAISSANCE.md + skill/SKILL.md: emit + render the map in Map
-- [ ] README outputs list mentions ARCHITECTURE.html/.md
-- [ ] cargo fmt + cargo test green; actionlint n/a
+- [x] src/architecture.rs: model structs (serde), loader, deterministic layout, MD + HTML render
+- [x] wire `omgs architecture` into main.rs (match existing subcommand pattern)
+- [x] validation runs inside `omgs architecture` (invalid -> `invalid:` lines + exit 1);
+      `omgs validate` itself is unchanged (findings only)
+- [x] tests/core.rs: schema-valid fixture renders; HTML has zero external URLs;
+      byte-deterministic across two renders; validate accepts/rejects; hostile escaping
+- [x] skill/RECONNAISSANCE.md + skill/SKILL.md: emit + render the map in Map
+- [x] README outputs list mentions ARCHITECTURE.html/.md
+- [x] cargo fmt + cargo test green; clippy clean
 
 ## Acceptance criteria
 
-- `schemas/architecture.schema.json` is valid JSON Schema; the sample fixture validates.
-- `omgs architecture --in fixture --out dir` writes ARCHITECTURE.md and ARCHITECTURE.html.
+- `skill/schemas/architecture.schema.json` is valid JSON Schema; the sample fixture validates.
+- `omgs architecture --in fixture --out dir` writes ARCHITECTURE.md and ARCHITECTURE.html;
+  invalid input prints `invalid:` lines and exits 1.
 - ARCHITECTURE.html contains the SVG graph, makes zero external requests (no http/https),
   and is byte-identical across two renders of the same input.
-- `omgs validate` accepts a valid architecture.json and rejects an invalid one.
 - `cargo test` green including the new tests; existing REPORT tests still pass.
 - Docs updated; no em/en dashes; commits without self-mention.
 - Branch only; GPT-6.1-Sol review + separate Claude evaluator before any merge; do
@@ -60,20 +61,25 @@ never changes a verdict.
 
 ## Review
 
-Implemented on branch feat/architecture-map:
-- schemas/architecture.schema.json; examples/architecture.sample.json.
+Implemented on branch feat/architecture-map (schema lives at
+skill/schemas/architecture.schema.json so the installed skill can reach it):
 - src/architecture.rs: lenient serde model, validate_architecture, deterministic
   integer-coordinate layered layout, Markdown + self-contained HTML renderers,
   from_json helper. Wired `omgs architecture --in --out` in main.rs; audit now
   seeds architecture.json (replacing the lowercase architecture.md placeholder,
   which avoided a macOS case collision with ARCHITECTURE.md).
-- tests/core.rs: 6 new tests (validate accept/reject, determinism, no external
-  requests with exactly one trusted <svg>, hostile-field escaping, minimal map
-  skips empty sections, lenient from_json). cargo test green (23), clippy clean,
-  release builds.
-- Docs: SKILL.md (Map + Report), RECONNAISSANCE.md (new section), README.
-- Verified render byte-identical across runs, zero external refs; previewed the
-  diagram visually (zone columns, boundary-crossing arrows, attack-surface marks).
+- examples/architecture.sample.json.
+- tests/core.rs: architecture tests covering validate accept/reject and structural
+  gaps, determinism, no-external-request (exactly one trusted <svg>), hostile-field
+  and markdown-link escaping, offline byte-contract, notes/principals in HTML,
+  minimal maps, wide/uppercased label clamping, single-column gutter, sample
+  fixture validity, and cyclic-flow rendering.
+- Docs: SKILL.md (Map + Report), RECONNAISSANCE.md (new section with the exact
+  keys), README.
 
-Acceptance criteria met. Pending: GPT-6.1-Sol review + separate Claude evaluator
-before merge; do not push to main unless the user says so.
+Review rounds: 4 GPT-6.1-Sol rounds converged to zero findings; a separate Claude
+evaluator then caught an undefined `--blue` CSS var (first-zone accent rendered
+black) and a schema link that dangled after skill install, both fixed here, plus
+code-span source sanitisation, lanes moved clear of zone headers, and extra tests.
+cargo test green (32), clippy clean, output byte-stable. Do not push to main
+unless the user says so.

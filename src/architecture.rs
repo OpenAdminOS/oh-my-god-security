@@ -637,10 +637,12 @@ fn render_svg(a: &ArchitectureFile, d: &Diagram) -> String {
         } else {
             "var(--faint)"
         };
+        // Lanes sit below the zone-header text (baseline y=MARGIN_TOP-44) and
+        // above the node boxes, so long edges do not strike the headers.
         let lane = if (fcy + tcy) / 2 <= d.height / 2 {
-            22
+            MARGIN_TOP - 18
         } else {
-            d.height - 22
+            d.height - 30
         };
         let arrow_right = |x: i64, y: i64| {
             format!(
@@ -810,6 +812,19 @@ fn zone_label(z: &Zone) -> &str {
 // Markdown
 // ---------------------------------------------------------------------------
 
+/// Sanitize a value for inside a Markdown code span: backslash escapes are
+/// literal there, so only neutralise a backtick (which would close the span)
+/// and newlines. No CommonMark escaping, which would otherwise show as text.
+fn md_code(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '`' => '\'',
+            '\n' | '\r' => ' ',
+            _ => c,
+        })
+        .collect()
+}
+
 fn md_inline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -848,7 +863,7 @@ pub fn render_architecture_markdown(a: &ArchitectureFile) -> String {
     let mut m = String::new();
     m.push_str(&format!("# Architecture: {}\n\n", md_inline(&a.target)));
     if !a.source_ref.is_empty() {
-        m.push_str(&format!("Source: `{}`\n\n", md_inline(&a.source_ref)));
+        m.push_str(&format!("Source: `{}`\n\n", md_code(&a.source_ref)));
     }
     m.push_str("Descriptive map produced during reconnaissance. It records how the reviewed application is built and what was examined; it never asserts a finding or a verdict.\n\n");
 
@@ -1219,8 +1234,8 @@ fn stack_row(body: &mut String, label: &str, items: &[String]) {
 }
 
 const CSS: &str = r#"
-:root{color-scheme:light dark;--bg:#f6f6f4;--surface:#fff;--sunk:#efefec;--text:#18181b;--muted:#4f4f57;--faint:#66666e;--line:#deded9;--link:#1d4ed8;--red:#b42318;--amber:#8a5300;--green:#166534;--violet:#5b3cc4;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-@media (prefers-color-scheme:dark){:root{--bg:#111113;--surface:#18181b;--sunk:#222226;--text:#ececef;--muted:#b4b4bc;--faint:#9a9aa3;--line:#2e2e34;--link:#9ab8ff;--red:#ff9b93;--amber:#f0c36a;--green:#86d9a0;--violet:#c0b0ff}}
+:root{color-scheme:light dark;--bg:#f6f6f4;--surface:#fff;--sunk:#efefec;--text:#18181b;--muted:#4f4f57;--faint:#66666e;--line:#deded9;--link:#1d4ed8;--blue:#0ea5e9;--red:#b42318;--amber:#8a5300;--green:#166534;--violet:#5b3cc4;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#111113;--surface:#18181b;--sunk:#222226;--text:#ececef;--muted:#b4b4bc;--faint:#9a9aa3;--line:#2e2e34;--link:#9ab8ff;--blue:#5cc8ff;--red:#ff9b93;--amber:#f0c36a;--green:#86d9a0;--violet:#c0b0ff}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
 .wrap{max-width:1040px;margin:0 auto;padding:0 24px}

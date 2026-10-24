@@ -85,7 +85,7 @@ If you are a coding agent asked to install OMGS and review a project, follow the
 4. Follow the skill's pipeline (map, isolated hunt, independent verify, prove, adjudicate, report). Validate every findings file with `omgs validate --findings <run-dir>/findings.json` before reporting.
 5. Execute proof tests or a locally built app only through `omgs prove --cmd "<test command>"`. If prove reports that no sandbox backend is available, stop at the traced tier, record the exact blocker, and tell the user. Never run target code unsandboxed to keep the flow moving.
 6. Render outputs with `omgs report --findings <run-dir>/findings.json --out <run-dir> --repo <name> --ref <commit> --mode <gate|advisory>`. Present `REPORT.html` or `REPORT.md`, ask intent questions in plain language, and hand over fix briefs. Do not apply fixes or commit anything unless the user explicitly asks.
-7. During reconnaissance, record the architecture map in `architecture.json` (schema in `schemas/`) and render it with `omgs architecture --in <run-dir>/architecture.json --out <run-dir>`. It produces `ARCHITECTURE.md` and a self-contained `ARCHITECTURE.html` describing the target's stack, components, trust boundaries, data flows, and attack surface. Descriptive only; it never changes a verdict.
+7. During reconnaissance, record the architecture map in `architecture.json` (schema in the skill's `schemas/`) and render it with `omgs architecture --in <run-dir>/architecture.json --out <run-dir>`. It produces `ARCHITECTURE.md` and a self-contained `ARCHITECTURE.html` describing the target's stack, components, trust boundaries, data flows, and attack surface. Descriptive only; it never changes a verdict.
 
 Shortcuts: `omgs review --repo-url <github-url>` clones a repository into the local OMGS targets area and initializes a run with stack detection and sensors. `omgs check --target <repo>` runs deterministic sensors and counts committed proof tests without executing target code. `omgs ledger set --ledger <run-dir>/coverage-ledger.json --unit <id> --status covered` records coverage progress.
 
@@ -103,7 +103,7 @@ cargo build --release
 ## Repository layout
 
 - `src/`: the deterministic Rust CLI (findings schema, finding identity across runs, stack detection, coverage ledger, redacted sensor execution, sandbox proof execution, report rendering to Markdown, a self contained HTML one pager, and SARIF, and the architecture map renderer).
-- `schemas/`: findings and coverage ledger JSON schemas.
+- `schemas/`: findings and coverage ledger JSON schemas (the agent-facing candidate and architecture schemas live in `skill/schemas/`).
 - `skill/`: the agent skill pack and attack class packs that your agent follows.
 - `.github/workflows/release.yml`: the signed, notarized, checksummed release pipeline.
 - `benchmark/`: the open benchmark design and case manifest format.

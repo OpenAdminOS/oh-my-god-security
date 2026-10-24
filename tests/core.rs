@@ -888,3 +888,39 @@ fn architecture_single_column_reserves_a_gutter() {
     assert!(html.contains("viewBox=\"0 0 396"));
     assert_eq!(html.matches("<svg").count(), 1);
 }
+
+#[test]
+fn architecture_sample_fixture_is_valid() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/architecture.sample.json"
+    );
+    let txt = std::fs::read_to_string(path).expect("read sample");
+    let a = from_json(&txt).expect("parse sample");
+    assert!(
+        validate_architecture(&a).is_empty(),
+        "sample must validate: {:?}",
+        validate_architecture(&a)
+    );
+    assert_eq!(render_architecture_html(&a).matches("<svg").count(), 1);
+    let _ = render_architecture_markdown(&a);
+}
+
+#[test]
+fn architecture_renders_cyclic_flows_without_panic() {
+    let mut a = arch();
+    a.flows.push(Flow {
+        from: "r".into(),
+        to: "c".into(),
+        ..Default::default()
+    });
+    a.flows.push(Flow {
+        from: "c".into(),
+        to: "r".into(),
+        ..Default::default()
+    });
+    assert!(validate_architecture(&a).is_empty());
+    let first = render_architecture_html(&a);
+    assert_eq!(first, render_architecture_html(&a));
+    assert!(first.contains("<svg"));
+}
