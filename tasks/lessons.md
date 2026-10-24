@@ -9,10 +9,13 @@ run unnotarized Developer ID packages as root. The user caught this.
 
 Why it matters: OMGS's core invariant is sandbox-only. All target code runs through `omgs prove`
 in an OS-enforced sandbox; there is never an unsandboxed fallback. Privileged installers and root
-helpers are the one class the sandbox cannot contain, so they move to a dedicated host. That
-exception is only safe on a genuinely disposable machine (throwaway VM or wiped box, no real data,
-no credentials, no Keychain), snapshotted and discarded. Weakening a real machine (Gatekeeper off,
-passwordless sudo) exposes it for as long as the change stands.
+helpers are the one class the sandbox cannot contain, and there is no tier or backend for running
+them, so their root-execution step has no proof tier: leave it `needs_validation` with a manual
+plan rather than running it anywhere unsandboxed. Weakening a real machine (Gatekeeper off,
+passwordless sudo) to run such a step is exactly the mistake this lesson records. If a person runs
+a live demonstration purely to inform severity, that is a manual step outside OMGS on a genuinely
+disposable machine (throwaway VM or wiped box, no real data, no credentials, no Keychain),
+snapshotted and discarded, and never a substitute for the `needs_validation` verdict.
 
 Rules for next time:
 - An effect the sandbox cannot contain (real root, Gatekeeper, a root helper) has no proof tier

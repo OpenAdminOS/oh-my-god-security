@@ -113,21 +113,26 @@ fn kill_group(child: &mut Child) {
 }
 
 fn run_with_timeout(mut child: Child, timeout_ms: u64) -> (bool, bool, String) {
+    use std::sync::mpsc;
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
-    let out_thread = std::thread::spawn(move || {
+    // Readers send their captured text over a channel instead of being joined,
+    // so a descendant that inherited or redirected the pipes cannot block us.
+    let (tx, rx) = mpsc::channel::<(u8, String)>();
+    let tx_out = tx.clone();
+    std::thread::spawn(move || {
         let mut s = String::new();
         if let Some(mut r) = stdout.take() {
             let _ = r.read_to_string(&mut s);
         }
-        s
+        let _ = tx_out.send((0, s));
     });
-    let err_thread = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut s = String::new();
         if let Some(mut r) = stderr.take() {
             let _ = r.read_to_string(&mut s);
         }
-        s
+        let _ = tx.send((1, s));
     });
     let start = Instant::now();
     let mut timed_out = false;
@@ -137,8 +142,6 @@ fn run_with_timeout(mut child: Child, timeout_ms: u64) -> (bool, bool, String) {
             Ok(None) => {
                 if start.elapsed() > Duration::from_millis(timeout_ms) {
                     timed_out = true;
-                    kill_group(&mut child);
-                    let _ = child.wait();
                     break false;
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -146,9 +149,30 @@ fn run_with_timeout(mut child: Child, timeout_ms: u64) -> (bool, bool, String) {
             Err(_) => break false,
         }
     };
-    let mut output = out_thread.join().unwrap_or_default();
-    output.push_str(&err_thread.join().unwrap_or_default());
-    (success, timed_out, output)
+    // Terminate the whole process group on every path, not only timeout: a
+    // command that forks a background child and exits (for example `sleep 60 &`)
+    // otherwise leaves target-controlled code running and holding the pipes.
+    // Killing the group closes the inherited pipe ends so the readers can finish.
+    kill_group(&mut child);
+    let _ = child.wait();
+
+    // Drain the readers, bounded by a deadline so a surviving writer cannot stall
+    // the result past the timeout.
+    let mut out = String::new();
+    let mut err = String::new();
+    let drain = Duration::from_millis(2_000);
+    let drain_start = Instant::now();
+    for _ in 0..2 {
+        let remaining = drain.checked_sub(drain_start.elapsed()).unwrap_or_default();
+        match rx.recv_timeout(remaining) {
+            Ok((0, s)) => out = s,
+            Ok((1, s)) => err = s,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    out.push_str(&err);
+    (success, timed_out, out)
 }
 
 fn base_env(cmd: &mut Command, scratch: &Path) {
@@ -314,6 +338,11 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
                 "/run",
                 "--tmpfs",
                 "/var/run",
+                // Re-expose the target read-only after the masks, so a target
+                // under a masked dir (for example /tmp) is not hidden.
+                "--ro-bind",
+                &cwd.to_string_lossy(),
+                &cwd.to_string_lossy(),
                 "--bind",
                 &scratch.to_string_lossy(),
                 &scratch.to_string_lossy(),
