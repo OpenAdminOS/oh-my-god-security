@@ -1454,3 +1454,57 @@ fn concurrent_reviews_of_one_url_never_delete_each_others_clone() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn route_rejects_wrong_value_types_without_writing() {
+    let dir = scratch("route-values");
+    let models = dir.join("models.json");
+    std::fs::write(&models, r#"{"roles":{"hunter":["m1","m2"]}}"#).unwrap();
+    for bad in [
+        r#"{"models":{"verifier":42}}"#,
+        r#"{"blockers":[7]}"#,
+        r#"{"reroutes":[{"role":"hunter","from":"m0","to":5}]}"#,
+        r#"{"reroutes":[{"role":"hunter","from":"m0","reason":false}]}"#,
+    ] {
+        std::fs::write(dir.join("run-metadata.json"), bad).unwrap();
+        let out = omgs(&[
+            "route",
+            "--run",
+            dir.to_str().unwrap(),
+            "--role",
+            "hunter",
+            "--models",
+            models.to_str().unwrap(),
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{bad}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("run-metadata.json")).unwrap(),
+            bad
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn status_accepts_schema_minimal_log_entries() {
+    let dir = scratch("status-minimal-log");
+    std::fs::write(
+        dir.join("pipeline-status.json"),
+        r#"{"stages":[],"updated_ms":1,"log":[{"m":"mapping started"}]}"#,
+    )
+    .unwrap();
+    omgs::status::apply(
+        &dir,
+        &omgs::status::Update {
+            stage: "map",
+            label: None,
+            parent: None,
+            state: "active",
+            detail: None,
+            counters: &[],
+            log: None,
+        },
+    )
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

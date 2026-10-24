@@ -128,13 +128,18 @@ fn check_document(doc: &Map<String, Value>) -> Result<(), String> {
     if let Some(log) = doc.get("log") {
         let log = log.as_array().ok_or("log must be an array")?;
         for (i, e) in log.iter().enumerate() {
+            // Per the status schema: m is required; ts and kind are optional
+            // strings.
             let ok = e.as_object().is_some_and(|o| {
-                ["ts", "kind", "m"]
-                    .iter()
-                    .all(|k| o.get(*k).is_some_and(|x| x.is_string()))
+                o.get("m").is_some_and(|x| x.is_string())
+                    && ["ts", "kind"]
+                        .iter()
+                        .all(|k| o.get(*k).is_none_or(|x| x.is_string()))
             });
             if !ok {
-                return Err(format!("log[{i}] needs string ts, kind and m"));
+                return Err(format!(
+                    "log[{i}] needs a string m (ts and kind are optional strings)"
+                ));
             }
         }
     }

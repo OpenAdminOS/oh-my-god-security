@@ -1412,6 +1412,7 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
     let next = omgs::runmeta::update(&run, |m| {
         // Malformed history must stop the command: silently ignoring it would
         // forget earlier refusals and send work back to a refusing model.
+        omgs::batch::check_meta_types(m)?;
         for (key, ok) in [
             ("reroutes", m.get("reroutes").is_none_or(|v| v.is_array())),
             ("models", m.get("models").is_none_or(|v| v.is_object())),
