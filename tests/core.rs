@@ -136,6 +136,7 @@ fn mxc_config_matches_verified_contract() {
         readonly: vec![PathBuf::from("/opt/homebrew")],
         denied: vec![PathBuf::from("/home/u/.cargo/credentials.toml")],
         rust: None,
+        list_parents: true,
     };
     let v = mxc_config(&input("windows"));
     assert_eq!(v["version"], "1.0.0");

@@ -209,8 +209,7 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
         {
             match (&record.test, &record.test_sha256) {
                 (Some(t), Some(_)) => {
-                    let name = t.rsplit(['/', '\\']).next().unwrap_or(t);
-                    if !record.command.contains(name) {
+                    if !command_names(&record.command, t) {
                         errors.push(format!(
                             "{at}: {r} ran a command that does not name its proof test {t}"
                         ));
@@ -220,7 +219,9 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
                     "{at}: {r} names no proof test; run omgs prove with --test <path in the target>"
                 )),
             }
-            if !record.assertion_failure() {
+            // A confirmed record needs the test failing on the target; a
+            // rejected one may rest on a control test that passes.
+            if f.verdict == crate::model::Verdict::Confirmed && !record.assertion_failure() {
                 errors.push(format!(
                     "{at}: {r} exited {}, a proven record needs the proof test failing on the target (126, 127 and signals mean the test never ran)",
                     record
@@ -232,6 +233,20 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
         }
     }
     errors
+}
+
+/// Whether one token of `command` (split on whitespace and quotes) is the
+/// test path, ends with it, or is its file name. A sanity check that the
+/// recorded command is the proof test, not evidence that it executed it:
+/// replay is that evidence.
+fn command_names(command: &str, test: &str) -> bool {
+    let norm = |s: &str| s.replace('\\', "/");
+    let test = norm(test);
+    let name = test.rsplit('/').next().unwrap_or(&test).to_string();
+    command
+        .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .map(norm)
+        .any(|tok| tok == test || tok.ends_with(&format!("/{test}")) || tok == name)
 }
 
 /// Cross-checks against what the runner wrote beside the record: the
@@ -416,7 +431,7 @@ fn redact_line(line: &str, lower: &str) -> String {
     }
     let cut = KEYS
         .iter()
-        .filter_map(|k| lower.find(k).map(|i| i + k.len()))
+        .flat_map(|k| lower.match_indices(k).map(|(i, _)| i + k.len()))
         .filter_map(|after| {
             lower[after..]
                 .find([':', '='])
@@ -461,6 +476,21 @@ mod tests {
         assert!(!json.contains("k-123"), "{json}");
         let bearer = redact("Authorization header: Bearer eyJabc.def\ncurl -H x\n");
         assert!(!bearer.contains("eyJabc"), "{bearer}");
+        let twice = redact("token x then token=abc\n");
+        assert!(!twice.contains("abc"), "{twice}");
+        assert!(command_names(
+            "sh tests/security/x.test.sh",
+            "tests/security/x.test.sh"
+        ));
+        assert!(command_names(
+            "cmd.exe /d /c tests\\security\\x.cmd",
+            "tests/security/x.cmd"
+        ));
+        assert!(command_names(
+            "swiftc main.swift v/Verifier.swift",
+            "main.swift"
+        ));
+        assert!(!command_names("exit 1 # x.test.shy", "tests/x.test.sh"));
         let url = redact("fetch https://bob:hunter2@example.test/x ok\n");
         assert!(
             !url.contains("hunter2") && url.contains("example.test/x ok"),

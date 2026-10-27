@@ -365,7 +365,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         Some(r) => {
             // Check and charge the budget in one locked step, before anything
             // runs, so concurrent proofs cannot overspend it. A run that is
-            // interrupted or blocked keeps its charge.
+            // interrupted keeps its charge; a blocked one gets it back below.
             let charged = omgs::runmeta::update(r, |m| {
                 let used = |k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
                 let (calls, proofs) = (used("agent_calls_used"), used("proof_runs_used"));
@@ -471,12 +471,22 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         started_at_ms,
         duration_ms: s.duration_ms,
         exit_code: s.exit_code,
-        // MXC enforces the config timeout first and reports it as an error.
-        timed_out: s.timed_out || s.output.contains("script timed out after"),
+        // MXC enforces the config timeout first and reports it as an error,
+        // which a large output can push past the capture cap; the duration
+        // tells it too.
+        timed_out: s.timed_out
+            || s.duration_ms >= timeout_ms
+            || s.output.contains("script timed out after"),
         capture_complete: s.capture_complete,
         cleanup_complete: s.cleanup_complete,
-        // MXC reports its own failures as a JSON error object on stderr.
-        executor_error: s.output.contains("{\"error\":{\"code\":"),
+        // MXC reports its own failures as a JSON error object on a stderr
+        // line; systemd-run reports a scope it could not start. Either way the
+        // command may never have run.
+        executor_error: s.output.lines().any(|l| {
+            let l = l.trim_start();
+            l.starts_with("{\"error\":{\"code\":")
+                || l.starts_with("Failed to start transient scope")
+        }),
         survivors: s
             .survivors
             .iter()
@@ -597,7 +607,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         }
     };
     let (enforced, gaps) = omgs::sandbox::declared_controls(os, Tier::Test);
-    println!("enforced for every proof run here:");
+    println!("every proof run here enforces the following (a limit marked as conditional is reported per run):");
     for e in enforced
         .iter()
         .chain(omgs::sandbox::declared_limits(os).iter())
@@ -685,7 +695,10 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         };
         let outcome = match prove(&request) {
             ProveOutcome::Ran(r) => r,
-            ProveOutcome::Blocked { reason } => return Err(reason),
+            ProveOutcome::Blocked { reason } => {
+                let _ = std::fs::remove_dir_all(&probe);
+                return Err(reason);
+            }
         };
         let out = outcome.run.output.clone();
         let _ = std::fs::remove_dir_all(&probe);

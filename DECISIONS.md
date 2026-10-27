@@ -36,7 +36,7 @@ Target controlled code, including builds, tests and the running app at level 2, 
 
 - No external network. Local client and server traffic stays on an isolated loopback.
 - An empty environment built from an explicit allowlist, with scratch local home, temp and cache directories. Dummy principals and dummy secrets only.
-- A read only target and toolchain. The target process writes only inside its assigned scratch directory.
+- A read only target and toolchain. The target process writes only inside its assigned scratch directory and a per-run copy of the target; the original target is never mounted.
 - Explicit limits on CPU, memory, processes, file size, disk and wall clock time.
 - No dependency installation and no network fetching during proof execution. Only tools and dependencies already present locally are used.
 - Execution stops at the minimum local effect that proves the boundary violation.

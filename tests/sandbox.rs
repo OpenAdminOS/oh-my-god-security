@@ -64,7 +64,7 @@ fn prove_refuses_an_executor_that_does_not_match_the_pin() {
     assert_eq!(out.status.code(), Some(3), "{t}");
     assert!(t.contains("refusing to run"), "{t}");
     assert!(t.contains("target code was not executed"), "{t}");
-    assert!(!t.contains("ran"), "{t}");
+    assert!(!t.lines().any(|l| l.trim() == "ran"), "{t}");
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -82,15 +82,35 @@ fn denials_hold_and_the_target_is_untouched() {
     let outside = d.join("outside.txt");
     std::fs::write(&outside, b"outside-secret-value").unwrap();
     let real_home = omgs::platform::home().unwrap();
+    // A real file in the real home, so a denied read is not just a missing file.
+    let home_probe = real_home.join(format!(".omgs-sbx-probe-{}", std::process::id()));
+    std::fs::write(&home_probe, b"home-secret-value").unwrap();
+    // A host loopback service answering HTTP, reachable from the test itself
+    // (positive control) and expected unreachable from inside.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut c in listener.incoming().flatten() {
+            use std::io::Write;
+            let _ = c.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 6\r\n\r\nHOSTOK");
+        }
+    });
+    let host_curl = std::process::Command::new("curl")
+        .args(["-sm3", &format!("http://127.0.0.1:{port}/")])
+        .output();
+    let curl_works = host_curl.is_ok_and(|o| String::from_utf8_lossy(&o.stdout) == "HOSTOK");
     let cmd = format!(
         "cat '{o}' 2>/dev/null && echo READ_OUTSIDE; \
          [ -n \"$(ls -A '{h}' 2>/dev/null | grep -vx -e .cargo -e .rustup)\" ] && echo LIST_HOME; \
+         cat '{hp}' 2>/dev/null; \
          cat '{h}/.ssh/known_hosts' >/dev/null 2>&1 && echo READ_SSH; \
          touch '{d}/escape' 2>/dev/null; \
          curl -sm3 https://example.com >/dev/null 2>&1 && echo NETWORK; \
+         curl -sm3 http://127.0.0.1:{port}/ 2>/dev/null; \
          echo changed > app.txt && cat app.txt",
         o = outside.display(),
         h = real_home.display(),
+        hp = home_probe.display(),
         d = d.display()
     );
     let out = omgs(
@@ -98,12 +118,18 @@ fn denials_hold_and_the_target_is_untouched() {
         &["prove", "--target", target.to_str().unwrap(), "--cmd", &cmd],
     );
     let t = text(&out);
+    let _ = std::fs::remove_file(&home_probe);
+    if !curl_works {
+        eprintln!("note: curl unavailable on the host, loopback denial not checked");
+    }
     for leak in [
         "READ_OUTSIDE",
         "outside-secret-value",
+        "home-secret-value",
         "LIST_HOME",
         "READ_SSH",
         "NETWORK",
+        "HOSTOK",
     ] {
         assert!(!t.contains(leak), "{leak} must be denied: {t}");
     }
@@ -155,6 +181,49 @@ fn setsid_escape_is_killed_reported_and_fails_the_run() {
     let t = text(&out);
     assert_eq!(out.status.code(), Some(1), "{t}");
     assert!(t.contains("survivor killed"), "{t}");
+    let record = record_from(&t);
+    assert!(
+        !record["survivors"].as_array().unwrap().is_empty(),
+        "{record}"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The unlinked record a prove run printed the path of.
+#[cfg(target_os = "macos")]
+fn record_from(output: &str) -> serde_json::Value {
+    let line = output
+        .lines()
+        .find_map(|l| l.strip_prefix("proof record: "))
+        .expect("prove prints its record path");
+    let path = line.split(" (").next().unwrap();
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn tier2_is_refused_without_linux_or_approval() {
+    let d = scratch("tier2-refuse");
+    let target = d.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let out = omgs(
+        &d.join("home"),
+        &[
+            "prove",
+            "--tier",
+            "2",
+            "--target",
+            target.to_str().unwrap(),
+            "--cmd",
+            "true",
+        ],
+    );
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(3), "{t}");
+    if cfg!(target_os = "linux") {
+        assert!(t.contains("one-time human approval"), "{t}");
+    } else {
+        assert!(t.contains("tier 2 runs only on Linux"), "{t}");
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -338,6 +407,39 @@ fn proof_records_back_confirmed_findings() {
     assert!(text(&redirected).contains("not this run's target"));
     std::fs::write(run.join("proofs/1.json"), original).unwrap();
 
+    // A rejected record may rest on a control test that passes.
+    std::fs::write(target.join("check.txt"), b"fixed").unwrap();
+    let control = omgs(
+        &home,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--finding",
+            &fp,
+            "--test",
+            x_test,
+            "--cmd",
+            failing,
+        ],
+    );
+    assert!(control.status.success(), "{}", text(&control));
+    let n = text(&control)
+        .lines()
+        .find_map(|l| l.split("proof_ref ").nth(1))
+        .map(|r| r.trim_end_matches(')').to_string())
+        .unwrap();
+    let mut rejected: serde_json::Value = serde_json::from_str(&finding(Some(&n))).unwrap();
+    rejected["findings"][0]["verdict"] = "rejected".into();
+    rejected["findings"][0]["severity"] = serde_json::Value::Null;
+    std::fs::write(&findings, rejected.to_string()).unwrap();
+    let ok_rejected = omgs(
+        &home,
+        &["validate", "--findings", findings.to_str().unwrap()],
+    );
+    assert!(ok_rejected.status.success(), "{}", text(&ok_rejected));
+    std::fs::write(target.join("check.txt"), b"vulnerable").unwrap();
+
     // A command that never ran (127) is not a failing proof test.
     let broken = omgs(
         &home,
@@ -354,11 +456,11 @@ fn proof_records_back_confirmed_findings() {
         ],
     );
     assert!(
-        text(&broken).contains("proof_ref proofs/4.json"),
+        text(&broken).contains("proof_ref proofs/5.json"),
         "{}",
         text(&broken)
     );
-    std::fs::write(&findings, finding(Some("proofs/4.json"))).unwrap();
+    std::fs::write(&findings, finding(Some("proofs/5.json"))).unwrap();
     let never_ran = omgs(
         &home,
         &["validate", "--findings", findings.to_str().unwrap()],

@@ -1175,7 +1175,14 @@ fn forged_or_broken_proof_records_are_rejected() {
         std::fs::write(&record_path, v.to_string()).unwrap();
     };
     type Change = dyn Fn(&mut serde_json::Value);
-    let cases: [(&str, &Change); 7] = [
+    let cases: [(&str, &Change); 10] = [
+        ("was recorded for finding", &|v| {
+            v["finding"] = "omgs-0000000000000000".into()
+        }),
+        ("cannot support", &|v| v["tier"] = "local_app".into()),
+        ("does not name its proof test", &|v| {
+            v["command"] = "exit 1".into()
+        }),
         ("not a pinned MXC", &|v| {
             v["executor_sha256"] = "1".repeat(64).into()
         }),
@@ -1199,5 +1206,40 @@ fn forged_or_broken_proof_records_are_rejected() {
         let errors = check(&dir);
         assert!(has(&errors, needle), "{needle}: {errors:?}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn report_and_critic_refuse_a_confirmed_record_without_a_proof() {
+    let dir = scratch("unproven");
+    let (ledger, cands, findings) = complete_run();
+    let w = |name: &str, v: String| std::fs::write(dir.join(name), v).unwrap();
+    w(
+        "coverage-ledger.json",
+        serde_json::to_string(&ledger).unwrap(),
+    );
+    w(
+        "candidates-red-1.json",
+        serde_json::json!({"candidates": [candidate_json(&cands[0].candidate)]}).to_string(),
+    );
+    // Confirmed and test_proven, but no proof record was ever written.
+    w("findings.json", serde_json::to_string(&findings).unwrap());
+    let report = omgs(&[
+        "report",
+        "--findings",
+        dir.join("findings.json").to_str().unwrap(),
+        "--out",
+        dir.join("out").to_str().unwrap(),
+    ]);
+    assert_eq!(report.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&report.stderr).contains("requires proof_ref"));
+    let critic = omgs(&["critic", "--run", dir.to_str().unwrap()]);
+    assert!(!critic.status.success());
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&critic.stdout),
+        String::from_utf8_lossy(&critic.stderr)
+    );
+    assert!(said.contains("requires proof_ref"), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
 }

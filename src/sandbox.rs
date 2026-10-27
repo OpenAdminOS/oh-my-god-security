@@ -1,5 +1,5 @@
 //! Proof execution under Microsoft MXC, the only sandbox backend. OMGS writes
-//! a deny-by-default MXC 1.0.0 config, runs the SHA-256 pinned executor for
+//! a deny-by-default config in MXC's 1.0.0 schema, runs the SHA-256 pinned executor for
 //! this OS under `supervise::run`, and reports exactly what was enforced.
 //! Target code never runs anywhere else: without a verified executor OMGS
 //! refuses and the finding stays at the tier it already earned.
@@ -95,6 +95,13 @@ pub struct Located {
 /// skipped over silently: it is named in the error.
 pub fn locate_executor() -> Result<Located, String> {
     let executor = this_executor()?;
+    if cfg!(target_os = "macos") {
+        if let Some(major) = macos_major().filter(|m| *m < 15) {
+            return Err(format!(
+                "MXC needs macOS 15 or later; this Mac runs macOS {major}, so omgs prove cannot run target code here."
+            ));
+        }
+    }
     let check = |path: &Path| match sha256::digest_file(path) {
         Ok(d) if d == executor.sha256 => Ok(()),
         Ok(d) => Err(format!(
@@ -140,6 +147,21 @@ pub fn locate_executor() -> Result<Located, String> {
             problems.join("; ")
         ))
     }
+}
+
+/// The running macOS major version, read from `sw_vers`.
+fn macos_major() -> Option<u32> {
+    let out = Command::new("/usr/bin/sw_vers")
+        .arg("-productVersion")
+        .env_clear()
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Manual install steps for the pinned executor, shown when it is missing.
@@ -319,6 +341,10 @@ pub struct ConfigInput<'a> {
     pub readonly: Vec<PathBuf>,
     pub denied: Vec<PathBuf>,
     pub rust: Option<RustHomes>,
+    /// Windows only: let the container list the parent directories of the
+    /// granted paths. Older ProcessContainer builds (Windows Server 2025)
+    /// reject the setting, so it can be turned off.
+    pub list_parents: bool,
 }
 
 pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
@@ -406,10 +432,14 @@ pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
                     }
                 }
             }
-            config["processContainer"] = serde_json::json!({
-                "ui": { "isolation": "desktop" },
-                "filesystem": { "enumeratePaths": enumerate }
-            });
+            config["processContainer"] = if input.list_parents {
+                serde_json::json!({
+                    "ui": { "isolation": "desktop" },
+                    "filesystem": { "enumeratePaths": enumerate }
+                })
+            } else {
+                serde_json::json!({ "ui": { "isolation": "desktop" } })
+            };
         }
         "macos" => {
             // User and group lookups (getpwuid) go through opendirectoryd;
@@ -753,7 +783,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         }
         _ => None,
     };
-    let config = mxc_config(&ConfigInput {
+    let mut input = ConfigInput {
         os,
         containment: located.executor.containment,
         command: &req.command,
@@ -764,24 +794,8 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         readonly,
         denied,
         rust,
-    });
-    let config_text = serde_json::to_string_pretty(&config).unwrap_or_default();
-    let config_path = run_dir.join("mxc-config.json");
-    if let Err(e) = crate::runmeta::write_atomic_bytes(&config_path, config_text.as_bytes()) {
-        return blocked(format!("failed to write MXC config: {e}"));
-    }
-
-    let mut cmd = Command::new(&executor);
-    cmd.arg("--config").arg(&config_path);
-    cmd.env_clear();
-    if os == "windows" {
-        for k in ["SYSTEMROOT", "WINDIR", "TEMP", "TMP"] {
-            if let Some(v) = std::env::var_os(k) {
-                cmd.env(k, v);
-            }
-        }
-    }
-    cmd.current_dir(&run_dir);
+        list_parents: true,
+    };
     let limits = supervise::Limits {
         // The executor enforces the config timeout itself; the supervisor
         // allows a short margin for teardown before killing it.
@@ -793,9 +807,42 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         tasks: Some(512),
         output_cap_bytes: 256 * 1024,
     };
-    let run = supervise::run(cmd, &limits, markers.as_ref());
+    let mut extra_gaps = Vec::new();
+    let (config_text, run) = loop {
+        let config = mxc_config(&input);
+        let config_text = serde_json::to_string_pretty(&config).unwrap_or_default();
+        let config_path = run_dir.join("mxc-config.json");
+        if let Err(e) = crate::runmeta::write_atomic_bytes(&config_path, config_text.as_bytes()) {
+            return blocked(format!("failed to write MXC config: {e}"));
+        }
+        let mut cmd = Command::new(&executor);
+        cmd.arg("--config").arg(&config_path);
+        cmd.env_clear();
+        if os == "windows" {
+            for k in ["SYSTEMROOT", "WINDIR", "TEMP", "TMP"] {
+                if let Some(v) = std::env::var_os(k) {
+                    cmd.env(k, v);
+                }
+            }
+        }
+        cmd.current_dir(&run_dir);
+        let run = supervise::run(cmd, &limits, markers.as_ref());
+        // MXC rejects the policy before starting anything, so nothing ran and
+        // retrying without the setting is safe.
+        if input.list_parents
+            && run
+                .output
+                .contains("enumeratePaths is not supported by this version of Windows")
+        {
+            input.list_parents = false;
+            extra_gaps.push("this Windows version cannot let the sandbox list parent directories; runtimes that resolve real paths from the drive root (such as Node) may fail to start".to_string());
+            continue;
+        }
+        break (config_text, run);
+    };
     let (mut enforced, mut gaps) = declared_controls(os, req.tier);
     enforced.extend(run.enforced.iter().cloned());
+    gaps.extend(extra_gaps);
     gaps.extend(run.notes.iter().cloned());
     // The workspace and scratch can be large and hold build output; the
     // config stays as part of the proof evidence.
