@@ -42,3 +42,15 @@ Rules for next time:
   never an empty value a checker can pass.
 - When fixing one instance of a bug class, sweep every struct the same input flows through
   before asking for re-review.
+
+## 2026-10-27: nothing discussed is deferred out of a release
+
+What happened: sandbox hardening was moved to "Deferred past 0.1" when it got hard, and other
+roadmap items stayed "still open" or "tracked" while the release was called ready. The user's
+rule: everything discussed for the release ships in that release.
+
+Rules for next time:
+- Never mark a discussed item as deferred, tracked, or "later" to close out a release. If it
+  is blocked, say so, say why, and keep it in scope until the user explicitly removes it.
+- Before calling a release ready, sweep IMPROVEMENTS.md, tasks/todo.md, DECISIONS.md, and
+  benchmark/feature-coverage.md for open, partial, tracked, or deferred items and list them.

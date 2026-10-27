@@ -5,7 +5,7 @@ use omgs::critic::{critique_dir, critique_run};
 use omgs::ledger::{add_unit, coverage_lines, set_status, validate_ledger, Ledger, Unit, STATUSES};
 use omgs::model::{identity, validate, FindingsFile};
 use omgs::report::{render_html, render_markdown, render_sarif, ReportMeta};
-use omgs::sandbox::{prove, ProveOutcome, ProveRequest};
+use omgs::sandbox::{prove, ProveOutcome, ProveRequest, Tier};
 use omgs::sensors::run_sensors;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -24,7 +24,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--cwd <dir>] [--scratch <dir>] [--timeout-ms <n>]\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n\nEvery option except --yes and --no-sensors takes a value, and a value may not begin with --.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value, and a value may not begin with --.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -42,7 +42,7 @@ fn main() -> ExitCode {
     }
     // Every option except the switches takes a value; a missing one is an
     // error rather than being skipped or taking the next option's name.
-    const SWITCHES: [&str; 2] = ["--yes", "--no-sensors"];
+    const SWITCHES: [&str; 3] = ["--yes", "--no-sensors", "--live"];
     for (i, a) in rest.iter().enumerate() {
         if a.starts_with("--") && !SWITCHES.contains(&a.as_str()) {
             match rest.get(i + 1) {
@@ -69,6 +69,7 @@ fn main() -> ExitCode {
         "validate" => cmd_validate(rest),
         "fingerprint" => cmd_fingerprint(rest),
         "prove" => cmd_prove(rest),
+        "approve" => cmd_approve(rest),
         "report" => cmd_report(rest),
         "architecture" => cmd_architecture(rest),
         "ledger" => cmd_ledger(rest),
@@ -79,6 +80,7 @@ fn main() -> ExitCode {
         "route" => cmd_route(rest),
         "intent" => cmd_intent(rest),
         "check" => cmd_check(rest),
+        "doctor" => cmd_doctor(rest),
         other => Err(format!("unknown command '{other}'")),
     };
     match result {
@@ -101,10 +103,22 @@ fn read_findings(path: &str) -> Result<FindingsFile, String> {
     omgs::shape::findings(&text).map_err(|e| format!("parse {path}: {e}"))
 }
 
+/// Evidence rules plus proof records, which live in `proofs/` beside the
+/// findings file.
+fn validate_at(file: &FindingsFile, path: &str) -> Vec<String> {
+    let dir = Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut errors = validate(file);
+    errors.extend(omgs::proof::validate_proofs(file, dir));
+    errors
+}
+
 fn cmd_validate(args: &[String]) -> Result<(), String> {
     let path = flag(args, "--findings").ok_or("validate requires --findings <path>")?;
     let file = read_findings(&path)?;
-    let errors = validate(&file);
+    let errors = validate_at(&file, &path);
     if errors.is_empty() {
         println!("valid: {} finding(s)", file.findings.len());
         Ok(())
@@ -168,50 +182,364 @@ fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
 
 fn cmd_prove(args: &[String]) -> Result<(), String> {
     let command = flag(args, "--cmd").ok_or("prove requires --cmd <command>")?;
-    let timeout: u64 = flag(args, "--timeout-ms")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(120_000);
-    let scratch = flag(args, "--scratch")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/share/omgs/prove-scratch"));
-    let request = ProveRequest {
-        command,
-        timeout_ms: timeout,
-        cwd: flag(args, "--cwd").map(PathBuf::from),
-        scratch,
+    let timeout_ms: u64 = match flag(args, "--timeout-ms") {
+        Some(v) => v
+            .parse()
+            .map_err(|_| format!("--timeout-ms must be a whole number, got '{v}'"))?,
+        None => 120_000,
     };
-    match prove(&request) {
-        ProveOutcome::BlockedNoSandbox { request_json } => {
-            eprintln!("needs_validation: no sandbox backend found, target code was not executed.");
-            eprintln!("Install an MXC executor (OMGS_MXC_EXEC), Seatbelt (macOS) or bubblewrap (Linux), then rerun. Planned containment request:");
-            eprintln!("{request_json}");
-            Err("__EXIT3__".into())
+    let tier = match flag(args, "--tier").as_deref() {
+        None | Some("1") => Tier::Test,
+        Some("2") => Tier::LocalApp,
+        Some(other) => return Err(format!("--tier must be 1 or 2, got '{other}'")),
+    };
+    let run = flag(args, "--run").map(PathBuf::from);
+    let finding = flag(args, "--finding");
+    if let Some(fp) = &finding {
+        if !omgs::model::is_fingerprint(fp) {
+            return Err(format!("--finding '{fp}' is not an omgs fingerprint"));
         }
-        ProveOutcome::Ran {
-            backend,
-            success,
-            timed_out,
-            output,
-        } => {
-            eprintln!(
-                "sandbox backend: {backend}{}",
-                if timed_out { " (timed out)" } else { "" }
+        if run.is_none() {
+            return Err(
+                "--finding needs --run <run-dir> so the proof record lands beside the findings"
+                    .into(),
             );
-            print!("{output}");
-            if success && !timed_out {
-                Ok(())
-            } else {
-                Err("__EXIT1__".into())
+        }
+    }
+    let test = flag(args, "--test");
+    if let Some(t) = &test {
+        if Path::new(t).is_absolute() || t.split(['/', '\\']).any(|s| s == "..") {
+            return Err(format!(
+                "--test '{t}' must be a path relative to the target"
+            ));
+        }
+    }
+    let meta = match &run {
+        Some(r) => Some(omgs::runmeta::read(r)?),
+        None => None,
+    };
+    let target = flag(args, "--target").map(PathBuf::from).or_else(|| {
+        meta.as_ref()
+            .and_then(|m| m.get("target").and_then(|t| t.as_str()).map(PathBuf::from))
+    });
+    let target = match target {
+        Some(t) => {
+            Some(std::fs::canonicalize(&t).map_err(|e| format!("target {}: {e}", t.display()))?)
+        }
+        None => None,
+    };
+    if tier == Tier::LocalApp {
+        if let Some(why) = omgs::sandbox::tier2_unavailable(std::env::consts::OS) {
+            eprintln!("needs_validation: target code was not executed. {why}");
+            return Err("__EXIT3__".into());
+        }
+        let t = target
+            .as_ref()
+            .ok_or("--tier 2 needs a target, since approval is per repository")?;
+        if !omgs::approval::is_approved(&data_dir(), t)? {
+            eprintln!("needs_validation: tier 2 runs a locally built app and needs a one-time human approval for {}.", t.display());
+            eprintln!(
+                "A person (not an agent) runs: omgs approve --target {}",
+                t.display()
+            );
+            return Err("__EXIT3__".into());
+        }
+    }
+    if let Some(m) = &meta {
+        // Every proof run counts against the run budget, like an agent call.
+        let budget = m.get("budget_agent_calls").and_then(|v| v.as_u64());
+        let calls = m
+            .get("agent_calls_used")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let proofs = m
+            .get("proof_runs_used")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if let Some(b) = budget {
+            if calls + proofs >= b {
+                return Err(format!(
+                    "run budget exhausted: {calls} agent call(s) and {proofs} proof run(s) against a budget of {b}"
+                ));
             }
         }
     }
+    let proof_dir = match &run {
+        Some(r) => Some(omgs::proof::reserve(r)?),
+        None => None,
+    };
+    let run_dir = match &proof_dir {
+        Some((_, d)) => d.clone(),
+        None => data_dir().join("prove").join(format!(
+            "{}-{}",
+            omgs::runmeta::now_ms(),
+            std::process::id()
+        )),
+    };
+    let request = ProveRequest {
+        command: command.clone(),
+        timeout_ms,
+        target: target.clone(),
+        run_dir: run_dir.clone(),
+        tier,
+    };
+    let started_at_ms = omgs::runmeta::now_ms();
+    let result = match prove(&request) {
+        ProveOutcome::Blocked { reason } => {
+            eprintln!("needs_validation: target code was not executed. {reason}");
+            return Err("__EXIT3__".into());
+        }
+        ProveOutcome::Ran(r) => r,
+    };
+    if let Some(r) = &run {
+        omgs::runmeta::update(r, |m| {
+            let used = m
+                .get("proof_runs_used")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            m.insert("proof_runs_used".into(), serde_json::json!(used + 1));
+            Ok(())
+        })?;
+    }
+    let s = &result.run;
+    let record = omgs::proof::ProofRecord {
+        schema: omgs::proof::SCHEMA.into(),
+        n: proof_dir.as_ref().map(|(n, _)| *n).unwrap_or(0),
+        finding,
+        test,
+        tier: match tier {
+            Tier::Test => "test".into(),
+            Tier::LocalApp => "local_app".into(),
+        },
+        command,
+        target: target.as_ref().map(|t| t.to_string_lossy().to_string()),
+        target_head: target.as_deref().and_then(omgs::proof::git_head),
+        started_at_ms,
+        duration_ms: s.duration_ms,
+        exit_code: s.exit_code,
+        timed_out: s.timed_out,
+        capture_complete: s.capture_complete,
+        survivors: s
+            .survivors
+            .iter()
+            .map(|v| omgs::proof::Survivor {
+                pid: v.pid,
+                command: v.command.clone(),
+            })
+            .collect(),
+        mxc_version: omgs::sandbox::MXC_VERSION.into(),
+        containment: result.containment.clone(),
+        executor: result.executor.to_string_lossy().to_string(),
+        executor_sha256: result.executor_sha256.clone(),
+        config_sha256: result.config_sha256.clone(),
+        enforced: result.enforced.clone(),
+        gaps: result.gaps.clone(),
+        output_sha256: omgs::sha256::digest(s.output.as_bytes()),
+        output_bytes_total: s.output_bytes_total,
+        output: omgs::proof::redact(&s.output),
+        omgs_version: env!("CARGO_PKG_VERSION").into(),
+    };
+    let record_path = match (&run, &proof_dir) {
+        (Some(r), Some(_)) => omgs::proof::write(r, &record)?,
+        _ => {
+            let p = run_dir.join("record.json");
+            let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
+            omgs::runmeta::write_atomic(&p, &format!("{text}\n"))?;
+            p
+        }
+    };
+    eprintln!(
+        "sandbox: MXC {} ({}), executor {} sha256 {}",
+        omgs::sandbox::MXC_VERSION,
+        result.containment,
+        result.executor.display(),
+        result.executor_sha256
+    );
+    for e in &result.enforced {
+        eprintln!("  enforced: {e}");
+    }
+    for g in &result.gaps {
+        eprintln!("  not enforced: {g}");
+    }
+    for v in &s.survivors {
+        eprintln!("  survivor killed: pid {} {}", v.pid, v.command);
+    }
+    eprintln!(
+        "exit {}{}{}, {} ms",
+        s.exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "none".into()),
+        if s.timed_out { ", timed out" } else { "" },
+        if s.capture_complete {
+            ""
+        } else {
+            ", output capture incomplete"
+        },
+        s.duration_ms
+    );
+    match &proof_dir {
+        Some((n, _)) => eprintln!(
+            "proof record: {} (proof_ref {})",
+            record_path.display(),
+            omgs::proof::reference(*n)
+        ),
+        None => eprintln!(
+            "proof record: {} (not linked to a run)",
+            record_path.display()
+        ),
+    }
+    print!("{}", record.output);
+    if s.success {
+        Ok(())
+    } else {
+        Err("__EXIT1__".into())
+    }
+}
+
+/// What this machine can and cannot do for OMGS. Executes no target code;
+/// `--live` runs one fixed command inside MXC to show a denial is enforced.
+fn cmd_doctor(args: &[String]) -> Result<(), String> {
+    use omgs::platform::which;
+    let os = std::env::consts::OS;
+    println!(
+        "omgs {} on {os} {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH
+    );
+    println!("data directory: {}", data_dir().display());
+    let ready = match omgs::sandbox::locate_executor() {
+        Ok(l) => {
+            println!(
+                "sandbox: MXC {} executor {} ({}), SHA-256 matches the pin",
+                omgs::sandbox::MXC_VERSION,
+                l.path.display(),
+                l.executor.containment
+            );
+            true
+        }
+        Err(e) => {
+            println!("sandbox: not ready. {e}");
+            false
+        }
+    };
+    let (enforced, gaps) = omgs::sandbox::declared_controls(os, Tier::Test);
+    println!("enforced for every proof run here:");
+    for e in enforced
+        .iter()
+        .chain(omgs::sandbox::declared_limits(os).iter())
+    {
+        println!("  {e}");
+    }
+    for g in &gaps {
+        println!("  not enforced: {g}");
+    }
+    if let Some(why) = omgs::sandbox::tier2_unavailable(os) {
+        println!("{why}");
+    }
+    let found = |names: &[&str]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|n| which(n).is_some())
+            .map(|n| n.to_string())
+            .collect()
+    };
+    let tools = found(&[
+        "swiftc", "cargo", "clang", "python3", "node", "npm", "pwsh", "go", "dotnet", "java",
+    ]);
+    println!(
+        "toolchains on PATH: {}",
+        if tools.is_empty() {
+            "none".into()
+        } else {
+            tools.join(", ")
+        }
+    );
+    let sensors = found(&["gitleaks", "semgrep", "trufflehog", "osv-scanner"]);
+    println!(
+        "sensors on PATH: {}",
+        if sensors.is_empty() {
+            "none".into()
+        } else {
+            sensors.join(", ")
+        }
+    );
+    if os == "linux"
+        && std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+    {
+        println!("hint: this kernel restricts unprivileged user namespaces (Ubuntu 24.04 and later). MXC needs them; see the README section on Linux for the AppArmor profile.");
+    }
+    if os == "windows" {
+        println!("note: PowerShell under MXC needs an interactive desktop session; over SSH (session 0) pwsh fails to start while cmd works.");
+    }
+    if !ready {
+        return Err("__EXIT1__".into());
+    }
+    if has(args, "--live") {
+        let probe = data_dir().join("doctor");
+        std::fs::create_dir_all(&probe).map_err(|e| e.to_string())?;
+        let secret = probe.join("outside-marker");
+        // The content must not appear in a denial message, which echoes the path.
+        let token = omgs::sha256::digest(
+            format!("{}-{}", omgs::runmeta::now_ms(), std::process::id()).as_bytes(),
+        );
+        write_out(&secret, token.as_bytes()).map_err(|e| e.to_string())?;
+        let cmd = if os == "windows" {
+            format!("cmd.exe /d /c type \"{}\"", secret.display())
+        } else {
+            format!("cat '{}'", secret.display())
+        };
+        let request = ProveRequest {
+            command: cmd,
+            timeout_ms: 30_000,
+            target: None,
+            run_dir: probe.join(format!("live-{}", omgs::runmeta::now_ms())),
+            tier: Tier::Test,
+        };
+        let denied = match prove(&request) {
+            ProveOutcome::Ran(r) => !r.run.success && !r.run.output.contains(&token),
+            ProveOutcome::Blocked { reason } => return Err(reason),
+        };
+        let _ = std::fs::remove_dir_all(&probe);
+        if denied {
+            println!("live check: reading a file outside the sandbox was denied");
+        } else {
+            println!(
+                "live check FAILED: the sandboxed command could read a file outside its workspace"
+            );
+            return Err("__EXIT1__".into());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_approve(args: &[String]) -> Result<(), String> {
+    let raw = flag(args, "--target").ok_or("approve requires --target <repo>")?;
+    let target = std::fs::canonicalize(&raw).map_err(|e| format!("target {raw}: {e}"))?;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    println!("Tier 2 builds and runs {} as a local app inside MXC, on dummy data, with external network denied.", target.display());
+    if let Some(why) = omgs::sandbox::tier2_unavailable(std::env::consts::OS) {
+        println!("Note: {why}");
+    }
+    println!("Type the folder name '{name}' to approve tier 2 for this repository:");
+    let typed = omgs::approval::read_from_terminal()?;
+    if typed.trim() != name {
+        return Err("not approved: the typed name did not match".into());
+    }
+    omgs::approval::approve(&data_dir(), &target)?;
+    println!("approved tier 2 for {}", target.display());
+    Ok(())
 }
 
 fn cmd_report(args: &[String]) -> Result<(), String> {
     let path = flag(args, "--findings").ok_or("report requires --findings <path>")?;
     let out = flag(args, "--out").ok_or("report requires --out <dir>")?;
     let file = read_findings(&path)?;
-    let errors = validate(&file);
+    let errors = validate_at(&file, &path);
     if !errors.is_empty() {
         for e in &errors {
             eprintln!("invalid: {e}");
@@ -390,7 +718,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
 /// into the target (or the store file being a link) would let the target
 /// author "recorded" answers.
 fn trusted_store(target: &Path) -> Result<PathBuf, String> {
-    let path = omgs::intent::answers_file(&home().join(".local/share/omgs"), target);
+    let path = omgs::intent::answers_file(&data_dir(), target);
     if resolve_existing_prefix(&path)?.starts_with(target) {
         return Err(format!(
             "the intent answer store {} resolves inside the target {}; refusing to use it",
@@ -410,36 +738,14 @@ fn trusted_store(target: &Path) -> Result<PathBuf, String> {
 /// Read the reviewer's answer store through a descriptor opened without
 /// following links, and only when it is a regular file with exactly one link,
 /// so neither a symlink nor a hardlink planted in the target can change what
-/// the store says. A missing store means no answers yet. Platforms without a
-/// stable link count fail closed: stored answers are Unix only.
+/// the store says. A missing store means no answers yet.
 fn read_store(path: &Path) -> Result<omgs::intent::Answers, String> {
     use std::io::Read;
-    if !cfg!(unix) {
-        return Err("stored intent answers are supported on Unix only".into());
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let mut file = match opts.open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-        Err(e) => return Err(format!("open {}: {e}", path.display())),
+    let Some(mut file) = omgs::platform::open_single_link(path)
+        .map_err(|e| format!("{}: {e}; refusing to trust it", path.display()))?
+    else {
+        return Ok(Default::default());
     };
-    let meta = file.metadata().map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if !meta.is_file() || meta.nlink() != 1 {
-            return Err(format!(
-                "{} must be a regular file with a single link; refusing to trust it",
-                path.display()
-            ));
-        }
-    }
     let mut text = String::new();
     file.read_to_string(&mut text)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -554,8 +860,17 @@ fn write_out(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> std::io::Res
     omgs::runmeta::write_atomic_bytes(path.as_ref(), contents.as_ref())
 }
 
+/// Never a relative fallback: without a home OMGS would write into the cwd,
+/// which may be the target.
 fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+    omgs::platform::home().unwrap_or_else(|| {
+        eprintln!("error: HOME (USERPROFILE on Windows) must be set to an absolute path");
+        std::process::exit(2)
+    })
+}
+
+fn data_dir() -> PathBuf {
+    omgs::platform::data_dir().unwrap_or_else(|| home().join(".local").join("share").join("omgs"))
 }
 
 fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -700,7 +1015,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         None => {
             // Claim run-N with an exclusive create, so parallel inits (batch
             // mode) never share a run directory.
-            let base = home().join(".local/share/omgs").join(&repo);
+            let base = data_dir().join(&repo);
             std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
             let mut n = 1;
             loop {
@@ -980,7 +1295,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     println!("committed proof tests found: {proofs}");
     let scratch = flag(args, "--out")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/share/omgs/prove-scratch"));
+        .unwrap_or_else(|| data_dir().join("prove-scratch"));
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
     let sensors = run_sensors(&target, &scratch);
     for tool in &sensors.tools_run {
@@ -1117,7 +1432,7 @@ fn cmd_critic(args: &[String]) -> Result<(), String> {
 /// disabled and no prompts; a reused clone must have the same origin.
 fn clone_target(raw_url: &str) -> Result<PathBuf, String> {
     let repo = omgs::batch::parse_repo_url(raw_url)?;
-    let targets = home().join(".local/share/omgs/targets");
+    let targets = data_dir().join("targets");
     let dest = targets.join(&repo.host).join(&repo.owner).join(&repo.name);
     let git = || {
         let mut c = std::process::Command::new("git");
@@ -1237,7 +1552,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             }
             // The batch output must sit outside the targets area and every
             // target in the list, including ones that later fail to clone.
-            let targets_root = home().join(".local/share/omgs/targets");
+            let targets_root = data_dir().join("targets");
             let dests: Vec<PathBuf> = urls
                 .iter()
                 .filter_map(|u| omgs::batch::parse_repo_url(u).ok())
@@ -1386,7 +1701,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 std::env::current_dir().map_err(|e| e.to_string())?.join(&out)
             };
             let mut targets: Vec<PathBuf> = vec![resolve_existing_prefix(
-                &home().join(".local/share/omgs/targets"),
+                &data_dir().join("targets"),
             )?];
             for r in &batch.runs {
                 if let Some(t) = r.target.as_deref() {
@@ -1489,7 +1804,7 @@ fn cmd_watch(args: &[String]) -> Result<(), String> {
 fn models_path(args: &[String]) -> PathBuf {
     flag(args, "--models")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/share/omgs/models.json"))
+        .unwrap_or_else(|| data_dir().join("models.json"))
 }
 
 fn cmd_route(args: &[String]) -> Result<(), String> {

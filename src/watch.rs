@@ -113,32 +113,8 @@ fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> b
 /// stall the server), read up to the size cap. Anything else serves the
 /// empty status: a planted link must never expose another run file.
 fn read_status(path: &Path) -> Option<Vec<u8>> {
-    // Without a stable way to check the link count and open without
-    // following links, other platforms fail closed and serve the empty status.
-    if !cfg!(unix) {
-        return None;
-    }
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() || meta.len() > MAX_STATUS {
-        return None;
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = opts.open(path).ok()?;
-    let meta = file.metadata().ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if meta.nlink() != 1 {
-            return None;
-        }
-    }
-    if !meta.is_file() {
+    let file = crate::platform::open_single_link(path).ok()??;
+    if file.metadata().ok()?.len() > MAX_STATUS {
         return None;
     }
     let mut body = Vec::new();

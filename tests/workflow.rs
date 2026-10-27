@@ -30,6 +30,8 @@ fn record(key: &str) -> Finding {
         hunted_by: Some("red-1".into()),
         verified_by: Some("blue-1".into()),
         candidates: vec![],
+        proof_ref: None,
+        trace: vec![],
     }
 }
 
@@ -265,6 +267,52 @@ fn candidate_json(c: &Candidate) -> serde_json::Value {
 }
 
 /// A complete run: one unit covered by one verified finding from one candidate.
+/// Write a clean failing-test proof record for every record above traced and
+/// point it there, as `omgs prove --run --finding` would.
+fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
+    for f in findings.findings.iter_mut() {
+        if f.proof_tier == ProofTier::Traced {
+            continue;
+        }
+        let (n, _) = omgs::proof::reserve(dir).unwrap();
+        let record = omgs::proof::ProofRecord {
+            schema: omgs::proof::SCHEMA.into(),
+            n,
+            finding: Some(f.fingerprint.clone()),
+            test: Some("tests/security/x.test.ts".into()),
+            tier: if f.proof_tier == ProofTier::TestProven {
+                "test"
+            } else {
+                "local_app"
+            }
+            .into(),
+            command: "npm test".into(),
+            target: None,
+            target_head: None,
+            started_at_ms: 0,
+            duration_ms: 1,
+            exit_code: Some(1),
+            timed_out: false,
+            capture_complete: true,
+            survivors: vec![],
+            mxc_version: omgs::sandbox::MXC_VERSION.into(),
+            containment: "seatbelt".into(),
+            executor: "mxc-exec-mac".into(),
+            executor_sha256: "0".repeat(64),
+            config_sha256: "0".repeat(64),
+            enforced: vec![],
+            gaps: vec![],
+            output_sha256: "0".repeat(64),
+            output_bytes_total: 0,
+            output: String::new(),
+            omgs_version: "test".into(),
+        };
+        omgs::proof::write(dir, &record).unwrap();
+        f.proof_ref = Some(omgs::proof::reference(n));
+    }
+    findings
+}
+
 fn complete_run() -> (Ledger, Vec<SourcedCandidate>, FindingsFile) {
     let f = record("a");
     let mut ledger = Ledger::default();
@@ -447,6 +495,7 @@ fn omgs(args: &[&str]) -> std::process::Output {
 fn cli_ledger_and_critic_end_to_end() {
     let dir = scratch("cli");
     let (ledger, cands, findings) = complete_run();
+    let findings = attest(&dir, findings);
     let mut ledger = ledger;
     ledger.units[0].status = "planned".into();
     ledger.units[0].evidence.clear();
@@ -561,6 +610,7 @@ fn critic_rejects_a_misspelled_candidates_file() {
 fn report_critic_describes_the_rendered_findings() {
     let dir = scratch("selected");
     let (ledger, cands, findings) = complete_run();
+    let findings = attest(&dir, findings);
     std::fs::write(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
@@ -910,6 +960,7 @@ fn duplicate_keys_and_enum_objects_are_errors() {
 fn report_fails_on_malformed_companion_files() {
     let dir = scratch("report-malformed");
     let (ledger, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
     std::fs::write(
         dir.join("findings.json"),
         serde_json::to_string(&findings).unwrap(),
@@ -962,6 +1013,7 @@ fn zero_lines_and_dangling_ledgers_are_errors() {
     {
         let dir = scratch("dangling-ledger");
         let (_, _, findings) = complete_run();
+        let findings = attest(&dir, findings);
         std::fs::write(
             dir.join("findings.json"),
             serde_json::to_string(&findings).unwrap(),

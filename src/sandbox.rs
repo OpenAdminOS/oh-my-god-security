@@ -1,252 +1,159 @@
-use std::io::Read;
+//! Proof execution under Microsoft MXC, the only sandbox backend. OMGS writes
+//! a deny-by-default MXC 1.0.0 config, runs the SHA-256 pinned executor for
+//! this OS under `supervise::run`, and reports exactly what was enforced.
+//! Target code never runs anywhere else: without a verified executor OMGS
+//! refuses and the finding stays at the tier it already earned.
+
+use crate::{platform, sha256, supervise};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
 
-/// Sandbox backends in priority order: an explicitly configured MXC
-/// executor, then OS native sandboxing (Seatbelt on macOS, bubblewrap on
-/// Linux). OMGS fails closed when no backend is available.
+/// The MXC release the executors below are pinned to.
+pub const MXC_VERSION: &str = "1.0.1";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Backend {
-    Mxc(PathBuf),
-    Seatbelt,
-    Bubblewrap(PathBuf),
+pub struct Executor {
+    pub file: &'static str,
+    pub sha256: &'static str,
+    /// MXC `containment` value for this executor.
+    pub containment: &'static str,
 }
 
-impl Backend {
-    pub fn label(&self) -> String {
-        match self {
-            Backend::Mxc(p) => format!("MXC executor {}", p.display()),
-            Backend::Seatbelt => "Seatbelt (sandbox-exec), network denied".into(),
-            Backend::Bubblewrap(p) => {
-                format!("bubblewrap {}, network namespace denied", p.display())
-            }
+/// The pinned executor for an OS and architecture, or why there is none.
+pub fn executor_for(os: &str, arch: &str) -> Result<Executor, String> {
+    let e = |file, sha256, containment| {
+        Ok(Executor {
+            file,
+            sha256,
+            containment,
+        })
+    };
+    match (os, arch) {
+        ("macos", "aarch64") => e(
+            "mxc-exec-mac",
+            "c54390e48a25187fdae10758c6a286bede49416cb610c88c6705fd8445e97f60",
+            "seatbelt",
+        ),
+        ("macos", _) => Err("MXC ships its macOS executor for Apple Silicon only, so omgs prove cannot run target code on this Intel Mac. Findings stay at the traced tier; run proofs on an Apple Silicon Mac, Linux or Windows 11.".into()),
+        ("linux", "aarch64") => e(
+            "lxc-exec",
+            "e8391d55c566ce95c6c838d349941fa0797f037fa617aa0fa4ec39443c6ccddf",
+            "bubblewrap",
+        ),
+        ("linux", "x86_64") => e(
+            "lxc-exec",
+            "5bd6bdf45bc6c0ecc9bccf372762b571de1f468142c4b2ff80fdb4c540922f26",
+            "bubblewrap",
+        ),
+        ("windows", "aarch64") => e(
+            "wxc-exec.exe",
+            "91aa4171e8809f33f19622c381116188eab7d8c8cffad231230a31b58146ee77",
+            "process",
+        ),
+        ("windows", "x86_64") => e(
+            "wxc-exec.exe",
+            "090f5d1f7bb93104ab08dcd4e8034ef954aeefcdaf6658dde5f7dff4cfc12f3a",
+            "process",
+        ),
+        _ => Err(format!(
+            "MXC has no executor for {os} {arch}, so omgs prove cannot run target code here."
+        )),
+    }
+}
+
+pub fn this_executor() -> Result<Executor, String> {
+    executor_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Where OMGS installs the executor: `<data dir>/mxc/<version>/<file>`.
+pub fn install_path(exec: &Executor) -> Option<PathBuf> {
+    platform::data_dir().map(|d| d.join("mxc").join(MXC_VERSION).join(exec.file))
+}
+
+#[derive(Debug, Clone)]
+pub struct Located {
+    pub path: PathBuf,
+    pub executor: Executor,
+}
+
+/// Find the executor (`OMGS_MXC_EXEC`, then the OMGS install path, then PATH)
+/// and accept it only when its SHA-256 matches the pin. A mismatch is never
+/// skipped over silently: it is named in the error.
+pub fn locate_executor() -> Result<Located, String> {
+    let executor = this_executor()?;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(p) = std::env::var_os("OMGS_MXC_EXEC").filter(|v| !v.is_empty()) {
+        candidates.push(PathBuf::from(p));
+    }
+    candidates.extend(install_path(&executor));
+    candidates.extend(platform::which(executor.file));
+    let mut problems = Vec::new();
+    for path in candidates {
+        if !path.is_file() {
+            continue;
+        }
+        match sha256::digest_file(&path) {
+            Ok(d) if d == executor.sha256 => return Ok(Located { path, executor }),
+            Ok(d) => problems.push(format!(
+                "{} has SHA-256 {d}, expected {} for MXC {MXC_VERSION}",
+                path.display(),
+                executor.sha256
+            )),
+            Err(e) => problems.push(format!("{} unreadable: {e}", path.display())),
         }
     }
-}
-
-fn which(name: &str) -> Option<PathBuf> {
-    let out = Command::new("which").arg(name).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if text.is_empty() {
-        None
+    let wanted = install_path(&executor)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| executor.file.to_string());
+    if problems.is_empty() {
+        Err(format!(
+            "MXC {MXC_VERSION} executor {} not found. Install it with the OMGS installer (it places the pinned, Microsoft-signed executor at {wanted}) or set OMGS_MXC_EXEC. Run omgs doctor for details.",
+            executor.file
+        ))
     } else {
-        Some(PathBuf::from(text))
+        Err(format!(
+            "no MXC executor matched the pinned digest, refusing to run: {}",
+            problems.join("; ")
+        ))
     }
 }
 
-pub fn find_backend() -> Option<Backend> {
-    if let Ok(path) = std::env::var("OMGS_MXC_EXEC") {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Some(Backend::Mxc(p));
-        }
-    }
-    for name in ["wxc-exec", "wxc-exec.exe", "mxc-exec"] {
-        if let Some(p) = which(name) {
-            return Some(Backend::Mxc(p));
-        }
-    }
-    if cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists() {
-        return Some(Backend::Seatbelt);
-    }
-    if cfg!(target_os = "linux") {
-        if let Some(p) = which("bwrap") {
-            return Some(Backend::Bubblewrap(p));
-        }
-    }
-    None
+/// Tier 1 runs a test; tier 2 runs a locally built app and its client
+/// together. Both use the same network policy: external network and host
+/// loopback denied. Tier 2 needs a loopback private to the sandbox, which
+/// only Linux provides (its own network namespace), so it runs only there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Test,
+    LocalApp,
 }
 
 pub struct ProveRequest {
     pub command: String,
     pub timeout_ms: u64,
-    pub cwd: Option<PathBuf>,
-    pub scratch: PathBuf,
+    /// Copied into the per-run workspace, which becomes the cwd. The original
+    /// is not mounted into the sandbox at all.
+    pub target: Option<PathBuf>,
+    /// Per-proof directory: holds workspace, scratch, markers and the config.
+    pub run_dir: PathBuf,
+    pub tier: Tier,
+}
+
+pub struct ProveResult {
+    pub executor: PathBuf,
+    pub executor_sha256: String,
+    pub containment: String,
+    pub config_sha256: String,
+    pub enforced: Vec<String>,
+    pub gaps: Vec<String>,
+    pub run: supervise::Supervised,
 }
 
 pub enum ProveOutcome {
-    BlockedNoSandbox {
-        request_json: String,
-    },
-    Ran {
-        backend: String,
-        success: bool,
-        timed_out: bool,
-        output: String,
-    },
+    Blocked { reason: String },
+    Ran(Box<ProveResult>),
 }
 
-fn request_json(req: &ProveRequest) -> String {
-    serde_json::to_string_pretty(&serde_json::json!({
-        "command": req.command,
-        "network": { "egress": { "default": "deny" } },
-        "timeoutMs": req.timeout_ms,
-        "omgs_policy": {
-            "target_access": "read_only",
-            "writes": "scratch_only",
-            "environment": "empty_allowlist",
-            "network": "denied"
-        }
-    }))
-    .unwrap_or_default()
-}
-
-/// Signal the whole process group the command leads, using `kill` with a
-/// negative pid (the group). Reaches background descendants a bare
-/// `child.kill()` would leave running and holding the pipes.
-///
-/// Limits (tracked in IMPROVEMENTS.md): on macOS there is no PID namespace, so a
-/// descendant that calls `setsid()` leaves this group and survives the signal.
-/// It stays confined by the sandbox profile (writes only to scratch, network
-/// denied), but can outlive the proof. The Linux backend runs under
-/// `--unshare-pid`, where the kernel reaps every descendant when the namespace
-/// init exits. There is also a microsecond pid/pgid-reuse window on the
-/// normal-exit path, since the leader is reaped before the signal lands.
-#[cfg(unix)]
-fn kill_group(pid: u32) {
-    let group = -(pid as i32);
-    unsafe {
-        libc::kill(group, libc::SIGTERM);
-    }
-    std::thread::sleep(Duration::from_millis(200));
-    unsafe {
-        libc::kill(group, libc::SIGKILL);
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_group(_pid: u32) {}
-
-/// Reap the child, bounded so a wedged leader cannot block the caller forever.
-fn reap_bounded(child: &mut Child) {
-    let start = Instant::now();
-    loop {
-        if let Ok(Some(_)) = child.try_wait() {
-            break;
-        }
-        if start.elapsed() > Duration::from_millis(1_000) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn supervise(child: &mut Child, timeout_ms: u64, group_leader: bool) -> (bool, bool) {
-    let pid = child.id();
-    let start = Instant::now();
-    let mut timed_out = false;
-    let success = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
-            Ok(None) => {
-                if start.elapsed() > Duration::from_millis(timeout_ms) {
-                    timed_out = true;
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => break false,
-        }
-    };
-    // Terminate descendants on every path, not only timeout: a command that
-    // backgrounds a child and exits (`sleep 60 & exit 0`) must not leave code
-    // running or holding the pipes.
-    if group_leader {
-        kill_group(pid);
-    }
-    let _ = child.kill(); // fallback: always signal the leader directly too
-    reap_bounded(child);
-    (success, timed_out)
-}
-
-fn run_with_timeout(mut child: Child, timeout_ms: u64, group_leader: bool) -> (bool, bool, String) {
-    use std::sync::mpsc;
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    // Readers send their captured text over a channel instead of being joined,
-    // so a descendant that inherited or redirected the pipes cannot block us.
-    let (tx, rx) = mpsc::channel::<(u8, String)>();
-    let tx_out = tx.clone();
-    std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(mut r) = stdout.take() {
-            let _ = r.read_to_string(&mut s);
-        }
-        let _ = tx_out.send((0, s));
-    });
-    std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(mut r) = stderr.take() {
-            let _ = r.read_to_string(&mut s);
-        }
-        let _ = tx.send((1, s));
-    });
-
-    let (mut success, timed_out) = supervise(&mut child, timeout_ms, group_leader);
-
-    // Drain the readers, bounded so a surviving writer cannot stall the result.
-    // If both pipe ends do not close within the deadline, a descendant kept them
-    // open: the capture is incomplete, so the run is not a clean success. (On
-    // macOS a setsid-detached child that redirects the pipes can still survive;
-    // it stays sandbox-confined and is a documented limitation.)
-    let mut out = String::new();
-    let mut err = String::new();
-    let mut received = 0;
-    let drain = Duration::from_millis(2_000);
-    let drain_start = Instant::now();
-    for _ in 0..2 {
-        let remaining = drain.checked_sub(drain_start.elapsed()).unwrap_or_default();
-        match rx.recv_timeout(remaining) {
-            Ok((0, s)) => {
-                out = s;
-                received += 1;
-            }
-            Ok((1, s)) => {
-                err = s;
-                received += 1;
-            }
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-    out.push_str(&err);
-    if received < 2 {
-        success = false;
-        out.push_str(
-            "\n[omgs] output capture did not complete before the deadline; a descendant may have retained the pipes. Not reported as success.",
-        );
-    }
-    (success, timed_out, out)
-}
-
-fn base_env(cmd: &mut Command, scratch: &Path) {
-    cmd.env_clear()
-        .env("HOME", scratch)
-        .env("TMPDIR", scratch)
-        .env(
-            "PATH",
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        )
-        .env("LANG", "C.UTF-8")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Run the sandboxed command as its own process-group leader so a timeout
-    // can signal the whole group, not just the immediate child.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-}
-
-/// MXC 1.0.0 one-shot config for wxc-exec style executors. Verified live
-/// against MXC SDK v1.0.0 release binaries on Windows: an empty env array is
-/// rejected there, so the required presence-only variables point at scratch.
 fn mxc_path(p: &Path) -> String {
     let s = p.to_string_lossy().to_string();
     // Windows canonicalize yields extended-length paths that cmd.exe rejects
@@ -260,38 +167,129 @@ fn mxc_path(p: &Path) -> String {
     }
 }
 
-pub fn mxc_config_json(req: &ProveRequest, scratch: &Path, cwd: &Path) -> String {
-    let scratch_s = mxc_path(scratch);
-    let env: Vec<String> = if cfg!(windows) {
+/// Every parent directory of a Windows or Unix path string, outermost first,
+/// with a bare drive written as its root (`C:` becomes `C:\`).
+fn parent_dirs(p: &str) -> Vec<String> {
+    p.char_indices()
+        .filter(|(_, c)| *c == '\\' || *c == '/')
+        .map(|(i, _)| &p[..i])
+        .filter(|a| !a.is_empty())
+        .map(|a| {
+            if a.ends_with(':') {
+                format!("{a}\\")
+            } else {
+                a.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Toolchain roots made readable inside the sandbox when they exist. System
+/// directories are already readable under every MXC backend.
+fn toolchain_roots(os: &str, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = match os {
+        "macos" => vec![
+            "/Applications/Xcode.app".into(),
+            "/Library/Developer/CommandLineTools".into(),
+            "/opt/homebrew".into(),
+            "/usr/local/bin".into(),
+            "/usr/local/lib".into(),
+            "/usr/local/microsoft".into(),
+        ],
+        "linux" => vec!["/opt".into(), "/usr/local".into()],
+        "windows" => vec![
+            r"C:\Program Files\PowerShell\7".into(),
+            r"C:\Program Files\nodejs".into(),
+            r"C:\Program Files\Git".into(),
+        ],
+        _ => vec![],
+    };
+    if let Some(h) = home {
+        roots.push(h.join(".cargo"));
+        roots.push(h.join(".rustup"));
+    }
+    roots
+}
+
+/// Secrets inside readable toolchain roots, denied explicitly.
+fn denied_inside_roots(home: Option<&Path>) -> Vec<PathBuf> {
+    home.map(|h| {
+        vec![
+            h.join(".cargo").join("credentials"),
+            h.join(".cargo").join("credentials.toml"),
+        ]
+    })
+    .unwrap_or_default()
+}
+
+/// Everything that varies per run, kept separate from probing the host so
+/// the config is testable.
+pub struct ConfigInput<'a> {
+    pub os: &'a str,
+    pub containment: &'a str,
+    pub command: &'a str,
+    pub timeout_ms: u64,
+    pub workspace: &'a Path,
+    pub scratch: &'a Path,
+    pub allowed_marker: Option<&'a Path>,
+    pub readonly: Vec<PathBuf>,
+    pub denied: Vec<PathBuf>,
+    pub cargo_home: Option<PathBuf>,
+}
+
+pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
+    let scratch = mxc_path(input.scratch);
+    let mut env: Vec<String> = if input.os == "windows" {
         vec![
             format!(
                 "SYSTEMROOT={}",
                 std::env::var("SYSTEMROOT").unwrap_or_else(|_| "C:\\Windows".into())
             ),
-            format!("LOCALAPPDATA={scratch_s}"),
-            format!("TEMP={scratch_s}"),
-            format!("TMP={scratch_s}"),
-            "PATH=C:\\Windows\\System32;C:\\Windows;C:\\Program Files\\PowerShell\\7".into(),
+            format!("USERPROFILE={scratch}"),
+            format!("LOCALAPPDATA={scratch}"),
+            format!("TEMP={scratch}"),
+            format!("TMP={scratch}"),
+            "PATH=C:\\Windows\\System32;C:\\Windows;C:\\Program Files\\PowerShell\\7;C:\\Program Files\\nodejs;C:\\Program Files\\Git\\cmd".into(),
         ]
     } else {
+        let mut path = if input.os == "macos" {
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
+        } else {
+            "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
+        };
+        if let Some(c) = &input.cargo_home {
+            path = format!("{}:{path}", c.join("bin").display());
+        }
         vec![
-            format!("HOME={scratch_s}"),
-            format!("TMPDIR={scratch_s}"),
-            "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".into(),
+            format!("HOME={scratch}"),
+            format!("TMPDIR={scratch}/"),
+            format!("XDG_CACHE_HOME={scratch}/cache"),
+            format!("CLANG_MODULE_CACHE_PATH={scratch}/clang-cache"),
+            format!("PATH={path}"),
             "LANG=C.UTF-8".into(),
         ]
     };
-    let mut readonly = Vec::new();
-    if cwd != scratch {
-        readonly.push(mxc_path(cwd));
+    if let Some(c) = &input.cargo_home {
+        env.push(format!("CARGO_HOME={}", mxc_path(c)));
+        env.push("CARGO_NET_OFFLINE=true".into());
+        if let Some(parent) = c.parent() {
+            let rustup = parent.join(".rustup");
+            if input.readonly.contains(&rustup) {
+                env.push(format!("RUSTUP_HOME={}", mxc_path(&rustup)));
+            }
+        }
+    }
+    let mut readonly: Vec<String> = input.readonly.iter().map(|p| mxc_path(p)).collect();
+    if let Some(m) = input.allowed_marker {
+        readonly.push(mxc_path(m));
     }
     let mut config = serde_json::json!({
         "version": "1.0.0",
-        "containment": "process",
+        "containment": input.containment,
         "process": {
-            "commandLine": req.command,
-            "cwd": mxc_path(cwd),
-            "timeout": req.timeout_ms,
+            "commandLine": input.command,
+            "cwd": mxc_path(input.workspace),
+            "timeout": input.timeout_ms,
             "env": env
         },
         "network": {
@@ -299,139 +297,313 @@ pub fn mxc_config_json(req: &ProveRequest, scratch: &Path, cwd: &Path) -> String
             "ingress": { "default": "deny", "hostLoopback": "deny" }
         },
         "filesystem": {
-            "readwritePaths": [scratch_s],
-            "readonlyPaths": readonly
-        },
-        // Windows console hosts such as pwsh fail DLL init when Win32k is
-        // fully blocked. Allow the UI subsystem, never input or clipboard.
-        "ui": { "disable": false, "injection": false, "clipboard": "none" }
+            "readwritePaths": [mxc_path(input.workspace), scratch],
+            "readonlyPaths": readonly,
+            "deniedPaths": input.denied.iter().map(|p| mxc_path(p)).collect::<Vec<_>>()
+        }
     });
-    if cfg!(windows) {
-        config["processContainer"] = serde_json::json!({ "ui": { "isolation": "desktop" } });
+    match input.os {
+        "windows" => {
+            // Windows console hosts such as pwsh fail DLL init when Win32k is
+            // fully blocked. Allow the UI subsystem, never input or clipboard.
+            config["ui"] =
+                serde_json::json!({ "disable": false, "injection": false, "clipboard": "none" });
+            // Runtimes such as Node resolve real paths by listing every parent
+            // directory from the drive root, which the container denies.
+            // Grant listing (not reading) of exactly those parents.
+            let mut enumerate: Vec<String> = Vec::new();
+            let granted = [mxc_path(input.workspace), scratch.clone()];
+            for p in granted.iter().chain(readonly.iter()) {
+                for a in parent_dirs(p) {
+                    if !enumerate.contains(&a) {
+                        enumerate.push(a);
+                    }
+                }
+            }
+            config["processContainer"] = serde_json::json!({
+                "ui": { "isolation": "desktop" },
+                "filesystem": { "enumeratePaths": enumerate }
+            });
+        }
+        "macos" => {
+            // User and group lookups (getpwuid) go through opendirectoryd;
+            // pwsh and several toolchains fail without it.
+            config["seatbelt"] = serde_json::json!({
+                "extraMachLookups": ["com.apple.system.opendirectoryd.libinfo"]
+            });
+        }
+        _ => {}
     }
-    serde_json::to_string_pretty(&config).unwrap_or_default()
+    config
+}
+
+/// Controls this config enforces, and what it leaves open, in report wording.
+pub fn declared_controls(os: &str, tier: Tier) -> (Vec<String>, Vec<String>) {
+    let mut enforced = vec![
+        format!("mxc {MXC_VERSION} deny-by-default filesystem"),
+        "target copied to a per-run workspace; the original is not mounted".to_string(),
+        "external network egress denied".to_string(),
+        "environment cleared to an allowlist with scratch home, temp and cache".to_string(),
+    ];
+    let mut gaps = Vec::new();
+    enforced.push("inbound network and host loopback denied".into());
+    if tier == Tier::LocalApp {
+        enforced.push("loopback private to the sandbox network namespace; host services unreachable".into());
+    }
+    if os == "windows" {
+        gaps.push("process tree owned by the MXC ProcessContainer; no per-process CPU, file size or open file limits on Windows".into());
+    }
+    (enforced, gaps)
+}
+
+/// What the supervisor adds around MXC on this OS, for `omgs doctor`. Each
+/// proof record lists what was actually applied on that run.
+pub fn declared_limits(os: &str) -> Vec<String> {
+    let mut v = vec!["wall clock limit; the whole process tree is killed on expiry".to_string()];
+    if os != "windows" {
+        v.push("CPU time, file size and open file limits".into());
+        v.push("process group signalled before the leader is reaped".into());
+    }
+    match os {
+        "macos" => v.push("survivor sweep: sandboxed processes that left the group are found and killed, and the run fails".into()),
+        "linux" => v.push("memory and task limits through a systemd user scope when one is available".into()),
+        _ => {}
+    }
+    v
+}
+
+/// Copy `src` into the empty directory `dst`: an APFS clone on macOS, a
+/// reflink where the filesystem supports it on Linux, a plain copy otherwise.
+pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
+    let from = format!("{}/.", src.display());
+    let attempts: Vec<Vec<&str>> = if cfg!(target_os = "macos") {
+        vec![vec!["-c", "-R", "-p"], vec!["-R", "-p"]]
+    } else if cfg!(target_os = "linux") {
+        vec![vec!["-a", "--reflink=auto"]]
+    } else {
+        vec![]
+    };
+    for flags in attempts {
+        let ok = Command::new(if cfg!(target_os = "macos") {
+            "/bin/cp"
+        } else {
+            "cp"
+        })
+        .args(&flags)
+        .arg(&from)
+        .arg(dst)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+        if ok {
+            return Ok(());
+        }
+        // A partial clone must not be mixed with the next attempt.
+        let _ = std::fs::remove_dir_all(dst);
+        std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    }
+    copy_recursive(src, dst)
+}
+
+fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    for entry in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
+            copy_recursive(&entry.path(), &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(entry.path(), &to)
+                .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
+        }
+        // Symlinks are skipped on the fallback path rather than followed out
+        // of the target tree.
+    }
+    Ok(())
+}
+
+/// Why tier 2 cannot run on this OS, if it cannot.
+pub fn tier2_unavailable(os: &str) -> Option<String> {
+    (os != "linux").then(|| {
+        format!(
+            "tier 2 runs only on Linux: on {os} the sandbox shares the host loopback, so a local app under test could reach or be reached by services on this machine. Run tier 2 on Linux or in a Linux VM; tier 1 proofs work here."
+        )
+    })
 }
 
 pub fn prove(req: &ProveRequest) -> ProveOutcome {
-    let Some(backend) = find_backend() else {
-        return ProveOutcome::BlockedNoSandbox {
-            request_json: request_json(req),
+    if req.tier == Tier::LocalApp {
+        if let Some(reason) = tier2_unavailable(std::env::consts::OS) {
+            return ProveOutcome::Blocked { reason };
+        }
+    }
+    let located = match locate_executor() {
+        Ok(l) => l,
+        Err(reason) => return ProveOutcome::Blocked { reason },
+    };
+    let os = std::env::consts::OS;
+    let blocked = |reason: String| ProveOutcome::Blocked { reason };
+    if let Err(e) = std::fs::create_dir_all(&req.run_dir) {
+        return blocked(format!("cannot create {}: {e}", req.run_dir.display()));
+    }
+    // MXC and Seatbelt match canonical paths, so resolve symlinks like /tmp.
+    let run_dir = std::fs::canonicalize(&req.run_dir).unwrap_or_else(|_| req.run_dir.clone());
+    let workspace = run_dir.join("workspace");
+    let scratch = run_dir.join("scratch");
+    if workspace.exists() || scratch.exists() {
+        return blocked(format!(
+            "{} already holds a proof run; use a fresh directory",
+            run_dir.display()
+        ));
+    }
+    if let Some(target) = &req.target {
+        let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.clone());
+        if !target.is_dir() {
+            return blocked(format!("target {} is not a directory", target.display()));
+        }
+        if run_dir.starts_with(&target) {
+            return blocked("the proof directory must be outside the target tree".into());
+        }
+        if let Err(e) = copy_tree(&target, &workspace) {
+            return blocked(format!("could not copy the target into the workspace: {e}"));
+        }
+    } else if let Err(e) = std::fs::create_dir_all(&workspace) {
+        return blocked(e.to_string());
+    }
+    for d in [
+        scratch.clone(),
+        scratch.join("cache"),
+        scratch.join("clang-cache"),
+    ] {
+        if let Err(e) = std::fs::create_dir_all(&d) {
+            return blocked(format!("cannot create {}: {e}", d.display()));
+        }
+    }
+
+    let markers = if os == "macos" {
+        let dir = run_dir.join("markers");
+        let m = supervise::SweepMarkers {
+            allowed: dir.join("allowed"),
+            denied: dir.join("denied"),
         };
+        let made = std::fs::create_dir_all(&dir)
+            .and_then(|_| std::fs::write(&m.allowed, b"omgs"))
+            .and_then(|_| std::fs::write(&m.denied, b"omgs"));
+        if let Err(e) = made {
+            return blocked(format!("cannot create survivor markers: {e}"));
+        }
+        Some(m)
+    } else {
+        None
     };
-    let label = backend.label();
-    let _ = std::fs::create_dir_all(&req.scratch);
-    // Seatbelt matches canonical paths, so resolve symlinks like /tmp first.
-    let scratch = std::fs::canonicalize(&req.scratch).unwrap_or_else(|_| req.scratch.clone());
-    let cwd = req
-        .cwd
-        .clone()
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-        .unwrap_or_else(|| scratch.clone());
-    let mut cmd = match &backend {
-        Backend::Mxc(executor) => {
-            let config_path = scratch.join("omgs-mxc-config.json");
-            if let Err(e) = std::fs::write(&config_path, mxc_config_json(req, &scratch, &cwd)) {
-                return ProveOutcome::Ran {
-                    backend: label,
-                    success: false,
-                    timed_out: false,
-                    output: format!("failed to write MXC config: {e}"),
-                };
+
+    let home = platform::home();
+    let readonly: Vec<PathBuf> = toolchain_roots(os, home.as_deref())
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect();
+    let denied: Vec<PathBuf> = denied_inside_roots(home.as_deref())
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect();
+    let cargo_home = home
+        .as_ref()
+        .map(|h| h.join(".cargo"))
+        .filter(|c| readonly.contains(c));
+    let config = mxc_config(&ConfigInput {
+        os,
+        containment: located.executor.containment,
+        command: &req.command,
+        timeout_ms: req.timeout_ms,
+        workspace: &workspace,
+        scratch: &scratch,
+        allowed_marker: markers.as_ref().map(|m| m.allowed.as_path()),
+        readonly,
+        denied,
+        cargo_home,
+    });
+    let config_text = serde_json::to_string_pretty(&config).unwrap_or_default();
+    let config_path = run_dir.join("mxc-config.json");
+    if let Err(e) = crate::runmeta::write_atomic_bytes(&config_path, config_text.as_bytes()) {
+        return blocked(format!("failed to write MXC config: {e}"));
+    }
+
+    let mut cmd = Command::new(&located.path);
+    cmd.arg("--config").arg(&config_path);
+    cmd.env_clear();
+    if os == "windows" {
+        for k in ["SYSTEMROOT", "WINDIR", "TEMP", "TMP"] {
+            if let Some(v) = std::env::var_os(k) {
+                cmd.env(k, v);
             }
-            let mut c = Command::new(executor);
-            c.args(["--config", &config_path.to_string_lossy()]);
-            c.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            c
         }
-        Backend::Seatbelt => {
-            let scratch_str = scratch.to_string_lossy().replace('"', "");
-            // Seatbelt is last-match-wins. Target build and test tooling needs
-            // broad file-read and process-exec, so those stay open, but network
-            // is denied, writes are confined to scratch, and the daemons that
-            // let sandboxed code mutate the host out of band are denied by name:
-            // cfprefsd (preferences), LaunchServices/coreservicesd, distributed
-            // and local notifications, mDNSResponder, and AppleEvents. This
-            // closes the observed cfprefsd write escape without breaking builds.
-            let profile = format!(
-                "(version 1)(allow default)(deny network*)(deny mach-register)(deny process-exec* (literal \"/bin/launchctl\") (literal \"/usr/bin/open\") (literal \"/usr/bin/osascript\") (literal \"/usr/bin/sudo\"))(deny mach-lookup (global-name \"com.apple.cfprefsd.daemon\") (global-name \"com.apple.cfprefsd.agent\") (global-name \"com.apple.launchservicesd\") (global-name \"com.apple.coreservices.launchservicesd\") (global-name \"com.apple.CoreServices.coreservicesd\") (global-name-prefix \"com.apple.lsd.\") (global-name \"com.apple.distributed_notifications@1v3\") (global-name \"com.apple.system.notification_center\") (global-name \"com.apple.mDNSResponder\") (global-name \"com.apple.coreservices.appleevents\"))(deny file-write*)(allow file-write* (subpath \"{scratch_str}\") (literal \"/dev/null\") (literal \"/dev/tty\"))"
-            );
-            let mut c = Command::new("/usr/bin/sandbox-exec");
-            c.args(["-p", &profile, "/bin/sh", "-c", &req.command]);
-            base_env(&mut c, &scratch);
-            c.current_dir(&cwd);
-            c
-        }
-        Backend::Bubblewrap(bwrap) => {
-            // Isolate namespaces and mask the writable host dirs. The root bind
-            // stays read-only and broad so arbitrary toolchains still resolve;
-            // narrowing it to an explicit path set needs validation on a real
-            // Linux host and is deferred. Network is off via --unshare-all.
-            let cwd_s = cwd.to_string_lossy().to_string();
-            let scratch_s = scratch.to_string_lossy().to_string();
-            let masked = ["/", "/tmp", "/run", "/var/run", "/dev", "/proc"];
-            let mut args: Vec<String> = vec![
-                "--unshare-all",
-                "--new-session",
-                "--die-with-parent",
-                "--ro-bind",
-                "/",
-                "/",
-                "--dev",
-                "/dev",
-                "--proc",
-                "/proc",
-                "--tmpfs",
-                "/tmp",
-                "--tmpfs",
-                "/run",
-                "--tmpfs",
-                "/var/run",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect();
-            // Re-expose the target read-only after the masks only when it is a
-            // real subdirectory, so re-binding cannot re-expose a masked dir
-            // (binding "/" or "/tmp" itself would undo the mask). A target that
-            // is literally a masked path is unsupported rather than re-exposed.
-            if !masked.contains(&cwd_s.as_str()) {
-                args.extend(["--ro-bind".into(), cwd_s.clone(), cwd_s.clone()]);
-            }
-            args.extend([
-                "--bind".into(),
-                scratch_s.clone(),
-                scratch_s,
-                "--chdir".into(),
-                cwd_s,
-                "/bin/sh".into(),
-                "-c".into(),
-                req.command.clone(),
-            ]);
-            let mut c = Command::new(bwrap);
-            c.args(&args);
-            base_env(&mut c, &scratch);
-            c
-        }
+    }
+    cmd.current_dir(&run_dir);
+    let limits = supervise::Limits {
+        // The executor enforces the config timeout itself; the supervisor
+        // allows a short margin for teardown before killing it.
+        wall_ms: req.timeout_ms.saturating_add(15_000),
+        cpu_secs: Some(req.timeout_ms.div_ceil(1000).saturating_mul(2).max(10)),
+        file_size_bytes: Some(1 << 30),
+        open_files: Some(1024),
+        memory_bytes: Some(4 << 30),
+        tasks: Some(512),
+        output_cap_bytes: 256 * 1024,
     };
-    let group_leader = !matches!(backend, Backend::Mxc(_));
-    match cmd.spawn() {
-        Ok(child) => {
-            let (success, timed_out, output) =
-                run_with_timeout(child, req.timeout_ms, group_leader);
-            ProveOutcome::Ran {
-                backend: label,
-                success,
-                timed_out,
-                output,
-            }
+    let run = supervise::run(cmd, &limits, markers.as_ref());
+    let (mut enforced, mut gaps) = declared_controls(os, req.tier);
+    enforced.extend(run.enforced.iter().cloned());
+    gaps.extend(run.notes.iter().cloned());
+    // The workspace and scratch can be large and hold build output; the
+    // config stays as part of the proof evidence.
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = std::fs::remove_dir_all(&scratch);
+    if let Some(m) = &markers {
+        if let Some(dir) = m.allowed.parent() {
+            let _ = std::fs::remove_dir_all(dir);
         }
-        Err(e) => ProveOutcome::Ran {
-            backend: label,
-            success: false,
-            timed_out: false,
-            output: format!("failed to start sandbox backend: {e}"),
-        },
+    }
+    ProveOutcome::Ran(Box::new(ProveResult {
+        executor: located.path,
+        executor_sha256: located.executor.sha256.to_string(),
+        containment: located.executor.containment.to_string(),
+        config_sha256: sha256::digest(config_text.as_bytes()),
+        enforced,
+        gaps,
+        run,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_dirs_cover_windows_and_unix_paths() {
+        assert_eq!(
+            parent_dirs(r"C:\Users\u\run\workspace"),
+            vec![r"C:\", r"C:\Users", r"C:\Users\u", r"C:\Users\u\run"]
+        );
+        assert_eq!(parent_dirs("/a/b/c"), vec!["/a", "/a/b"]);
+    }
+
+    #[test]
+    fn every_supported_platform_has_a_pin_and_intel_mac_refuses() {
+        for (os, arch, file) in [
+            ("macos", "aarch64", "mxc-exec-mac"),
+            ("linux", "aarch64", "lxc-exec"),
+            ("linux", "x86_64", "lxc-exec"),
+            ("windows", "aarch64", "wxc-exec.exe"),
+            ("windows", "x86_64", "wxc-exec.exe"),
+        ] {
+            let e = executor_for(os, arch).expect("pinned");
+            assert_eq!(e.file, file);
+            assert_eq!(e.sha256.len(), 64);
+        }
+        let intel = executor_for("macos", "x86_64").unwrap_err();
+        assert!(intel.contains("Apple Silicon"));
+        assert!(executor_for("freebsd", "x86_64").is_err());
     }
 }

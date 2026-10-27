@@ -26,7 +26,7 @@ upholds all of them and the control, and exits zero.
 ## Run it through the sandbox (the expected path)
 
 ```
-omgs prove --cwd benchmark/fixtures/installer-trust \
+omgs prove --target benchmark/fixtures/installer-trust \
   --cmd 'swiftc main.swift vulnerable/Verifier.swift -o "$TMPDIR/probe" && "$TMPDIR/probe"'
 ```
 
@@ -35,13 +35,9 @@ of the defect. Swap `vulnerable` for `fixed` and the same command succeeds. The 
 Swift toolchain and the OMGS sandbox backend; it never needs root, a real installer, Gatekeeper, or a
 dedicated host.
 
-A benign line may appear in the output:
-
-```
-swiftc: error: couldn't create cache file '/var/folders/.../T/xcrun_db-...' (errno=Operation not permitted)
-```
-
-That is the sandbox denying `xcrun` a write to the real per-user temp dir, outside scratch. The
+Benign lines may appear in the output, such as `xcodebuild` reporting that it could not read
+`DARWIN_USER_CACHE_DIR`, or `xcrun` failing to create a cache file under `/var/folders`. That is
+MXC denying writes to the real per-user cache and temp directories, outside the run's scratch. The
 compile and the proof still complete; it is the containment working, not a failure.
 
 ## Scope of this proof

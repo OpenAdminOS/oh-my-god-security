@@ -450,6 +450,8 @@ fn open_record(key: &str, intent_id: Option<&str>, path: &str) -> Finding {
         hunted_by: Some("red-1".into()),
         verified_by: Some("blue-1".into()),
         candidates: vec![],
+        proof_ref: None,
+        trace: vec![],
     }
 }
 

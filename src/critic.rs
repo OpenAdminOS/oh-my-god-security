@@ -306,5 +306,9 @@ pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport,
                 }),
         );
     }
-    Ok(critique(&ledger, names.len(), &candidates, findings))
+    let mut report = critique(&ledger, names.len(), &candidates, findings);
+    for e in crate::proof::validate_proofs(findings, dir) {
+        report.gaps.push(format!("findings {e}"));
+    }
+    Ok(report)
 }

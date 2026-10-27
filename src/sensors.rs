@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -17,18 +17,7 @@ pub struct SensorsReport {
     pub hits: Vec<SensorHit>,
 }
 
-fn which(name: &str) -> Option<PathBuf> {
-    let out = Command::new("which").arg(name).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(text))
-    }
-}
+use crate::platform::which;
 
 /// Run deterministic sensor tools against source text. Sensors never execute
 /// target code. Raw scanner output can contain matched secret values, so only
