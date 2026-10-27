@@ -226,7 +226,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         Some(v) => v
             .parse()
             .map_err(|_| format!("--timeout-ms must be a whole number, got '{v}'"))?,
-        None => 120_000,
+        None => replay.as_ref().map(|r| r.timeout_ms).unwrap_or(120_000),
     };
     omgs::sandbox::validate_input(&command, timeout_ms)?;
     let tier = match (&replay, flag(args, "--tier").as_deref()) {
@@ -307,6 +307,17 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         }
         None => None,
     };
+    if let Some(run_target) = meta
+        .as_ref()
+        .and_then(|m| m.get("target"))
+        .and_then(|v| v.as_str())
+    {
+        if target.as_deref().map(canon) != Some(canon(Path::new(run_target))) {
+            return Err(format!(
+                "--target must match this run's target {run_target}"
+            ));
+        }
+    }
     let target_head = target.as_deref().and_then(omgs::proof::git_head);
     if let Some(r) = &replay {
         if r.target_head != target_head {
@@ -409,16 +420,18 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             // runs, so concurrent proofs cannot overspend it. A run that is
             // interrupted keeps its charge; a blocked one gets it back below.
             let charged = omgs::runmeta::update(r, |m| {
+                omgs::runmeta::check_numeric_fields(m)?;
                 let used = |k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
                 let (calls, proofs) = (used("agent_calls_used"), used("proof_runs_used"));
                 if let Some(b) = m.get("budget_agent_calls").and_then(|v| v.as_u64()) {
-                    if calls + proofs >= b {
+                    if u128::from(calls) + u128::from(proofs) >= u128::from(b) {
                         return Err(format!(
                             "run budget exhausted: {calls} agent call(s) and {proofs} proof run(s) against a budget of {b}"
                         ));
                     }
                 }
-                m.insert("proof_runs_used".into(), serde_json::json!(proofs + 1));
+                let next = proofs.checked_add(1).ok_or("proof_runs_used exhausted")?;
+                m.insert("proof_runs_used".into(), serde_json::json!(next));
                 Ok(())
             });
             if let Err(e) = charged {
@@ -448,8 +461,8 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     };
     // Nothing ran: give the budget charge and the reserved number back.
     let release = || {
-        if let (Some(r), Some((_, d))) = (&run, &proof_dir) {
-            let _ = std::fs::remove_dir_all(d);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        if let (Some(r), Some(_)) = (&run, &proof_dir) {
             let _ = release_proof_charge(r);
         }
     };
@@ -507,16 +520,23 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         target: target.as_ref().map(|t| t.to_string_lossy().to_string()),
         target_head,
         target_sha256: result.target_sha256.clone(),
+        proof_dir: std::fs::canonicalize(&run_dir)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into(),
         marker_nonce: result.marker_nonce.clone(),
         command_started: s.command_started,
         command_finished: s.command_finished,
+        timeout_ms,
         started_at_ms,
         duration_ms: s.duration_ms,
         exit_code: s.exit_code,
         timed_out: s.timed_out,
         capture_complete: s.capture_complete,
         cleanup_complete: s.cleanup_complete,
-        executor_error: !s.command_started,
+        executor_error: s.executor_error,
+        killed: s.killed,
+        interrupted: s.interrupted,
         survivors: s
             .survivors
             .iter()
@@ -567,7 +587,15 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         s.exit_code
             .map(|c| c.to_string())
             .unwrap_or_else(|| "none".into()),
-        if s.timed_out { ", timed out" } else { "" },
+        if s.executor_error {
+            ", executor error"
+        } else if s.killed {
+            ", killed"
+        } else if s.timed_out {
+            ", timed out"
+        } else {
+            ""
+        },
         if s.capture_complete {
             ""
         } else {
@@ -864,6 +892,9 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_approve(args: &[String]) -> Result<(), String> {
+    if let Some(why) = omgs::sandbox::tier2_unavailable(std::env::consts::OS) {
+        return Err(why);
+    }
     let raw = flag(args, "--target").ok_or("approve requires --target <repo>")?;
     let target = std::fs::canonicalize(&raw).map_err(|e| format!("target {raw}: {e}"))?;
     let name = target
@@ -871,9 +902,6 @@ fn cmd_approve(args: &[String]) -> Result<(), String> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     println!("Tier 2 builds and runs {} as a local app inside MXC, on dummy data, with external network denied.", target.display());
-    if let Some(why) = omgs::sandbox::tier2_unavailable(std::env::consts::OS) {
-        println!("Note: {why}");
-    }
     println!("Type the folder name '{name}' to approve tier 2 for this repository:");
     let typed = omgs::approval::read_from_terminal()?;
     if typed.trim() != name {
@@ -1473,7 +1501,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let meta = serde_json::json!({
+    let mut meta = serde_json::json!({
         "repo": repo, "target": target.to_string_lossy(), "source_ref": source_ref,
         "mode": mode, "budget_agent_calls": budget, "profile": "standard",
         "execution_policy": "sandboxed-source-and-local-only", "run_status": "in_progress",
@@ -1482,10 +1510,12 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         "files_first_party": first_party.len(),
         "files_vendored_excluded": vendored_count,
         "started_unix": started_unix,
-        "agent_calls_used": null,
         "hunter": flag(rest, "--hunter"),
         "verifier": flag(rest, "--verifier")
     });
+    if budget.is_none() {
+        meta.as_object_mut().unwrap().remove("budget_agent_calls");
+    }
     write_out(
         out_abs.join("run-metadata.json"),
         serde_json::to_string_pretty(&meta).unwrap(),
@@ -1620,7 +1650,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     let proofs = files
         .iter()
         .filter(|f| {
-            let s = f.to_string_lossy();
+            let s = f.to_string_lossy().replace('\\', "/");
             s.contains("/tests/security/")
                 || s.contains(".security.test.")
                 || s.contains(".security.spec.")

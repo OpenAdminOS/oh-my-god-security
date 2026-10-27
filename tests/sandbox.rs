@@ -83,9 +83,22 @@ fn denials_hold_and_the_target_is_untouched() {
     std::fs::write(&outside, b"outside-secret-value").unwrap();
     let real_home = omgs::platform::home().unwrap();
     // A real file in the real home, so a denied read is not just a missing file.
-    let home_probe = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(format!(".omgs-sbx-probe-{}", std::process::id()));
-    std::fs::write(&home_probe, b"home-secret-value").unwrap();
+    let home_probe = real_home.join(format!(".omgs-sbx-probe-{}", std::process::id()));
+    struct Probe(PathBuf);
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let mut probe = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&home_probe)
+        .unwrap();
+    let _probe = Probe(home_probe.clone());
+    use std::io::Write;
+    probe.write_all(b"home-secret-value").unwrap();
+    drop(probe);
     // A host loopback service answering HTTP, reachable from the test itself
     // (positive control) and expected unreachable from inside.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -120,9 +133,7 @@ fn denials_hold_and_the_target_is_untouched() {
     );
     let t = text(&out);
     let _ = std::fs::remove_file(&home_probe);
-    if !curl_works {
-        eprintln!("note: curl unavailable on the host, loopback denial not checked");
-    }
+    assert!(curl_works, "host loopback positive control must answer");
     for leak in [
         "READ_OUTSIDE",
         "outside-secret-value",
@@ -280,6 +291,8 @@ fn proof_records_back_confirmed_findings() {
             x_test,
             "--cmd",
             failing,
+            "--timeout-ms",
+            "17000",
         ],
     );
     let t = text(&out);
@@ -394,6 +407,12 @@ fn proof_records_back_confirmed_findings() {
     let replayed: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(run.join("proofs/3.json")).unwrap()).unwrap();
     assert_eq!(replayed["replays"], 1);
+    assert_eq!(replayed["timeout_ms"], 17000);
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(run.join("proofs/3/mxc-config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(config["process"]["timeout"], 17000);
 
     // A replay never takes a host path from an edited record.
     let original = std::fs::read_to_string(run.join("proofs/1.json")).unwrap();
@@ -577,19 +596,59 @@ fn concurrent_or_repeated_proofs_cannot_overspend_the_budget() {
         ],
     );
     assert!(init.status.success(), "{}", text(&init));
-    // The charge lands before anything runs: the first proof spends the
-    // budget, the second is refused with exit 3 because nothing ran.
-    let prove = || {
-        omgs(
-            &home,
-            &["prove", "--run", run.to_str().unwrap(), "--cmd", "true"],
-        )
-    };
-    let first = prove();
-    assert_ne!(first.status.code(), Some(2), "{}", text(&first));
-    let second = prove();
-    assert_eq!(second.status.code(), Some(3), "{}", text(&second));
-    assert!(text(&second).contains("budget exhausted"));
+    let executor = omgs::sandbox::locate_executor().unwrap();
+    let mut children = Vec::new();
+    for _ in 0..6 {
+        children.push(
+            std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .args([
+                    "prove",
+                    "--run",
+                    run.to_str().unwrap(),
+                    "--cmd",
+                    "echo budget-proof-ran",
+                ])
+                .env("OMGS_HOME", &home)
+                .env("OMGS_MXC_EXEC", &executor.path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    let outputs: Vec<_> = children
+        .into_iter()
+        .map(|c| c.wait_with_output().unwrap())
+        .collect();
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|o| o.status.success() && text(o).contains("budget-proof-ran"))
+            .count(),
+        1,
+        "{:?}",
+        outputs.iter().map(text).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|o| o.status.code() == Some(3) && text(o).contains("budget exhausted"))
+            .count(),
+        5
+    );
+    assert_eq!(omgs::runmeta::read(&run).unwrap()["proof_runs_used"], 1);
+    assert_eq!(
+        std::fs::read_dir(run.join("proofs"))
+            .unwrap()
+            .filter(|e| e
+                .as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|s| s == "json"))
+            .count(),
+        1
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -939,4 +998,234 @@ fn doctor_discloses_planned_controls_and_gaps_without_an_executor() {
         assert!(t.contains(gap), "{gap}: {t}");
     }
     let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn target_mismatch_and_invalid_metadata_never_charge_budget() {
+    let d = scratch("strict-meta");
+    let target = d.join("target");
+    let other = d.join("other");
+    let run = d.join("run");
+    for path in [&target, &other, &run] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let meta = serde_json::json!({"target": target, "budget_agent_calls": 1});
+    let meta_path = run.join(omgs::runmeta::FILE);
+    std::fs::write(&meta_path, meta.to_string()).unwrap();
+    let mismatch = omgs(
+        &d.join("home"),
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--target",
+            other.to_str().unwrap(),
+            "--cmd",
+            "echo ran",
+        ],
+    );
+    assert_eq!(mismatch.status.code(), Some(2), "{}", text(&mismatch));
+    assert!(text(&mismatch).contains("must match this run's target"));
+    assert_eq!(
+        std::fs::read_to_string(&meta_path).unwrap(),
+        meta.to_string()
+    );
+    for key in ["budget_agent_calls", "agent_calls_used", "proof_runs_used"] {
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("1"),
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!([]),
+        ] {
+            let mut invalid = meta.clone();
+            invalid[key] = value;
+            let saved = invalid.to_string();
+            std::fs::write(&meta_path, &saved).unwrap();
+            let out = omgs(
+                &d.join("home"),
+                &["prove", "--run", run.to_str().unwrap(), "--cmd", "echo ran"],
+            );
+            assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+            assert!(text(&out).contains(key));
+            assert_eq!(std::fs::read_to_string(&meta_path).unwrap(), saved);
+        }
+    }
+    assert!(!run.join("proofs").exists());
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn approve_refuses_tier2_before_prompting_or_writing() {
+    let d = scratch("approve-refuse");
+    let out = omgs(
+        &d.join("home"),
+        &["approve", "--target", d.to_str().unwrap()],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(text(&out).contains("tier 2 runs only on Linux"));
+    assert!(!d.join("home/tier2-approvals.json").exists());
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn proof_test_paths_are_counted_on_every_os() {
+    let d = scratch("check-paths");
+    let target = d.join("target");
+    std::fs::create_dir_all(target.join("tests/security")).unwrap();
+    for rel in [
+        "tests/security/test.rs",
+        "a.security.test.js",
+        "b.security.spec.ts",
+    ] {
+        std::fs::write(target.join(rel), b"text only").unwrap();
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "check",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            d.join("out").to_str().unwrap(),
+        ])
+        .env("OMGS_HOME", d.join("home"))
+        .env("PATH", "")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("committed proof tests found: 3"));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn doctor_and_proofs_list_memory_and_task_gap_once() {
+    let d = scratch("unique-gaps");
+    let doctor = omgs(&d, &["doctor"]);
+    let needle = if cfg!(target_os = "linux") {
+        "memory and task limits conditional"
+    } else {
+        "memory and task limits not applied"
+    };
+    assert_eq!(
+        text(&doctor).matches(needle).count(),
+        1,
+        "{}",
+        text(&doctor)
+    );
+    if mxc_ready() {
+        let out = omgs(&d, &["prove", "--cmd", "echo ok"]);
+        let record = record_from(&text(&out));
+        assert_eq!(
+            record["gaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|g| g.as_str().unwrap().contains(needle))
+                .count(),
+            1
+        );
+        assert_eq!(text(&out).matches(needle).count(), 1, "{}", text(&out));
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn narrowed_homebrew_roots_support_python_node_and_cargo() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("build-tools");
+    let target = d.join("target");
+    std::fs::create_dir_all(target.join("src")).unwrap();
+    std::fs::write(
+        target.join("Cargo.toml"),
+        "[package]\nname='sandbox-probe'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        target.join("src/main.rs"),
+        "fn main() { println!(\"cargo-ok\"); }",
+    )
+    .unwrap();
+    let out = omgs(&d.join("home"), &["prove", "--target", target.to_str().unwrap(), "--cmd", "python3 -I -c 'print(\"python-ok\")' && node -e 'console.log(\"node-ok\")' && cargo run --offline"]);
+    assert!(out.status.success(), "{}", text(&out));
+    for tool in ["python-ok", "node-ok", "cargo-ok"] {
+        assert!(text(&out).contains(tool), "{}", text(&out));
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupting_prove_cleans_the_executor_group_and_marks_the_record_unclean() {
+    if !mxc_ready() {
+        return;
+    }
+    for number in [libc::SIGINT, libc::SIGTERM] {
+        let d = scratch(&format!("signal-{number}"));
+        let run = d.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join(omgs::runmeta::FILE), "{}").unwrap();
+        // The detached child also exercises the macOS survivor sweep.
+        let command = if cfg!(target_os = "macos") {
+            "python3 -I -c 'import os,time\npid=os.fork()\nif pid==0:\n os.setsid()\n open(\"ready\",\"w\").write(str(os.getpid()))\n time.sleep(120)\n os._exit(0)\ntime.sleep(120)'"
+        } else {
+            "sleep 120 & echo $! > ready; wait"
+        };
+        let executor = omgs::sandbox::locate_executor().unwrap();
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .args(["prove", "--run", run.to_str().unwrap(), "--cmd", command])
+            .env("OMGS_HOME", d.join("home"))
+            .env("OMGS_MXC_EXEC", executor.path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let ready = run.join("proofs/1/workspace/ready");
+        let start = std::time::Instant::now();
+        let pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&ready) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            if start.elapsed().as_secs() >= 20 || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let out = child.wait_with_output().unwrap();
+                panic!("proof never became ready: {}", text(&out));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(unsafe { libc::kill(child.id() as i32, number) }, 0);
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+        assert!(
+            record.interrupted && record.killed && !record.clean(),
+            "{record:?}"
+        );
+        assert!(!record.timed_out && !record.executor_error, "{record:?}");
+        assert!(record.cleanup_complete, "{record:?}");
+        assert!(text(&out).contains(", killed"), "{}", text(&out));
+        assert!(!text(&out).contains(", timed out"), "{}", text(&out));
+        if cfg!(target_os = "macos") {
+            assert!(record.survivors.iter().any(|s| s.pid == pid), "{record:?}");
+        }
+        let gone = std::time::Instant::now();
+        while unsafe { libc::kill(pid, 0) } == 0 && gone.elapsed().as_secs() < 3 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Linux may retain an inert orphan zombie until its namespace is reaped.
+        #[cfg(target_os = "linux")]
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            assert!(stat.split(") ").nth(1).unwrap().starts_with('Z'), "{stat}");
+        }
+        #[cfg(target_os = "macos")]
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "pid {pid} survived");
+        std::fs::remove_dir_all(d).unwrap();
+    }
 }

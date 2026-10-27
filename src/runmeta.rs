@@ -63,10 +63,23 @@ pub fn read(dir: &Path) -> Result<Map<String, Value>, String> {
     let text =
         std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     match crate::shape::strict_json(&text) {
-        Ok(Value::Object(m)) => Ok(m),
+        Ok(Value::Object(m)) => {
+            check_numeric_fields(&m)?;
+            Ok(m)
+        }
         Ok(_) => Err(format!("{} is not a JSON object", path.display())),
         Err(e) => Err(format!("parse {}: {e}", path.display())),
     }
+}
+
+/// Counters and budgets are unsigned integers when present, never null.
+pub fn check_numeric_fields(meta: &Map<String, Value>) -> Result<(), String> {
+    for key in ["budget_agent_calls", "agent_calls_used", "proof_runs_used"] {
+        if meta.get(key).is_some_and(|v| v.as_u64().is_none()) {
+            return Err(format!("{key} must be a non-negative integer or absent"));
+        }
+    }
+    Ok(())
 }
 
 const LOCK: &str = ".omgs-run.lock";
@@ -120,6 +133,7 @@ pub fn update<T>(
     with_lock(dir, || {
         let mut meta = read(dir)?;
         let out = change(&mut meta)?;
+        check_numeric_fields(&meta)?;
         let text = serde_json::to_string_pretty(&Value::Object(meta)).map_err(|e| e.to_string())?;
         write_atomic(&dir.join(FILE), &format!("{text}\n"))?;
         Ok(out)

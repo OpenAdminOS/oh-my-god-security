@@ -45,9 +45,12 @@ pub struct ProofRecord {
     pub target_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_sha256: Option<String>,
+    /// Original canonical proof directory, retained when a run is archived.
+    pub proof_dir: String,
     pub marker_nonce: String,
     pub command_started: bool,
     pub command_finished: bool,
+    pub timeout_ms: u64,
     pub started_at_ms: u64,
     pub duration_ms: u64,
     pub exit_code: Option<i32>,
@@ -60,6 +63,10 @@ pub struct ProofRecord {
     /// so the command may never have started.
     #[serde(default)]
     pub executor_error: bool,
+    #[serde(default)]
+    pub killed: bool,
+    #[serde(default)]
+    pub interrupted: bool,
     pub survivors: Vec<Survivor>,
     pub mxc_version: String,
     pub containment: String,
@@ -88,6 +95,8 @@ impl ProofRecord {
             && self.capture_complete
             && self.cleanup_complete
             && !self.executor_error
+            && !self.killed
+            && !self.interrupted
             && self.survivors.is_empty()
     }
 
@@ -152,6 +161,11 @@ pub fn load(run: &Path, proof_ref: &str) -> Result<ProofRecord, String> {
         .and_then(|r| r.strip_suffix(".json"))
         .and_then(|r| r.parse().ok())
         .ok_or_else(|| format!("proof_ref '{proof_ref}' must look like proofs/<n>.json"))?;
+    if proof_ref != reference(n) || n == 0 {
+        return Err(format!(
+            "proof_ref '{proof_ref}' must use canonical proofs/<n>.json form"
+        ));
+    }
     let path = record_path(run, n);
     let text =
         std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -314,7 +328,21 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
             } else {
                 crate::sandbox::Tier::Test
             };
-            let (declared, _) = crate::sandbox::declared_controls(os, tier);
+            let (declared, gaps) = crate::sandbox::declared_controls(os, tier);
+            for gap in gaps {
+                let present = if gap.starts_with("readable toolchain roots and caches") {
+                    record.gaps.iter().any(|g| {
+                        g.starts_with(
+                            "readable toolchain roots and caches (may contain private content): ",
+                        )
+                    })
+                } else {
+                    record.gaps.contains(&gap)
+                };
+                if !present {
+                    errors.push(format!("does not list the required gap '{gap}'"));
+                }
+            }
             if let Some(missing) = declared.iter().find(|c| !record.enforced.contains(c)) {
                 errors.push(format!("does not list the required control '{missing}'"));
             }
@@ -326,6 +354,11 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
             record.mxc_version,
             crate::sandbox::MXC_VERSION
         ));
+    }
+    if run.join(crate::runmeta::FILE).exists() {
+        if let Err(error) = crate::runmeta::read(run) {
+            errors.push(format!("invalid run metadata: {error}"));
+        }
     }
     let run_target = crate::runmeta::read(run)
         .ok()
@@ -350,6 +383,26 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
             errors.push("test-draft does not match test_sha256".into());
         }
     }
+    if record.test_from.is_none() {
+        if let (Some(target), Some(test)) = (&record.target, &record.test) {
+            let rel = test.replace('\\', "/");
+            if Path::new(&rel).is_absolute()
+                || rel.contains(':')
+                || rel.split('/').any(|p| p == "..")
+            {
+                errors.push("test must be relative to the recorded target".into());
+            } else if Path::new(target).exists() {
+                let digest = crate::sha256::digest_file(&Path::new(target).join(rel));
+                if digest.ok().as_ref() != record.test_sha256.as_ref()
+                    || record.test_sha256.is_none()
+                {
+                    errors.push(
+                        "target test changed or is unreadable; does not match test_sha256".into(),
+                    );
+                }
+            }
+        }
+    }
     if crate::sha256::digest(record.output.as_bytes()) != record.output_sha256 {
         errors.push("redacted output does not match output_sha256".into());
     }
@@ -363,7 +416,7 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
                 .map_err(|e| e.to_string())
                 .and_then(crate::shape::strict_json)
             {
-                Ok(config) => errors.extend(config_evidence(run, record, &config)),
+                Ok(config) => errors.extend(config_evidence(record, &config)),
                 Err(e) => errors.push(format!("invalid MXC config: {e}")),
             }
         }
@@ -383,7 +436,7 @@ fn is_digest(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn config_evidence(run: &Path, record: &ProofRecord, config: &serde_json::Value) -> Vec<String> {
+fn config_evidence(record: &ProofRecord, config: &serde_json::Value) -> Vec<String> {
     let mut errors = Vec::new();
     let os = match record.containment.as_str() {
         "seatbelt" => "macos",
@@ -409,15 +462,14 @@ fn config_evidence(run: &Path, record: &ProofRecord, config: &serde_json::Value)
     {
         errors.push("MXC config commandLine is not the wrapped record.command".into());
     }
-    if config
-        .pointer("/process/timeout")
-        .and_then(|v| v.as_u64())
-        .is_none_or(|t| !(1..=u64::from(u32::MAX)).contains(&t))
+    if !(1..=u64::from(u32::MAX)).contains(&record.timeout_ms)
+        || config.pointer("/process/timeout").and_then(|v| v.as_u64()) != Some(record.timeout_ms)
     {
-        errors.push("MXC config timeout must be a finite MXC millisecond count".into());
+        errors.push(
+            "MXC config timeout must match record.timeout_ms, a finite MXC millisecond count"
+                .into(),
+        );
     }
-    let dir = run.join(DIR).join(record.n.to_string());
-    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
     let norm = |p: &str| {
         let p = p.replace('\\', "/");
         let p = p.strip_prefix("//?/").unwrap_or(&p);
@@ -427,15 +479,89 @@ fn config_evidence(run: &Path, record: &ProofRecord, config: &serde_json::Value)
             p.to_string()
         }
     };
-    let workspace = norm(&dir.join("workspace").to_string_lossy());
-    let scratch = norm(&dir.join("scratch").to_string_lossy());
-    if config
+    // Keep the original config intact when a run is moved. Every grant must
+    // still be relative to the same canonical proofs/<n> anchor in its cwd.
+    let cwd = config
         .pointer("/process/cwd")
         .and_then(|v| v.as_str())
         .map(norm)
-        != Some(workspace.clone())
+        .unwrap_or_default();
+    let recorded_dir = norm(&record.proof_dir);
+    let suffix = format!("/proofs/{}/workspace", record.n);
+    let absolute = if os == "windows" {
+        cwd.starts_with("//")
+            || (cwd.as_bytes().get(1) == Some(&b':') && cwd.as_bytes().get(2) == Some(&b'/'))
+    } else {
+        cwd.starts_with('/')
+    };
+    if !absolute
+        || cwd != format!("{recorded_dir}/workspace")
+        || !cwd.ends_with(&suffix)
+        || cwd.split('/').any(|p| p == "." || p == "..")
     {
         errors.push("MXC config cwd must be this proof's proofs/<n>/workspace".into());
+    }
+    let dir = recorded_dir;
+    let workspace = format!("{dir}/workspace");
+    let scratch = format!("{dir}/scratch");
+    let allowed = format!("{dir}/markers/allowed");
+    let denied = format!("{dir}/markers/denied");
+    let roots: Vec<String> =
+        crate::sandbox::toolchain_roots(os, crate::platform::home().as_deref())
+            .iter()
+            .map(|p| norm(&p.to_string_lossy()))
+            .collect();
+    let readonly = config
+        .pointer("/filesystem/readonlyPaths")
+        .and_then(|v| v.as_array());
+    if readonly.is_none_or(|paths| {
+        paths.iter().any(|p| {
+            p.as_str().is_none_or(|p| {
+                let p = norm(p);
+                !(roots.contains(&p) || os == "macos" && p == allowed)
+            })
+        })
+    }) {
+        errors.push("MXC config readonlyPaths must be limited to toolchain roots and this proof's allowed marker".into());
+    }
+    if os == "macos"
+        && readonly.is_none_or(|paths| {
+            !paths
+                .iter()
+                .any(|p| p.as_str().map(norm).as_ref() == Some(&allowed))
+        })
+    {
+        errors.push("MXC config readonlyPaths must include this proof's allowed marker".into());
+    }
+    let denied_paths = config
+        .pointer("/filesystem/deniedPaths")
+        .and_then(|v| v.as_array());
+    let expected_denied = if os == "macos" { vec![denied] } else { vec![] };
+    if denied_paths.is_none_or(|paths| {
+        paths
+            .iter()
+            .map(|p| p.as_str().map(norm))
+            .collect::<Option<Vec<_>>>()
+            .as_ref()
+            != Some(&expected_denied)
+    }) {
+        errors.push("MXC config deniedPaths must match this proof's denied marker policy".into());
+    }
+    let keys = crate::sandbox::environment_keys(os);
+    let mut seen = std::collections::HashSet::new();
+    if config
+        .pointer("/process/env")
+        .and_then(|v| v.as_array())
+        .is_none_or(|env| {
+            env.iter().any(|v| {
+                let Some((key, _)) = v.as_str().and_then(|s| s.split_once('=')) else {
+                    return true;
+                };
+                !keys.contains(&key) || !seen.insert(key.to_string())
+            })
+        })
+    {
+        errors.push("MXC config process.env must use unique allowlisted environment keys".into());
     }
     let rw = config
         .pointer("/filesystem/readwritePaths")
@@ -586,7 +712,8 @@ pub fn redact(text: &str) -> String {
 /// One line: credential URLs lose their user info, bearer tokens and the
 /// value after a credential keyword (quoted or bare, `:` or `=`) are masked.
 fn redact_line(line: &str, lower: &str) -> String {
-    const KEYS: [&str; 13] = [
+    const KEYS: [&str; 14] = [
+        "credential",
         "password",
         "passwd",
         "secret",
@@ -664,6 +791,7 @@ mod tests {
             "access_key=private",
             "session_id: private",
             "TOKEN_VALUE=private",
+            "credentials: private",
         ] {
             let masked = redact(line);
             assert!(masked.contains("[omgs redacted]"), "{masked}");

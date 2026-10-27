@@ -316,3 +316,29 @@ fn executor_text_errors_and_outer_exit_codes_cannot_substitute_for_markers() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn timeout_words_and_signal_death_are_not_timeouts() {
+    let nonce = "nonce";
+    let cmd = shell("printf 'OMGS_START_nonce\nscript timed out after 1ms\nOMGS_END_nonce:0\n'");
+    let result = omgs::supervise::run_marked(cmd, &limits(), None, nonce);
+    assert!(result.success && !result.timed_out, "{result:?}");
+    let result = omgs::supervise::run_marked(
+        shell("printf 'OMGS_START_nonce\n'; kill -KILL $$"),
+        &limits(),
+        None,
+        nonce,
+    );
+    assert!(
+        result.killed && !result.timed_out && !result.executor_error,
+        "{result:?}"
+    );
+    assert!(!result.success && !result.command_finished);
+    let result =
+        omgs::supervise::run_marked(Command::new("/omgs/no-executor"), &limits(), None, nonce);
+    assert!(
+        result.executor_error && !result.timed_out && !result.killed,
+        "{result:?}"
+    );
+}

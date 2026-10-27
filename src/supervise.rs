@@ -36,6 +36,9 @@ pub struct Supervised {
     pub enumerate_rejected: bool,
     pub success: bool,
     pub timed_out: bool,
+    pub executor_error: bool,
+    pub killed: bool,
+    pub interrupted: bool,
     pub duration_ms: u64,
     pub output: String,
     pub output_bytes_total: u64,
@@ -52,6 +55,61 @@ const POLL: Duration = Duration::from_millis(10);
 #[cfg(unix)]
 const TERM_GRACE: Duration = Duration::from_millis(150);
 const DRAIN: Duration = Duration::from_secs(2);
+
+#[cfg(unix)]
+mod interruption {
+    use super::*;
+    use std::sync::atomic::AtomicI32;
+    use std::sync::{Mutex, MutexGuard};
+
+    static SIGNAL: AtomicI32 = AtomicI32::new(0);
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    extern "C" fn handler(number: libc::c_int) {
+        SIGNAL.store(number, Ordering::Relaxed);
+    }
+
+    pub(super) fn pending() -> bool {
+        SIGNAL.load(Ordering::Relaxed) != 0
+    }
+
+    pub(super) struct Guard {
+        previous: Vec<(libc::c_int, libc::sigaction)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl Guard {
+        pub(super) fn install() -> io::Result<Self> {
+            let lock = LOCK
+                .lock()
+                .map_err(|_| io::Error::other("signal handler lock poisoned"))?;
+            let mut guard = Self {
+                previous: Vec::new(),
+                _lock: lock,
+            };
+            SIGNAL.store(0, Ordering::Relaxed);
+            for number in [libc::SIGINT, libc::SIGTERM] {
+                let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+                let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+                action.sa_sigaction = handler as *const () as usize;
+                unsafe { libc::sigemptyset(&mut action.sa_mask) };
+                if unsafe { libc::sigaction(number, &action, &mut old) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                guard.previous.push((number, old));
+            }
+            Ok(guard)
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            for (number, old) in &self.previous {
+                unsafe { libc::sigaction(*number, old, std::ptr::null_mut()) };
+            }
+        }
+    }
+}
 
 enum Message {
     Data(usize, Vec<u8>),
@@ -77,7 +135,6 @@ struct MarkerScan {
     exit_code: Option<i32>,
     invalid: bool,
     enumerate_rejected: bool,
-    mxc_timed_out: bool,
 }
 
 impl MarkerScan {
@@ -110,7 +167,6 @@ impl MarkerScan {
         {
             self.enumerate_rejected = true;
         }
-        self.mxc_timed_out |= lower.contains("script timed out after");
         let Some(nonce) = &self.nonce else { return };
         if line == format!("OMGS_START_{nonce}") {
             self.invalid |= self.started || self.finished;
@@ -342,26 +398,37 @@ fn signal(pid: i32, number: i32, notes: &mut Vec<String>) -> bool {
 struct Waited {
     status: Option<ExitStatus>,
     timed_out: bool,
+    interrupted: bool,
     healthy: bool,
 }
 
 fn wait(
     child: &mut Child,
     wall_ms: u64,
+    check_signals: bool,
     rx: &mpsc::Receiver<Message>,
     capture: &mut Capture,
     notes: &mut Vec<String>,
 ) -> Waited {
+    #[cfg(not(unix))]
+    let _ = check_signals;
     let start = Instant::now();
     let mut waited = Waited {
         status: None,
         timed_out: false,
+        interrupted: false,
         healthy: true,
     };
     #[cfg(unix)]
     let mut owns_leader = true;
     loop {
         capture.drain(rx, notes);
+        #[cfg(unix)]
+        if check_signals && interruption::pending() {
+            waited.interrupted = true;
+            notes.push("proof interrupted by SIGINT or SIGTERM; executor cleanup required".into());
+            break;
+        }
         #[cfg(unix)]
         let status = exited_without_reaping(child.id());
         #[cfg(not(unix))]
@@ -880,6 +947,9 @@ fn run_inner(
         enumerate_rejected: false,
         success: false,
         timed_out: false,
+        executor_error: false,
+        killed: false,
+        interrupted: false,
         duration_ms: 0,
         output: String::new(),
         output_bytes_total: 0,
@@ -896,15 +966,10 @@ fn run_inner(
         (cmd, cgroups) = cgroup::wrap(cmd, limits, &mut result.notes);
     }
     #[cfg(not(target_os = "linux"))]
-    for (name, value) in [
-        ("memory_bytes", limits.memory_bytes),
-        ("tasks", limits.tasks),
-    ] {
-        if let Some(value) = value {
-            result.notes.push(format!(
-                "{name}={value} not applied: Linux cgroups required"
-            ));
-        }
+    if limits.memory_bytes.is_some() || limits.tasks.is_some() {
+        result
+            .notes
+            .push("memory and task limits not applied: Linux cgroups required".into());
     }
     #[cfg(not(unix))]
     for (name, value) in [
@@ -925,9 +990,24 @@ fn run_inner(
             .push("survivor sweep not applied: only available on macOS".into());
     }
     #[cfg(unix)]
+    let _signals = if nonce.is_some() {
+        match interruption::Guard::install() {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                result.executor_error = true;
+                result.output = format!("failed to install proof signal handlers: {error}");
+                result.notes.push(result.output.clone());
+                return result;
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(unix)]
     let unix_controls = match prepare_unix(&mut cmd, limits) {
         Ok(controls) => controls,
         Err(error) => {
+            result.executor_error = true;
             result.output = format!("failed to prepare executor: {error}");
             result.notes.push(result.output.clone());
             result.duration_ms = elapsed_ms(start);
@@ -940,6 +1020,7 @@ fn run_inner(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
+            result.executor_error = true;
             result.output = format!("failed to start executor: {error}");
             result.notes.push(result.output.clone());
             result.duration_ms = elapsed_ms(start);
@@ -993,10 +1074,14 @@ fn run_inner(
     let waited = wait(
         &mut child,
         limits.wall_ms,
+        nonce.is_some(),
         &rx,
         &mut capture,
         &mut result.notes,
     );
+    result.interrupted = waited.interrupted;
+    result.killed = waited.interrupted
+        || (!waited.timed_out && waited.status.is_some_and(|s| s.code().is_none()));
     result.timed_out = waited.timed_out;
     if !result.timed_out {
         result.exit_code = waited.status.and_then(|status| status.code());
@@ -1031,11 +1116,18 @@ fn run_inner(
         capture.evidence.line(stream);
     }
     result.enumerate_rejected = capture.evidence.enumerate_rejected;
-    result.timed_out |= capture.evidence.mxc_timed_out;
     if nonce.is_some() {
         result.command_started = capture.evidence.started;
         result.command_finished = capture.evidence.finished && !capture.evidence.invalid;
         result.exit_code = capture.evidence.exit_code;
+        result.executor_error = !result.command_started && !result.interrupted && !result.killed;
+    }
+    #[cfg(unix)]
+    if nonce.is_some() && interruption::pending() {
+        result.interrupted = true;
+        result.killed = true;
+        result.executor_error = false;
+        result.timed_out = false;
     }
     result.output_bytes_total = capture.total;
     result.output = capture.text();
@@ -1054,6 +1146,9 @@ fn run_inner(
     result.cleanup_complete = cleanup_complete;
     result.success = result.exit_code == Some(0)
         && !result.timed_out
+        && !result.interrupted
+        && !result.killed
+        && !result.executor_error
         && result.capture_complete
         && result.survivors.is_empty()
         && cleanup_complete;

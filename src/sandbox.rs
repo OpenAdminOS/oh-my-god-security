@@ -96,11 +96,7 @@ pub struct Located {
 pub fn locate_executor() -> Result<Located, String> {
     let executor = this_executor()?;
     if cfg!(target_os = "macos") {
-        if let Some(major) = macos_major().filter(|m| *m < 15) {
-            return Err(format!(
-                "MXC needs macOS 15 or later; this Mac runs macOS {major}, so omgs prove cannot run target code here."
-            ));
-        }
+        require_macos_version(macos_major())?;
     }
     let check = |path: &Path| match sha256::digest_file(path) {
         Ok(d) if d == executor.sha256 => Ok(()),
@@ -156,12 +152,23 @@ fn macos_major() -> Option<u32> {
         .env_clear()
         .output()
         .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     String::from_utf8_lossy(&out.stdout)
         .trim()
         .split('.')
         .next()?
         .parse()
         .ok()
+}
+
+fn require_macos_version(major: Option<u32>) -> Result<(), String> {
+    match major {
+        Some(15..) => Ok(()),
+        Some(major) => Err(format!("MXC needs macOS 15 or later; this Mac runs macOS {major}, so omgs prove cannot run target code here.")),
+        None => Err("cannot determine the macOS version from sw_vers; refusing to run target code because MXC needs macOS 15 or later".into()),
+    }
 }
 
 /// Manual install steps for the pinned executor, shown when it is missing.
@@ -261,12 +268,18 @@ fn parent_dirs(p: &str) -> Vec<String> {
 
 /// Toolchain roots made readable inside the sandbox when they exist. System
 /// directories are already readable under every MXC backend.
-fn toolchain_roots(os: &str, home: Option<&Path>) -> Vec<PathBuf> {
+pub fn toolchain_roots(os: &str, home: Option<&Path>) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = match os {
         "macos" => vec![
             "/Applications/Xcode.app".into(),
             "/Library/Developer/CommandLineTools".into(),
-            "/opt/homebrew".into(),
+            "/opt/homebrew/bin".into(),
+            "/opt/homebrew/lib".into(),
+            "/opt/homebrew/opt".into(),
+            "/opt/homebrew/Cellar".into(),
+            "/opt/homebrew/share".into(),
+            "/opt/homebrew/include".into(),
+            "/opt/homebrew/Frameworks".into(),
             "/usr/local/bin".into(),
             "/usr/local/lib".into(),
             "/usr/local/microsoft".into(),
@@ -412,6 +425,33 @@ pub struct ConfigInput<'a> {
     pub list_parents: bool,
 }
 
+pub fn environment_keys(os: &str) -> Vec<&'static str> {
+    let mut keys = if os == "windows" {
+        vec![
+            "SYSTEMROOT",
+            "USERPROFILE",
+            "LOCALAPPDATA",
+            "TEMP",
+            "TMP",
+            "PATH",
+        ]
+    } else {
+        vec![
+            "HOME",
+            "TMPDIR",
+            "XDG_CACHE_HOME",
+            "CLANG_MODULE_CACHE_PATH",
+            "PATH",
+            "LANG",
+        ]
+    };
+    if os == "macos" {
+        keys.push("OPENSSL_CONF");
+    }
+    keys.extend(["CARGO_HOME", "CARGO_NET_OFFLINE", "RUSTUP_HOME"]);
+    keys
+}
+
 pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
     let scratch = mxc_path(input.scratch);
     let mut env: Vec<String> = if input.os == "windows" {
@@ -444,6 +484,9 @@ pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
             "LANG=C.UTF-8".into(),
         ]
     };
+    if input.os == "macos" {
+        env.push(format!("OPENSSL_CONF={scratch}/openssl.cnf"));
+    }
     if let Some(r) = &input.rust {
         if input.os == "windows" {
             if let Some(p) = env.iter_mut().find(|e| e.starts_with("PATH=")) {
@@ -626,10 +669,8 @@ pub fn declared_limits(os: &str) -> Vec<String> {
         v.push("CPU time, file size and open file limits".into());
         v.push("process group signalled before the leader is reaped".into());
     }
-    match os {
-        "macos" => v.push("survivor sweep: sandboxed processes that left the group are found and killed, and the run fails".into()),
-        "linux" => v.push("memory and task limits through a systemd user scope when one is available".into()),
-        _ => {}
+    if os == "macos" {
+        v.push("survivor sweep: sandboxed processes that left the group are found and killed, and the run fails".into());
     }
     v
 }
@@ -783,7 +824,107 @@ fn overlapping_root<'a>(run_dir: &Path, readonly: &'a [PathBuf]) -> Option<&'a P
         .find(|r| run_dir.starts_with(r) || r.starts_with(run_dir))
 }
 
+struct BlockedCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for BlockedCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn stage_workspace(
+    req: &ProveRequest,
+    workspace: &Path,
+    scratch: &Path,
+    readonly: &[PathBuf],
+    nonce: &str,
+) -> Result<(Option<String>, Option<RustHomes>), String> {
+    if let Some(target) = &req.target {
+        let target = std::fs::canonicalize(target).map_err(|e| format!("target: {e}"))?;
+        if !target.is_dir() {
+            return Err(format!("target {} is not a directory", target.display()));
+        }
+        if workspace.starts_with(&target) {
+            return Err("the proof directory must be outside the target tree".into());
+        }
+        copy_tree(&target, workspace)?;
+    } else {
+        std::fs::create_dir_all(workspace).map_err(|e| e.to_string())?;
+    }
+    let digest = if req.target.is_some() {
+        Some(
+            crate::proof::tree_digest(workspace)
+                .map_err(|e| format!("cannot digest target snapshot: {e}"))?,
+        )
+    } else {
+        None
+    };
+    if req
+        .expected_tree_sha256
+        .as_ref()
+        .is_some_and(|want| Some(want) != digest.as_ref())
+    {
+        return Err("target snapshot differs from the recorded tree; refusing to replay".into());
+    }
+    if let Some((draft, rel)) = &req.stage {
+        stage_file(workspace, rel, draft)
+            .map_err(|e| format!("cannot stage the draft test at {rel}: {e}"))?;
+    }
+    for dir in [
+        scratch.to_path_buf(),
+        scratch.join("cache"),
+        scratch.join("clang-cache"),
+    ] {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    if cfg!(target_os = "macos") {
+        std::fs::write(scratch.join("openssl.cnf"), b"").map_err(|e| e.to_string())?;
+    }
+    let home = platform::home();
+    let rust = match home.as_ref().map(|h| h.join(".cargo")) {
+        Some(cargo) if readonly.contains(&cargo.join("bin")) => {
+            let cargo_home = scratch.join("cargo-home");
+            std::fs::create_dir_all(&cargo_home).map_err(|e| e.to_string())?;
+            for sub in RUST_CACHES {
+                let real = cargo.join(sub);
+                if readonly.contains(&real) {
+                    link_dir(&real, &cargo_home.join(sub))
+                        .map_err(|e| format!("cannot link the cargo {sub} cache: {e}"))?;
+                }
+            }
+            Some(RustHomes {
+                bin: cargo.join("bin"),
+                cargo_home,
+                rustup_home: home
+                    .map(|h| h.join(".rustup"))
+                    .filter(|r| readonly.contains(r)),
+            })
+        }
+        _ => None,
+    };
+    write_wrapper(std::env::consts::OS, workspace, &req.command, nonce)
+        .map_err(|e| format!("cannot write command wrapper: {e}"))?;
+    Ok((digest, rust))
+}
+
 pub fn prove(req: &ProveRequest) -> ProveOutcome {
+    if req.run_dir.join("workspace").exists() || req.run_dir.join("scratch").exists() {
+        return ProveOutcome::Blocked {
+            reason: format!(
+                "{} already holds a proof run; use a fresh directory",
+                req.run_dir.display()
+            ),
+        };
+    }
+    let mut cleanup = BlockedCleanup {
+        path: req.run_dir.clone(),
+        armed: true,
+    };
     if let Err(reason) = validate_input(&req.command, req.timeout_ms) {
         return ProveOutcome::Blocked { reason };
     }
@@ -820,52 +961,6 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             run_dir.display()
         ));
     }
-    if let Some(target) = &req.target {
-        let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.clone());
-        if !target.is_dir() {
-            return blocked(format!("target {} is not a directory", target.display()));
-        }
-        if run_dir.starts_with(&target) {
-            return blocked("the proof directory must be outside the target tree".into());
-        }
-        if let Err(e) = copy_tree(&target, &workspace) {
-            return blocked(format!("could not copy the target into the workspace: {e}"));
-        }
-    } else if let Err(e) = std::fs::create_dir_all(&workspace) {
-        return blocked(e.to_string());
-    }
-    let target_sha256 = if req.target.is_some() {
-        match crate::proof::tree_digest(&workspace) {
-            Ok(d) => Some(d),
-            Err(e) => return blocked(format!("cannot digest target snapshot: {e}")),
-        }
-    } else {
-        None
-    };
-    if req
-        .expected_tree_sha256
-        .as_ref()
-        .is_some_and(|d| Some(d) != target_sha256.as_ref())
-    {
-        return blocked(
-            "target snapshot differs from the recorded tree; refusing to replay".into(),
-        );
-    }
-    if let Some((draft, rel)) = &req.stage {
-        if let Err(e) = stage_file(&workspace, rel, draft) {
-            return blocked(format!("cannot stage the draft test at {rel}: {e}"));
-        }
-    }
-    for d in [
-        scratch.clone(),
-        scratch.join("cache"),
-        scratch.join("clang-cache"),
-    ] {
-        if let Err(e) = std::fs::create_dir_all(&d) {
-            return blocked(format!("cannot create {}: {e}", d.display()));
-        }
-    }
-
     let home = platform::home();
     let readonly: Vec<PathBuf> = toolchain_roots(os, home.as_deref())
         .into_iter()
@@ -931,32 +1026,11 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     // (allowed marker) next to one it denies; deny it explicitly so no
     // readable root can ever grant it.
     let denied: Vec<PathBuf> = markers.iter().map(|m| m.denied.clone()).collect();
-    let rust = match home.as_ref().map(|h| h.join(".cargo")) {
-        Some(cargo) if readonly.contains(&cargo.join("bin")) => {
-            let cargo_home = scratch.join("cargo-home");
-            if let Err(e) = std::fs::create_dir_all(&cargo_home) {
-                return blocked(format!("cannot create {}: {e}", cargo_home.display()));
-            }
-            for sub in RUST_CACHES {
-                let real = cargo.join(sub);
-                if readonly.contains(&real) {
-                    if let Err(e) = link_dir(&real, &cargo_home.join(sub)) {
-                        return blocked(format!("cannot link the cargo {sub} cache: {e}"));
-                    }
-                }
-            }
-            let rustup = home.as_ref().map(|h| h.join(".rustup"));
-            Some(RustHomes {
-                bin: cargo.join("bin"),
-                cargo_home,
-                rustup_home: rustup.filter(|r| readonly.contains(r)),
-            })
-        }
-        _ => None,
+    let (target_sha256, rust) = match stage_workspace(req, &workspace, &scratch, &readonly, &nonce)
+    {
+        Ok(staged) => staged,
+        Err(reason) => return blocked(reason),
     };
-    if let Err(e) = write_wrapper(os, &workspace, &req.command, &nonce) {
-        return blocked(format!("cannot write command wrapper: {e}"));
-    }
     let mut input = ConfigInput {
         os,
         containment: located.executor.containment,
@@ -1016,58 +1090,40 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
                     return blocked(format!("cannot reset retry workspace: {e}"));
                 }
             }
-            if let Some(target) = &req.target {
-                if let Err(e) = copy_tree(target, &workspace) {
-                    return blocked(e);
-                }
-                if crate::proof::tree_digest(&workspace).ok() != target_sha256 {
-                    return blocked("target changed before MXC retry".into());
-                }
-            } else if let Err(e) = std::fs::create_dir_all(&workspace) {
-                return blocked(e.to_string());
+            let (digest, rust) =
+                match stage_workspace(req, &workspace, &scratch, &input.readonly, &nonce) {
+                    Ok(staged) => staged,
+                    Err(reason) => return blocked(reason),
+                };
+            if digest != target_sha256 {
+                return blocked("target changed before MXC retry".into());
             }
-            if let Some((draft, rel)) = &req.stage {
-                if let Err(e) = stage_file(&workspace, rel, draft) {
-                    return blocked(e.to_string());
-                }
-            }
-            for d in [
-                scratch.clone(),
-                scratch.join("cache"),
-                scratch.join("clang-cache"),
-            ] {
-                if let Err(e) = std::fs::create_dir_all(d) {
-                    return blocked(e.to_string());
-                }
-            }
-            if let Some(r) = &input.rust {
-                if let Err(e) = std::fs::create_dir_all(&r.cargo_home) {
-                    return blocked(e.to_string());
-                }
-                for sub in RUST_CACHES {
-                    let real = r.bin.parent().unwrap_or(&r.bin).join(sub);
-                    if input.readonly.contains(&real) {
-                        if let Err(e) = link_dir(&real, &r.cargo_home.join(sub)) {
-                            return blocked(e.to_string());
-                        }
-                    }
-                }
-            }
-            if let Err(e) = write_wrapper(os, &workspace, &req.command, &nonce) {
-                return blocked(e.to_string());
-            }
+            input.rust = rust;
             input.list_parents = false;
             extra_gaps.push("this Windows version cannot let the sandbox list parent directories; runtimes that resolve real paths from the drive root (such as Node) may fail to start".to_string());
             continue;
         }
         break (config_text, run);
     };
-    run.timed_out |= !run.command_finished;
-    run.success &= run.command_started && run.command_finished && !run.timed_out;
+    if run.command_started && !run.command_finished && !run.interrupted && !run.killed {
+        if run.duration_ms >= req.timeout_ms {
+            run.timed_out = true;
+        } else {
+            run.killed = true;
+        }
+    }
+    if os != "windows" && matches!(run.exit_code, Some(129..=255)) {
+        run.killed = true;
+    }
+    run.success &= run.command_started && run.command_finished && !run.timed_out && !run.killed;
     let (mut enforced, mut gaps) = declared_controls(os, req.tier);
     enforced.extend(run.enforced.iter().cloned());
     gaps.extend(extra_gaps);
-    gaps.extend(run.notes.iter().cloned());
+    for note in &run.notes {
+        if !gaps.contains(note) {
+            gaps.push(note.clone());
+        }
+    }
     // The workspace and scratch can be large and hold build output; the
     // config stays as part of the proof evidence.
     let _ = std::fs::remove_dir_all(&workspace);
@@ -1078,6 +1134,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
+    cleanup.armed = false;
     ProveOutcome::Ran(Box::new(ProveResult {
         executor: located.path,
         executor_sha256: located.executor.sha256.to_string(),
@@ -1094,6 +1151,88 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn macos_version_check_refuses_old_or_unknown_versions() {
+        assert!(require_macos_version(Some(14))
+            .unwrap_err()
+            .contains("macOS 15"));
+        assert!(require_macos_version(None)
+            .unwrap_err()
+            .contains("cannot determine"));
+        assert!(require_macos_version(Some(15)).is_ok());
+        assert!(require_macos_version(Some(26)).is_ok());
+    }
+
+    #[test]
+    fn homebrew_grants_exclude_configuration_and_state() {
+        let roots = toolchain_roots("macos", None);
+        for denied in ["/opt/homebrew/etc", "/opt/homebrew/var"] {
+            assert!(!roots.iter().any(|r| Path::new(denied).starts_with(r)));
+        }
+        assert!(roots.contains(&PathBuf::from("/opt/homebrew/Cellar")));
+    }
+
+    #[test]
+    fn blocked_proofs_remove_their_staging_directory() {
+        let d = std::env::temp_dir().join(format!("omgs-blocked-{}", std::process::id()));
+        let req = |command: &str| ProveRequest {
+            command: command.into(),
+            timeout_ms: 1000,
+            target: None,
+            run_dir: d.clone(),
+            tier: Tier::Test,
+            stage: None,
+            expected_tree_sha256: None,
+        };
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("test-draft"), b"draft").unwrap();
+        assert!(matches!(prove(&req("")), ProveOutcome::Blocked { .. }));
+        assert!(!d.exists());
+        if locate_executor().is_ok() {
+            let mut request = req("echo ok");
+            request.stage = Some((d.join("missing"), "test".into()));
+            assert!(matches!(prove(&request), ProveOutcome::Blocked { .. }));
+            assert!(!d.exists());
+            request.stage = None;
+            request.expected_tree_sha256 = Some("a".repeat(64));
+            assert!(matches!(prove(&request), ProveOutcome::Blocked { .. }));
+            assert!(!d.exists());
+        }
+    }
+
+    #[test]
+    fn environment_allowlist_matches_every_emitted_key() {
+        for os in ["macos", "linux", "windows"] {
+            let config = mxc_config(&ConfigInput {
+                os,
+                containment: "test",
+                command: "echo test",
+                timeout_ms: 1000,
+                workspace: Path::new("/run/workspace"),
+                scratch: Path::new("/run/scratch"),
+                allowed_marker: None,
+                readonly: vec![],
+                denied: vec![],
+                rust: Some(RustHomes {
+                    bin: "/tools/bin".into(),
+                    cargo_home: "/run/scratch/cargo-home".into(),
+                    rustup_home: Some("/tools/rustup".into()),
+                }),
+                list_parents: false,
+            });
+            let mut keys: Vec<_> = config["process"]["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().split_once('=').unwrap().0)
+                .collect();
+            let mut expected = environment_keys(os);
+            keys.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(keys, expected, "{os}");
+        }
+    }
 
     #[test]
     fn invalid_commands_and_mxc_timeouts_are_refused() {
@@ -1115,6 +1254,9 @@ mod tests {
             command_started: false,
             command_finished: false,
             enumerate_rejected: true,
+            executor_error: true,
+            killed: false,
+            interrupted: false,
             success: false,
             timed_out: false,
             duration_ms: 1,
