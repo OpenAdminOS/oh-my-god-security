@@ -36,6 +36,15 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let rest = &args[1..];
+    if cmd == "doctor"
+        && rest
+            .iter()
+            .any(|a| !["--live", "--help", "-h"].contains(&a.as_str()))
+    {
+        usage();
+        eprintln!("error: doctor accepts only --live");
+        return ExitCode::from(2);
+    }
     if rest.iter().any(|a| a == "--help" || a == "-h") {
         usage();
         return ExitCode::SUCCESS;
@@ -49,6 +58,9 @@ fn main() -> ExitCode {
                 Some(v) if !v.starts_with("--") => {}
                 _ => {
                     eprintln!("error: {a} requires a value");
+                    if cmd == "doctor" {
+                        usage();
+                    }
                     return ExitCode::from(2);
                 }
             }
@@ -204,7 +216,14 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             let r = run
                 .as_ref()
                 .ok_or("--replay needs --run <run-dir>, the run that holds the record")?;
-            for conflicting in ["--cmd", "--finding", "--test", "--tier", "--target"] {
+            for conflicting in [
+                "--cmd",
+                "--finding",
+                "--test",
+                "--tier",
+                "--target",
+                "--timeout-ms",
+            ] {
                 if flag(args, conflicting).is_some() {
                     return Err(format!(
                         "--replay takes everything from the record; drop {conflicting}"
@@ -219,7 +238,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         None => None,
     };
     let command = match &replay {
-        Some(r) => r.command.clone(),
+        Some(r) => omgs::proof::recorded_command(run.as_ref().unwrap(), r)?,
         None => flag(args, "--cmd").ok_or("prove requires --cmd <command>")?,
     };
     let timeout_ms: u64 = match flag(args, "--timeout-ms") {
@@ -325,9 +344,6 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
                 "target commit differs from the recorded target_head; refusing to replay".into(),
             );
         }
-        if meta.as_ref().and_then(|m| m.get("target")).is_some() && target.is_none() {
-            return Err("--replay record must name this run's target".into());
-        }
         let errors = omgs::proof::runner_evidence(run.as_ref().unwrap(), r);
         if !errors.is_empty() {
             return Err(format!(
@@ -357,7 +373,9 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         return Err("--test-from needs --test <target-relative path> to stage it at".into());
     }
     let test_sha256 = match (&test, &draft) {
-        (Some(t), Some(d)) => {
+        (Some(_), Some(d)) => {
+            let digest = omgs::sha256::digest_file(d)
+                .map_err(|e| format!("--test-from {}: {e}", d.display()))?;
             let d = std::fs::canonicalize(d)
                 .map_err(|e| format!("--test-from {}: {e}", d.display()))?;
             if target.as_ref().is_some_and(|base| d.starts_with(base)) {
@@ -366,7 +384,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             if !d.is_file() {
                 return Err(format!("--test-from {} is not a file", d.display()));
             }
-            Some(omgs::sha256::digest_file(&d).map_err(|e| format!("read {t}: {e}"))?)
+            Some(digest)
         }
         (Some(t), None) => {
             let base = target
@@ -473,7 +491,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         Some(d) => {
             let copy = run_dir.join("test-draft");
             let kept = std::fs::create_dir_all(&run_dir)
-                .and_then(|_| std::fs::copy(d, &copy).map(|_| ()))
+                .and_then(|_| omgs::sandbox::stage_file(&run_dir, "test-draft", d))
                 .map_err(|e| e.to_string())
                 .and_then(|_| omgs::sha256::digest_file(&copy).map_err(|e| e.to_string()));
             if kept.ok() != test_sha256 {
@@ -505,6 +523,8 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     };
     let s = &result.run;
     let output = omgs::proof::redact(&s.output);
+    omgs::runmeta::write_atomic_bytes(&run_dir.join("command.txt"), command.as_bytes())
+        .map_err(|e| e.to_string())?;
     let record = omgs::proof::ProofRecord {
         schema: omgs::proof::SCHEMA.into(),
         n: proof_dir.as_ref().map(|(n, _)| *n).unwrap_or(0),
@@ -517,7 +537,11 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             Tier::Test => "test".into(),
             Tier::LocalApp => "local_app".into(),
         },
-        command,
+        command: omgs::proof::redact(&command),
+        command_sha256: omgs::sha256::digest(command.as_bytes()),
+        wrapped_command_sha256: result.wrapped_command_sha256.clone(),
+        readable_roots: result.readable_roots.clone(),
+        system_root: result.system_root.clone(),
         target: target.as_ref().map(|t| t.to_string_lossy().to_string()),
         target_head,
         target_sha256: result.target_sha256.clone(),
@@ -544,7 +568,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             .iter()
             .map(|v| omgs::proof::Survivor {
                 pid: v.pid,
-                command: v.command.clone(),
+                command: omgs::proof::redact(&v.command),
             })
             .collect(),
         mxc_version: omgs::sandbox::MXC_VERSION.into(),
@@ -568,6 +592,14 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             p
         }
     };
+    {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(record.output.as_bytes())
+            .map_err(|e| e.to_string())?;
+        stdout.flush().map_err(|e| e.to_string())?;
+    }
     eprintln!(
         "sandbox: MXC {} ({}), executor {} sha256 {}",
         omgs::sandbox::MXC_VERSION,
@@ -582,7 +614,11 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         eprintln!("  not enforced: {g}");
     }
     for v in &s.survivors {
-        eprintln!("  survivor killed: pid {} {}", v.pid, v.command);
+        eprintln!(
+            "  survivor killed: pid {} {}",
+            v.pid,
+            omgs::proof::redact(&v.command)
+        );
     }
     eprintln!(
         "exit {}{}{}, {} ms",
@@ -659,7 +695,6 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             }
         );
     }
-    print!("{}", record.output);
     if let Some(orig) = &replay {
         let code = |c: Option<i32>| c.map(|c| c.to_string()).unwrap_or_else(|| "none".into());
         let same = record.exit_code == orig.exit_code && record.clean() && orig.clean();
@@ -686,6 +721,10 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
 /// What this machine can and cannot do for OMGS. Executes no target code;
 /// `--live` runs one fixed command inside MXC to show a denial is enforced.
 fn cmd_doctor(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|arg| arg != "--live") {
+        usage();
+        return Err("doctor accepts only --live".into());
+    }
     use omgs::platform::which;
     let os = std::env::consts::OS;
     println!(
@@ -840,7 +879,15 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             );
             return Err("__EXIT1__".into());
         }
-        println!("live check: the probe ran, read a nested workspace file, and was denied a file outside it");
+        if outcome
+            .gaps
+            .iter()
+            .any(|g| g.starts_with("this Windows version refuses parent directory enumeration"))
+        {
+            println!("live check: the probe read a nested workspace file; outside read not proven on this host");
+        } else {
+            println!("live check: the probe ran, read a nested workspace file, and was denied a file outside it");
+        }
         println!("applied on that run:");
         for e in &outcome.enforced {
             println!("  {e}");

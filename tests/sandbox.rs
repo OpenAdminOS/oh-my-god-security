@@ -82,23 +82,10 @@ fn denials_hold_and_the_target_is_untouched() {
     let outside = d.join("outside.txt");
     std::fs::write(&outside, b"outside-secret-value").unwrap();
     let real_home = omgs::platform::home().unwrap();
-    // A real file in the real home, so a denied read is not just a missing file.
-    let home_probe = real_home.join(format!(".omgs-sbx-probe-{}", std::process::id()));
-    struct Probe(PathBuf);
-    impl Drop for Probe {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let mut probe = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&home_probe)
-        .unwrap();
-    let _probe = Probe(home_probe.clone());
-    use std::io::Write;
-    probe.write_all(b"home-secret-value").unwrap();
-    drop(probe);
+    // The checkout is already present under the real home. Read it without
+    // writing a probe outside the test's scratch directories.
+    let home_probe = std::env::current_dir().unwrap().join("Cargo.toml");
+    assert!(home_probe.starts_with(&real_home) && home_probe.is_file());
     // A host loopback service answering HTTP, reachable from the test itself
     // (positive control) and expected unreachable from inside.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -113,12 +100,19 @@ fn denials_hold_and_the_target_is_untouched() {
         .args(["-sm3", &format!("http://127.0.0.1:{port}/")])
         .output();
     let curl_works = host_curl.is_ok_and(|o| String::from_utf8_lossy(&o.stdout) == "HOSTOK");
+    // Linux shows synthetic mount ancestors when scratch is beneath HOME.
+    let mount_parent = d
+        .strip_prefix(&real_home)
+        .ok()
+        .and_then(|p| p.components().next())
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .unwrap_or_default();
     let cmd = format!(
         "cat '{o}' 2>/dev/null && echo READ_OUTSIDE; \
-         [ -n \"$(ls -A '{h}' 2>/dev/null | grep -vx -e .cargo -e .rustup)\" ] && echo LIST_HOME; \
-         cat '{hp}' 2>/dev/null; \
-         cat '{h}/.ssh/known_hosts' >/dev/null 2>&1 && echo READ_SSH; \
+         [ -n \"$(ls -A '{h}' 2>/dev/null | grep -vx -e .cargo -e .rustup -e '{mount_parent}')\" ] && echo LIST_HOME; \
+         cat '{hp}' >/dev/null 2>&1 && echo READ_HOME; \
          touch '{d}/escape' 2>/dev/null; \
+         curl --version >/dev/null 2>&1 && echo CURL_EXISTS; \
          curl -sm3 https://example.com >/dev/null 2>&1 && echo NETWORK; \
          curl -sm3 http://127.0.0.1:{port}/ 2>/dev/null; \
          echo changed > app.txt && cat app.txt",
@@ -132,14 +126,16 @@ fn denials_hold_and_the_target_is_untouched() {
         &["prove", "--target", target.to_str().unwrap(), "--cmd", &cmd],
     );
     let t = text(&out);
-    let _ = std::fs::remove_file(&home_probe);
     assert!(curl_works, "host loopback positive control must answer");
+    assert!(
+        t.lines().any(|line| line == "CURL_EXISTS"),
+        "sandbox curl must exist: {t}"
+    );
     for leak in [
         "READ_OUTSIDE",
         "outside-secret-value",
-        "home-secret-value",
+        "READ_HOME",
         "LIST_HOME",
-        "READ_SSH",
         "NETWORK",
         "HOSTOK",
     ] {
@@ -1166,7 +1162,7 @@ fn interrupting_prove_cleans_the_executor_group_and_marks_the_record_unclean() {
     if !mxc_ready() {
         return;
     }
-    for number in [libc::SIGINT, libc::SIGTERM] {
+    for number in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         let d = scratch(&format!("signal-{number}"));
         let run = d.join("run");
         std::fs::create_dir_all(&run).unwrap();
@@ -1216,18 +1212,16 @@ fn interrupting_prove_cleans_the_executor_group_and_marks_the_record_unclean() {
         if cfg!(target_os = "macos") {
             assert!(record.survivors.iter().any(|s| s.pid == pid), "{record:?}");
         }
-        let gone = std::time::Instant::now();
-        while unsafe { libc::kill(pid, 0) } == 0 && gone.elapsed().as_secs() < 3 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        // Linux may retain an inert orphan zombie until its namespace is reaped.
-        #[cfg(target_os = "linux")]
-        if unsafe { libc::kill(pid, 0) } == 0 {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-            assert!(stat.split(") ").nth(1).unwrap().starts_with('Z'), "{stat}");
-        }
         #[cfg(target_os = "macos")]
-        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "pid {pid} survived");
+        {
+            let gone = std::time::Instant::now();
+            while unsafe { libc::kill(pid, 0) } == 0 && gone.elapsed().as_secs() < 3 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "pid {pid} survived");
+        }
+        // On Linux pid belongs to MXC's namespace, not the host. The separate
+        // new-session tests check host-visible command markers after teardown.
         std::fs::remove_dir_all(d).unwrap();
     }
 }
@@ -1308,4 +1302,164 @@ fn a_test_readable_only_on_the_host_is_not_a_clean_record() {
     assert!(!record.clean());
     assert!(!record.output.contains("COMMAND_SHOULD_NOT_RUN"));
     let _ = std::fs::remove_dir_all(d);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_new_session_descendants_die_with_the_pid_namespace() {
+    if !mxc_ready() {
+        return;
+    }
+    let py = omgs::platform::which("python3").expect("Linux escape probes need python3");
+    for method in ["setsid", "spawn"] {
+        let d = scratch(&format!("linux-escape-{method}"));
+        let run = d.join("run");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join(omgs::runmeta::FILE), "{}").unwrap();
+        let marker = format!("omgs-r4-{method}-{}", std::process::id());
+        let args = format!(
+            "[\"{}\",\"-I\",\"-c\",\"import time; time.sleep(120)\",\"{marker}\"]",
+            py.display()
+        );
+        let launch = if method == "spawn" {
+            format!(
+                "os.posix_spawn(\"{}\", {args}, {{}}, setsid=True)",
+                py.display()
+            )
+        } else {
+            format!("if os.fork()==0:\n os.setsid()\n if os.fork()==0:\n  os.execv(\"{}\", {args})\n os._exit(0)", py.display())
+        };
+        let command = format!("'{}' -I -c 'import os,time\n{launch}\nwhile not os.path.exists(\"release\"):\n time.sleep(0.01)\nprint(\"escape positive control observed\")'", py.display());
+        let executor = omgs::sandbox::locate_executor().unwrap();
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .args([
+                "prove",
+                "--run",
+                run.to_str().unwrap(),
+                "--cmd",
+                &command,
+                "--timeout-ms",
+                "10000",
+            ])
+            .env("OMGS_HOME", &d)
+            .env("OMGS_MXC_EXEC", executor.path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let visible = || {
+            std::fs::read_dir("/proc").unwrap().flatten().any(|entry| {
+                entry.file_name().to_string_lossy().parse::<u32>().is_ok()
+                    && std::fs::read(entry.path().join("cmdline")).is_ok_and(|bytes| {
+                        bytes.split(|b| *b == 0).any(|arg| arg == marker.as_bytes())
+                    })
+            })
+        };
+        let start = std::time::Instant::now();
+        while !visible() && start.elapsed().as_secs() < 8 && child.try_wait().unwrap().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let observed = visible();
+        if observed {
+            std::fs::write(run.join("proofs/1/workspace/release"), b"go").unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            observed,
+            "host must see the detached descendant before teardown: {}",
+            text(&out)
+        );
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(
+            !visible(),
+            "detached descendant survived namespace teardown"
+        );
+        let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+        assert!(record.clean(), "{record:?}");
+        assert!(record
+            .enforced
+            .iter()
+            .any(|e| e == "MXC PID namespace teardown kills descendants, including new sessions"));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn doctor_rejects_unknown_arguments_with_usage() {
+    let d = scratch("doctor-args");
+    for args in [
+        vec!["doctor", "--bogus"],
+        vec!["doctor", "--bogus", "value"],
+        vec!["doctor", "oops"],
+        vec!["doctor", "--yes"],
+        vec!["doctor", "--bogus", "--help"],
+    ] {
+        let out = omgs(&d, &args);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(text(&out).contains("Usage:"), "{}", text(&out));
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn executable_drafts_keep_their_mode_and_commands_are_redacted() {
+    use std::os::unix::fs::PermissionsExt;
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("exec-draft");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target": target}).to_string(),
+    )
+    .unwrap();
+    let draft = d.join("draft.sh");
+    std::fs::write(&draft, "#!/bin/sh\necho executable-draft\n").unwrap();
+    std::fs::set_permissions(&draft, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--target",
+            target.to_str().unwrap(),
+            "--test",
+            "tests/x.sh",
+            "--test-from",
+            draft.to_str().unwrap(),
+            "--cmd",
+            "./tests/x.sh && token=private-value",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert!(record.output.contains("executable-draft"));
+    assert!(!record.command.contains("private-value"));
+    assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+    let replay = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(replay.status.success(), "{}", text(&replay));
+    let conflict = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--replay",
+            "1",
+            "--timeout-ms",
+            "1",
+        ],
+    );
+    assert_eq!(conflict.status.code(), Some(2));
+    assert!(text(&conflict).contains("drop --timeout-ms"));
+    std::fs::remove_dir_all(d).unwrap();
 }

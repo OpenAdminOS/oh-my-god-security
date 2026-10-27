@@ -28,6 +28,8 @@ Status after rounds on 2026-10-16: the first six projects, the next twenty proje
 
 ## Proof tiers and lifecycle
 
+The earlier tier 2 field run predates the 2026-10-27 decision that tier 2 runs only on Linux.
+
 | Surface | Status | Evidence |
 | --- | --- | --- |
 | Tier 0 traced | Tested | 79 records across 26 projects. |

@@ -11,6 +11,9 @@ DEST="$DEST_ROOT/bin"
 
 os="$(uname -s)"
 arch="$(uname -m)"
+if [ "$os/$arch" = Darwin/x86_64 ] && [ "$(/usr/sbin/sysctl -in sysctl.proc_translated 2>/dev/null || true)" = 1 ]; then
+  arch=arm64
+fi
 case "$os/$arch" in
   Darwin/arm64) asset="omgs-aarch64-apple-darwin" ;;
   Darwin/x86_64) asset="omgs-x86_64-apple-darwin" ;;

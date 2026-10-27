@@ -38,6 +38,12 @@ pub struct ProofRecord {
     /// `test` (tier 1) or `local_app` (tier 2).
     pub tier: String,
     pub command: String,
+    pub command_sha256: String,
+    pub wrapped_command_sha256: String,
+    /// Toolchain grants at proof time, independent of the validating host.
+    pub readable_roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// Commit the target's checkout pointed at, read from `.git` as text.
@@ -153,7 +159,12 @@ pub fn reference(n: u32) -> String {
 
 pub fn write(run: &Path, record: &ProofRecord) -> Result<PathBuf, String> {
     let path = record_path(run, record.n);
-    let text = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
+    let mut record = record.clone();
+    record.command = redact(&record.command);
+    for survivor in &mut record.survivors {
+        survivor.command = redact(&survivor.command);
+    }
+    let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
     crate::runmeta::write_atomic(&path, &format!("{text}\n"))?;
     Ok(path)
 }
@@ -172,8 +183,7 @@ pub fn load(run: &Path, proof_ref: &str) -> Result<ProofRecord, String> {
         ));
     }
     let path = record_path(run, n);
-    let text =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text = read_text(&path, 2 << 20)?;
     // Strict like every other run input: duplicate keys and unknown fields
     // are errors.
     let record: ProofRecord =
@@ -184,6 +194,25 @@ pub fn load(run: &Path, proof_ref: &str) -> Result<ProofRecord, String> {
     Ok(record)
 }
 
+fn read_text(path: &Path, limit: u64) -> Result<String, String> {
+    crate::platform::read_bounded(path, limit)
+        .map_err(|e| format!("read {}: {e}", path.display()))
+        .and_then(|bytes| String::from_utf8(bytes).map_err(|e| e.to_string()))
+}
+
+/// Exact replay input stays beside the config; the record carries a redacted
+/// display and digests. Config and command artifacts may contain credentials.
+pub fn recorded_command(run: &Path, record: &ProofRecord) -> Result<String, String> {
+    let path = run.join(DIR).join(record.n.to_string()).join("command.txt");
+    let command = read_text(&path, 1 << 20)?;
+    if crate::sha256::digest(command.as_bytes()) != record.command_sha256
+        || redact(&command) != record.command
+    {
+        return Err("saved command does not match record.command or command_sha256".into());
+    }
+    Ok(command)
+}
+
 /// Every record that claims a proof tier must reference a clean proof record
 /// for its own fingerprint and tier. `run` is the directory that holds the
 /// findings file.
@@ -192,7 +221,8 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
     for (i, f) in file.findings.iter().enumerate() {
         let at = format!("findings[{i}] '{}'", f.title);
         let want = match f.proof_tier {
-            ProofTier::Traced => continue,
+            ProofTier::Traced if f.proof_ref.is_none() => continue,
+            ProofTier::Traced => "traced",
             ProofTier::TestProven => "test",
             ProofTier::SandboxExploited => "local_app",
         };
@@ -216,6 +246,9 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
                 record.finding.as_deref().unwrap_or("none"),
                 f.fingerprint
             ));
+        }
+        if f.proof_tier == ProofTier::Traced {
+            continue;
         }
         if record.tier != want {
             errors.push(format!(
@@ -241,32 +274,30 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
         );
         // Both tiers use one convention: the proof test or harness exits with a
         // failing assertion when the target permits the unauthorized effect.
-        {
-            match (&record.test, &record.test_sha256) {
-                (Some(t), Some(_)) => {
-                    if !command_names(&record.command, t) {
-                        errors.push(format!(
-                            "{at}: {r} ran a command that does not name its proof test {t}"
-                        ));
-                    }
+        match (&record.test, &record.test_sha256) {
+            (Some(t), Some(_)) => {
+                if !recorded_command(run, &record).is_ok_and(|command| command_names(&command, t)) {
+                    errors.push(format!(
+                        "{at}: {r} ran a command that does not name its proof test {t}"
+                    ));
                 }
-                _ => errors.push(format!(
-                    "{at}: {r} names no proof test; run omgs prove with --test <path in the target>"
-                )),
             }
-            // Every non-rejected record needs the test failing on the target; a
-            // rejected one may rest on a control test that passes.
-            if (f.verdict != crate::model::Verdict::Rejected && !record.assertion_failure())
-                || !matches!(record.exit_code, Some(0..=125))
-            {
-                errors.push(format!(
+            _ => errors.push(format!(
+                "{at}: {r} names no proof test; run omgs prove with --test <path in the target>"
+            )),
+        }
+        // Every non-rejected record needs the test failing on the target; a
+        // rejected one may rest on a control test that passes.
+        if (f.verdict != crate::model::Verdict::Rejected && !record.assertion_failure())
+            || !matches!(record.exit_code, Some(0..=125))
+        {
+            errors.push(format!(
                     "{at}: {r} exited {}, a proven record needs the proof test failing on the target (126, 127 and signals mean the test never ran)",
                     record
                         .exit_code
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| "without a code".into())
                 ));
-            }
         }
     }
     errors
@@ -322,12 +353,6 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
             record.containment, e.containment
         )),
         Some(e) => {
-            if !record.executor.ends_with(e.file) {
-                errors.push(format!(
-                    "names executor {} for the {} digest",
-                    record.executor, e.file
-                ));
-            }
             let os = match e.containment {
                 "seatbelt" => "macos",
                 "bubblewrap" => "linux",
@@ -420,13 +445,16 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
         .join(DIR)
         .join(record.n.to_string())
         .join("mxc-config.json");
-    match std::fs::read(&config) {
+    match crate::platform::read_bounded(&config, 2 << 20) {
         Ok(bytes) if crate::sha256::digest(&bytes) == record.config_sha256 => {
             match std::str::from_utf8(&bytes)
                 .map_err(|e| e.to_string())
                 .and_then(crate::shape::strict_json)
             {
-                Ok(config) => errors.extend(config_evidence(record, &config)),
+                Ok(config) => match recorded_command(run, record) {
+                    Ok(command) => errors.extend(config_evidence(record, &config, &command)),
+                    Err(e) => errors.push(e),
+                },
                 Err(e) => errors.push(format!("invalid MXC config: {e}")),
             }
         }
@@ -446,7 +474,7 @@ fn is_digest(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn config_evidence(record: &ProofRecord, config: &serde_json::Value) -> Vec<String> {
+fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &str) -> Vec<String> {
     let mut errors = Vec::new();
     let os = match record.containment.as_str() {
         "seatbelt" => "macos",
@@ -464,16 +492,18 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value) -> Vec<Stri
             errors.push(format!("MXC config {pointer} must be {expected}"));
         }
     }
-    let wrapped = crate::sandbox::wrapped_command(
+    let wrapped = crate::sandbox::wrapped_command_at(
         os,
-        &record.command,
+        command,
         &record.marker_nonce,
         record.test.as_deref(),
+        record.system_root.as_deref().unwrap_or(r"C:\Windows"),
     );
     if config
         .pointer("/process/commandLine")
         .and_then(|v| v.as_str())
         != Some(&wrapped)
+        || crate::sha256::digest(wrapped.as_bytes()) != record.wrapped_command_sha256
     {
         errors.push("MXC config commandLine is not the wrapped record.command".into());
     }
@@ -521,11 +551,32 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value) -> Vec<Stri
     let scratch = format!("{dir}/scratch");
     let allowed = format!("{dir}/markers/allowed");
     let denied = format!("{dir}/markers/denied");
-    let roots: Vec<String> =
-        crate::sandbox::toolchain_roots(os, crate::platform::home().as_deref())
-            .iter()
-            .map(|p| norm(&p.to_string_lossy()))
-            .collect();
+    let roots: Vec<String> = record.readable_roots.iter().map(|p| norm(p)).collect();
+    let static_roots: Vec<String> = crate::sandbox::toolchain_roots(os, None)
+        .iter()
+        .map(|p| norm(&p.to_string_lossy()))
+        .collect();
+    let absolute = |p: &str| {
+        if os == "windows" {
+            p.starts_with("//")
+                || (p.as_bytes().get(1) == Some(&b':') && p.as_bytes().get(2) == Some(&b'/'))
+        } else {
+            p.starts_with('/')
+        }
+    };
+    if roots.iter().any(|p| {
+        !absolute(p)
+            || p.split('/').any(|c| c == "." || c == "..")
+            || !(static_roots.contains(p)
+                || ["/.cargo/bin", "/.cargo/registry", "/.cargo/git", "/.rustup"]
+                    .iter()
+                    .any(|suffix| p.strip_suffix(suffix).is_some_and(|base| !base.is_empty())))
+    }) || roots.iter().collect::<std::collections::HashSet<_>>().len() != roots.len()
+    {
+        errors.push(
+            "recorded readable_roots must be static toolchains or absolute Rust cache roots".into(),
+        );
+    }
     let readonly = config
         .pointer("/filesystem/readonlyPaths")
         .and_then(|v| v.as_array());
@@ -562,21 +613,54 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value) -> Vec<Stri
     }) {
         errors.push("MXC config deniedPaths must match this proof's denied marker policy".into());
     }
-    let keys = crate::sandbox::environment_keys(os);
-    let mut seen = std::collections::HashSet::new();
-    if config
-        .pointer("/process/env")
-        .and_then(|v| v.as_array())
-        .is_none_or(|env| {
-            env.iter().any(|v| {
-                let Some((key, _)) = v.as_str().and_then(|s| s.split_once('=')) else {
-                    return true;
-                };
-                !keys.contains(&key) || !seen.insert(key.to_string())
-            })
-        })
-    {
-        errors.push("MXC config process.env must use unique allowlisted environment keys".into());
+    let path_at = |suffix: &str| {
+        let separator = if os == "windows" { "\\" } else { "/" };
+        PathBuf::from(format!(
+            "{}{separator}{}",
+            record.proof_dir,
+            suffix.replace('/', separator)
+        ))
+    };
+    let cargo_bin = record
+        .readable_roots
+        .iter()
+        .find(|p| norm(p).ends_with("/.cargo/bin"));
+    let rust = cargo_bin.map(|bin| crate::sandbox::RustHomes {
+        bin: PathBuf::from(bin),
+        cargo_home: path_at("scratch/cargo-home"),
+        rustup_home: record
+            .readable_roots
+            .iter()
+            .find(|p| norm(p).ends_with("/.rustup"))
+            .map(PathBuf::from),
+    });
+    let allowed_path = path_at("markers/allowed");
+    let expected = crate::sandbox::mxc_config_at(
+        &crate::sandbox::ConfigInput {
+            os,
+            containment: &record.containment,
+            command: &wrapped,
+            timeout_ms: record.timeout_ms,
+            workspace: &path_at("workspace"),
+            scratch: &path_at("scratch"),
+            allowed_marker: (os == "macos").then_some(allowed_path.as_path()),
+            readonly: record.readable_roots.iter().map(PathBuf::from).collect(),
+            denied: if os == "macos" {
+                vec![path_at("markers/denied")]
+            } else {
+                vec![]
+            },
+            rust,
+            list_parents: config.pointer("/processContainer/filesystem").is_some(),
+        },
+        record.system_root.as_deref().unwrap_or(r"C:\Windows"),
+    );
+    if config.pointer("/process/env") != expected.pointer("/process/env") {
+        errors.push("MXC config process.env must match full allowlisted KEY=value entries reconstructed from the record".into());
+    }
+    if config != &expected {
+        errors
+            .push("MXC config has unknown keys or values outside the closed runner schema".into());
     }
     let rw = config
         .pointer("/filesystem/readwritePaths")
@@ -604,7 +688,8 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value) -> Vec<Stri
 }
 
 /// Content identity of the copied target before staging the proof test.
-/// Links are hashed as links, never followed into outside content.
+/// Links are hashed as links, never followed into outside content. All .git
+/// content is included because config and hooks can change execution.
 pub fn tree_digest(root: &Path) -> std::io::Result<String> {
     fn field(h: &mut crate::sha256::Sha256, bytes: &[u8]) {
         h.update(&(bytes.len() as u64).to_le_bytes());
@@ -614,9 +699,6 @@ pub fn tree_digest(root: &Path) -> std::io::Result<String> {
         let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
-            if entry.file_name() == ".git" {
-                continue;
-            }
             let path = entry.path();
             let rel = path.strip_prefix(root).map_err(std::io::Error::other)?;
             field(h, rel.as_os_str().as_encoded_bytes());
@@ -659,11 +741,11 @@ pub fn tree_digest(root: &Path) -> std::io::Result<String> {
 pub fn git_head(target: &Path) -> Option<String> {
     let mut git = target.join(".git");
     if git.is_file() {
-        let text = std::fs::read_to_string(&git).ok()?;
+        let text = read_text(&git, 1 << 20).ok()?;
         let p = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
         git = if p.is_absolute() { p } else { target.join(p) };
     }
-    let head = std::fs::read_to_string(git.join("HEAD")).ok()?;
+    let head = read_text(&git.join("HEAD"), 1 << 20).ok()?;
     let head = head.trim();
     let Some(reference) = head.strip_prefix("ref:").map(str::trim) else {
         return is_hex40(head).then(|| head.to_string());
@@ -672,18 +754,18 @@ pub fn git_head(target: &Path) -> Option<String> {
         return None;
     }
     // Linked worktrees keep branch refs in the common dir.
-    let common = std::fs::read_to_string(git.join("commondir"))
+    let common = read_text(&git.join("commondir"), 1 << 20)
         .ok()
         .map(|c| git.join(c.trim()))
         .unwrap_or_else(|| git.clone());
     for dir in [&git, &common] {
-        if let Ok(v) = std::fs::read_to_string(dir.join(reference)) {
+        if let Ok(v) = read_text(&dir.join(reference), 1 << 20) {
             let v = v.trim();
             if is_hex40(v) {
                 return Some(v.to_string());
             }
         }
-        if let Ok(packed) = std::fs::read_to_string(dir.join("packed-refs")) {
+        if let Ok(packed) = read_text(&dir.join("packed-refs"), 16 << 20) {
             for line in packed.lines() {
                 if let Some((sha, name)) = line.split_once(' ') {
                     if name == reference && is_hex40(sha) {
@@ -777,6 +859,20 @@ fn redact_line(line: &str, lower: &str) -> String {
                 })
                 .map(|j| after + j + 1)
         })
+        .chain(KEYS.iter().flat_map(|key| {
+            let flag = format!("--{key}");
+            lower
+                .match_indices(&flag)
+                .filter_map(|(i, _)| {
+                    let after = i + flag.len();
+                    lower
+                        .as_bytes()
+                        .get(after)
+                        .is_some_and(u8::is_ascii_whitespace)
+                        .then_some(after)
+                })
+                .collect::<Vec<_>>()
+        }))
         .chain(lower.find("bearer ").map(|i| i + "bearer ".len()))
         .min();
     match cut {
@@ -807,6 +903,8 @@ mod tests {
             "session_id: private",
             "TOKEN_VALUE=private",
             "credentials: private",
+            "tool --token private",
+            "tool --password private",
         ] {
             let masked = redact(line);
             assert!(masked.contains("[omgs redacted]"), "{masked}");
@@ -818,17 +916,20 @@ mod tests {
     }
 
     #[test]
-    fn tree_digest_includes_dirty_changes_but_excludes_git() {
+    fn tree_digest_includes_dirty_changes_and_git_behavior() {
         let d = std::env::temp_dir().join(format!("omgs-digest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(d.join(".git")).unwrap();
-        std::fs::write(d.join("a"), b"one").unwrap();
+        std::fs::create_dir_all(d.join("nested/.git/hooks")).unwrap();
+        for name in ["a", "nested/.git/config", "nested/.git/hooks/pre-commit"] {
+            std::fs::write(d.join(name), b"one").unwrap();
+        }
         let first = tree_digest(&d).unwrap();
-        std::fs::write(d.join(".git/HEAD"), b"changed").unwrap();
-        assert_eq!(tree_digest(&d).unwrap(), first);
-        std::fs::write(d.join("a"), b"two").unwrap();
-        assert_ne!(tree_digest(&d).unwrap(), first);
-        std::fs::write(d.join("a"), b"one").unwrap();
+        for name in ["a", "nested/.git/config", "nested/.git/hooks/pre-commit"] {
+            std::fs::write(d.join(name), b"two").unwrap();
+            assert_ne!(tree_digest(&d).unwrap(), first, "{name}");
+            std::fs::write(d.join(name), b"one").unwrap();
+            assert_eq!(tree_digest(&d).unwrap(), first, "{name}");
+        }
         std::fs::create_dir(d.join("empty")).unwrap();
         assert_ne!(tree_digest(&d).unwrap(), first);
         let _ = std::fs::remove_dir_all(d);

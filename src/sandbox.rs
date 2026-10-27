@@ -76,7 +76,18 @@ pub fn pinned_executors() -> Vec<Executor> {
 }
 
 pub fn this_executor() -> Result<Executor, String> {
+    if cfg!(all(target_os = "macos", target_arch = "x86_64")) && rosetta_translated() {
+        return Err("this x86_64 omgs binary is running under Rosetta on Apple Silicon; install omgs-aarch64-apple-darwin to run proofs with the arm64 MXC executor".into());
+    }
     executor_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn rosetta_translated() -> bool {
+    Command::new("/usr/sbin/sysctl")
+        .args(["-in", "sysctl.proc_translated"])
+        .env_clear()
+        .output()
+        .is_ok_and(|out| out.status.success() && out.stdout.trim_ascii() == b"1")
 }
 
 /// Where OMGS installs the executor: `<data dir>/mxc/<version>/<file>`.
@@ -225,6 +236,9 @@ pub struct ProveResult {
     pub executor_sha256: String,
     pub containment: String,
     pub config_sha256: String,
+    pub wrapped_command_sha256: String,
+    pub readable_roots: Vec<String>,
+    pub system_root: Option<String>,
     pub marker_nonce: String,
     pub target_sha256: Option<String>,
     pub enforced: Vec<String>,
@@ -453,14 +467,15 @@ pub fn environment_keys(os: &str) -> Vec<&'static str> {
     keys
 }
 
-pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
-    let scratch = mxc_path(input.scratch);
-    let mut env: Vec<String> = if input.os == "windows" {
+pub fn environment(
+    os: &str,
+    scratch: &str,
+    rust: Option<&RustHomes>,
+    system_root: &str,
+) -> Vec<String> {
+    let mut env: Vec<String> = if os == "windows" {
         vec![
-            format!(
-                "SYSTEMROOT={}",
-                std::env::var("SYSTEMROOT").unwrap_or_else(|_| "C:\\Windows".into())
-            ),
+            format!("SYSTEMROOT={system_root}"),
             format!("USERPROFILE={scratch}"),
             format!("LOCALAPPDATA={scratch}"),
             format!("TEMP={scratch}"),
@@ -468,12 +483,12 @@ pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
             "PATH=C:\\Windows\\System32;C:\\Windows;C:\\Program Files\\PowerShell\\7;C:\\Program Files\\nodejs;C:\\Program Files\\Git\\cmd".into(),
         ]
     } else {
-        let mut path = if input.os == "macos" {
+        let mut path = if os == "macos" {
             "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
         } else {
             "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
         };
-        if let Some(r) = &input.rust {
+        if let Some(r) = rust {
             path = format!("{}:{path}", r.bin.display());
         }
         vec![
@@ -485,11 +500,11 @@ pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
             "LANG=C.UTF-8".into(),
         ]
     };
-    if input.os == "macos" {
+    if os == "macos" {
         env.push(format!("OPENSSL_CONF={scratch}/openssl.cnf"));
     }
-    if let Some(r) = &input.rust {
-        if input.os == "windows" {
+    if let Some(r) = rust {
+        if os == "windows" {
             if let Some(p) = env.iter_mut().find(|e| e.starts_with("PATH=")) {
                 *p = format!("PATH={};{}", mxc_path(&r.bin), &p[5..]);
             }
@@ -500,6 +515,17 @@ pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
             env.push(format!("RUSTUP_HOME={}", mxc_path(rh)));
         }
     }
+    env
+}
+
+pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
+    let system_root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into());
+    mxc_config_at(input, &system_root)
+}
+
+pub fn mxc_config_at(input: &ConfigInput, system_root: &str) -> serde_json::Value {
+    let scratch = mxc_path(input.scratch);
+    let env = environment(input.os, &scratch, input.rust.as_ref(), system_root);
     let mut readonly: Vec<String> = input.readonly.iter().map(|p| mxc_path(p)).collect();
     if let Some(m) = input.allowed_marker {
         readonly.push(mxc_path(m));
@@ -590,7 +616,12 @@ pub fn declared_controls(os: &str, tier: Tier) -> (Vec<String>, Vec<String>) {
             "loopback private to the sandbox network namespace; host services unreachable".into(),
         );
     }
+    if os == "linux" {
+        enforced
+            .push("MXC PID namespace teardown kills descendants, including new sessions".into());
+    }
     if os == "windows" {
+        gaps.push("supervisor wall clock expiry kills only the executor; descendant cleanup depends on MXC ProcessContainer teardown".into());
         gaps.push("process tree owned by the MXC ProcessContainer; no per-process CPU, file size or open file limits on Windows".into());
     }
     (enforced, gaps)
@@ -628,8 +659,18 @@ fn wrapper_name(command: &str, nonce: &str, test: Option<&str>) -> String {
 }
 
 pub fn wrapped_command(os: &str, command: &str, nonce: &str, test: Option<&str>) -> String {
+    let root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into());
+    wrapped_command_at(os, command, nonce, test, &root)
+}
+
+pub fn wrapped_command_at(
+    os: &str,
+    command: &str,
+    nonce: &str,
+    test: Option<&str>,
+    root: &str,
+) -> String {
     if os == "windows" {
-        let root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into());
         format!(
             r#""{root}\System32\cmd.exe" /d /v:off /c {}.cmd"#,
             wrapper_name(command, nonce, test)
@@ -680,7 +721,11 @@ fn retry_without_enumeration(os: &str, run: &supervise::Supervised) -> bool {
 /// What the supervisor adds around MXC on this OS, for `omgs doctor`. Each
 /// proof record lists what was actually applied on that run.
 pub fn declared_limits(os: &str) -> Vec<String> {
-    let mut v = vec!["wall clock limit; the whole process tree is killed on expiry".to_string()];
+    let mut v = if os == "windows" {
+        vec!["supervisor wall clock expiry kills only the executor; descendant cleanup depends on MXC ProcessContainer teardown".to_string()]
+    } else {
+        vec!["wall clock limit; the process group is killed on expiry".to_string()]
+    };
     if os != "windows" {
         v.push("CPU time, file size and open file limits".into());
         v.push("process group signalled before the leader is reaped".into());
@@ -824,20 +869,44 @@ pub fn stage_file(workspace: &Path, rel: &str, draft: &Path) -> std::io::Result<
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let bytes = std::fs::read(draft)?;
+    let source = platform::open_single_link(draft)?
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "draft missing"))?;
+    let permissions = source.metadata()?.permissions();
+    if source.metadata()?.len() > sha256::FILE_LIMIT {
+        return Err(Error::other("draft exceeds byte limit"));
+    }
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    source
+        .take(sha256::FILE_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > sha256::FILE_LIMIT {
+        return Err(Error::other("draft exceeds byte limit"));
+    }
     // create_new refuses an entry that appeared since, link or not.
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&dest)?;
-    out.write_all(&bytes)
+    out.write_all(&bytes)?;
+    out.set_permissions(permissions)
 }
 
 /// A readable root that contains, or is contained in, the run directory.
 fn overlapping_root<'a>(run_dir: &Path, readonly: &'a [PathBuf]) -> Option<&'a PathBuf> {
-    readonly
-        .iter()
-        .find(|r| run_dir.starts_with(r) || r.starts_with(run_dir))
+    let normalize = |p: &Path| {
+        let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        if cfg!(windows) {
+            PathBuf::from(mxc_path(&p).to_lowercase())
+        } else {
+            p
+        }
+    };
+    let run_dir = normalize(run_dir);
+    readonly.iter().find(|r| {
+        let root = normalize(r);
+        run_dir.starts_with(&root) || root.starts_with(&run_dir)
+    })
 }
 
 struct BlockedCleanup {
@@ -1188,6 +1257,10 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         executor_sha256: located.executor.sha256.to_string(),
         containment: located.executor.containment.to_string(),
         config_sha256: sha256::digest(config_text.as_bytes()),
+        wrapped_command_sha256: sha256::digest(wrapped.as_bytes()),
+        readable_roots: input.readonly.iter().map(|p| mxc_path(p)).collect(),
+        system_root: (os == "windows")
+            .then(|| std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into())),
         marker_nonce: nonce,
         target_sha256,
         enforced,
@@ -1331,6 +1404,19 @@ mod tests {
         run.capture_complete = true;
         run.timed_out = true;
         assert!(!retry_without_enumeration("windows", &run));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn readable_root_overlap_uses_canonical_case_insensitive_paths() {
+        let d = std::env::temp_dir().join(format!("OmGs-Overlap-{}", std::process::id()));
+        let root = d.join("Toolchain");
+        let run = root.join("proofs/1");
+        std::fs::create_dir_all(&run).unwrap();
+        let canonical = std::fs::canonicalize(&run).unwrap();
+        let readable = vec![PathBuf::from(root.to_string_lossy().to_lowercase())];
+        assert!(overlapping_root(&canonical, &readable).is_some());
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[cfg(windows)]

@@ -113,13 +113,29 @@ pub fn open_single_link(path: &Path) -> std::io::Result<Option<std::fs::File>> {
         Err(e) => return Err(e),
     };
     let meta = file.metadata()?;
-    if !meta.is_file() || link_count(&file)? != 1 {
+    if !meta.is_file() || is_link(&meta) || link_count(&file)? != 1 {
         return Err(Error::other(format!(
             "{} must be a regular file with a single link",
             path.display()
         )));
     }
     Ok(Some(file))
+}
+
+/// Read a bounded regular file from the descriptor checked above.
+pub fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+    let file =
+        open_single_link(path)?.ok_or_else(|| Error::new(ErrorKind::NotFound, "file missing"))?;
+    if file.metadata()?.len() > limit {
+        return Err(Error::other("file exceeds byte limit"));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(Error::other("file exceeds byte limit"));
+    }
+    Ok(bytes)
 }
 
 #[cfg(unix)]

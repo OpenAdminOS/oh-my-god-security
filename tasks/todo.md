@@ -10,8 +10,8 @@ release uses a fresh squashed history.
 
 Decisions 2026-10-27 (round 2): GPT-6.1-Sol writes the process supervision module
 (`src/supervise.rs`: rlimits, group signal before reap, macOS survivor sweep); `omgs prove` refuses
-on Intel Macs (no MXC executor there), documented in doctor and Known limitations; the five MXC
-executors are mirrored as OMGS release assets with Microsoft signatures intact, pinned by SHA-256,
+on Intel Macs (no MXC executor there), documented in doctor and Known limitations; PR 5 will mirror the five MXC
+executors as OMGS release assets with Microsoft signatures intact, pinned by SHA-256,
 MIT notice included; tier 2 runs only on Linux (decided after testing showed the macOS sandbox
 shares the host loopback in both directions, and Windows blocks loopback inside the container).
 
@@ -21,12 +21,13 @@ shares the host loopback in both directions, and Windows blocks loopback inside 
 - [x] Spike on the Lima Ubuntu VM and the Windows mini PC
 - [x] `src/sandbox.rs` emits MXC configs and runs the pinned executor; built-in profiles removed
 - [x] Per-run writable workspace copy of the target; target untouched
-- [ ] rlimits, `waitid(WNOWAIT)` group signal, macOS survivor sweep (GPT-6.1-Sol, `src/supervise.rs`)
+- [x] rlimits, `waitid(WNOWAIT)` group signal, macOS survivor sweep (GPT-6.1-Sol, `src/supervise.rs`)
 - [x] `prove --run --finding` proof records; `proof_ref` and `trace`; `validate` checks proofs
 - [x] Budget enforcement and tier-2 first-run approval
-- [x] `omgs doctor`; Windows portability; Windows CI (CI run pending)
+- [x] `omgs doctor`; Windows portability; Windows CI through Test (round 3 green; round 4 verification below)
 - [x] DECISIONS.md amendment: declared minimum set per OS
-- [ ] Tests, docs, reviews, merge
+- [x] Tests and docs for rounds 1 through 4
+- [ ] Independent round 4 full-diff reviews and merge
   - Round 2 (2026-10-27): GPT-6.1-Sol implements the round 2 fixes; evidence that the named test ran
     uses runner start and end markers (not per-stack adapters); windows-2025 CI must be fully green
     through the Test step before merge.
@@ -73,3 +74,31 @@ shares the host loopback in both directions, and Windows blocks loopback inside 
 - [ ] User steps: visibility, tag ruleset, tag push, tap and winget; fresh-machine install test
 
 ## Review
+
+PR 1 results before round 4: commit `0bb66b0` passed all four CI jobs, including
+windows-2025 through Test. Local macOS, Lima Ubuntu and Windows 11 exercised the
+pinned MXC executors. Earlier reviews required in-sandbox test reachability,
+marker-based execution evidence, canonical proof grants, honest platform gaps,
+readable-root isolation and full-diff independent review. Those fixes remain.
+
+Round 4 implements bounded no-follow hashing, exact replay timeout, digest-only
+executor identity, recorded readable roots, full environment values, closed
+config schema, command redaction with replay digests, nested `.git` hashing,
+traced-reference identity checks, ordered console output, SIGHUP cleanup,
+executable draft staging, canonical Windows overlap checks, Rosetta guidance and
+Rust 1.89 minimum. Linux `setsid` and `posix_spawn(SETSID)` probes on Lima exited
+cleanly with no marked descendants in the host process table. Regression tests
+include a live host-process positive control before PID namespace teardown.
+Windows wall-clock and doctor enumeration limitations are disclosed explicitly.
+
+Round 4 local verification: macOS passed fmt, clippy with warnings denied and all
+182 tests; Lima Ubuntu arm64 passed all 178 tests; Windows 11 x64 passed all 156
+tests, including canonical root overlap and supervisor wall-clock disclosure.
+All three live doctor probes passed. Linux escape probes observed each detached
+child in the host process table before teardown and found no survivor after it.
+The x86_64 macOS build passed, but Rosetta execution could not be checked because
+this host has no translation runtime. Installer shell syntax was checked.
+
+Every final PR CI job must pass on the pushed head, including windows-2025
+through Test. Independent reviews and merge remain required; implementation is
+not approval.

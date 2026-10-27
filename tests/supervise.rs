@@ -342,3 +342,28 @@ fn timeout_words_and_signal_death_are_not_timeouts() {
         "{result:?}"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_wall_clock_kills_executor_and_discloses_descendant_dependency() {
+    let mut cmd = Command::new("cmd.exe");
+    cmd.args(["/d", "/q", "/c", "for /l %i in (1,0,2) do @rem"]);
+    let mut limits = limits();
+    limits.wall_ms = 150;
+    let start = std::time::Instant::now();
+    let result = run(cmd, &limits, None);
+    assert!(
+        result.timed_out && !result.success && result.cleanup_complete,
+        "{result:?}"
+    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    assert!(omgs::sandbox::declared_limits("windows")
+        .iter()
+        .any(|limit| limit.contains("kills only the executor")));
+    assert!(
+        omgs::sandbox::declared_controls("windows", omgs::sandbox::Tier::Test)
+            .1
+            .iter()
+            .any(|gap| gap.contains("descendant cleanup depends on MXC"))
+    );
+}

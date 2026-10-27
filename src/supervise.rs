@@ -81,19 +81,21 @@ mod interruption {
 
     impl Guard {
         pub(super) fn install() -> io::Result<Self> {
-            let lock = LOCK
-                .lock()
-                .map_err(|_| io::Error::other("signal handler lock poisoned"))?;
+            let lock = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
             let mut guard = Self {
                 previous: Vec::new(),
                 _lock: lock,
             };
             SIGNAL.store(0, Ordering::Relaxed);
-            for number in [libc::SIGINT, libc::SIGTERM] {
+            for number in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                // SAFETY: zero is a valid initial sigaction before its fields are set.
                 let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+                // SAFETY: sigaction fills this initialized writable structure.
                 let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
                 action.sa_sigaction = handler as *const () as usize;
+                // SAFETY: sa_mask is a valid writable signal set.
                 unsafe { libc::sigemptyset(&mut action.sa_mask) };
+                // SAFETY: both structures live through the call; handler only stores an atomic.
                 if unsafe { libc::sigaction(number, &action, &mut old) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -106,6 +108,7 @@ mod interruption {
     impl Drop for Guard {
         fn drop(&mut self) {
             for (number, old) in &self.previous {
+                // SAFETY: old is the saved action for this signal, protected by LOCK.
                 unsafe { libc::sigaction(*number, old, std::ptr::null_mut()) };
             }
         }
@@ -294,7 +297,9 @@ fn reader<R: Read + Send + 'static>(
 #[cfg(unix)]
 fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     let fd = pipe.as_raw_fd();
+    // SAFETY: pipe owns fd throughout both fcntl calls.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    // SAFETY: F_SETFL takes integer flags for this live descriptor.
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -348,7 +353,8 @@ fn prepare_unix(cmd: &mut Command, limits: &Limits) -> io::Result<Vec<String>> {
         }
     }
     cmd.process_group(0);
-    // Build everything before fork. Only setrlimit and errno access run here.
+    // SAFETY: all data is prepared before fork; the callback uses only setrlimit
+    // and errno access, which do not acquire Rust locks or allocate on success.
     unsafe {
         cmd.pre_exec(move || {
             for (resource, value, _, _) in settings {
@@ -370,7 +376,9 @@ fn prepare_unix(cmd: &mut Command, limits: &Limits) -> io::Result<Vec<String>> {
 
 #[cfg(unix)]
 fn exited_without_reaping(pid: u32) -> io::Result<bool> {
+    // SAFETY: zero initializes the output storage required by waitid.
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: info is writable and pid names our child; WNOWAIT retains it.
     let result = unsafe {
         libc::waitid(
             libc::P_PID,
@@ -382,12 +390,13 @@ fn exited_without_reaping(pid: u32) -> io::Result<bool> {
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
-    // libc exposes the Darwin field and Linux union through the same accessor.
+    // SAFETY: waitid succeeded and initialized the siginfo pid field.
     Ok(unsafe { info.si_pid() } != 0)
 }
 
 #[cfg(unix)]
 fn signal(pid: i32, number: i32, notes: &mut Vec<String>) -> bool {
+    // SAFETY: kill accepts a numeric pid or negative process group id.
     if unsafe { libc::kill(pid, number) } == 0 {
         return true;
     }
@@ -439,7 +448,9 @@ fn wait(
         #[cfg(unix)]
         if check_signals && interruption::pending() {
             waited.interrupted = true;
-            notes.push("proof interrupted by SIGINT or SIGTERM; executor cleanup required".into());
+            notes.push(
+                "proof interrupted by SIGINT, SIGTERM or SIGHUP; executor cleanup required".into(),
+            );
             break;
         }
         #[cfg(unix)]
@@ -680,8 +691,10 @@ mod sweep {
     }
 
     fn info(pid: i32) -> io::Result<libc::proc_bsdinfo> {
+        // SAFETY: proc_bsdinfo is a plain C output structure.
         let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
         let size = std::mem::size_of_val(&info) as i32;
+        // SAFETY: the buffer has the exact size passed to proc_pidinfo.
         let result = unsafe {
             libc::proc_pidinfo(
                 pid,
@@ -698,6 +711,7 @@ mod sweep {
     }
 
     fn pids() -> io::Result<Vec<i32>> {
+        // SAFETY: a null buffer asks libproc for the process count.
         let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
         if count <= 0 {
             return Err(io::Error::last_os_error());
@@ -705,6 +719,7 @@ mod sweep {
         let mut pids = vec![0i32; (count as usize).saturating_add(1024)];
         let bytes = i32::try_from(pids.len().saturating_mul(std::mem::size_of::<i32>()))
             .map_err(|_| io::Error::other("pid list is too large"))?;
+        // SAFETY: pids has bytes writable bytes and remains live through the call.
         let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
         if count <= 0 {
             return Err(io::Error::last_os_error());
@@ -721,7 +736,7 @@ mod sweep {
         let size = std::mem::size_of::<i32>();
         let bytes = i32::try_from(pids.len().saturating_mul(size))
             .map_err(|_| io::Error::other("uid pid list is too large"))?;
-        // PROC_UID_ONLY filters in the kernel, including protected other users.
+        // SAFETY: pids has bytes writable bytes; PROC_UID_ONLY filters by uid.
         let count = unsafe { libc::proc_listpids(4, uid, pids.as_mut_ptr().cast(), bytes) };
         if count <= 0 {
             return Err(io::Error::last_os_error());
@@ -739,6 +754,7 @@ mod sweep {
             if pid <= 0 {
                 continue;
             }
+            // SAFETY: getpgid accepts a numeric pid without a pointer.
             let pgid = unsafe { libc::getpgid(pid) };
             if pgid < 0 {
                 let error = io::Error::last_os_error();
@@ -761,6 +777,7 @@ mod sweep {
 
     fn matches(pid: i32, allowed: &CString, denied: &CString) -> io::Result<bool> {
         let operation = b"file-read-data\0";
+        // SAFETY: operation and path are NUL terminated and live through the call.
         let check = |path: &CString| unsafe {
             sandbox_check(pid, operation.as_ptr().cast(), 1, path.as_ptr())
         };
@@ -780,9 +797,11 @@ mod sweep {
 
     fn command(pid: i32, notes: &mut Vec<String>) -> String {
         let mut buffer = [0u8; 4096];
+        // SAFETY: buffer is writable for the specified byte count.
         let mut count =
             unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
         if count <= 0 {
+            // SAFETY: the same live buffer is passed with its full byte count.
             count =
                 unsafe { libc::proc_name(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
         }
@@ -818,7 +837,9 @@ mod sweep {
             return false;
         }
         result.enforced.push("survivor_sweep".into());
+        // SAFETY: getpid has no pointer arguments or preconditions.
         let own = unsafe { libc::getpid() };
+        // SAFETY: geteuid has no pointer arguments or preconditions.
         let uid = unsafe { libc::geteuid() };
         let start = Instant::now();
         let mut healthy = true;
