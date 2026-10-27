@@ -292,7 +292,7 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
                 "local_app"
             }
             .into(),
-            command: "npm test".into(),
+            command: "npm test -- tests/security/x.test.ts".into(),
             target: None,
             target_head: None,
             started_at_ms: 0,
@@ -308,7 +308,7 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             executor: mac.file.into(),
             executor_sha256: mac.sha256.into(),
             config_sha256: omgs::sha256::digest(config),
-            enforced: vec!["mxc deny-by-default filesystem".into()],
+            enforced: omgs::sandbox::declared_controls("macos", omgs::sandbox::Tier::Test).0,
             gaps: vec![],
             output_sha256: "0".repeat(64),
             output_bytes_total: 0,

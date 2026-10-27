@@ -62,7 +62,7 @@ fn prove_refuses_an_executor_that_does_not_match_the_pin() {
         return;
     }
     assert_eq!(out.status.code(), Some(3), "{t}");
-    assert!(t.contains("pinned digest"), "{t}");
+    assert!(t.contains("refusing to run"), "{t}");
     assert!(t.contains("target code was not executed"), "{t}");
     assert!(!t.contains("ran"), "{t}");
     let _ = std::fs::remove_dir_all(&d);
@@ -169,11 +169,21 @@ fn proof_records_back_confirmed_findings() {
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("check.txt"), b"vulnerable").unwrap();
     std::fs::create_dir_all(target.join("tests/security")).unwrap();
-    std::fs::write(
-        target.join("tests/security/x.test.sh"),
-        b"grep -q vulnerable check.txt",
-    )
-    .unwrap();
+    // A proof test that fails on the vulnerable target.
+    let (x_test, failing, x_body): (&str, &str, &[u8]) = if cfg!(windows) {
+        (
+            "tests/security/x.test.cmd",
+            "cmd.exe /d /c tests\\security\\x.test.cmd",
+            b"@findstr /m vulnerable check.txt >nul && exit /b 1\r\n@exit /b 0\r\n",
+        )
+    } else {
+        (
+            "tests/security/x.test.sh",
+            "sh tests/security/x.test.sh",
+            b"grep -q vulnerable check.txt && exit 1; exit 0",
+        )
+    };
+    std::fs::write(target.join(x_test), x_body).unwrap();
     let run = d.join("run");
     let init = omgs(
         &home,
@@ -189,12 +199,6 @@ fn proof_records_back_confirmed_findings() {
     );
     assert!(init.status.success(), "{}", text(&init));
     let fp = omgs::fingerprint("missing_authz", "GET /x", "db.x", "tenant");
-    // A proof test that fails on the vulnerable target.
-    let failing = if cfg!(windows) {
-        "cmd.exe /d /c findstr vulnerable check.txt && exit 1"
-    } else {
-        "grep -q vulnerable check.txt && exit 1"
-    };
     let out = omgs(
         &home,
         &[
@@ -204,7 +208,7 @@ fn proof_records_back_confirmed_findings() {
             "--finding",
             &fp,
             "--test",
-            "tests/security/x.test.sh",
+            x_test,
             "--cmd",
             failing,
         ],
@@ -321,6 +325,19 @@ fn proof_records_back_confirmed_findings() {
         serde_json::from_str(&std::fs::read_to_string(run.join("proofs/3.json")).unwrap()).unwrap();
     assert_eq!(replayed["replays"], 1);
 
+    // A replay never takes a host path from an edited record.
+    let original = std::fs::read_to_string(run.join("proofs/1.json")).unwrap();
+    let mut edited: serde_json::Value = serde_json::from_str(&original).unwrap();
+    edited["target"] = serde_json::json!(d.to_str().unwrap());
+    std::fs::write(run.join("proofs/1.json"), edited.to_string()).unwrap();
+    let redirected = omgs(
+        &home,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert_eq!(redirected.status.code(), Some(2), "{}", text(&redirected));
+    assert!(text(&redirected).contains("not this run's target"));
+    std::fs::write(run.join("proofs/1.json"), original).unwrap();
+
     // A command that never ran (127) is not a failing proof test.
     let broken = omgs(
         &home,
@@ -331,9 +348,9 @@ fn proof_records_back_confirmed_findings() {
             "--finding",
             &fp,
             "--test",
-            "tests/security/x.test.sh",
+            x_test,
             "--cmd",
-            "omgs-no-such-command-xyz",
+            &format!("omgs-no-such-command-xyz {x_test}"),
         ],
     );
     assert!(
@@ -379,6 +396,10 @@ fn posix_spawn_setsid_escape_is_killed_and_fails_the_run() {
 
 #[test]
 fn concurrent_or_repeated_proofs_cannot_overspend_the_budget() {
+    // Without MXC nothing runs and the charge is given back, so this needs it.
+    if !mxc_ready() {
+        return;
+    }
     let d = scratch("budget");
     let home = d.join("home");
     let target = d.join("target");
@@ -399,8 +420,8 @@ fn concurrent_or_repeated_proofs_cannot_overspend_the_budget() {
         ],
     );
     assert!(init.status.success(), "{}", text(&init));
-    // The charge lands before anything runs, so this holds with or without
-    // MXC installed: the first proof spends the budget, the second is refused.
+    // The charge lands before anything runs: the first proof spends the
+    // budget, the second is refused with exit 3 because nothing ran.
     let prove = || {
         omgs(
             &home,
@@ -410,7 +431,7 @@ fn concurrent_or_repeated_proofs_cannot_overspend_the_budget() {
     let first = prove();
     assert_ne!(first.status.code(), Some(2), "{}", text(&first));
     let second = prove();
-    assert_eq!(second.status.code(), Some(2), "{}", text(&second));
+    assert_eq!(second.status.code(), Some(3), "{}", text(&second));
     assert!(text(&second).contains("budget exhausted"));
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -447,5 +468,163 @@ fn installer_trust_fixture_fails_vulnerable_and_passes_fixed() {
     let fixed = run("fixed");
     assert!(fixed.status.success(), "{}", text(&fixed));
     assert!(text(&fixed).contains("INVARIANTS HOLD"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn an_mxc_timeout_is_never_a_proof() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("mxc-timeout");
+    let home = d.join("home");
+    let target = d.join("target");
+    std::fs::create_dir_all(target.join("tests")).unwrap();
+    let (test, cmd): (&str, &str) = if cfg!(windows) {
+        ("tests/slow.cmd", "cmd.exe /d /c tests\\slow.cmd")
+    } else {
+        ("tests/slow.sh", "sh tests/slow.sh")
+    };
+    let body: &[u8] = if cfg!(windows) {
+        b"@for /l %%i in (1,1,2000000000) do @rem\r\n"
+    } else {
+        b"sleep 30"
+    };
+    std::fs::write(target.join(test), body).unwrap();
+    let run = d.join("run");
+    let init = omgs(
+        &home,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let fp = omgs::fingerprint("missing_authz", "GET /t", "db.t", "tenant");
+    let out = omgs(
+        &home,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--finding",
+            &fp,
+            "--test",
+            test,
+            "--timeout-ms",
+            "2000",
+            "--cmd",
+            cmd,
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run.join("proofs/1.json")).unwrap()).unwrap();
+    assert_eq!(record["timed_out"], true, "{record}");
+    let findings = run.join("findings.json");
+    std::fs::write(
+        &findings,
+        serde_json::json!({"findings": [{
+            "fingerprint": fp, "title": "t", "verdict": "confirmed", "severity": "high",
+            "proof_tier": "test_proven", "attack_class": "missing_authz", "entry_point": "GET /t",
+            "sink": "db.t", "boundary": "tenant", "location": {"path": "a.ts", "line": 1},
+            "evidence": "e", "hunted_by": "red-1", "verified_by": "blue-1",
+            "proof_ref": "proofs/1.json"
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    let v = omgs(
+        &home,
+        &["validate", "--findings", findings.to_str().unwrap()],
+    );
+    assert_eq!(v.status.code(), Some(1), "{}", text(&v));
+    assert!(text(&v).contains("did not finish cleanly"), "{}", text(&v));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_denials_hold_and_the_target_is_untouched() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("deny-win");
+    let target = d.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("app.txt"), b"original").unwrap();
+    let outside = d.join("outside.txt");
+    std::fs::write(&outside, b"outside-secret-value").unwrap();
+    let cmd = format!(
+        "cmd.exe /d /c type \"{}\" & echo changed> app.txt & type app.txt",
+        outside.display()
+    );
+    let out = omgs(
+        &d.join("home"),
+        &["prove", "--target", target.to_str().unwrap(), "--cmd", &cmd],
+    );
+    let t = text(&out);
+    assert!(!t.contains("outside-secret-value"), "{t}");
+    assert!(t.contains("changed"), "{t}");
+    assert_eq!(std::fs::read(target.join("app.txt")).unwrap(), b"original");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_tier2_has_a_private_loopback() {
+    if !mxc_ready() {
+        return;
+    }
+    let Some(py) = omgs::platform::which("python3") else {
+        eprintln!("skipping: python3 not found");
+        return;
+    };
+    let d = scratch("tier2");
+    let home = d.join("home");
+    let target = d.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    // A service on the host loopback the app under test must not reach.
+    let host = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let host_port = host.local_addr().unwrap().port();
+    std::fs::write(
+        target.join("app.py"),
+        format!(
+            "import socket\ns=socket.socket();s.bind(('127.0.0.1',0));s.listen()\nc=socket.create_connection(s.getsockname());a,_=s.accept();c.send(b'hi');print('INSIDE',a.recv(2))\ntry:\n    socket.create_connection(('127.0.0.1',{host_port}),timeout=2);print('HOST_REACHED')\nexcept OSError:\n    print('host unreachable')\n"
+        ),
+    )
+    .unwrap();
+    // The approval is a person's step; the test seeds it as that person would.
+    let canonical = target.canonicalize().unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("tier2-approvals.json"),
+        serde_json::json!({"approvals": [{"target": canonical, "approved_at_ms": 0}]}).to_string(),
+    )
+    .unwrap();
+    let out = omgs(
+        &home,
+        &[
+            "prove",
+            "--tier",
+            "2",
+            "--target",
+            target.to_str().unwrap(),
+            "--cmd",
+            &format!("{} -I app.py", py.display()),
+        ],
+    );
+    let t = text(&out);
+    assert!(t.contains("INSIDE b'hi'"), "{t}");
+    assert!(
+        t.contains("host unreachable") && !t.contains("HOST_REACHED"),
+        "{t}"
+    );
+    drop(host);
     let _ = std::fs::remove_dir_all(&d);
 }

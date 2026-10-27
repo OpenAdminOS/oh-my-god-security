@@ -95,34 +95,44 @@ pub struct Located {
 /// skipped over silently: it is named in the error.
 pub fn locate_executor() -> Result<Located, String> {
     let executor = this_executor()?;
-    let mut candidates: Vec<PathBuf> = Vec::new();
+    let check = |path: &Path| match sha256::digest_file(path) {
+        Ok(d) if d == executor.sha256 => Ok(()),
+        Ok(d) => Err(format!(
+            "{} has SHA-256 {d}, expected {} for MXC {MXC_VERSION}",
+            path.display(),
+            executor.sha256
+        )),
+        Err(e) => Err(format!("{} unreadable: {e}", path.display())),
+    };
+    // An explicit OMGS_MXC_EXEC is authoritative: if it is wrong, say so
+    // rather than quietly using some other executor.
     if let Some(p) = std::env::var_os("OMGS_MXC_EXEC").filter(|v| !v.is_empty()) {
-        candidates.push(PathBuf::from(p));
+        let path = PathBuf::from(p);
+        return check(&path)
+            .map(|_| Located {
+                path,
+                executor: executor.clone(),
+            })
+            .map_err(|e| format!("OMGS_MXC_EXEC is set but unusable, refusing to run: {e}"));
     }
-    candidates.extend(install_path(&executor));
-    candidates.extend(platform::which(executor.file));
     let mut problems = Vec::new();
-    for path in candidates {
+    for path in install_path(&executor)
+        .into_iter()
+        .chain(platform::which(executor.file))
+    {
         if !path.is_file() {
             continue;
         }
-        match sha256::digest_file(&path) {
-            Ok(d) if d == executor.sha256 => return Ok(Located { path, executor }),
-            Ok(d) => problems.push(format!(
-                "{} has SHA-256 {d}, expected {} for MXC {MXC_VERSION}",
-                path.display(),
-                executor.sha256
-            )),
-            Err(e) => problems.push(format!("{} unreadable: {e}", path.display())),
+        match check(&path) {
+            Ok(()) => return Ok(Located { path, executor }),
+            Err(e) => problems.push(e),
         }
     }
-    let wanted = install_path(&executor)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| executor.file.to_string());
     if problems.is_empty() {
         Err(format!(
-            "MXC {MXC_VERSION} executor {} not found. Install it with the OMGS installer (it places the pinned, Microsoft-signed executor at {wanted}) or set OMGS_MXC_EXEC. Run omgs doctor for details.",
-            executor.file
+            "MXC {MXC_VERSION} executor {} not found. {}",
+            executor.file,
+            install_hint(&executor)
         ))
     } else {
         Err(format!(
@@ -131,6 +141,29 @@ pub fn locate_executor() -> Result<Located, String> {
         ))
     }
 }
+
+/// Manual install steps for the pinned executor, shown when it is missing.
+pub fn install_hint(executor: &Executor) -> String {
+    let member = format!(
+        "{}/{}",
+        if std::env::consts::ARCH == "aarch64" {
+            "arm64"
+        } else {
+            "x64"
+        },
+        executor.file
+    );
+    let dest = install_path(executor)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| executor.file.to_string());
+    format!(
+        "Install it once: download mxc-release-binaries.zip from https://github.com/microsoft/mxc/releases/tag/v{MXC_VERSION} (SHA-256 {MXC_ZIP_SHA256}), extract only {member}, and place it at {dest} (its own SHA-256 must be {}). Or point OMGS_MXC_EXEC at an existing copy. Run omgs doctor to check.",
+        executor.sha256
+    )
+}
+
+/// SHA-256 of Microsoft's MXC release archive the executors are taken from.
+pub const MXC_ZIP_SHA256: &str = "0e832239454ba7fcd338ff56218a287eef4c0a01c1484084b869f55feff8abe9";
 
 /// Tier 1 runs a test; tier 2 runs a locally built app and its client
 /// together. Both use the same network policy: external network and host
@@ -458,34 +491,117 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
         let _ = std::fs::remove_dir_all(dst);
         std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     }
-    copy_recursive(src, dst)
+    let roots = (
+        std::fs::canonicalize(src).map_err(|e| e.to_string())?,
+        dst.to_path_buf(),
+    );
+    copy_recursive(src, dst, &roots)
 }
 
-fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+/// `roots` is (canonical source root, destination root) of the whole copy.
+fn copy_recursive(src: &Path, dst: &Path, roots: &(PathBuf, PathBuf)) -> Result<(), String> {
     for entry in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
         let ty = entry.file_type().map_err(|e| e.to_string())?;
         let to = dst.join(entry.file_name());
         if ty.is_dir() {
             std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
-            copy_recursive(&entry.path(), &to)?;
+            copy_recursive(&entry.path(), &to, roots)?;
         } else if ty.is_file() {
             std::fs::copy(entry.path(), &to)
                 .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
+        } else if ty.is_symlink() {
+            copy_link(&entry.path(), &to, roots)?;
         }
-        // Symlinks are skipped on the fallback path rather than followed out
-        // of the target tree.
     }
     Ok(())
+}
+
+/// Keep a link (pnpm stores, monorepo packages) that resolves inside the
+/// target: a directory becomes a junction to its copy, a file is copied.
+/// Links that leave the target are dropped, never followed out of it.
+fn copy_link(link: &Path, to: &Path, roots: &(PathBuf, PathBuf)) -> Result<(), String> {
+    let Ok(resolved) = std::fs::canonicalize(link) else {
+        return Ok(());
+    };
+    let Ok(rel) = resolved.strip_prefix(&roots.0) else {
+        return Ok(());
+    };
+    let mapped = roots.1.join(rel);
+    if resolved.is_dir() {
+        // The directory may not be copied yet; create it so the link resolves.
+        std::fs::create_dir_all(&mapped).map_err(|e| e.to_string())?;
+        link_dir(&mapped, to).map_err(|e| format!("link {}: {e}", to.display()))
+    } else if resolved.is_file() {
+        std::fs::copy(&resolved, to)
+            .map(|_| ())
+            .map_err(|e| format!("copy {}: {e}", link.display()))
+    } else {
+        Ok(())
+    }
 }
 
 /// Why tier 2 cannot run on this OS, if it cannot.
 pub fn tier2_unavailable(os: &str) -> Option<String> {
     (os != "linux").then(|| {
         format!(
-            "tier 2 runs only on Linux: on {os} the sandbox shares the host loopback, so a local app under test could reach or be reached by services on this machine. Run tier 2 on Linux or in a Linux VM; tier 1 proofs work here."
+            "tier 2 runs only on Linux: a local app and its client need a loopback of their own, which the {os} sandbox can only get by opening this machine's loopback to the app. OMGS keeps it closed, so run tier 2 on Linux or in a Linux VM; tier 1 proofs work here."
         )
     })
+}
+
+/// Copy `draft` to `workspace/rel` without following any link. The workspace
+/// is a copy of the target, which controls its layout: a symlinked directory
+/// on the way would otherwise make this unsandboxed write land on the host.
+pub fn stage_file(workspace: &Path, rel: &str, draft: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    let parts: Vec<&str> = rel
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    let Some((file, dirs)) = parts.split_last() else {
+        return Err(Error::new(ErrorKind::InvalidInput, "empty test path"));
+    };
+    if parts.iter().any(|p| *p == ".." || p.contains(':')) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "test path leaves the workspace",
+        ));
+    }
+    let mut dir = workspace.to_path_buf();
+    for part in dirs {
+        dir.push(part);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_dir() => {}
+            Ok(_) => {
+                return Err(Error::other(format!(
+                    "{} is a link or file in the target, not a directory",
+                    dir.display()
+                )))
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => std::fs::create_dir(&dir)?,
+            Err(e) => return Err(e),
+        }
+    }
+    let dest = dir.join(file);
+    match std::fs::symlink_metadata(&dest) {
+        Ok(m) if m.file_type().is_file() => std::fs::remove_file(&dest)?,
+        Ok(_) => {
+            return Err(Error::other(format!(
+                "{} is a link or directory in the target",
+                dest.display()
+            )))
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let bytes = std::fs::read(draft)?;
+    // create_new refuses an entry that appeared since, link or not.
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dest)?;
+    out.write_all(&bytes)
 }
 
 /// A readable root that contains, or is contained in, the run directory.
@@ -535,13 +651,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         return blocked(e.to_string());
     }
     if let Some((draft, rel)) = &req.stage {
-        let dest = workspace.join(rel);
-        let staged = dest
-            .parent()
-            .map(std::fs::create_dir_all)
-            .unwrap_or(Ok(()))
-            .and_then(|_| std::fs::copy(draft, &dest).map(|_| ()));
-        if let Err(e) = staged {
+        if let Err(e) = stage_file(&workspace, rel, draft) {
             return blocked(format!("cannot stage the draft test at {rel}: {e}"));
         }
     }
@@ -711,6 +821,29 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_never_writes_through_a_link_in_the_target() {
+        let d = std::env::temp_dir().join(format!("omgs-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (ws, outside) = (d.join("ws"), d.join("outside"));
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let draft = d.join("draft");
+        std::fs::write(&draft, b"test").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("tests")).unwrap();
+        assert!(stage_file(&ws, "tests/x.sh", &draft).is_err());
+        std::os::unix::fs::symlink(outside.join("f"), ws.join("f.sh")).unwrap();
+        assert!(stage_file(&ws, "f.sh", &draft).is_err());
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        assert!(stage_file(&ws, "a/b/c.sh", &draft).is_ok());
+        std::fs::write(ws.join("existing.sh"), b"old").unwrap();
+        assert!(stage_file(&ws, "existing.sh", &draft).is_ok());
+        assert_eq!(std::fs::read(ws.join("existing.sh")).unwrap(), b"test");
+        assert!(stage_file(&ws, "../x", &draft).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn run_directories_inside_readable_roots_are_refused() {

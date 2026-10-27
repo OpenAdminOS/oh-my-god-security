@@ -10,12 +10,14 @@ pub const SCHEMA: &str = "omgs-proof/1";
 pub const DIR: &str = "proofs";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Survivor {
     pub pid: i32,
     pub command: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProofRecord {
     pub schema: String,
     pub n: u32,
@@ -141,9 +143,12 @@ pub fn load(run: &Path, proof_ref: &str) -> Result<ProofRecord, String> {
     let path = record_path(run, n);
     let text =
         std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let record: ProofRecord =
-        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
-    if record.schema != SCHEMA || record.n != n {
+    // Strict like every other run input: duplicate keys and unknown fields
+    // are errors.
+    let record: ProofRecord = crate::shape::strict_json(&text)
+        .and_then(|v| serde_json::from_value(v).map_err(|e| e.to_string()))
+        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+    if record.schema != SCHEMA || record.n != n || n == 0 {
         return Err(format!("{} is not proof record {n}", path.display()));
     }
     Ok(record)
@@ -199,16 +204,25 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
                 .into_iter()
                 .map(|e| format!("{at}: {r} {e}")),
         );
-        // A tier 1 proof is a security test that fails on the vulnerable code.
-        if want == "test" {
-            if record.test.is_none() || record.test_sha256.is_none() {
-                errors.push(format!(
+        // Both tiers use one convention: the proof test or harness exits with a
+        // failing assertion when the target permits the unauthorized effect.
+        {
+            match (&record.test, &record.test_sha256) {
+                (Some(t), Some(_)) => {
+                    let name = t.rsplit(['/', '\\']).next().unwrap_or(t);
+                    if !record.command.contains(name) {
+                        errors.push(format!(
+                            "{at}: {r} ran a command that does not name its proof test {t}"
+                        ));
+                    }
+                }
+                _ => errors.push(format!(
                     "{at}: {r} names no proof test; run omgs prove with --test <path in the target>"
-                ));
+                )),
             }
             if !record.assertion_failure() {
                 errors.push(format!(
-                    "{at}: {r} exited {}, a test_proven record needs the proof test failing on the target (126, 127 and signals mean the test never ran)",
+                    "{at}: {r} exited {}, a proven record needs the proof test failing on the target (126, 127 and signals mean the test never ran)",
                     record
                         .exit_code
                         .map(|c| c.to_string())
@@ -240,7 +254,46 @@ fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
             "claims containment {} for an executor that provides {}",
             record.containment, e.containment
         )),
-        Some(_) => {}
+        Some(e) => {
+            if !record.executor.ends_with(e.file) {
+                errors.push(format!(
+                    "names executor {} for the {} digest",
+                    record.executor, e.file
+                ));
+            }
+            let os = match e.containment {
+                "seatbelt" => "macos",
+                "bubblewrap" => "linux",
+                _ => "windows",
+            };
+            let tier = if record.tier == "local_app" {
+                crate::sandbox::Tier::LocalApp
+            } else {
+                crate::sandbox::Tier::Test
+            };
+            let (declared, _) = crate::sandbox::declared_controls(os, tier);
+            if let Some(missing) = declared.iter().find(|c| !record.enforced.contains(c)) {
+                errors.push(format!("does not list the required control '{missing}'"));
+            }
+        }
+    }
+    if record.mxc_version != crate::sandbox::MXC_VERSION {
+        errors.push(format!(
+            "ran MXC {}, not the pinned {}",
+            record.mxc_version,
+            crate::sandbox::MXC_VERSION
+        ));
+    }
+    if let Some(t) = &record.target {
+        let run_target = crate::runmeta::read(run)
+            .ok()
+            .and_then(|m| m.get("target").and_then(|v| v.as_str()).map(String::from));
+        if let Some(rt) = run_target {
+            let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
+            if canon(t) != canon(&rt) {
+                errors.push(format!("ran against {t}, not this run's target {rt}"));
+            }
+        }
     }
     let config = run
         .join(DIR)
@@ -310,16 +363,6 @@ fn is_hex40(s: &str) -> bool {
 /// the rest of a line after a credential keyword and its separator, and PEM
 /// private key bodies. Proof runs use dummy secrets, so this is a backstop.
 pub fn redact(text: &str) -> String {
-    const KEYS: [&str; 8] = [
-        "password",
-        "passwd",
-        "secret",
-        "token",
-        "api_key",
-        "apikey",
-        "authorization",
-        "private_key",
-    ];
     let mut out = String::with_capacity(text.len());
     let mut in_pem = false;
     for line in text.split_inclusive('\n') {
@@ -335,28 +378,69 @@ pub fn redact(text: &str) -> String {
             }
             continue;
         }
-        let cut = KEYS
-            .iter()
-            .filter_map(|k| lower.find(k).map(|i| i + k.len()))
-            .filter_map(|after| {
-                lower[after..]
-                    .find([':', '='])
-                    .filter(|j| lower[after..after + j].trim().is_empty())
-                    .map(|j| after + j + 1)
-            })
-            .min();
-        match cut {
-            Some(c) if line.is_char_boundary(c) => {
-                out.push_str(&line[..c]);
-                out.push_str(" [omgs redacted]");
-                if line.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-            _ => out.push_str(line),
-        }
+        out.push_str(&redact_line(line, &lower));
     }
     out
+}
+
+/// One line: credential URLs lose their user info, bearer tokens and the
+/// value after a credential keyword (quoted or bare, `:` or `=`) are masked.
+fn redact_line(line: &str, lower: &str) -> String {
+    const KEYS: [&str; 9] = [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "api-key",
+        "authorization",
+        "private_key",
+    ];
+    let mut line = line.to_string();
+    let mut lower = lower.to_string();
+    // scheme://user:pass@host
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("://").map(|i| i + from + 3) {
+        let end = lower[i..]
+            .find(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'')
+            .map(|e| e + i)
+            .unwrap_or(lower.len());
+        if let Some(at) = lower[i..end].rfind('@').map(|a| a + i) {
+            if lower[i..at].contains(':') {
+                line.replace_range(i..at, "[omgs redacted]");
+                lower = line.to_ascii_lowercase();
+            }
+        }
+        from = i.min(lower.len());
+    }
+    let cut = KEYS
+        .iter()
+        .filter_map(|k| lower.find(k).map(|i| i + k.len()))
+        .filter_map(|after| {
+            lower[after..]
+                .find([':', '='])
+                .filter(|j| {
+                    lower[after..after + j]
+                        .chars()
+                        .all(|c| c.is_whitespace() || c == '"' || c == '\'')
+                })
+                .map(|j| after + j + 1)
+        })
+        .chain(lower.find("bearer ").map(|i| i + "bearer ".len()))
+        .min();
+    match cut {
+        Some(c) if line.is_char_boundary(c) => {
+            let newline = line.ends_with('\n');
+            line.truncate(c);
+            line.push_str(" [omgs redacted]");
+            if newline {
+                line.push('\n');
+            }
+            line
+        }
+        _ => line,
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +457,15 @@ mod tests {
         assert!(r.contains("authorization required\n"));
         assert!(!r.contains("abc123") && !r.contains("xyz") && !r.contains("MIIB"));
         assert!(r.ends_with("done\n"));
+        let json = redact("{\"api_key\": \"k-123\", \"x\": 1}\n");
+        assert!(!json.contains("k-123"), "{json}");
+        let bearer = redact("Authorization header: Bearer eyJabc.def\ncurl -H x\n");
+        assert!(!bearer.contains("eyJabc"), "{bearer}");
+        let url = redact("fetch https://bob:hunter2@example.test/x ok\n");
+        assert!(
+            !url.contains("hunter2") && url.contains("example.test/x ok"),
+            "{url}"
+        );
     }
 
     #[test]

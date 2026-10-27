@@ -913,6 +913,7 @@ fn concurrent_intent_answers_and_ledger_updates_are_not_lost() {
         kids.push(
             std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
                 .env("HOME", &home)
+                .env_remove("OMGS_HOME")
                 .args(["intent", "answer", "--target", target.to_str().unwrap()])
                 .args([
                     "--id",
@@ -1068,6 +1069,7 @@ fn batch_output_inside_the_targets_area_is_refused_before_cloning() {
     std::fs::write(dir.join("list.txt"), "https://github.com/a/b\n").unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("HOME", &home)
+        .env_remove("OMGS_HOME")
         .args([
             "batch",
             "init",
@@ -1093,6 +1095,7 @@ fn report_shows_only_reviewer_recorded_answers() {
     let run_cmd = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
             .env("HOME", &home)
+            .env_remove("OMGS_HOME")
             .args(args)
             .output()
             .unwrap()
@@ -1331,6 +1334,7 @@ fn batch_init_needs_an_empty_output_directory() {
     std::fs::write(dir.join("list.txt"), "https://github.com/a/b\n").unwrap();
     let res = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("HOME", &home)
+        .env_remove("OMGS_HOME")
         .args([
             "batch",
             "init",
@@ -1434,6 +1438,7 @@ fn concurrent_reviews_of_one_url_never_delete_each_others_clone() {
     let spawn = || {
         std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
             .env("HOME", &home)
+            .env_remove("OMGS_HOME")
             .env("PATH", &path)
             .args([
                 "review",
@@ -1537,6 +1542,7 @@ fn answer_stores_inside_the_target_are_never_trusted() {
     let run = dir.join("run");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("HOME", &home)
+        .env_remove("OMGS_HOME")
         .args(["audit", "init", "--target", target.to_str().unwrap()])
         .args(["--out", run.to_str().unwrap(), "--no-sensors"])
         .output()
@@ -1562,6 +1568,7 @@ fn answer_stores_inside_the_target_are_never_trusted() {
     .unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("HOME", &home2)
+        .env_remove("OMGS_HOME")
         .args(["intent", "answer", "--target", target2.to_str().unwrap()])
         .args([
             "--id",
@@ -1581,6 +1588,7 @@ fn answer_stores_inside_the_target_are_never_trusted() {
     let run2 = dir2.join("run");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("HOME", &home2)
+        .env_remove("OMGS_HOME")
         .args(["audit", "init", "--target", target2.to_str().unwrap()])
         .args(["--out", run2.to_str().unwrap(), "--no-sensors"])
         .output()
@@ -1602,6 +1610,7 @@ fn a_hardlinked_answer_store_is_never_trusted() {
     let run_omgs = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
             .env("HOME", &home)
+            .env_remove("OMGS_HOME")
             .args(args)
             .output()
             .unwrap()
@@ -1705,6 +1714,7 @@ fn a_reused_clone_matches_by_repository_identity_not_spelling() {
     std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let res = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("HOME", &home)
+        .env_remove("OMGS_HOME")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .args([
             "review",

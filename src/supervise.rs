@@ -919,16 +919,11 @@ pub fn run(mut cmd: Command, limits: &Limits, markers: Option<&SweepMarkers>) ->
         Some(markers) => sweep::run(markers, &mut result) && cleanup_complete,
         None => cleanup_complete,
     };
+    // The scope's exit status is the command's, so a failing proof test exits
+    // nonzero with the limits fully applied. Only systemd-run's own refusal
+    // to create the scope means they were not; it is checked once capture ends.
     #[cfg(target_os = "linux")]
-    if waited.status.is_some_and(|status| status.success()) {
-        result.enforced.extend(cgroups);
-    } else {
-        for control in cgroups {
-            result.notes.push(format!(
-                "{control} could not be confirmed: scope did not exit successfully"
-            ));
-        }
-    }
+    let pending_cgroups = cgroups;
     let drain = Instant::now();
     while capture.done != [true; 2] && drain.elapsed() < DRAIN {
         match rx.recv_timeout(DRAIN.saturating_sub(drain.elapsed()).min(POLL)) {
@@ -946,6 +941,18 @@ pub fn run(mut cmd: Command, limits: &Limits, markers: Option<&SweepMarkers>) ->
     }
     result.output_bytes_total = capture.total;
     result.output = capture.text();
+    #[cfg(target_os = "linux")]
+    if !pending_cgroups.is_empty() {
+        if result.output.contains("Failed to start transient scope") {
+            for control in pending_cgroups {
+                result.notes.push(format!(
+                    "{control} not applied: systemd-run could not start the scope"
+                ));
+            }
+        } else {
+            result.enforced.extend(pending_cgroups);
+        }
+    }
     result.cleanup_complete = cleanup_complete;
     result.success = result.exit_code == Some(0)
         && !result.timed_out

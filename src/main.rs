@@ -250,8 +250,28 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         Some(r) => Some(omgs::runmeta::read(r)?),
         None => None,
     };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let target = match &replay {
-        Some(r) => r.target.clone().map(PathBuf::from),
+        // A replay never takes a host path from the record: the target must be
+        // this run's own target, so an edited record cannot point it elsewhere.
+        Some(r) => match &r.target {
+            None => None,
+            Some(t) => {
+                let run_target = meta
+                    .as_ref()
+                    .and_then(|m| m.get("target").and_then(|v| v.as_str()))
+                    .ok_or(
+                        "--replay of a record with a target needs a run initialised against it",
+                    )?;
+                if canon(Path::new(t)) != canon(Path::new(run_target)) {
+                    return Err(format!(
+                        "{} names target {t}, not this run's target {run_target}; refusing to replay it",
+                        omgs::proof::reference(r.n)
+                    ));
+                }
+                Some(PathBuf::from(run_target))
+            }
+        },
         None => flag(args, "--target").map(PathBuf::from).or_else(|| {
             meta.as_ref()
                 .and_then(|m| m.get("target").and_then(|t| t.as_str()).map(PathBuf::from))
@@ -271,7 +291,13 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         (Some(_), Some(_)) => {
             return Err("--replay takes everything from the record; drop --test-from".into())
         }
-        (Some(r), None) => r.test_from.clone().map(PathBuf::from),
+        // The runner kept its own copy of the draft beside the record; the
+        // original path in the record is informational only.
+        (Some(r), None) => r.test_from.as_ref().map(|_| {
+            run.as_ref()
+                .map(|d| d.join("proofs").join(r.n.to_string()).join("test-draft"))
+                .unwrap_or_default()
+        }),
         (None, d) => d.map(PathBuf::from),
     };
     if draft.is_some() && test.is_none() {
@@ -310,12 +336,12 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         ),
         None => None,
     };
-    if let (Some(r), Some(now)) = (&replay, &test_sha256) {
-        if r.test_sha256.as_ref() != Some(now) {
-            eprintln!(
-                "note: the proof test changed since record {} was written",
-                r.n
-            );
+    if let Some(r) = &replay {
+        if r.test_sha256 != test_sha256 {
+            return Err(format!(
+                "the proof test differs from the one {} ran; refusing to replay a different test",
+                omgs::proof::reference(r.n)
+            ));
         }
     }
     if tier == Tier::LocalApp {
@@ -329,7 +355,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         if !omgs::approval::is_approved(&data_dir(), t)? {
             eprintln!("needs_validation: tier 2 runs a locally built app and needs a one-time human approval for {}.", t.display());
             eprintln!(
-                "A person (not an agent) runs: omgs approve --target {}",
+                "Ask the person you are working for to run, at their own terminal: omgs approve --target {}",
                 t.display()
             );
             return Err("__EXIT3__".into());
@@ -340,7 +366,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             // Check and charge the budget in one locked step, before anything
             // runs, so concurrent proofs cannot overspend it. A run that is
             // interrupted or blocked keeps its charge.
-            omgs::runmeta::update(r, |m| {
+            let charged = omgs::runmeta::update(r, |m| {
                 let used = |k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
                 let (calls, proofs) = (used("agent_calls_used"), used("proof_runs_used"));
                 if let Some(b) = m.get("budget_agent_calls").and_then(|v| v.as_u64()) {
@@ -352,7 +378,14 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
                 }
                 m.insert("proof_runs_used".into(), serde_json::json!(proofs + 1));
                 Ok(())
-            })?;
+            });
+            if let Err(e) = charged {
+                if e.starts_with("run budget exhausted") {
+                    eprintln!("needs_validation: target code was not executed. {e}");
+                    return Err("__EXIT3__".into());
+                }
+                return Err(e);
+            }
             Some(omgs::proof::reserve(r)?)
         }
         None => None,
@@ -365,17 +398,55 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             std::process::id()
         )),
     };
+    // Nothing ran: give the budget charge and the reserved number back.
+    let release = || {
+        if let (Some(r), Some((_, d))) = (&run, &proof_dir) {
+            let _ = std::fs::remove_dir_all(d);
+            let _ = omgs::runmeta::update(r, |m| {
+                let used = m
+                    .get("proof_runs_used")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
+                m.insert(
+                    "proof_runs_used".into(),
+                    serde_json::json!(used.saturating_sub(1)),
+                );
+                Ok(())
+            });
+        }
+    };
+    // Keep the runner's own copy of the draft beside the record and stage
+    // from it, so what ran is what was hashed and a replay never reads a host
+    // path out of the record.
+    let staged_draft = match &draft {
+        Some(d) => {
+            let copy = run_dir.join("test-draft");
+            let kept = std::fs::create_dir_all(&run_dir)
+                .and_then(|_| std::fs::copy(d, &copy).map(|_| ()))
+                .map_err(|e| e.to_string())
+                .and_then(|_| omgs::sha256::digest_file(&copy).map_err(|e| e.to_string()));
+            if kept.ok() != test_sha256 {
+                release();
+                return Err(format!("could not keep a verified copy of {}", d.display()));
+            }
+            Some(copy)
+        }
+        None => None,
+    };
     let request = ProveRequest {
         command: command.clone(),
         timeout_ms,
         target: target.clone(),
         run_dir: run_dir.clone(),
         tier,
-        stage: draft.clone().zip(test.clone()),
+        stage: staged_draft.zip(test.clone()),
     };
+    // Read before the copy, so the commit describes the tree that was copied.
+    let target_head = target.as_deref().and_then(omgs::proof::git_head);
     let started_at_ms = omgs::runmeta::now_ms();
     let result = match prove(&request) {
         ProveOutcome::Blocked { reason } => {
+            release();
             eprintln!("needs_validation: target code was not executed. {reason}");
             return Err("__EXIT3__".into());
         }
@@ -396,11 +467,12 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         },
         command,
         target: target.as_ref().map(|t| t.to_string_lossy().to_string()),
-        target_head: target.as_deref().and_then(omgs::proof::git_head),
+        target_head,
         started_at_ms,
         duration_ms: s.duration_ms,
         exit_code: s.exit_code,
-        timed_out: s.timed_out,
+        // MXC enforces the config timeout first and reports it as an error.
+        timed_out: s.timed_out || s.output.contains("script timed out after"),
         capture_complete: s.capture_complete,
         cleanup_complete: s.cleanup_complete,
         // MXC reports its own failures as a JSON error object on stderr.
@@ -619,8 +691,12 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         let _ = std::fs::remove_dir_all(&probe);
         if !out.contains(&inside) {
             println!(
-                "live check FAILED: the probe did not run (it could not read its own workspace)"
+                "live check FAILED: the probe did not run (it could not read its own workspace). Its output:"
             );
+            println!("{}", omgs::proof::redact(&out));
+            for g in &outcome.gaps {
+                println!("  note: {g}");
+            }
             return Err("__EXIT1__".into());
         }
         if out.contains(&outside) || outcome.run.exit_code == Some(0) {
@@ -630,6 +706,60 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             return Err("__EXIT1__".into());
         }
         println!("live check: the probe ran, read its workspace, and was denied a file outside it");
+        println!("applied on that run:");
+        for e in &outcome.enforced {
+            println!("  {e}");
+        }
+        for g in &outcome.gaps {
+            println!("  not enforced: {g}");
+        }
+        // A toolchain on the host PATH may still be out of reach inside, for
+        // example under a version manager in the home directory.
+        let names: Vec<&str> = tools.iter().map(|t| t.as_str()).collect();
+        let cmd = if os == "windows" {
+            format!(
+                "cmd.exe /d /c for %t in ({}) do @where %t >nul 2>&1 && echo omgs-reach %t",
+                names.join(" ")
+            )
+        } else {
+            format!(
+                "for t in {}; do command -v $t >/dev/null 2>&1 && echo omgs-reach $t; done; exit 0",
+                names.join(" ")
+            )
+        };
+        let reach = ProveRequest {
+            command: cmd,
+            timeout_ms: 30_000,
+            target: None,
+            run_dir: probe.join("reach"),
+            tier: Tier::Test,
+            stage: None,
+        };
+        if let ProveOutcome::Ran(r) = prove(&reach) {
+            let found = |n: &str| {
+                r.run
+                    .output
+                    .lines()
+                    .any(|l| l.trim() == format!("omgs-reach {n}"))
+            };
+            let (inside, outside): (Vec<&str>, Vec<&str>) =
+                names.iter().copied().partition(|n| found(n));
+            println!(
+                "toolchains reachable inside the sandbox: {}",
+                if inside.is_empty() {
+                    "none".into()
+                } else {
+                    inside.join(", ")
+                }
+            );
+            if !outside.is_empty() {
+                println!(
+                    "on PATH here but NOT reachable inside the sandbox: {} (proofs that need them fail; install them system wide)",
+                    outside.join(", ")
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&probe);
     }
     Ok(())
 }
