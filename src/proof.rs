@@ -432,7 +432,7 @@ fn config_evidence(run: &Path, record: &ProofRecord, config: &serde_json::Value)
     if config
         .pointer("/process/cwd")
         .and_then(|v| v.as_str())
-        .map(&norm)
+        .map(norm)
         != Some(workspace.clone())
     {
         errors.push("MXC config cwd must be this proof's proofs/<n>/workspace".into());
@@ -451,7 +451,7 @@ fn config_evidence(run: &Path, record: &ProofRecord, config: &serde_json::Value)
             || ![&workspace, &scratch].iter().all(|want| {
                 paths
                     .iter()
-                    .any(|p| p.as_str().map(&norm).as_ref() == Some(*want))
+                    .any(|p| p.as_str().map(norm).as_ref() == Some(*want))
             })
     }) {
         errors.push(
