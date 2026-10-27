@@ -87,15 +87,15 @@ an intra-target hardlink pair, an 8 MiB file, symlinked executor and test paths,
 and prompt FIFO and device refusal. Symlink destinations are disclosed.
 
 Credential flag components are redacted in output, saved command displays and
-survivor lines. Every CLI subcommand rejects unknown and duplicate options
-before mutation, preserving the documented repeatable evidence and counter
+survivor lines, including quoted flags and single-dash long names. Every CLI
+subcommand rejects unknown and duplicate options before mutation, preserving the documented repeatable evidence and counter
 options. Shell operators delimit unquoted test names. Validation requires
 bubblewrap for local-app records, forbids proof references on traced findings,
 and avoids a test-name diagnostic after a missing or altered saved command.
 
 Unix proof directories are 0700 and exact command and config artifacts are
-0600. Unix signal guards cover preparation through execution; interrupted preparation
-removes the proof directory and releases a charged reservation. Tests exercise
+0600. Unix signal guards cover preparation through execution; interrupted
+preparation removes the proof directory and releases a charged reservation. Tests exercise
 SIGINT, SIGTERM and SIGHUP before and after executor launch. Denial tests create
 their home probe directly in the real home, with a scoped skip if unwritable.
 Forged readable roots and extended Windows UNC proof directories have regression

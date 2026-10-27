@@ -875,8 +875,15 @@ fn redact_line(line: &str, lower: &str) -> String {
                 })
                 .map(|j| after + j + 1)
         })
-        .chain(lower.match_indices("--").filter_map(|(i, _)| {
-            let start = i + 2;
+        .chain(lower.match_indices('-').filter_map(|(i, _)| {
+            if lower[..i]
+                .chars()
+                .next_back()
+                .is_some_and(|c| !c.is_whitespace() && !"\"';&|()<>".contains(c))
+            {
+                return None;
+            }
+            let start = i + lower[i..].bytes().take_while(|b| *b == b'-').count();
             let end = lower[start..]
                 .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
                 .map(|n| start + n)
@@ -889,9 +896,11 @@ fn redact_line(line: &str, lower: &str) -> String {
                     .windows(keyword.len())
                     .any(|parts| parts == keyword)
             });
-            let next = lower.as_bytes().get(end)?;
+            let separator =
+                end + usize::from(matches!(lower.as_bytes().get(end), Some(b'\'' | b'"')));
+            let next = lower.as_bytes().get(separator)?;
             (sensitive && (*next == b'=' || next.is_ascii_whitespace()))
-                .then_some(end + usize::from(*next == b'='))
+                .then_some(separator + usize::from(*next == b'='))
         }))
         .chain(lower.find("bearer ").map(|i| i + "bearer ".len()))
         .min();
@@ -938,6 +947,10 @@ mod tests {
     #[test]
     fn credential_flag_components_are_redacted() {
         for flag in [
+            "-access-token",
+            "-client_secret",
+            "\"--access-token\"",
+            "'--client_secret'",
             "--access-token",
             "--secret-key",
             "--client_secret",

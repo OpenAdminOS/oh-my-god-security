@@ -9,13 +9,14 @@ content reads for executor, test and snapshot hashes. Content accepts hardlinks
 and symlinks to regular files; snapshot hashing has no size cap. Target FIFOs,
 sockets and devices are refused before copying. Linux workspace copies break
 hardlink relationships. Snapshots include all `.git` content. Validation accepts
-executor names by their pinned digest and checks the full saved configuration with recorded readable roots and exact
-environment values. Replay requires the recorded timeout. Traced findings must
-omit proof references, and local-app proof records require Linux bubblewrap containment. Missing or altered commands produce one diagnostic.
+executor names by their pinned digest and checks the full saved configuration
+with recorded readable roots and exact environment values. Replay requires the recorded timeout. Traced findings must
+omit proof references, and local-app proof records require Linux bubblewrap
+containment. Missing or altered commands produce one diagnostic.
 
 Proof records redact commands and survivor command lines, including credential
-components in hyphenated and underscored flags. CLI commands reject unknown and
-duplicate options before any budget charge, except documented repeatable options.
+components in hyphenated and underscored flags, including quoted flags and
+single-dash long names. CLI commands reject unknown and duplicate options before any budget charge, except documented repeatable options.
 Shell operators delimit unquoted proof-test tokens. Exact command and
 config artifacts remain available for replay and must be protected. On Unix,
 proof directories are 0700 and command and config files are 0600. Executable
