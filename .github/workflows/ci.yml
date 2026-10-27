@@ -6,7 +6,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, feat/pr1b-followups]
 
 permissions:
   contents: read
@@ -68,6 +68,13 @@ jobs:
           chmod +x "$exe"
           # omgs checks the executor's own SHA-256 against its pin before use.
           echo "OMGS_MXC_EXEC=$exe" >> "$GITHUB_ENV"
+      - name: MXC CLI capabilities
+        shell: bash
+        run: |
+          "$OMGS_MXC_EXEC" --help
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            "$OMGS_MXC_EXEC" --probe
+          fi
       - name: Doctor
         shell: bash
         run: cargo run --locked -q -- doctor --live
