@@ -18,6 +18,15 @@ echo NESTED_DIR
 dir tests\security
 echo NESTED_READ
 type tests\security\nested.cmd
+echo FINDSTR_RELATIVE
+findstr /m vulnerable check.txt >nul
+echo FINDSTR_EXIT=%errorlevel%
+echo FINDSTR_ABSOLUTE
+%SYSTEMROOT%\System32\findstr.exe /m vulnerable check.txt >nul
+echo FINDSTR_ABSOLUTE_EXIT=%errorlevel%
+echo FINDSTR_PIPE
+type check.txt | findstr vulnerable
+echo FINDSTR_PIPE_EXIT=%errorlevel%
 echo ROOT_EXEC
 cmd.exe /d /c root.cmd
 echo ROOT_EXIT=%errorlevel%
