@@ -6,7 +6,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main, feat/pr1b-followups]
+    branches: [main]
 
 permissions:
   contents: read
