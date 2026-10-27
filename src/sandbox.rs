@@ -4,6 +4,9 @@
 //! Target code never runs anywhere else: without a verified executor OMGS
 //! refuses and the finding stays at the tier it already earned.
 
+mod preflight;
+pub use preflight::{windows_build_report, windows_probe};
+
 use crate::platform::mxc_path;
 use crate::{platform, sha256, supervise};
 use std::path::{Path, PathBuf};
@@ -734,10 +737,25 @@ const MAX_SPECIAL_PATHS: usize = 20;
 
 fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
     let mut gaps = Vec::new();
-    let mut specials = 0;
+    let mut special_paths = Vec::new();
+    let mut links = Vec::new();
     let mut outside_links = 0;
     let root = std::fs::canonicalize(src).map_err(|e| e.to_string())?;
-    inspect_target(&root, &root, &mut gaps, &mut specials, &mut outside_links)?;
+    inspect_target(
+        &root,
+        &root,
+        &mut special_paths,
+        &mut links,
+        &mut outside_links,
+    )?;
+    special_paths.sort();
+    let specials = special_paths.len();
+    gaps.extend(
+        special_paths
+            .iter()
+            .take(MAX_SPECIAL_PATHS)
+            .map(|path| format!("skipped target socket or FIFO: {}", path.display())),
+    );
     if specials > MAX_SPECIAL_PATHS {
         gaps.push(format!(
             "skipped {} additional target sockets or FIFOs",
@@ -790,6 +808,7 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
             Err(_) => false,
         };
         if ok {
+            record_live_links(&root, dst, &links, &mut gaps);
             return Ok(gaps);
         }
         // A partial clone must not be mixed with the next attempt.
@@ -798,14 +817,15 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
     }
     let roots = (root, dst.to_path_buf());
     copy_recursive(src, dst, &roots)?;
+    record_live_links(&roots.0, dst, &links, &mut gaps);
     Ok(gaps)
 }
 
 fn inspect_target(
     root: &Path,
     dir: &Path,
-    gaps: &mut Vec<String>,
-    specials: &mut usize,
+    specials: &mut Vec<PathBuf>,
+    links: &mut Vec<PathBuf>,
     outside_links: &mut usize,
 ) -> Result<(), String> {
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
@@ -813,25 +833,28 @@ fn inspect_target(
         let entry = entry.map_err(|e| e.to_string())?;
         let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
         if platform::is_link(&meta) {
+            links.push(
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|e| e.to_string())?
+                    .to_path_buf(),
+            );
             if !std::fs::canonicalize(entry.path()).is_ok_and(|p| p.starts_with(root)) {
                 *outside_links += 1;
             }
             continue;
         }
         if meta.is_dir() {
-            inspect_target(root, &entry.path(), gaps, specials, outside_links)?;
+            inspect_target(root, &entry.path(), specials, links, outside_links)?;
         } else if platform::contentless(&meta) {
-            *specials += 1;
-            if *specials <= MAX_SPECIAL_PATHS {
-                gaps.push(format!(
-                    "skipped target socket or FIFO: {}",
-                    entry
-                        .path()
-                        .strip_prefix(root)
-                        .map_err(|e| e.to_string())?
-                        .display()
-                ));
-            }
+            specials.push(
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|e| e.to_string())?
+                    .to_path_buf(),
+            );
         } else if !meta.is_file() {
             return Err(format!(
                 "unsupported target file type at {}; devices are refused",
@@ -840,6 +863,22 @@ fn inspect_target(
         }
     }
     Ok(())
+}
+
+fn record_live_links(root: &Path, dst: &Path, links: &[PathBuf], gaps: &mut Vec<String>) {
+    if cfg!(unix) {
+        let mut live: Vec<_> = links
+            .iter()
+            .filter(|rel| std::fs::canonicalize(dst.join(rel)).is_ok_and(|p| p.starts_with(root)))
+            .collect();
+        live.sort();
+        for rel in live {
+            gaps.push(format!(
+                "target link reaches live target from workspace: {}",
+                rel.display()
+            ));
+        }
+    }
 }
 
 /// `roots` is (canonical source root, destination root) of the whole copy.
@@ -1245,6 +1284,18 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         Ok(staged) => staged,
         Err(reason) => return blocked(reason),
     };
+    let (list_parents, probe_fallback, windows_notes) = if os == "windows" {
+        match preflight::windows_policy(windows_probe(&executor)) {
+            Ok(policy) => policy,
+            Err(reason) => return blocked(reason),
+        }
+    } else {
+        (false, false, Vec::new())
+    };
+    extra_gaps.extend(windows_notes);
+    if os == "windows" {
+        extra_gaps.push(windows_build_report());
+    }
     let mut input = ConfigInput {
         os,
         containment: located.executor.containment,
@@ -1256,7 +1307,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         readonly,
         denied,
         rust,
-        list_parents: true,
+        list_parents,
     };
     if let Err(e) = supervise::check_interrupted() {
         return blocked(e.to_string());
@@ -1288,28 +1339,28 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         if let Err(e) = crate::runmeta::write_atomic_bytes(&config_path, config_text.as_bytes()) {
             return blocked(format!("failed to write MXC config: {e}"));
         }
-        let mut cmd = Command::new(&executor);
-        cmd.arg("--config").arg(&config_path);
-        cmd.env_clear();
-        if os == "windows" {
-            for k in [
-                "SYSTEMROOT",
-                "WINDIR",
-                "TEMP",
-                "TMP",
-                "USERPROFILE",
-                "LOCALAPPDATA",
-            ] {
-                if let Some(v) = std::env::var_os(k) {
-                    cmd.env(k, v);
-                }
-            }
+        let validation = preflight::dry_run(&executor, &config_path, &run_dir);
+        if probe_fallback
+            && !validation.success
+            && input.list_parents
+            && retry_without_enumeration(os, &validation)
+        {
+            input.list_parents = false;
+            extra_gaps.push(
+                "Windows enumeration fallback: dry-run refusal; retry without enumeratePaths"
+                    .into(),
+            );
+            extra_gaps.push(preflight::enumeration_gap());
+            continue;
         }
-        cmd.current_dir(&run_dir);
+        if let Err(reason) = preflight::dry_run_result(&validation) {
+            return blocked(reason);
+        }
+        let cmd = preflight::workload_command(&executor, &config_path, &run_dir);
         let run = supervise::run_marked(cmd, &limits, markers.as_ref(), &nonce);
         // MXC rejects the policy before starting anything, so nothing ran and
         // retrying without the setting is safe.
-        if input.list_parents && retry_without_enumeration(os, &run) {
+        if probe_fallback && input.list_parents && retry_without_enumeration(os, &run) {
             for dir in [&workspace, &scratch] {
                 if let Err(e) = std::fs::remove_dir_all(dir) {
                     return blocked(format!("cannot reset retry workspace: {e}"));
@@ -1329,7 +1380,11 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             extra_gaps.extend(retry_gaps);
             input.rust = rust;
             input.list_parents = false;
-            extra_gaps.push("this Windows version refuses parent directory enumeration; relative nested file access is supported, but directory listing, absolute path resolution and NUL device redirection may fail; denied CMD redirection can retain exit 0".to_string());
+            extra_gaps.push(
+                "Windows enumeration fallback: executor refusal; retry without enumeratePaths"
+                    .into(),
+            );
+            extra_gaps.push(preflight::enumeration_gap());
             continue;
         }
         break (config_text, run);
@@ -1354,6 +1409,8 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             .push("named proof test readability was not established inside the sandbox".into());
     }
     let (mut enforced, mut gaps) = declared_controls(os, req.tier);
+    enforced
+        .push("MXC configuration accepted by executor --dry-run before workload execution".into());
     enforced.extend(run.enforced.iter().cloned());
     gaps.extend(extra_gaps);
     for note in &run.notes {
@@ -1519,7 +1576,7 @@ mod tests {
         let socket = std::os::unix::net::UnixListener::bind(src.join("socket")).unwrap();
         let special_copy = d.join("special-copy");
         let gaps = copy_tree_with_gaps(&src, &special_copy).unwrap();
-        assert_eq!(gaps.len(), 3);
+        assert_eq!(gaps.len(), 4);
         assert!(
             gaps.iter().any(|g| g.starts_with("2 target link(s)")),
             "{gaps:?}"
@@ -1558,12 +1615,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn copied_absolute_reentering_and_chained_links_disclose_live_target_access() {
+        use std::os::unix::fs::symlink;
+        let d = std::env::temp_dir().join(format!("omgs-live-links-{}", std::process::id()));
+        let src = d.join("target");
+        std::fs::create_dir_all(&src).unwrap();
+        let src = std::fs::canonicalize(src).unwrap();
+        std::fs::write(src.join("file"), "original").unwrap();
+        symlink(src.join("file"), src.join("absolute")).unwrap();
+        symlink("../target/file", src.join("reenter")).unwrap();
+        symlink("absolute", src.join("chain")).unwrap();
+        symlink("file", src.join("internal")).unwrap();
+        for fallback in [false, true] {
+            if fallback {
+                use std::os::unix::ffi::OsStrExt;
+                let name = std::ffi::CString::new(src.join("pipe").as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            let dst = d.join(format!("copy-{fallback}"));
+            let gaps = copy_tree_with_gaps(&src, &dst).unwrap();
+            for link in ["absolute", "reenter", "chain"] {
+                assert!(
+                    gaps.contains(&format!(
+                        "target link reaches live target from workspace: {link}"
+                    )),
+                    "{gaps:?}"
+                );
+                assert_eq!(
+                    std::fs::canonicalize(dst.join(link)).unwrap(),
+                    src.join("file")
+                );
+            }
+            assert!(!gaps.iter().any(|g| g.ends_with(": internal")));
+        }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn special_file_gaps_list_twenty_paths_then_the_remaining_count() {
         use std::os::unix::ffi::OsStrExt;
         let d = std::env::temp_dir().join(format!("omgs-gap-cap-{}", std::process::id()));
         let src = d.join("target");
         std::fs::create_dir_all(&src).unwrap();
-        for n in 0..27 {
+        for n in (0..27).rev() {
             let path = src.join(format!("pipe-{n}"));
             let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
             assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
@@ -1573,6 +1668,11 @@ mod tests {
         assert!(gaps[..20]
             .iter()
             .all(|g| g.starts_with("skipped target socket or FIFO: pipe-")));
+        let mut expected: Vec<_> = (0..27)
+            .map(|n| format!("skipped target socket or FIFO: pipe-{n}"))
+            .collect();
+        expected.sort();
+        assert_eq!(gaps[..20], expected[..20]);
         assert_eq!(gaps[20], "skipped 7 additional target sockets or FIFOs");
         assert_eq!(std::fs::read_dir(d.join("copy")).unwrap().count(), 0);
         std::fs::remove_dir_all(d).unwrap();

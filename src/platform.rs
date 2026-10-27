@@ -346,3 +346,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+/// Keep gap diagnostics on one line without terminal control sequences.
+pub fn escape_controls(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    #[test]
+    fn gap_controls_are_escaped_without_changing_printable_paths() {
+        assert_eq!(
+            super::escape_controls("a\nb\r\t\u{1b}[31m café"),
+            "a\\nb\\r\\t\\u{1b}[31m café"
+        );
+    }
+}

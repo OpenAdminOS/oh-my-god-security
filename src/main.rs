@@ -57,7 +57,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--hunter <id>] [--verifier <id>]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--hunter <id>] [--verifier <id>]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -737,7 +737,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         eprintln!("  enforced: {e}");
     }
     for g in &result.gaps {
-        eprintln!("  not enforced: {g}");
+        eprintln!("  not enforced: {}", omgs::platform::escape_controls(g));
     }
     for v in &s.survivors {
         eprintln!(
@@ -855,6 +855,9 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         std::env::consts::ARCH
     );
     println!("data directory: {}", data_dir().display());
+    if os == "windows" {
+        println!("{}", omgs::sandbox::windows_build_report());
+    }
     let ready = match omgs::sandbox::locate_executor() {
         Ok(l) => {
             println!(
@@ -863,6 +866,21 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
                 l.path.display(),
                 l.executor.containment
             );
+            if os == "windows" {
+                match omgs::sandbox::windows_probe(&l.path) {
+                    Ok(p) => {
+                        for note in p.notes() {
+                            println!("{}", omgs::platform::escape_controls(&note));
+                        }
+                        if let Err(reason) = p.require_process() {
+                            println!("sandbox: not ready. {reason}");
+                            return Err("__EXIT1__".into());
+                        }
+                    }
+                    Err(e) => println!("{}", omgs::platform::escape_controls(&format!(
+                        "Windows capability probe unavailable; proofs use guarded enumeration fallback: {e}"))),
+                }
+            }
             true
         }
         Err(e) => {
@@ -886,7 +904,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         println!("  {e}");
     }
     for g in &gaps {
-        println!("  not enforced: {g}");
+        println!("  not enforced: {}", omgs::platform::escape_controls(g));
     }
     if let Some(why) = omgs::sandbox::tier2_unavailable(os) {
         println!("{why}");
@@ -994,7 +1012,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             );
             println!("{}", omgs::proof::redact(&out));
             for g in &outcome.gaps {
-                println!("  note: {g}");
+                println!("  note: {}", omgs::platform::escape_controls(g));
             }
             return Err("__EXIT1__".into());
         }
@@ -1018,7 +1036,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             println!("  {e}");
         }
         for g in &outcome.gaps {
-            println!("  not enforced: {g}");
+            println!("  not enforced: {}", omgs::platform::escape_controls(g));
         }
         // A toolchain on the host PATH may still be out of reach inside, for
         // example under a version manager in the home directory.
@@ -2580,6 +2598,8 @@ mod cli_tests {
                 format!("{known}=5000"),
                 format!("{known}=5000 extra text"),
                 "--help".into(),
+                "-h".into(),
+                "--help=anything".into(),
             ] {
                 let mut args = Vec::new();
                 if !sub.is_empty() {
@@ -2767,6 +2787,9 @@ mod cli_tests {
                         "skill",
                         "release",
                         "ignore-missing",
+                        "dry-run",
+                        "config",
+                        "probe",
                         "version",
                         "opt",
                     ]

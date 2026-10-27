@@ -34,11 +34,27 @@ shares the host loopback in both directions, and Windows blocks loopback inside 
 
 ## PR 1b: follow-ups from the final PR 1 review (before release)
 
-- [ ] Redaction: carry quote state forward in one pass (no quadratic rescans on long lines)
-- [ ] Record absolute or re-entering symlinks that point back into the live target as a gap
-- [ ] Sort skipped special files before listing; escape control characters in printed gap paths
-- [ ] Usage text and README: say `--help`, `-h` and `--help=` are refused as free-text values
-- [ ] Refresh the copy and digest notes in this file to match skipped FIFOs and sockets
+- [x] Redaction: carry quote state forward in one pass (no quadratic rescans on long lines)
+- [x] Record absolute or re-entering symlinks that point back into the live target as a gap
+- [x] Sort skipped special files before listing; escape control characters in printed gap paths
+- [x] Usage text and README: say `--help`, `-h` and `--help=` are refused as free-text values
+- [x] Refresh the copy and digest notes in this file to match skipped FIFOs and sockets
+- [x] Test-name check: split only on shell delimiters, like the redaction fix (gate R9-N1)
+- [x] Windows: use `wxc-exec --probe` for capabilities (enumeratePaths, deny paths, tier) instead of run-and-retry; show the tier in doctor and records
+- [x] Validate every config with the executor's `--dry-run` before running, so a rejected config is reported as such
+- [x] doctor: check the Windows build against MXC's published minimum builds and say when a feature is unavailable
+- [x] README: link Microsoft's MXC docs where it explains why proofs run in a sandbox
+
+Decided 2026-10-27: the four MXC items above are in 0.1; Windows Learning Mode capture is not.
+
+PR 1b local verification: macOS passed fmt, Clippy with warnings denied and all
+221 tests; Lima Ubuntu arm64 passed all 217 tests; Windows 11 x64 passed all
+189 tests. All three pinned executors accepted valid dry-runs, rejected invalid
+configs without starting a workload, and passed the live doctor check. The Lima
+host has no rustfmt; no toolchain components were installed. Windows 11 reported
+build 10.0.26200.9711 and base-container probe capabilities, including enumeration.
+The five push CI jobs, including windows-2025 through Test, remain the head check;
+parent-owned full-diff reviews and PR creation are separate from this implementation.
 
 ## PR 2: role briefs, stacks and packs (`feat/role-briefs-packs`)
 
@@ -90,9 +106,10 @@ The updated branch adds Rust 1.89.0 build and test coverage as a fifth job.
 Content hashing now accepts regular content through symlinks and hardlinks,
 without a snapshot size cap. Small trust files keep bounded, single-link,
 no-follow reads. Linux copies break hardlink relationships. Copy and digest
-both refuse target FIFOs, sockets and devices. Regression coverage includes
+both skip target FIFOs and sockets; copy records their sorted paths as gaps (first
+20, then a remaining count). Both refuse devices before reading them. Regression coverage includes
 an intra-target hardlink pair, an 8 MiB file, symlinked executor and test paths,
-and prompt FIFO and device refusal. Symlink destinations are disclosed.
+and prompt FIFO skipping and device refusal. Symlink destinations are disclosed.
 
 Credential flag components are redacted in output, saved command displays and
 survivor lines, including quoted flags and single-dash long names. Every CLI

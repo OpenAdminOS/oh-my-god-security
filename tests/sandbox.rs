@@ -1846,3 +1846,82 @@ fn symlink_proofs_replay_when_sockets_appear_or_disappear() {
     }
     std::fs::remove_dir_all(d).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn gap_paths_escape_terminal_controls_but_records_keep_the_path() {
+    use std::os::unix::ffi::OsStrExt;
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("gap-controls");
+    let target = d.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let name = "pipe\nforged\r\t\u{1b}[31m";
+    let fifo = std::ffi::CString::new(target.join(name).as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let out = omgs(
+        &d.join("home"),
+        &[
+            "prove",
+            "--target",
+            target.to_str().unwrap(),
+            "--cmd",
+            "echo ran",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains(name));
+    assert!(
+        stderr.contains("pipe\\nforged\\r\\t\\u{1b}[31m"),
+        "{stderr}"
+    );
+    let record = record_from(&text(&out));
+    assert!(record["gaps"].as_array().unwrap().iter().any(|g| {
+        g.as_str() == Some(format!("skipped target socket or FIFO: {name}").as_str())
+    }));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_records_bind_probe_selection_to_the_saved_config() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("windows-probe-config");
+    let out = omgs(&d.join("home"), &["prove", "--cmd", "echo ran"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let record = record_from(&text(&out));
+    let gaps: Vec<_> = record["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g.as_str().unwrap())
+        .collect();
+    assert!(gaps.iter().any(|g| g.starts_with("Windows OS build")));
+    let probe =
+        omgs::sandbox::windows_probe(&omgs::sandbox::locate_executor().unwrap().path).unwrap();
+    assert!(gaps
+        .iter()
+        .any(|g| g.contains("Windows capability selection: probe;")));
+    assert!(gaps
+        .iter()
+        .any(|g| g.contains(&format!("tier={}", probe.tier))));
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(Path::new(record["proof_dir"].as_str().unwrap()).join("mxc-config.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        !config["processContainer"]["filesystem"]["enumeratePaths"].is_null(),
+        probe.probes.base_container_supports_enumerate_paths
+    );
+    assert!(record["enforced"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e.as_str().unwrap().contains("--dry-run")));
+    std::fs::remove_dir_all(d).unwrap();
+}

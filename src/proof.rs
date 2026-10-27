@@ -327,7 +327,7 @@ pub fn command_names(command: &str, test: &str) -> bool {
             quote = None;
         } else if quote.is_none() && (c == '\'' || c == '"') {
             quote = Some(c);
-        } else if quote.is_none() && (c.is_whitespace() || ";&|()<>".contains(c)) {
+        } else if quote.is_none() && (c == ' ' || c == '\t' || ";&|()<>".contains(c)) {
             tokens.push(std::mem::take(&mut token));
         } else {
             token.push(c);
@@ -876,6 +876,7 @@ fn redact_line(line: &str, lower: &str) -> String {
         })
     };
     let mut masks = Vec::new();
+    let mut quotes = QuoteCursor::default();
     let mut i = 0;
     while i < lower.len() {
         let name_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
@@ -932,7 +933,7 @@ fn redact_line(line: &str, lower: &str) -> String {
             if !assigned && lower[value..].starts_with("--") {
                 continue;
             }
-            let (end, replacement) = value_mask(&line, value);
+            let (end, replacement) = value_mask(&line, value, quotes.at(&line, value));
             if end > value {
                 masks.push((value, end, replacement));
                 i = end;
@@ -947,10 +948,16 @@ fn redact_line(line: &str, lower: &str) -> String {
             break;
         }
     }
+    let mut quotes = QuoteCursor::default();
+    let mut masked_until = 0;
     for (at, _) in lower.match_indices("bearer ") {
+        if at < masked_until {
+            continue;
+        }
         let start = at + "bearer ".len();
         if !lower[start..].starts_with("[omgs redacted]") {
-            let (end, replacement) = value_mask(&line, start);
+            let (end, replacement) = value_mask(&line, start, quotes.at(&line, start));
+            masked_until = end;
             masks.push((start, end, replacement));
         }
     }
@@ -970,8 +977,7 @@ fn redact_line(line: &str, lower: &str) -> String {
 }
 
 /// One shell token, preserving a quote opened before the value.
-fn value_mask(line: &str, start: usize) -> (usize, &'static str) {
-    let mut quote = quote_at(line, start);
+fn value_mask(line: &str, start: usize, mut quote: Option<char>) -> (usize, &'static str) {
     let replacement = match quote {
         Some('\'') => "[omgs redacted]'",
         Some('"') => "[omgs redacted]\"",
@@ -1001,27 +1007,61 @@ fn value_mask(line: &str, start: usize) -> (usize, &'static str) {
     (end, replacement)
 }
 
-/// A value can start inside a quote that opened before the flag name.
-fn quote_at(line: &str, at: usize) -> Option<char> {
-    let mut quote = None;
-    let mut escaped = false;
-    for c in line[..at].chars() {
-        if escaped {
-            escaped = false;
-        } else if c == '\\' && quote != Some('\'') {
-            escaped = true;
-        } else if quote == Some(c) {
-            quote = None;
-        } else if quote.is_none() && matches!(c, '\'' | '"') {
-            quote = Some(c);
+/// Carry shell quote state forward; each prefix is consumed only once.
+#[derive(Default)]
+struct QuoteCursor {
+    pos: usize,
+    quote: Option<char>,
+    escaped: bool,
+}
+
+impl QuoteCursor {
+    fn at(&mut self, line: &str, at: usize) -> Option<char> {
+        for c in line[self.pos..at].chars() {
+            if self.escaped {
+                self.escaped = false;
+            } else if c == '\\' && self.quote != Some('\'') {
+                self.escaped = true;
+            } else if self.quote == Some(c) {
+                self.quote = None;
+            } else if self.quote.is_none() && matches!(c, '\'' | '"') {
+                self.quote = Some(c);
+            }
         }
+        self.pos = at;
+        self.quote
     }
-    quote
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_credential_lines_have_bounded_redaction_time() {
+        let line = "tool \"--password=hidden value\" Bearer secret ".repeat(30_000);
+        let started = std::time::Instant::now();
+        let masked = redact(&line);
+        assert!(!masked.contains("hidden") && !masked.contains("secret"));
+        assert_eq!(redact(&masked), masked);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn unicode_whitespace_stays_in_unquoted_test_arguments() {
+        for sep in ['\u{a0}', '\u{2003}'] {
+            let test = format!("tests/a{sep}b.sh");
+            assert!(command_names(&format!("sh {test}"), &test));
+            assert!(!command_names(
+                &format!("sh prefix{sep}tests/check.sh"),
+                "tests/check.sh"
+            ));
+            assert!(!command_names(
+                &format!("sh tests/check.sh{sep}suffix"),
+                "tests/check.sh"
+            ));
+        }
+    }
 
     #[test]
     fn credential_values_end_only_at_shell_delimiters_or_the_line_end() {
