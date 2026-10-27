@@ -58,34 +58,43 @@ const TERM_GRACE: Duration = Duration::from_millis(150);
 const DRAIN: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
-mod interruption {
+pub mod interruption {
     use super::*;
     use std::sync::atomic::AtomicI32;
     use std::sync::{Mutex, MutexGuard};
 
     static SIGNAL: AtomicI32 = AtomicI32::new(0);
     static LOCK: Mutex<()> = Mutex::new(());
+    thread_local! { static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
     extern "C" fn handler(number: libc::c_int) {
         SIGNAL.store(number, Ordering::Relaxed);
     }
 
-    pub(super) fn pending() -> bool {
-        SIGNAL.load(Ordering::Relaxed) != 0
+    pub fn pending() -> bool {
+        DEPTH.with(|d| d.get() != 0) && SIGNAL.load(Ordering::Relaxed) != 0
     }
 
-    pub(super) struct Guard {
+    pub struct Guard {
         previous: Vec<(libc::c_int, libc::sigaction)>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: Option<MutexGuard<'static, ()>>,
     }
 
     impl Guard {
-        pub(super) fn install() -> io::Result<Self> {
+        pub fn install() -> io::Result<Self> {
+            if DEPTH.with(|d| d.get() != 0) {
+                DEPTH.with(|d| d.set(d.get() + 1));
+                return Ok(Self {
+                    previous: Vec::new(),
+                    _lock: None,
+                });
+            }
             let lock = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
             let mut guard = Self {
                 previous: Vec::new(),
-                _lock: lock,
+                _lock: Some(lock),
             };
+            DEPTH.with(|d| d.set(1));
             SIGNAL.store(0, Ordering::Relaxed);
             for number in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
                 // SAFETY: zero is a valid initial sigaction before its fields are set.
@@ -107,12 +116,25 @@ mod interruption {
 
     impl Drop for Guard {
         fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get() - 1));
             for (number, old) in &self.previous {
                 // SAFETY: old is the saved action for this signal, protected by LOCK.
                 unsafe { libc::sigaction(*number, old, std::ptr::null_mut()) };
             }
         }
     }
+}
+
+/// Preparation loops cooperate with the same guard as executor supervision.
+pub fn check_interrupted() -> io::Result<()> {
+    #[cfg(unix)]
+    if interruption::pending() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "proof interrupted before execution",
+        ));
+    }
+    Ok(())
 }
 
 enum Message {

@@ -33,11 +33,14 @@ pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut n = 0u32;
     let (tmp, mut file) = loop {
         let tmp = path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&tmp) {
             Ok(f) => break (tmp, f),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => n += 1,
             Err(e) => return Err(e),

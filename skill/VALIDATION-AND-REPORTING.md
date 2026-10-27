@@ -10,7 +10,7 @@ Reject a candidate only with concrete counterevidence that defeats the claimed r
 
 | Tier | Machine value | Evidence and verdict |
 | --- | --- | --- |
-| 0 | `traced` | Complete input-to-sink trace and claimed boundary violation. Candidate only; never confirmed. |
+| 0 | `traced` | Complete input-to-sink trace and claimed boundary violation. Candidate only; never confirmed. Omit `proof_ref` and keep the source trace in `evidence`. |
 | 1 | `test_proven` | A security invariant test fails because the real target path permits the unauthorized effect, inside `omgs prove`, under the project's own test runner or, when that runner cannot run in the sandbox, an equivalent harness that compiles and exercises the unmodified target code and asserts the same invariant. Decisive evidence earns confirmed. |
 | 2 | `sandbox_exploited` | Sandbox verified against a locally built copy of the app on synthetic data. Use only when a test cannot decide, after human approval of the first tier 2 run per repository. |
 
@@ -30,6 +30,8 @@ Do not rely on the sandbox to contain daemon-mediated effects. Under MXC on macO
 4. Assert the minimum decisive effect: response contents for a read, unchanged synthetic state for a denied write, or no privileged effect for an invalid event. A status code alone is insufficient when a mutation could occur before the response.
 5. Submit the test and exact runner invocation to `omgs prove`. Run test discovery, setup, builds, and prerequisites only there. No installs, downloads, remote credentials, or external endpoints. Record runner exit, assertion output, authorized control, observed effect, backend/policy/limits, and source identity.
 6. Confirm only when the invariant fails for the claimed security reason. Syntax errors, missing modules, unrelated assertions, and all-denied fixtures are blockers or harness failures. Preserve the test as the fix acceptance check. A future approved patch should make the same test pass without weakening the invariant, with all reruns still sandboxed.
+
+Validation requires bubblewrap containment for every `local_app` proof record. Replay requires the recorded `timeout_ms`, rejects overrides, consumes proof budget and checks the target commit, copied-tree digest including all `.git` content, inner exit code and cleanliness. Exact command and config artifacts can contain credentials, so protect the entire run directory. On Unix proof directories are 0700 and command and config files are 0600. Content hashing accepts hardlinks and symlinks resolving to regular files; small trust files retain bounded, single-link, no-follow reads. Snapshot hashing has no size cap. Target FIFOs, sockets and devices are refused before copying.
 
 For tier 2 (Linux only), the runner builds and runs a writable workspace copy with only local synthetic services on the sandbox's private loopback. Tier 2 uses the same convention as tier 1: a named harness or test, passed with `--test`, that fails with an assertion when the unauthorized effect happens and passes when it does not. Approval must cover the local effect and stop condition. Stop after one minimal decisive result; never point the client, app, webhook, or database at a live or third party system. If local dependencies or enforced controls are missing, record the exact blocker and a manual plan with the same safety constraints.
 

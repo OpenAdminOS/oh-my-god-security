@@ -78,6 +78,22 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  msrv:
+    name: rust (1.89)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: 1.89.0
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: cargo test --locked
+
   actionlint:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

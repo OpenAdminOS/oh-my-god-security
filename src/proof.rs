@@ -140,7 +140,14 @@ pub fn reserve(run: &Path) -> Result<(u32, PathBuf), String> {
         .ok_or("proof numbers exhausted")?;
     loop {
         let d = dir.join(n.to_string());
-        match std::fs::create_dir(&d) {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&d) {
             Ok(()) => return Ok((n, d)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < u32::MAX => n += 1,
             Err(e) => return Err(format!("create {}: {e}", d.display())),
@@ -221,8 +228,12 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
     for (i, f) in file.findings.iter().enumerate() {
         let at = format!("findings[{i}] '{}'", f.title);
         let want = match f.proof_tier {
-            ProofTier::Traced if f.proof_ref.is_none() => continue,
-            ProofTier::Traced => "traced",
+            ProofTier::Traced => {
+                if f.proof_ref.is_some() {
+                    errors.push(format!("{at}: traced findings must not carry proof_ref; retain the source trace in evidence"));
+                }
+                continue;
+            }
             ProofTier::TestProven => "test",
             ProofTier::SandboxExploited => "local_app",
         };
@@ -246,9 +257,6 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
                 record.finding.as_deref().unwrap_or("none"),
                 f.fingerprint
             ));
-        }
-        if f.proof_tier == ProofTier::Traced {
-            continue;
         }
         if record.tier != want {
             errors.push(format!(
@@ -276,7 +284,7 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
         // failing assertion when the target permits the unauthorized effect.
         match (&record.test, &record.test_sha256) {
             (Some(t), Some(_)) => {
-                if !recorded_command(run, &record).is_ok_and(|command| command_names(&command, t)) {
+                if recorded_command(run, &record).is_ok_and(|command| !command_names(&command, t)) {
                     errors.push(format!(
                         "{at}: {r} ran a command that does not name its proof test {t}"
                     ));
@@ -303,7 +311,7 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
     errors
 }
 
-/// Whether one quote-aware whitespace token of `command` is the
+/// Whether one quote-aware shell token of `command` is the
 /// full test path or its file name. A sanity check that the
 /// recorded command is the proof test, not evidence that it executed it:
 /// replay and the independent evaluator must check that separately.
@@ -319,7 +327,7 @@ pub fn command_names(command: &str, test: &str) -> bool {
             quote = None;
         } else if quote.is_none() && (c == '\'' || c == '"') {
             quote = Some(c);
-        } else if quote.is_none() && c.is_whitespace() {
+        } else if quote.is_none() && (c.is_whitespace() || ";&|()<>".contains(c)) {
             tokens.push(std::mem::take(&mut token));
         } else {
             token.push(c);
@@ -339,6 +347,9 @@ pub fn command_names(command: &str, test: &str) -> bool {
 /// defence against a process that runs as the user and forges every file.
 pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
     let mut errors = Vec::new();
+    if record.tier == "local_app" && record.containment != "bubblewrap" {
+        errors.push("local_app records require bubblewrap containment on Linux".into());
+    }
     match crate::sandbox::pinned_executors()
         .into_iter()
         .find(|e| e.sha256 == record.executor_sha256)
@@ -516,12 +527,16 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
         );
     }
     let norm = |p: &str| {
+        let p = if os == "windows" {
+            crate::platform::mxc_path(Path::new(p))
+        } else {
+            p.to_string()
+        };
         let p = p.replace('\\', "/");
-        let p = p.strip_prefix("//?/").unwrap_or(&p);
         if os == "windows" {
             p.to_ascii_lowercase()
         } else {
-            p.to_string()
+            p
         }
     };
     // Keep the original config intact when a run is moved. Every grant must
@@ -699,6 +714,7 @@ pub fn tree_digest(root: &Path) -> std::io::Result<String> {
         let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
+            crate::supervise::check_interrupted()?;
             let path = entry.path();
             let rel = path.strip_prefix(root).map_err(std::io::Error::other)?;
             field(h, rel.as_os_str().as_encoded_bytes());
@@ -724,7 +740,7 @@ pub fn tree_digest(root: &Path) -> std::io::Result<String> {
                     field(h, b"file");
                     field(h, crate::sha256::digest_file(&path)?.as_bytes());
                 } else {
-                    return Err(std::io::Error::other("unsupported target file type"));
+                    return Err(std::io::Error::other(format!("unsupported target file type at {}; only regular files, directories and symlinks are supported", path.display())));
                 }
             }
         }
@@ -859,19 +875,23 @@ fn redact_line(line: &str, lower: &str) -> String {
                 })
                 .map(|j| after + j + 1)
         })
-        .chain(KEYS.iter().flat_map(|key| {
-            let flag = format!("--{key}");
-            lower
-                .match_indices(&flag)
-                .filter_map(|(i, _)| {
-                    let after = i + flag.len();
-                    lower
-                        .as_bytes()
-                        .get(after)
-                        .is_some_and(u8::is_ascii_whitespace)
-                        .then_some(after)
-                })
-                .collect::<Vec<_>>()
+        .chain(lower.match_indices("--").filter_map(|(i, _)| {
+            let start = i + 2;
+            let end = lower[start..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+                .map(|n| start + n)
+                .unwrap_or(lower.len());
+            let name = &lower[start..end];
+            let components: Vec<_> = name.split(['-', '_']).collect();
+            let sensitive = KEYS.iter().any(|key| {
+                let keyword: Vec<_> = key.split(['-', '_']).collect();
+                components
+                    .windows(keyword.len())
+                    .any(|parts| parts == keyword)
+            });
+            let next = lower.as_bytes().get(end)?;
+            (sensitive && (*next == b'=' || next.is_ascii_whitespace()))
+                .then_some(end + usize::from(*next == b'='))
         }))
         .chain(lower.find("bearer ").map(|i| i + "bearer ".len()))
         .min();
@@ -913,6 +933,54 @@ mod tests {
                 "{masked}"
             );
         }
+    }
+
+    #[test]
+    fn credential_flag_components_are_redacted() {
+        for flag in [
+            "--access-token",
+            "--secret-key",
+            "--client_secret",
+            "--my-password-value",
+            "--api-key",
+            "--api_key",
+            "--service-api-key",
+        ] {
+            for separator in [" ", "="] {
+                let text = format!("tool {flag}{separator}hidden-credential");
+                let masked = redact(&text);
+                assert!(!masked.contains("hidden-credential"), "{text}: {masked}");
+                assert!(masked.contains("[omgs redacted]"), "{masked}");
+            }
+        }
+        assert_eq!(
+            redact("tool --tokenizer value -p visible"),
+            "tool --tokenizer value -p visible"
+        );
+    }
+
+    #[test]
+    fn shell_operators_bound_test_tokens_unless_quoted() {
+        for command in [
+            "sh tests/check.sh; exit 1",
+            "sh tests/check.sh&&exit 1",
+            "sh tests/check.sh||exit 1",
+            "sh tests/check.sh|cat",
+            "sh tests/check.sh&wait",
+            "(tests/check.sh)",
+            "cat<tests/check.sh",
+            "cat>tests/check.sh",
+        ] {
+            assert!(command_names(command, "tests/check.sh"), "{command}");
+        }
+        assert!(command_names(
+            "sh 'tests/a;b&c(d)<e>.sh'",
+            "tests/a;b&c(d)<e>.sh"
+        ));
+        assert!(!command_names(
+            "echo 'tests/check.sh; exit 1'",
+            "tests/check.sh"
+        ));
     }
 
     #[test]

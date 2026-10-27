@@ -126,29 +126,18 @@ pub fn digest(data: &[u8]) -> String {
     hex(&h.finish())
 }
 
-/// Maximum bytes hashed per file, including target snapshots.
-pub const FILE_LIMIT: u64 = 1 << 30;
-
-/// Hex SHA-256 of a bounded regular file, without following its final link.
+/// Hex SHA-256 of regular content. Links and hardlinks are valid content;
+/// trust files use platform::read_bounded instead.
 pub fn digest_file(path: &std::path::Path) -> std::io::Result<String> {
     use std::io::Read;
-    let file = crate::platform::open_single_link(path)?
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "file missing"))?;
-    if file.metadata()?.len() > FILE_LIMIT {
-        return Err(std::io::Error::other("file exceeds hash byte limit"));
-    }
-    let mut f = file.take(FILE_LIMIT + 1);
-    let mut total = 0;
+    let mut file = crate::platform::open_regular(path)?;
     let mut h = Sha256::new();
     let mut buf = vec![0u8; 1 << 16];
     loop {
-        let n = f.read(&mut buf)?;
+        crate::supervise::check_interrupted()?;
+        let n = file.read(&mut buf)?;
         if n == 0 {
             break;
-        }
-        total += n as u64;
-        if total > FILE_LIMIT {
-            return Err(std::io::Error::other("file exceeds hash byte limit"));
         }
         h.update(&buf[..n]);
     }

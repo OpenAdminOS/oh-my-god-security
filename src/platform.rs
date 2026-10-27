@@ -122,6 +122,74 @@ pub fn open_single_link(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     Ok(Some(file))
 }
 
+/// Open content through links, rejecting special files before reading them.
+pub fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} must resolve to a regular file",
+            describe_path(path)
+        )));
+    }
+    let file = opts.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(
+            "opened content is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+pub fn describe_path(path: &Path) -> String {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if is_link(&meta) => format!(
+            "{} (symlink to {})",
+            path.display(),
+            std::fs::canonicalize(path)
+                .or_else(|_| std::fs::read_link(path))
+                .unwrap_or_default()
+                .display()
+        ),
+        _ => path.display().to_string(),
+    }
+}
+
+/// Create a private directory, including when the caller reserved it earlier.
+pub fn private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Remove Windows extended path prefixes for both writer and validator.
+pub fn mxc_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if s.get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\UNC\"))
+    {
+        format!(r"\\{}", &s[8..])
+    } else {
+        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    }
+}
+
 /// Read a bounded regular file from the descriptor checked above.
 pub fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Error, ErrorKind, Read};

@@ -82,10 +82,28 @@ fn denials_hold_and_the_target_is_untouched() {
     let outside = d.join("outside.txt");
     std::fs::write(&outside, b"outside-secret-value").unwrap();
     let real_home = omgs::platform::home().unwrap();
-    // The checkout is already present under the real home. Read it without
-    // writing a probe outside the test's scratch directories.
-    let home_probe = std::env::current_dir().unwrap().join("Cargo.toml");
-    assert!(home_probe.starts_with(&real_home) && home_probe.is_file());
+    let home_probe = real_home.join(format!(".omgs-home-probe-{}", std::process::id()));
+    let home_probe_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&home_probe);
+    let home_check = match home_probe_file {
+        Ok(mut file) => {
+            use std::io::Write;
+            file.write_all(b"home-probe").unwrap();
+            format!(
+                "cat '{}' >/dev/null 2>&1 && echo READ_HOME;",
+                home_probe.display()
+            )
+        }
+        Err(error) => {
+            eprintln!(
+                "skipping home-file read subprobe: cannot create probe directly in {}: {error}",
+                real_home.display()
+            );
+            String::new()
+        }
+    };
     // A host loopback service answering HTTP, reachable from the test itself
     // (positive control) and expected unreachable from inside.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -110,7 +128,7 @@ fn denials_hold_and_the_target_is_untouched() {
     let cmd = format!(
         "cat '{o}' 2>/dev/null && echo READ_OUTSIDE; \
          [ -n \"$(ls -A '{h}' 2>/dev/null | grep -vx -e .cargo -e .rustup -e '{mount_parent}')\" ] && echo LIST_HOME; \
-         cat '{hp}' >/dev/null 2>&1 && echo READ_HOME; \
+         {home_check} \
          touch '{d}/escape' 2>/dev/null; \
          curl --version >/dev/null 2>&1 && echo CURL_EXISTS; \
          curl -sm3 https://example.com >/dev/null 2>&1 && echo NETWORK; \
@@ -118,13 +136,15 @@ fn denials_hold_and_the_target_is_untouched() {
          echo changed > app.txt && cat app.txt",
         o = outside.display(),
         h = real_home.display(),
-        hp = home_probe.display(),
         d = d.display()
     );
     let out = omgs(
         &home,
         &["prove", "--target", target.to_str().unwrap(), "--cmd", &cmd],
     );
+    if !home_check.is_empty() {
+        let _ = std::fs::remove_file(&home_probe);
+    }
     let t = text(&out);
     assert!(curl_works, "host loopback positive control must answer");
     assert!(
@@ -1434,10 +1454,13 @@ fn executable_drafts_keep_their_mode_and_commands_are_redacted() {
             "--test-from",
             draft.to_str().unwrap(),
             "--cmd",
-            "./tests/x.sh && token=private-value",
+            "./tests/x.sh --access-token private-value && echo tool --secret-key=inline-private --client_secret following-private",
         ],
     );
     assert!(out.status.success(), "{}", text(&out));
+    for value in ["private-value", "inline-private", "following-private"] {
+        assert!(!text(&out).contains(value), "{}", text(&out));
+    }
     let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
     assert!(record.output.contains("executable-draft"));
     assert!(!record.command.contains("private-value"));
@@ -1462,4 +1485,170 @@ fn executable_drafts_keep_their_mode_and_commands_are_redacted() {
     assert_eq!(conflict.status.code(), Some(2));
     assert!(text(&conflict).contains("drop --timeout-ms"));
     std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn cli_rejects_unknown_and_duplicate_options_before_charging_budget() {
+    let d = scratch("cli-options");
+    let run = d.join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    let meta = serde_json::json!({"budget_agent_calls": 1, "proof_runs_used": 0});
+    let bytes = serde_json::to_vec(&meta).unwrap();
+    std::fs::write(run.join(omgs::runmeta::FILE), &bytes).unwrap();
+    for tail in [
+        vec!["--cmd", "exit 0", "--timeot-ms", "1"],
+        vec!["--cmd", "exit 0", "--cmd", "exit 1"],
+        vec!["--cmd", "exit 0", "--tier", "1", "--tier", "2"],
+        vec!["--cmd", "exit 0", "--timeout-ms", "1", "--timeout-ms", "2"],
+        vec!["--cmd", "exit 0", "unexpected"],
+    ] {
+        let mut args = vec!["prove", "--run", run.to_str().unwrap()];
+        args.extend(tail);
+        let out = omgs(&d.join("home"), &args);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(text(&out).contains("Usage:"), "{}", text(&out));
+        assert_eq!(std::fs::read(run.join(omgs::runmeta::FILE)).unwrap(), bytes);
+        assert!(!run.join("proofs").exists());
+    }
+    for args in [
+        vec!["doctor", "--live", "--live"],
+        vec!["setup", "--yes", "--yes"],
+        vec!["audit", "init", "--target", "x", "--typo", "y"],
+        vec!["validate", "--findings", "x", "--findings", "y"],
+        vec!["status", "--run", "x", "--run", "y"],
+        vec!["intent", "list", "--stack", "x", "--stack", "y"],
+    ] {
+        let out = omgs(&d.join("home"), &args);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert!(text(&out).contains("Usage:"));
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_executor_and_proof_test_run_with_private_artifacts() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("content-links");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(target.join("real.sh"), "exit 1\n").unwrap();
+    symlink("real.sh", target.join("proof.sh")).unwrap();
+    let executor = d.join("executor-link");
+    symlink(omgs::sandbox::locate_executor().unwrap().path, &executor).unwrap();
+    std::fs::write(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target": target}).to_string(),
+    )
+    .unwrap();
+    for linked in [true, false] {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"));
+        cmd.args([
+            "prove",
+            "--target",
+            target.to_str().unwrap(),
+            "--test",
+            "proof.sh",
+            "--cmd",
+            "sh proof.sh; exit 1",
+        ])
+        .env("OMGS_HOME", d.join("home"))
+        .env("OMGS_MXC_EXEC", &executor);
+        if linked {
+            cmd.args(["--run", run.to_str().unwrap()]);
+        }
+        let out = cmd.output().unwrap();
+        let t = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{t}");
+        assert!(t.contains("symlink to"), "{t}");
+        let record = if linked {
+            serde_json::to_value(omgs::proof::load(&run, "proofs/1.json").unwrap()).unwrap()
+        } else {
+            record_from(&t)
+        };
+        assert_eq!(record["command_finished"], true, "{record}");
+        assert_eq!(record["test_reachable"], true, "{record}");
+        let proof_dir = Path::new(record["proof_dir"].as_str().unwrap());
+        assert_eq!(
+            std::fs::metadata(proof_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for file in ["command.txt", "mxc-config.json"] {
+            assert_eq!(
+                std::fs::metadata(proof_dir.join(file))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "{file}"
+            );
+        }
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn preparation_signals_release_the_reservation_and_remove_the_workspace() {
+    if !mxc_ready() {
+        return;
+    }
+    let executor = omgs::sandbox::locate_executor().unwrap();
+    for number in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        let d = scratch(&format!("prepare-signal-{number}"));
+        let target = d.join("target");
+        let run = d.join("run");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        // Copy finishes quickly; hashing leaves a deterministic preparation window.
+        std::fs::File::create(target.join("large"))
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        std::fs::write(
+            run.join(omgs::runmeta::FILE),
+            serde_json::json!({"target": target, "proof_runs_used": 0}).to_string(),
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .args([
+                "prove",
+                "--run",
+                run.to_str().unwrap(),
+                "--cmd",
+                "echo TARGET_RAN",
+            ])
+            .env("OMGS_HOME", d.join("home"))
+            .env("OMGS_MXC_EXEC", &executor.path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        while !run.join("proofs/1/workspace/large").exists() {
+            if child.try_wait().unwrap().is_some() || start.elapsed().as_secs() > 20 {
+                let _ = child.kill();
+                panic!(
+                    "preparation never started: {}",
+                    text(&child.wait_with_output().unwrap())
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(unsafe { libc::kill(child.id() as i32, number) }, 0);
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+        assert!(text(&out).contains("interrupted"), "{}", text(&out));
+        assert!(!text(&out).contains("TARGET_RAN"), "{}", text(&out));
+        assert!(!run.join("proofs/1").exists());
+        assert!(!run.join("proofs/1.json").exists());
+        assert_eq!(omgs::runmeta::read(&run).unwrap()["proof_runs_used"], 0);
+        std::fs::remove_dir_all(d).unwrap();
+    }
 }

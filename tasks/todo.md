@@ -24,10 +24,10 @@ shares the host loopback in both directions, and Windows blocks loopback inside 
 - [x] rlimits, `waitid(WNOWAIT)` group signal, macOS survivor sweep (GPT-6.1-Sol, `src/supervise.rs`)
 - [x] `prove --run --finding` proof records; `proof_ref` and `trace`; `validate` checks proofs
 - [x] Budget enforcement and tier-2 first-run approval
-- [x] `omgs doctor`; Windows portability; Windows CI through Test (round 3 green; round 4 verification below)
+- [x] `omgs doctor`; Windows portability; Windows CI through Test (round 5 verification below)
 - [x] DECISIONS.md amendment: declared minimum set per OS
-- [x] Tests and docs for rounds 1 through 4
-- [ ] Independent round 4 full-diff reviews and merge
+- [x] Tests and docs for rounds 1 through 5
+- [ ] Independent round 5 full-diff re-reviews and merge
   - Round 2 (2026-10-27): GPT-6.1-Sol implements the round 2 fixes; evidence that the named test ran
     uses runner start and end markers (not per-stack adapters); windows-2025 CI must be fully green
     through the Test step before merge.
@@ -75,30 +75,40 @@ shares the host loopback in both directions, and Windows blocks loopback inside 
 
 ## Review
 
-PR 1 results before round 4: commit `0bb66b0` passed all four CI jobs, including
-windows-2025 through Test. Local macOS, Lima Ubuntu and Windows 11 exercised the
-pinned MXC executors. Earlier reviews required in-sandbox test reachability,
-marker-based execution evidence, canonical proof grants, honest platform gaps,
-readable-root isolation and full-diff independent review. Those fixes remain.
+PR 1 round 5 fixes all twelve requested review items. The starting head
+`f924e85` passed all four existing CI jobs, including windows-2025 through Test.
+The updated branch adds Rust 1.89.0 build and test coverage as a fifth job.
 
-Round 4 implements bounded no-follow hashing, exact replay timeout, digest-only
-executor identity, recorded readable roots, full environment values, closed
-config schema, command redaction with replay digests, nested `.git` hashing,
-traced-reference identity checks, ordered console output, SIGHUP cleanup,
-executable draft staging, canonical Windows overlap checks, Rosetta guidance and
-Rust 1.89 minimum. Linux `setsid` and `posix_spawn(SETSID)` probes on Lima exited
-cleanly with no marked descendants in the host process table. Regression tests
-include a live host-process positive control before PID namespace teardown.
-Windows wall-clock and doctor enumeration limitations are disclosed explicitly.
+Content hashing now accepts regular content through symlinks and hardlinks,
+without a snapshot size cap. Small trust files keep bounded, single-link,
+no-follow reads. Linux copies break hardlink relationships. Copy and digest
+both refuse target FIFOs, sockets and devices. Regression coverage includes
+an intra-target hardlink pair, an 8 MiB file, symlinked executor and test paths,
+and prompt FIFO and device refusal. Symlink destinations are disclosed.
 
-Round 4 local verification: macOS passed fmt, clippy with warnings denied and all
-182 tests; Lima Ubuntu arm64 passed all 178 tests; Windows 11 x64 passed all 156
-tests, including canonical root overlap and supervisor wall-clock disclosure.
-All three live doctor probes passed. Linux escape probes observed each detached
-child in the host process table before teardown and found no survivor after it.
-The x86_64 macOS build passed, but Rosetta execution could not be checked because
-this host has no translation runtime. Installer shell syntax was checked.
+Credential flag components are redacted in output, saved command displays and
+survivor lines. Every CLI subcommand rejects unknown and duplicate options
+before mutation, preserving the documented repeatable evidence and counter
+options. Shell operators delimit unquoted test names. Validation requires
+bubblewrap for local-app records, forbids proof references on traced findings,
+and avoids a test-name diagnostic after a missing or altered saved command.
 
-Every final PR CI job must pass on the pushed head, including windows-2025
-through Test. Independent reviews and merge remain required; implementation is
-not approval.
+Unix proof directories are 0700 and exact command and config artifacts are
+0600. Unix signal guards cover preparation through execution; interrupted preparation
+removes the proof directory and releases a charged reservation. Tests exercise
+SIGINT, SIGTERM and SIGHUP before and after executor launch. Denial tests create
+their home probe directly in the real home, with a scoped skip if unwritable.
+Forged readable roots and extended Windows UNC proof directories have regression
+coverage. README, skill and decision text agree on replay timeout, all `.git`
+content, credential artifacts, Linux PID namespaces and Windows MXC teardown.
+
+Round 5 local verification: macOS passed fmt, clippy with warnings denied and
+all 192 tests; Lima Ubuntu arm64 passed all 188 tests; Windows 11 x64 passed
+all 163 tests. All three live doctor probes passed with the pinned executors.
+The Windows host has no Clippy component; its lint check runs in CI. The workflow
+lint and skill metadata validator passed. Rust 1.89.0 is checked by the new CI job.
+
+All five final PR CI jobs must pass on the pushed head, including windows-2025
+through Test. Independent full-diff reviews and the separate evaluator remain
+pending; implementation is not approval. Nothing from round 5 is deferred out
+of 0.1. No merge is authorized by this implementation task.

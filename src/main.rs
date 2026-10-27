@@ -29,6 +29,82 @@ fn usage() {
     );
 }
 
+/// Validate the complete option list before any command can mutate run state.
+fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
+    let (allowed, positional): (&str, bool) = match cmd {
+        "setup" => ("--yes --from", false),
+        "review" => ("--repo-url --mode --budget --no-sensors", false),
+        "audit" if args.first().is_some_and(|a| a == "init") => {
+            ("--target --out --mode --budget --no-sensors", true)
+        }
+        "batch" if args.first().is_some_and(|a| a == "init") => {
+            ("--list --out --mode --budget --no-sensors", true)
+        }
+        "batch" if args.first().is_some_and(|a| a == "index") => ("--batch --out", true),
+        "validate" => ("--findings", false),
+        "fingerprint" => ("--attack-class --entry-point --sink --boundary", false),
+        "prove" => (
+            "--cmd --target --run --finding --test --test-from --replay --tier --timeout-ms",
+            false,
+        ),
+        "approve" => ("--target", false),
+        "report" => (
+            "--findings --out --repo --ref --mode --sandbox --hunters --verifier --agent-calls",
+            false,
+        ),
+        "architecture" => ("--in --out", false),
+        "ledger" if args.first().is_some_and(|a| a == "list") => ("--ledger", true),
+        "ledger" if args.first().is_some_and(|a| a == "add") => {
+            ("--ledger --unit --surface --classes --status --note", true)
+        }
+        "ledger" if args.first().is_some_and(|a| a == "set") => {
+            ("--ledger --unit --status --evidence --note", true)
+        }
+        "critic" => ("--run", false),
+        "status" => (
+            "--run --stage --state --label --parent --detail --counter --log",
+            false,
+        ),
+        "watch" => ("--run --max-ms", false),
+        "route" => ("--run --role --refused --reason --models", false),
+        "intent" if args.first().is_some_and(|a| a == "list") => ("--stack --attack-class", true),
+        "intent" if args.first().is_some_and(|a| a == "answer") => {
+            ("--target --id --answer --source --scope", true)
+        }
+        "check" => ("--target --out", false),
+        "doctor" => ("--live", false),
+        "help" | "--help" | "-h" | "--version" | "-V" => ("", false),
+        "audit" | "batch" | "ledger" | "intent" if args == ["--help"] || args == ["-h"] => {
+            ("", false)
+        }
+        _ => return Err(format!("unknown command or subcommand '{cmd}'")),
+    };
+    let mut help_requested = false;
+    let mut seen = std::collections::HashSet::new();
+    let mut i = usize::from(positional);
+    while i < args.len() {
+        let option = args[i].as_str();
+        let help = option == "--help" || option == "-h";
+        help_requested |= help;
+        if !help && !allowed.split_whitespace().any(|a| a == option) {
+            return Err(format!("unknown option '{option}' for {cmd}"));
+        }
+        let repeatable = (cmd == "ledger" && option == "--evidence")
+            || (cmd == "status" && option == "--counter");
+        if !seen.insert(option) && !repeatable {
+            return Err(format!("duplicate option '{option}'"));
+        }
+        i += 1;
+        if !help && !["--yes", "--no-sensors", "--live"].contains(&option) {
+            match args.get(i) {
+                Some(value) if !value.starts_with("--") => i += 1,
+                _ => return Err(format!("{option} requires a value")),
+            }
+        }
+    }
+    Ok(help_requested)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first().map(|s| s.as_str()) else {
@@ -36,35 +112,17 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let rest = &args[1..];
-    if cmd == "doctor"
-        && rest
-            .iter()
-            .any(|a| !["--live", "--help", "-h"].contains(&a.as_str()))
-    {
-        usage();
-        eprintln!("error: doctor accepts only --live");
-        return ExitCode::from(2);
-    }
-    if rest.iter().any(|a| a == "--help" || a == "-h") {
-        usage();
-        return ExitCode::SUCCESS;
-    }
-    // Every option except the switches takes a value; a missing one is an
-    // error rather than being skipped or taking the next option's name.
-    const SWITCHES: [&str; 3] = ["--yes", "--no-sensors", "--live"];
-    for (i, a) in rest.iter().enumerate() {
-        if a.starts_with("--") && !SWITCHES.contains(&a.as_str()) {
-            match rest.get(i + 1) {
-                Some(v) if !v.starts_with("--") => {}
-                _ => {
-                    eprintln!("error: {a} requires a value");
-                    if cmd == "doctor" {
-                        usage();
-                    }
-                    return ExitCode::from(2);
-                }
-            }
+    match validate_options(cmd, rest) {
+        Err(e) => {
+            usage();
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
         }
+        Ok(true) => {
+            usage();
+            return ExitCode::SUCCESS;
+        }
+        Ok(false) => {}
     }
     let result: Result<(), String> = match cmd {
         "--help" | "-h" | "help" => {
@@ -208,6 +266,8 @@ fn release_proof_charge(run: &Path) -> Result<(), String> {
 }
 
 fn cmd_prove(args: &[String]) -> Result<(), String> {
+    #[cfg(unix)]
+    let _signals = omgs::supervise::interruption::Guard::install().map_err(|e| e.to_string())?;
     let run = flag(args, "--run").map(PathBuf::from);
     // A replay reruns a recorded proof exactly, so an independent evaluator
     // can check a result instead of trusting the file that claims it.
@@ -393,11 +453,17 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             let path = base.join(t);
             if !path.is_file() {
                 return Err(format!(
-                    "--test {t} is not a file in the target {}; stage a draft with --test-from <file>",
-                    base.display()
+                    "--test {t} does not resolve to a regular file at {}; stage a draft with --test-from <file>",
+                    omgs::platform::describe_path(&path)
                 ));
             }
-            Some(omgs::sha256::digest_file(&path).map_err(|e| format!("read {t}: {e}"))?)
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| omgs::platform::is_link(&m)) {
+                eprintln!("proof test: {}", omgs::platform::describe_path(&path));
+            }
+            Some(
+                omgs::sha256::digest_file(&path)
+                    .map_err(|e| format!("read {}: {e}", omgs::platform::describe_path(&path)))?,
+            )
         }
         (None, _) => None,
     };
@@ -432,6 +498,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             return Err("__EXIT3__".into());
         }
     }
+    omgs::supervise::check_interrupted().map_err(|e| e.to_string())?;
     let proof_dir = match &run {
         Some(r) => {
             // Check and charge the budget in one locked step, before anything
@@ -490,7 +557,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     let staged_draft = match &draft {
         Some(d) => {
             let copy = run_dir.join("test-draft");
-            let kept = std::fs::create_dir_all(&run_dir)
+            let kept = omgs::platform::private_dir(&run_dir)
                 .and_then(|_| omgs::sandbox::stage_file(&run_dir, "test-draft", d))
                 .map_err(|e| e.to_string())
                 .and_then(|_| omgs::sha256::digest_file(&copy).map_err(|e| e.to_string()));

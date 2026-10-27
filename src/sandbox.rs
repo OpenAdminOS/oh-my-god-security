@@ -4,6 +4,7 @@
 //! Target code never runs anywhere else: without a verified executor OMGS
 //! refuses and the finding stays at the tier it already earned.
 
+use crate::platform::mxc_path;
 use crate::{platform, sha256, supervise};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -113,10 +114,10 @@ pub fn locate_executor() -> Result<Located, String> {
         Ok(d) if d == executor.sha256 => Ok(()),
         Ok(d) => Err(format!(
             "{} has SHA-256 {d}, expected {} for MXC {MXC_VERSION}",
-            path.display(),
+            platform::describe_path(path),
             executor.sha256
         )),
-        Err(e) => Err(format!("{} unreadable: {e}", path.display())),
+        Err(e) => Err(format!("{} unreadable: {e}", platform::describe_path(path))),
     };
     // An explicit OMGS_MXC_EXEC is authoritative: if it is wrong, say so
     // rather than quietly using some other executor.
@@ -249,19 +250,6 @@ pub struct ProveResult {
 pub enum ProveOutcome {
     Blocked { reason: String },
     Ran(Box<ProveResult>),
-}
-
-fn mxc_path(p: &Path) -> String {
-    let s = p.to_string_lossy().to_string();
-    // Windows canonicalize yields extended-length paths that cmd.exe rejects
-    // as a working directory. Strip the prefix for config consumption.
-    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        s
-    }
 }
 
 /// Every parent directory of a Windows or Unix path string, outermost first,
@@ -739,23 +727,42 @@ pub fn declared_limits(os: &str) -> Vec<String> {
 /// Copy `src` into the empty directory `dst`: an APFS clone on macOS, a
 /// reflink where the filesystem supports it on Linux, a plain copy otherwise.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
+    refuse_special_files(src)?;
+    supervise::check_interrupted().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
     let from = format!("{}/.", src.display());
     let attempts: Vec<Vec<&str>> = if cfg!(target_os = "macos") {
         vec![vec!["-c", "-R", "-p"], vec!["-R", "-p"]]
     } else if cfg!(target_os = "linux") {
-        vec![vec!["-a", "--reflink=auto"]]
+        vec![vec!["-a", "--no-preserve=links", "--reflink=auto"]]
     } else {
         vec![]
     };
     for flags in attempts {
-        let ok = Command::new("/bin/cp")
+        let child = Command::new("/bin/cp")
             .args(&flags)
             .arg(&from)
             .arg(dst)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .spawn();
+        let ok = match child {
+            Ok(mut child) => loop {
+                if let Err(e) = supervise::check_interrupted() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e.to_string());
+                }
+                match child.try_wait() {
+                    Ok(Some(status)) => break status.success(),
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                    Err(e) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(e.to_string());
+                    }
+                }
+            },
+            Err(_) => false,
+        };
         if ok {
             return Ok(());
         }
@@ -770,9 +777,31 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     copy_recursive(src, dst, &roots)
 }
 
+/// Match digest policy before invoking platform copy tools, which differ on FIFOs.
+fn refuse_special_files(dir: &Path) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        supervise::check_interrupted().map_err(|e| e.to_string())?;
+        let entry = entry.map_err(|e| e.to_string())?;
+        let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+        if platform::is_link(&meta) {
+            continue;
+        }
+        if meta.is_dir() {
+            refuse_special_files(&entry.path())?;
+        } else if !meta.is_file() {
+            return Err(format!(
+                "unsupported target file type at {}; FIFOs, sockets and devices are refused",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `roots` is (canonical source root, destination root) of the whole copy.
 fn copy_recursive(src: &Path, dst: &Path, roots: &(PathBuf, PathBuf)) -> Result<(), String> {
     for entry in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
+        supervise::check_interrupted().map_err(|e| e.to_string())?;
         let entry = entry.map_err(|e| e.to_string())?;
         let ty = entry.file_type().map_err(|e| e.to_string())?;
         let to = dst.join(entry.file_name());
@@ -869,26 +898,23 @@ pub fn stage_file(workspace: &Path, rel: &str, draft: &Path) -> std::io::Result<
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let source = platform::open_single_link(draft)?
-        .ok_or_else(|| Error::new(ErrorKind::NotFound, "draft missing"))?;
+    let mut source = platform::open_regular(draft)?;
     let permissions = source.metadata()?.permissions();
-    if source.metadata()?.len() > sha256::FILE_LIMIT {
-        return Err(Error::other("draft exceeds byte limit"));
-    }
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    source
-        .take(sha256::FILE_LIMIT + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > sha256::FILE_LIMIT {
-        return Err(Error::other("draft exceeds byte limit"));
-    }
     // create_new refuses an entry that appeared since, link or not.
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&dest)?;
-    out.write_all(&bytes)?;
+    use std::io::Read;
+    let mut bytes = vec![0u8; 1 << 16];
+    loop {
+        supervise::check_interrupted()?;
+        let n = source.read(&mut bytes)?;
+        if n == 0 {
+            break;
+        }
+        out.write_all(&bytes[..n])?;
+    }
     out.set_permissions(permissions)
 }
 
@@ -1004,6 +1030,15 @@ fn stage_workspace(
 }
 
 pub fn prove(req: &ProveRequest) -> ProveOutcome {
+    #[cfg(unix)]
+    let _signals = match supervise::interruption::Guard::install() {
+        Ok(guard) => guard,
+        Err(e) => {
+            return ProveOutcome::Blocked {
+                reason: format!("cannot install proof signal guard: {e}"),
+            }
+        }
+    };
     if req.run_dir.join("workspace").exists() || req.run_dir.join("scratch").exists() {
         return ProveOutcome::Blocked {
             reason: format!(
@@ -1057,7 +1092,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     };
     let os = std::env::consts::OS;
     let blocked = |reason: String| ProveOutcome::Blocked { reason };
-    if let Err(e) = std::fs::create_dir_all(&req.run_dir) {
+    if let Err(e) = platform::private_dir(&req.run_dir) {
         return blocked(format!("cannot create {}: {e}", req.run_dir.display()));
     }
     // MXC and Seatbelt match canonical paths, so resolve symlinks like /tmp.
@@ -1153,6 +1188,9 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         rust,
         list_parents: true,
     };
+    if let Err(e) = supervise::check_interrupted() {
+        return blocked(e.to_string());
+    }
     let limits = supervise::Limits {
         // The executor enforces the config timeout itself; the supervisor
         // allows a short margin for teardown before killing it.
@@ -1165,6 +1203,15 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         output_cap_bytes: 256 * 1024,
     };
     let mut extra_gaps = Vec::new();
+    for path in std::iter::once(located.path.clone()).chain(
+        req.test
+            .as_ref()
+            .and_then(|test| req.target.as_ref().map(|target| target.join(test))),
+    ) {
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| platform::is_link(&m)) {
+            extra_gaps.push(platform::describe_path(&path));
+        }
+    }
     let (config_text, mut run) = loop {
         let config = mxc_config(&input);
         let config_text = serde_json::to_string_pretty(&config).unwrap_or_default();
@@ -1354,6 +1401,56 @@ mod tests {
             expected.sort_unstable();
             assert_eq!(keys, expected, "{os}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copies_hardlinks_and_large_content_and_refuses_special_files() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let d = std::env::temp_dir().join(format!("omgs-copy-content-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let src = d.join("target");
+        let dst = d.join("copy");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a"), b"hardlinked content").unwrap();
+        std::fs::hard_link(src.join("a"), src.join("b")).unwrap();
+        let data = vec![37u8; 8 << 20];
+        std::fs::write(src.join("large"), &data).unwrap();
+        let digest = crate::proof::tree_digest(&src).unwrap();
+        copy_tree(&src, &dst).unwrap();
+        assert_eq!(crate::proof::tree_digest(&dst).unwrap(), digest);
+        assert_eq!(std::fs::read(dst.join("large")).unwrap(), data);
+        assert_ne!(
+            std::fs::metadata(dst.join("a")).unwrap().ino(),
+            std::fs::metadata(dst.join("b")).unwrap().ino()
+        );
+        let fifo = src.join("pipe");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let start = std::time::Instant::now();
+        assert!(copy_tree(&src, &d.join("fifo-copy"))
+            .unwrap_err()
+            .contains("FIFOs"));
+        assert!(crate::proof::tree_digest(&src)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported target file type"));
+        assert!(crate::sha256::digest_file(&fifo).is_err());
+        assert!(crate::sha256::digest_file(Path::new("/dev/zero")).is_err());
+        std::os::unix::fs::symlink(&fifo, d.join("fifo-link")).unwrap();
+        assert!(crate::sha256::digest_file(&d.join("fifo-link")).is_err());
+        std::os::unix::fs::symlink(&src, d.join("dir-link")).unwrap();
+        assert!(crate::sha256::digest_file(&d.join("dir-link")).is_err());
+        assert!(start.elapsed().as_secs() < 10);
+        std::fs::remove_file(&fifo).unwrap();
+        let socket = std::os::unix::net::UnixListener::bind(src.join("socket")).unwrap();
+        assert!(copy_tree(&src, &d.join("socket-copy"))
+            .unwrap_err()
+            .contains("sockets"));
+        assert!(crate::proof::tree_digest(&src).is_err());
+        drop(socket);
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
