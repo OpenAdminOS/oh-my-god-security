@@ -977,8 +977,11 @@ fn value_mask(line: &str, start: usize) -> (usize, &'static str) {
         Some('"') => "[omgs redacted]\"",
         _ => "[omgs redacted]",
     };
+    // The line ending is a hard limit even inside an unclosed quote, so a
+    // masked value never swallows the next line.
+    let end = line.trim_end_matches(['\r', '\n']).len().max(start);
     let mut escaped = false;
-    for (offset, c) in line[start..].char_indices() {
+    for (offset, c) in line[start..end].char_indices() {
         if escaped {
             escaped = false;
         } else if c == '\\' && quote != Some('\'') {
@@ -988,12 +991,14 @@ fn value_mask(line: &str, start: usize) -> (usize, &'static str) {
         } else if quote.is_none() {
             if c == '\'' || c == '"' {
                 quote = Some(c);
-            } else if c.is_whitespace() || ";&|()<>".contains(c) {
+            } else if c == ' ' || c == '\t' || ";&|()<>".contains(c) {
+                // Only shell delimiters end an argument; other Unicode
+                // whitespace stays inside it and inside the mask.
                 return (start + offset, replacement);
             }
         }
     }
-    (line.len(), replacement)
+    (end, replacement)
 }
 
 /// A value can start inside a quote that opened before the flag name.
@@ -1017,6 +1022,23 @@ fn quote_at(line: &str, at: usize) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_values_end_only_at_shell_delimiters_or_the_line_end() {
+        for sep in ['\u{a0}', '\u{2003}', '\r'] {
+            let line = format!("--password=public{sep}SECRET_SUFFIX --verbose\n");
+            let r = redact(&line);
+            assert!(!r.contains("SECRET_SUFFIX"), "{sep:?}: {r}");
+            assert!(r.contains("--verbose"), "{sep:?}: {r}");
+            assert_eq!(redact(&r), r);
+        }
+        let r = redact("it's --token abc\nnext line\n");
+        assert!(!r.contains("abc"), "{r}");
+        assert!(r.contains("\nnext line\n"), "{r}");
+        let r = redact("--token \"abc def\nnext\n");
+        assert!(!r.contains("abc"), "{r}");
+        assert!(r.ends_with("\nnext\n"), "{r}");
+    }
 
     #[test]
     fn quoted_credential_tokens_mask_the_entire_value() {

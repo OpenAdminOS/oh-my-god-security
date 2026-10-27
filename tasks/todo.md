@@ -32,6 +32,14 @@ shares the host loopback in both directions, and Windows blocks loopback inside 
     uses runner start and end markers (not per-stack adapters); windows-2025 CI must be fully green
     through the Test step before merge.
 
+## PR 1b: follow-ups from the final PR 1 review (before release)
+
+- [ ] Redaction: carry quote state forward in one pass (no quadratic rescans on long lines)
+- [ ] Record absolute or re-entering symlinks that point back into the live target as a gap
+- [ ] Sort skipped special files before listing; escape control characters in printed gap paths
+- [ ] Usage text and README: say `--help`, `-h` and `--help=` are refused as free-text values
+- [ ] Refresh the copy and digest notes in this file to match skipped FIFOs and sockets
+
 ## PR 2: role briefs, stacks and packs (`feat/role-briefs-packs`)
 
 - [ ] `skill/agents/` briefs: red hunter, blue verifier, evaluator, green fixer
