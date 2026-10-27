@@ -254,7 +254,7 @@ fn proof_records_back_confirmed_findings() {
         (
             "tests/security/x.test.cmd",
             "cmd.exe /d /c tests\\security\\x.test.cmd",
-            b"@findstr /m vulnerable check.txt >nul && exit /b 1\r\n@exit /b 0\r\n",
+            b"@echo off\r\nset \"omgs_value=\"\r\nset /p omgs_value=<check.txt\r\nif not defined omgs_value exit /b 126\r\nif \"%omgs_value%\"==\"vulnerable\" exit /b 1\r\nexit /b 0\r\n",
         )
     } else {
         (
@@ -304,6 +304,7 @@ fn proof_records_back_confirmed_findings() {
     assert_eq!(record["finding"], fp.as_str());
     assert_eq!(record["tier"], "test");
     assert_eq!(record["exit_code"], 1);
+    assert_eq!(record["test_reachable"], true);
     assert_eq!(record["mxc_version"], omgs::sandbox::MXC_VERSION);
     assert!(!record["enforced"].as_array().unwrap().is_empty());
     assert_eq!(record["config_sha256"].as_str().unwrap().len(), 64);
@@ -358,7 +359,7 @@ fn proof_records_back_confirmed_findings() {
             "draft.test.cmd",
             "tests/security/new.test.cmd",
             "cmd.exe /d /c tests\\security\\new.test.cmd",
-            b"@findstr /m vulnerable check.txt >nul && exit /b 1\r\n@exit /b 0\r\n",
+            b"@echo off\r\nset \"omgs_value=\"\r\nset /p omgs_value=<check.txt\r\nif not defined omgs_value exit /b 126\r\nif \"%omgs_value%\"==\"vulnerable\" exit /b 1\r\nexit /b 0\r\n",
         )
     } else {
         (
@@ -391,6 +392,7 @@ fn proof_records_back_confirmed_findings() {
     let staged_record: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(run.join("proofs/2.json")).unwrap()).unwrap();
     assert_eq!(staged_record["exit_code"], 1);
+    assert_eq!(staged_record["test_reachable"], true);
     assert_eq!(staged_record["executor_error"], false);
     assert!(staged_record["test_from"]
         .as_str()
@@ -1228,4 +1230,82 @@ fn interrupting_prove_cleans_the_executor_group_and_marks_the_record_unclean() {
         assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "pid {pid} survived");
         std::fs::remove_dir_all(d).unwrap();
     }
+}
+
+#[test]
+fn unreachable_tests_never_run_the_command() {
+    use omgs::sandbox::{prove, ProveOutcome, ProveRequest, Tier};
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("unreachable-test");
+    let target = d.join("target");
+    std::fs::create_dir_all(target.join("directory")).unwrap();
+    for (n, test) in ["missing test's file", "directory"].iter().enumerate() {
+        let request = ProveRequest {
+            command: "echo UNREACHABLE_COMMAND_RAN".into(),
+            test: Some((*test).into()),
+            target: Some(target.clone()),
+            run_dir: d.join(n.to_string()),
+            timeout_ms: 10000,
+            tier: Tier::Test,
+            stage: None,
+            expected_tree_sha256: None,
+        };
+        let ProveOutcome::Ran(result) = prove(&request) else {
+            panic!("the wrapper must run with the real executor");
+        };
+        assert_eq!(result.run.test_reachable, Some(false), "{:?}", result.run);
+        assert_eq!(result.run.exit_code, Some(126), "{:?}", result.run);
+        assert!(result.run.command_started && result.run.command_finished);
+        assert!(!result.run.success);
+        assert!(!result.run.output.contains("UNREACHABLE_COMMAND_RAN"));
+    }
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn a_test_readable_only_on_the_host_is_not_a_clean_record() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("host-only-test");
+    let target = d.join("target");
+    let outside = d.join("outside");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("proof.txt"), "host-only-test").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, target.join("tests")).unwrap();
+    #[cfg(windows)]
+    {
+        let link = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(target.join("tests"))
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(link.status.success(), "{}", text(&link));
+    }
+    // The command would pass without the wrapper's in-sandbox check.
+    let out = omgs(
+        &d.join("home"),
+        &[
+            "prove",
+            "--target",
+            target.to_str().unwrap(),
+            "--test",
+            "tests/proof.txt",
+            "--cmd",
+            "echo tests/proof.txt COMMAND_SHOULD_NOT_RUN",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let record = record_from(&text(&out));
+    assert_eq!(record["test_reachable"], false, "{record}");
+    assert_eq!(record["exit_code"], 126, "{record}");
+    let record: omgs::proof::ProofRecord = serde_json::from_value(record).unwrap();
+    assert!(!record.clean());
+    assert!(!record.output.contains("COMMAND_SHOULD_NOT_RUN"));
+    let _ = std::fs::remove_dir_all(d);
 }

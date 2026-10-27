@@ -50,6 +50,9 @@ pub struct ProofRecord {
     pub marker_nonce: String,
     pub command_started: bool,
     pub command_finished: bool,
+    /// The wrapper opened the named test inside the sandbox before execution.
+    #[serde(default)]
+    pub test_reachable: Option<bool>,
     pub timeout_ms: u64,
     pub started_at_ms: u64,
     pub duration_ms: u64,
@@ -88,6 +91,8 @@ impl ProofRecord {
     pub fn clean(&self) -> bool {
         self.command_started
             && self.command_finished
+            && (self.test_reachable == Some(true)
+                || (self.test.is_none() && self.test_reachable.is_none()))
             && self.exit_code.is_some()
             && self.marker_nonce.len() == 64
             && self.marker_nonce.bytes().all(|b| b.is_ascii_hexdigit())
@@ -222,6 +227,11 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
         if !record.clean() {
             errors.push(format!(
                 "{at}: {r} did not finish cleanly (timeout, executor error, incomplete capture or cleanup, or surviving processes)"
+            ));
+        }
+        if record.test.is_some() && record.test_reachable != Some(true) {
+            errors.push(format!(
+                "{at}: {r} proof test was not reachable inside the sandbox"
             ));
         }
         errors.extend(
@@ -454,7 +464,12 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value) -> Vec<Stri
             errors.push(format!("MXC config {pointer} must be {expected}"));
         }
     }
-    let wrapped = crate::sandbox::wrapped_command(os, &record.command, &record.marker_nonce);
+    let wrapped = crate::sandbox::wrapped_command(
+        os,
+        &record.command,
+        &record.marker_nonce,
+        record.test.as_deref(),
+    );
     if config
         .pointer("/process/commandLine")
         .and_then(|v| v.as_str())

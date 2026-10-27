@@ -206,6 +206,7 @@ pub enum Tier {
 
 pub struct ProveRequest {
     pub command: String,
+    pub test: Option<String>,
     pub timeout_ms: u64,
     /// Copied into the per-run workspace, which becomes the cwd. The original
     /// is not mounted into the sandbox at all.
@@ -603,7 +604,7 @@ pub fn conditional_gaps(os: &str) -> Vec<String> {
         gaps.push("memory and task limits conditional on an available systemd user scope".into());
     }
     if os == "windows" {
-        gaps.push("parent directory enumeration conditional on Windows support; runtimes that resolve paths from the drive root may fail without it".into());
+        gaps.push("parent directory enumeration conditional on Windows support; directory listing and absolute path resolution may fail without it".into());
     }
     gaps
 }
@@ -619,33 +620,48 @@ pub fn validate_input(command: &str, timeout_ms: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn wrapper_name(command: &str, nonce: &str) -> String {
+fn wrapper_name(command: &str, nonce: &str, test: Option<&str>) -> String {
     format!(
         ".omgs-{}",
-        sha256::digest(format!("{nonce}\0{command}").as_bytes())
+        sha256::digest(format!("{nonce}\0{command}\0{}", test.unwrap_or("")).as_bytes())
     )
 }
 
-pub fn wrapped_command(os: &str, command: &str, nonce: &str) -> String {
+pub fn wrapped_command(os: &str, command: &str, nonce: &str, test: Option<&str>) -> String {
     if os == "windows" {
         let root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into());
         format!(
             r#""{root}\System32\cmd.exe" /d /v:off /c {}.cmd"#,
-            wrapper_name(command, nonce)
+            wrapper_name(command, nonce, test)
         )
     } else {
         let quoted = command.replace('\'', "'\"'\"'");
-        format!("printf '\\nOMGS_START_{nonce}\\n'; /bin/sh -c '{quoted}'; omgs_exit=$?; printf '\\nOMGS_END_{nonce}:%s\\n' \"$omgs_exit\"; exit \"$omgs_exit\"")
+        let check = test.map(|t| {
+            let t = t.replace('\'', "'\"'\"'");
+            format!("if [ -f './{t}' ] && /bin/cat './{t}' >/dev/null 2>&1; then printf 'OMGS_TEST_{nonce}:1\\n'; else printf 'OMGS_TEST_{nonce}:0\\nOMGS_END_{nonce}:126\\n'; exit 126; fi; ")
+        }).unwrap_or_default();
+        format!("printf '\\nOMGS_START_{nonce}\\n'; {check}/bin/sh -c '{quoted}'; omgs_exit=$?; printf '\\nOMGS_END_{nonce}:%s\\n' \"$omgs_exit\"; exit \"$omgs_exit\"")
     }
 }
 
-fn write_wrapper(os: &str, workspace: &Path, command: &str, nonce: &str) -> std::io::Result<()> {
+fn write_wrapper(
+    os: &str,
+    workspace: &Path,
+    command: &str,
+    nonce: &str,
+    test: Option<&str>,
+) -> std::io::Result<()> {
     if os == "windows" {
-        let name = wrapper_name(command, nonce);
+        let name = wrapper_name(command, nonce, test);
         let root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into());
         // Explicit exit preserves cmd's 9009 for a missing command.
         let command = format!("({}) & exit /b", command.replace('%', "%%"));
-        let wrapper = format!("@echo off\r\necho OMGS_START_{nonce}\r\n\"{root}\\System32\\cmd.exe\" /d /v:off /s /c \"{command}\"\r\nset \"omgs_exit=%errorlevel%\"\r\necho(\r\necho OMGS_END_{nonce}:%omgs_exit%\r\nexit /b %omgs_exit%\r\n");
+        // Denied redirection can retain exit 0; gate on the built-in running.
+        let check = test.map(|t| {
+            let t = t.replace('/', "\\").replace('%', "%%");
+            format!("if not exist \"{t}\" goto omgs_unreachable\r\nif exist \"{t}\\\" goto omgs_unreachable\r\nset \"omgs_readable=\"\r\n(set \"omgs_readable=1\") <\"{t}\"\r\nif not defined omgs_readable goto omgs_unreachable\r\necho OMGS_TEST_{nonce}:1\r\n")
+        }).unwrap_or_default();
+        let wrapper = format!("@echo off\r\necho OMGS_START_{nonce}\r\n{check}\"{root}\\System32\\cmd.exe\" /d /v:off /s /c \"{command}\"\r\nset \"omgs_exit=%errorlevel%\"\r\necho(\r\necho OMGS_END_{nonce}:%omgs_exit%\r\nexit /b %omgs_exit%\r\n:omgs_unreachable\r\necho OMGS_TEST_{nonce}:0\r\necho OMGS_END_{nonce}:126\r\nexit /b 126\r\n");
         std::fs::write(workspace.join(format!("{name}.cmd")), wrapper)?;
     }
     Ok(())
@@ -907,8 +923,14 @@ fn stage_workspace(
         }
         _ => None,
     };
-    write_wrapper(std::env::consts::OS, workspace, &req.command, nonce)
-        .map_err(|e| format!("cannot write command wrapper: {e}"))?;
+    write_wrapper(
+        std::env::consts::OS,
+        workspace,
+        &req.command,
+        nonce,
+        req.test.as_deref(),
+    )
+    .map_err(|e| format!("cannot write command wrapper: {e}"))?;
     Ok((digest, rust))
 }
 
@@ -936,7 +958,25 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             }
         }
     };
-    let wrapped = wrapped_command(std::env::consts::OS, &req.command, &nonce);
+    if let Some(test) = &req.test {
+        if test.is_empty()
+            || test.starts_with(['/', '\\'])
+            || Path::new(test).is_absolute()
+            || test.contains(['\0', '\r', '\n', ':'])
+            || test.split(['/', '\\']).any(|p| p == "..")
+            || (cfg!(windows) && test.contains('"'))
+        {
+            return ProveOutcome::Blocked {
+                reason: "proof test must be a safe workspace-relative file path".into(),
+            };
+        }
+    }
+    let wrapped = wrapped_command(
+        std::env::consts::OS,
+        &req.command,
+        &nonce,
+        req.test.as_deref(),
+    );
     if req.tier == Tier::LocalApp {
         if let Some(reason) = tier2_unavailable(std::env::consts::OS) {
             return ProveOutcome::Blocked { reason };
@@ -1100,7 +1140,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             }
             input.rust = rust;
             input.list_parents = false;
-            extra_gaps.push("this Windows version cannot let the sandbox list parent directories; runtimes that resolve real paths from the drive root (such as Node) may fail to start".to_string());
+            extra_gaps.push("this Windows version refuses parent directory enumeration; relative nested file access is supported, but directory listing, absolute path resolution and NUL device redirection may fail; denied CMD redirection can retain exit 0".to_string());
             continue;
         }
         break (config_text, run);
@@ -1115,7 +1155,15 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     if os != "windows" && matches!(run.exit_code, Some(129..=255)) {
         run.killed = true;
     }
-    run.success &= run.command_started && run.command_finished && !run.timed_out && !run.killed;
+    run.success &= run.command_started
+        && run.command_finished
+        && !run.timed_out
+        && !run.killed
+        && (req.test.is_none() || run.test_reachable == Some(true));
+    if req.test.is_some() && run.test_reachable != Some(true) {
+        run.notes
+            .push("named proof test readability was not established inside the sandbox".into());
+    }
     let (mut enforced, mut gaps) = declared_controls(os, req.tier);
     enforced.extend(run.enforced.iter().cloned());
     gaps.extend(extra_gaps);
@@ -1178,6 +1226,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("omgs-blocked-{}", std::process::id()));
         let req = |command: &str| ProveRequest {
             command: command.into(),
+            test: None,
             timeout_ms: 1000,
             target: None,
             run_dir: d.clone(),
@@ -1253,6 +1302,7 @@ mod tests {
             exit_code: None,
             command_started: false,
             command_finished: false,
+            test_reachable: None,
             enumerate_rejected: true,
             executor_error: true,
             killed: false,

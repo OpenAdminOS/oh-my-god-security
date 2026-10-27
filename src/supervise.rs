@@ -33,6 +33,7 @@ pub struct Supervised {
     pub exit_code: Option<i32>,
     pub command_started: bool,
     pub command_finished: bool,
+    pub test_reachable: Option<bool>,
     pub enumerate_rejected: bool,
     pub success: bool,
     pub timed_out: bool,
@@ -133,6 +134,7 @@ struct MarkerScan {
     started: bool,
     finished: bool,
     exit_code: Option<i32>,
+    test_reachable: Option<bool>,
     invalid: bool,
     enumerate_rejected: bool,
 }
@@ -171,6 +173,17 @@ impl MarkerScan {
         if line == format!("OMGS_START_{nonce}") {
             self.invalid |= self.started || self.finished;
             self.started = true;
+        }
+        if let Some(value) = line.strip_prefix(&format!("OMGS_TEST_{nonce}:")) {
+            self.invalid |= !self.started || self.finished || self.test_reachable.is_some();
+            self.test_reachable = match value {
+                "1" => Some(true),
+                "0" => Some(false),
+                _ => {
+                    self.invalid = true;
+                    None
+                }
+            };
         }
         if let Some(code) = line.strip_prefix(&format!("OMGS_END_{nonce}:")) {
             self.invalid |= !self.started || self.finished;
@@ -944,6 +957,7 @@ fn run_inner(
         exit_code: None,
         command_started: false,
         command_finished: false,
+        test_reachable: None,
         enumerate_rejected: false,
         success: false,
         timed_out: false,
@@ -1119,6 +1133,7 @@ fn run_inner(
     if nonce.is_some() {
         result.command_started = capture.evidence.started;
         result.command_finished = capture.evidence.finished && !capture.evidence.invalid;
+        result.test_reachable = capture.evidence.test_reachable;
         result.exit_code = capture.evidence.exit_code;
         result.executor_error = !result.command_started && !result.interrupted && !result.killed;
     }
@@ -1178,7 +1193,7 @@ mod tests {
                 ..MarkerScan::default()
             },
         };
-        let mut bytes = format!("OMGS_START_{nonce}\r\n").into_bytes();
+        let mut bytes = format!("OMGS_START_{nonce}\r\nOMGS_TEST_{nonce}:1\r\n").into_bytes();
         bytes.extend(vec![b'x'; 300_000]);
         bytes.extend(format!("\nOMGS_END_{nonce}:17\r\n").as_bytes());
         for chunk in bytes.chunks(7) {
@@ -1187,6 +1202,7 @@ mod tests {
         assert!(capture.evidence.started && capture.evidence.finished);
         assert!(!capture.evidence.invalid);
         assert_eq!(capture.evidence.exit_code, Some(17));
+        assert_eq!(capture.evidence.test_reachable, Some(true));
         assert_eq!(capture.text().len(), 10);
     }
 
@@ -1211,6 +1227,23 @@ mod tests {
         };
         reversed.receive(0, b"OMGS_END_n:1\nOMGS_START_n\n");
         assert!(reversed.invalid);
+    }
+
+    #[test]
+    fn test_reachability_markers_require_order_valid_values_and_uniqueness() {
+        for bytes in [
+            "OMGS_TEST_n:1\nOMGS_START_n\nOMGS_END_n:0\n",
+            "OMGS_START_n\nOMGS_END_n:0\nOMGS_TEST_n:1\n",
+            "OMGS_START_n\nOMGS_TEST_n:0\nOMGS_TEST_n:1\nOMGS_END_n:0\n",
+            "OMGS_START_n\nOMGS_TEST_n:yes\nOMGS_END_n:0\n",
+        ] {
+            let mut scan = MarkerScan {
+                nonce: Some("n".into()),
+                ..MarkerScan::default()
+            };
+            scan.receive(0, bytes.as_bytes());
+            assert!(scan.invalid, "{bytes}");
+        }
     }
 
     #[test]

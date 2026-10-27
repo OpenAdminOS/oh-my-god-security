@@ -486,6 +486,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     };
     let request = ProveRequest {
         command: command.clone(),
+        test: test.clone(),
         timeout_ms,
         target: target.clone(),
         run_dir: run_dir.clone(),
@@ -527,6 +528,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         marker_nonce: result.marker_nonce.clone(),
         command_started: s.command_started,
         command_finished: s.command_finished,
+        test_reachable: s.test_reachable,
         timeout_ms,
         started_at_ms,
         duration_ms: s.duration_ms,
@@ -631,6 +633,9 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         }
         if !record.command_finished {
             reasons.push("command did not emit its end marker");
+        }
+        if record.test.is_some() && record.test_reachable != Some(true) {
+            reasons.push("proof test was not reachable inside the sandbox");
         }
         if !record.clean() {
             reasons.push("run did not finish cleanly");
@@ -779,19 +784,22 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             )
         };
         let (inside, outside) = (token("inside"), token("outside"));
-        write_out(target.join("inside.txt"), inside.as_bytes()).map_err(|e| e.to_string())?;
+        let inside_test = "probe/deep/inside.txt";
+        std::fs::create_dir_all(target.join("probe/deep")).map_err(|e| e.to_string())?;
+        write_out(target.join(inside_test), inside.as_bytes()).map_err(|e| e.to_string())?;
         let secret = probe.join("outside.txt");
         write_out(&secret, outside.as_bytes()).map_err(|e| e.to_string())?;
         let cmd = if os == "windows" {
             format!(
-                "cmd.exe /d /c type inside.txt & type \"{}\"",
+                "cmd.exe /d /c type probe\\deep\\inside.txt & type \"{}\"",
                 secret.display()
             )
         } else {
-            format!("cat inside.txt; cat '{}'", secret.display())
+            format!("cat {inside_test}; cat '{}'", secret.display())
         };
         let request = ProveRequest {
             command: cmd,
+            test: Some(inside_test.into()),
             timeout_ms: 30_000,
             target: Some(target),
             run_dir: probe.join("run"),
@@ -811,6 +819,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         if !out.contains(&inside)
             || !outcome.run.command_started
             || !outcome.run.command_finished
+            || outcome.run.test_reachable != Some(true)
             || outcome.run.timed_out
             || !outcome.run.capture_complete
             || !outcome.run.cleanup_complete
@@ -831,7 +840,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             );
             return Err("__EXIT1__".into());
         }
-        println!("live check: the probe ran, read its workspace, and was denied a file outside it");
+        println!("live check: the probe ran, read a nested workspace file, and was denied a file outside it");
         println!("applied on that run:");
         for e in &outcome.enforced {
             println!("  {e}");
@@ -844,7 +853,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         let names: Vec<&str> = tools.iter().map(|t| t.as_str()).collect();
         let cmd = if os == "windows" {
             format!(
-                "cmd.exe /d /c for %t in ({}) do @where %t >nul 2>&1 && echo omgs-reach %t",
+                "cmd.exe /d /c for %t in ({}) do @where %t && echo omgs-reach %t",
                 names.join(" ")
             )
         } else {
@@ -855,6 +864,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         };
         let reach = ProveRequest {
             command: cmd,
+            test: None,
             timeout_ms: 30_000,
             target: None,
             run_dir: probe.join("reach"),

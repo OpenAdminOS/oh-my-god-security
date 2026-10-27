@@ -68,10 +68,6 @@ jobs:
           chmod +x "$exe"
           # omgs checks the executor's own SHA-256 against its pin before use.
           echo "OMGS_MXC_EXEC=$exe" >> "$GITHUB_ENV"
-      - name: Windows filesystem diagnostics
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./.github/windows-diagnostics.ps1
       - name: Doctor
         shell: bash
         run: cargo run --locked -q -- doctor --live

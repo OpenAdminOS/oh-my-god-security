@@ -285,7 +285,8 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
         };
         let nonce = "a".repeat(64);
         let command = "npm test -- tests/security/x.test.ts";
-        let wrapped = omgs::sandbox::wrapped_command(os, command, &nonce);
+        let wrapped =
+            omgs::sandbox::wrapped_command(os, command, &nonce, Some("tests/security/x.test.ts"));
         let allowed_marker = proof_dir.join("markers/allowed");
         let config = omgs::sandbox::mxc_config(&omgs::sandbox::ConfigInput {
             os,
@@ -332,6 +333,7 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             marker_nonce: nonce,
             command_started: true,
             command_finished: true,
+            test_reachable: Some(true),
             timeout_ms: 1000,
             started_at_ms: 0,
             duration_ms: 1,
@@ -1412,6 +1414,22 @@ fn every_proven_verdict_requires_a_valid_inner_exit_and_clean_markers() {
         Verdict::NeedsValidation,
         Verdict::Rejected,
     ] {
+        for reachable in [None, Some(false)] {
+            for exit in [0, 1] {
+                let mut findings = findings.clone();
+                findings.findings[0].verdict = verdict;
+                let mut record = original.clone();
+                record.test_reachable = reachable;
+                record.exit_code = Some(exit);
+                omgs::proof::write(&dir, &record).unwrap();
+                let errors = omgs::proof::validate_proofs(&findings, &dir);
+                assert!(has(&errors, "did not finish cleanly"), "{errors:?}");
+                assert!(
+                    has(&errors, "not reachable inside the sandbox"),
+                    "{errors:?}"
+                );
+            }
+        }
         for code in [
             None,
             Some(-1),
