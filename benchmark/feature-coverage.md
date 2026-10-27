@@ -11,9 +11,10 @@ Status after rounds on 2026-10-16: the first six projects, the next twenty proje
 | audit init | Tested | 26 field targets plus reruns. Stack detection, sensors, outside-tree enforcement, owner-only permissions, shared-temp warning, gate and advisory metadata. |
 | validate | Tested | 26 report sets accepted; deliberately invalid records rejected for fingerprint, severity, proof tier, and evidence violations with exit 1. Since 2026-10-24 also rejects missing or equal `hunted_by` and `verified_by`, repeated locations, and invalid or doubly merged `candidates` (unit tests). |
 | fingerprint | Tested | Stable across repeated and case-variant inputs. Used by every hunter record. |
-| prove, Seatbelt backend | Tested | Scratch write allowed, outside write denied, network denied, timeout enforced. Full target template executed in sandbox and produced the first confirmed finding. Seatbelt does not isolate the process list, observed when a proof ran pgrep. |
-| prove, MXC backend | Partial | Real MXC v1.0.0 executor on the Windows mini PC: config-based backend in OMGS, dry-run validation passes, cmd workloads contained (scratch write allowed, outside write denied, network denied). PowerShell hosts fail DLL initialization from an SSH session despite desktop UI isolation; see multi-machine results. |
-| prove, bubblewrap backend | Tested | Linux NUC: scratch write allowed, outside write denied on a read-only root, network denied, timeout enforced. |
+| prove, MXC on macOS | Tested | 2026-10-27, MXC 1.0.1 `mxc-exec-mac`: installer-trust fixture (vulnerable exits 1, fixed exits 0), home and `~/.ssh` reads, outside writes, network, `defaults write`, `open`, `launchctl` and clipboard denied, Apple Events not delivered, workspace writable, target byte-identical, `setsid` grandchild killed and named, timeout kills the tree (`tests/sandbox.rs`). Earlier runs used the retired Seatbelt profile. |
+| prove, MXC on Windows | Tested | 2026-10-27, MXC 1.0.1 `wxc-exec.exe` on the Windows 11 mini PC: `omgs doctor --live` denial, home reads denied, workspace writable, proof records written. PowerShell hosts still need an interactive desktop session; over SSH only cmd workloads run. |
+| prove, MXC on Linux | Tested | 2026-10-27, MXC 1.0.1 `lxc-exec` on Ubuntu 24.04 arm64: home shows only the toolchain mounts, outside reads, writes and network denied, timeout kills the tree, memory and task limits applied through a systemd user scope. |
+| prove proof records | Tested | `prove --run --finding` writes `proofs/<n>.json` with executor digest, config digest, enforced controls, gaps, exit, survivors and redacted output; `validate`, `report` and `critic` reject a tier above traced without a matching clean record. |
 | report (Markdown, HTML, SARIF) | Tested | 26 targets rendered; HTML escaping and zero external requests covered by unit tests; SARIF emitted one result for the single confirmed finding and parses as JSON. |
 | ledger set | Tested | Valid transitions applied, unknown unit rejected with exit 2. Since 2026-10-24 `covered` requires `--evidence` and `deferred`, `blocked`, `out_of_scope` require `--note` (unit and end-to-end tests). |
 | ledger add, ledger list | Unit tested | Duplicate ids and unknown statuses refused; list exits 1 on rule violations. No field run yet. |
@@ -26,6 +27,8 @@ Status after rounds on 2026-10-16: the first six projects, the next twenty proje
 | Gate enforcement | Untested by design gap | Mode is recorded in metadata and reports, but no CLI command fails a build in gate mode. Locked design says deterministic proof tests gate in the target CI, which no field target has exercised yet. |
 
 ## Proof tiers and lifecycle
+
+The earlier tier 2 field run predates the 2026-10-27 decision that tier 2 runs only on Linux.
 
 | Surface | Status | Evidence |
 | --- | --- | --- |

@@ -100,6 +100,19 @@ pub struct Finding {
     /// record. The record's own fingerprint is implicit.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub candidates: Vec<String>,
+    /// The runner-written proof record behind `proof_tier`, `proofs/<n>.json`
+    /// beside the findings file. Required for any tier above traced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof_ref: Option<String>,
+    /// Source to sink steps, in order, for readers and fixing agents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trace: Vec<TraceStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceStep {
+    pub location: Location,
+    pub note: String,
 }
 
 /// `findings` is required, so a misspelled key fails to parse instead of
@@ -163,6 +176,16 @@ pub fn validate(file: &FindingsFile) -> Vec<String> {
                     loc.path,
                     loc.line.map(|l| format!(":{l}")).unwrap_or_default()
                 ));
+            }
+        }
+        for (j, step) in f.trace.iter().enumerate() {
+            if step.location.path.trim().is_empty() || step.location.line == Some(0) {
+                errors.push(format!(
+                    "{at}: trace[{j}] needs a path and a one-based line"
+                ));
+            }
+            if step.note.trim().is_empty() {
+                errors.push(format!("{at}: trace[{j}] note is empty"));
             }
         }
         if let Some(id) = &f.intent_id {

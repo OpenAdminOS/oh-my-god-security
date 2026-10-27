@@ -157,11 +157,7 @@ pub fn check_meta_types(meta: &serde_json::Map<String, serde_json::Value>) -> Re
         None | Some(Value::String(_)) => {}
         _ => return wrong("run_status"),
     }
-    match meta.get("agent_calls_used") {
-        None | Some(Value::Null) => {}
-        Some(v) if v.is_u64() => {}
-        _ => return wrong("agent_calls_used"),
-    }
+    crate::runmeta::check_numeric_fields(meta)?;
     match meta.get("reroutes") {
         None => {}
         Some(Value::Array(a)) if a.iter().all(|r| r.is_object()) => {}

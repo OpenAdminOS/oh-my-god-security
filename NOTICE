@@ -10,10 +10,11 @@ This project pins and may redistribute material from cloudflare/security-audit-s
 licensed under the MIT License. Its copyright and permission notices are preserved
 with that material wherever it is included.
 
-This project integrates with the Microsoft eXecution Container (MXC) SDK and
-executor as a sandbox backend. MXC is a dependency referenced by name in build
-files and documentation of the sandbox interface. Use of MXC is subject to its
-own license terms as published with that project.
+This project runs proofs only inside Microsoft MXC (https://github.com/microsoft/mxc),
+licensed under the MIT License. OMGS pins the MXC 1.0.1 executors (mxc-exec-mac,
+lxc-exec, wxc-exec.exe) by SHA-256. OMGS releases may redistribute those
+executors unmodified, with Microsoft's signatures intact; when they do, the MXC
+MIT copyright and permission notice is shipped beside them.
 
 Deterministic sensor tools invoked by the CLI, when present on the user system,
 remain under their own licenses and are not redistributed by this project unless

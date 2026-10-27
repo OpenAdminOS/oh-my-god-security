@@ -5,54 +5,183 @@ use omgs::critic::{critique_dir, critique_run};
 use omgs::ledger::{add_unit, coverage_lines, set_status, validate_ledger, Ledger, Unit, STATUSES};
 use omgs::model::{identity, validate, FindingsFile};
 use omgs::report::{render_html, render_markdown, render_sarif, ReportMeta};
-use omgs::sandbox::{prove, ProveOutcome, ProveRequest};
+use omgs::sandbox::{prove, ProveOutcome, ProveRequest, Tier};
 use omgs::sensors::run_sensors;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// The value after `name`. A following token that is itself an option means
-/// the value is missing, never that the option name is the value.
+fn boolean_option(name: &str) -> bool {
+    ["--yes", "--no-sensors", "--live", "--help", "-h"].contains(&name)
+}
+
+fn free_text_option(name: &str) -> bool {
+    [
+        "--cmd", "--note", "--answer", "--detail", "--log", "--reason",
+    ]
+    .contains(&name)
+}
+
+/// Walk option/value pairs so a free-text value cannot become another option.
+fn options(args: &[String]) -> impl Iterator<Item = (&str, Option<&str>)> {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while let Some(arg) = args.get(i) {
+            i += 1;
+            if !arg.starts_with('-') {
+                continue;
+            }
+            if let Some((name, value)) = arg.split_once('=') {
+                return Some((name, Some(value)));
+            }
+            let value = if boolean_option(arg) {
+                None
+            } else {
+                let value = args.get(i).map(String::as_str);
+                i += usize::from(value.is_some());
+                value
+            };
+            return Some((arg.as_str(), value));
+        }
+        None
+    })
+}
+
 fn flag(args: &[String], name: &str) -> Option<String> {
-    args.windows(2)
-        .find(|w| w[0] == name)
-        .map(|w| w[1].clone())
-        .filter(|v| !v.starts_with("--"))
+    options(args)
+        .find(|(option, _)| *option == name)
+        .and_then(|(_, value)| value.map(str::to_string))
 }
 fn has(args: &[String], name: &str) -> bool {
-    args.iter().any(|a| a == name)
+    options(args).any(|(option, _)| option == name)
 }
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--cwd <dir>] [--scratch <dir>] [--timeout-ms <n>]\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n\nEvery option except --yes and --no-sensors takes a value, and a value may not begin with --.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--hunter <id>] [--verifier <id>]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument.\n",
         env!("CARGO_PKG_VERSION")
     );
+}
+
+/// Validate the complete option list before any command can mutate run state.
+fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
+    let (allowed, positional): (&str, bool) = match cmd {
+        "setup" => ("--yes --from", false),
+        "review" => ("--repo-url --mode --budget --no-sensors", false),
+        "audit" if args.first().is_some_and(|a| a == "init") => (
+            "--target --out --mode --budget --no-sensors --hunter --verifier",
+            true,
+        ),
+        "batch" if args.first().is_some_and(|a| a == "init") => {
+            ("--list --out --mode --budget --no-sensors", true)
+        }
+        "batch" if args.first().is_some_and(|a| a == "index") => ("--batch --out", true),
+        "validate" => ("--findings", false),
+        "fingerprint" => ("--attack-class --entry-point --sink --boundary", false),
+        "prove" => (
+            "--cmd --target --run --finding --test --test-from --replay --tier --timeout-ms",
+            false,
+        ),
+        "approve" => ("--target", false),
+        "report" => (
+            "--findings --out --repo --ref --mode --sandbox --hunters --verifier --agent-calls",
+            false,
+        ),
+        "architecture" => ("--in --out", false),
+        "ledger" if args.first().is_some_and(|a| a == "list") => ("--ledger", true),
+        "ledger" if args.first().is_some_and(|a| a == "add") => {
+            ("--ledger --unit --surface --classes --status --note", true)
+        }
+        "ledger" if args.first().is_some_and(|a| a == "set") => {
+            ("--ledger --unit --status --evidence --note", true)
+        }
+        "critic" => ("--run", false),
+        "status" => (
+            "--run --stage --state --label --parent --detail --counter --log",
+            false,
+        ),
+        "watch" => ("--run --max-ms", false),
+        "route" => ("--run --role --refused --reason --models", false),
+        "intent" if args.first().is_some_and(|a| a == "list") => ("--stack --attack-class", true),
+        "intent" if args.first().is_some_and(|a| a == "answer") => {
+            ("--target --id --answer --source --scope", true)
+        }
+        "check" => ("--target --out", false),
+        "doctor" => ("--live", false),
+        "help" | "--help" | "-h" | "--version" | "-V" => ("", false),
+        "audit" | "batch" | "ledger" | "intent" if args == ["--help"] || args == ["-h"] => {
+            ("", false)
+        }
+        _ => return Err(format!("unknown command or subcommand '{cmd}'")),
+    };
+    let mut help_requested = false;
+    let mut seen = std::collections::HashSet::new();
+    let mut i = usize::from(positional);
+    while i < args.len() {
+        let (option, inline) = args[i]
+            .split_once('=')
+            .map_or((args[i].as_str(), None), |(k, v)| (k, Some(v)));
+        let help = option == "--help" || option == "-h";
+        help_requested |= help;
+        if !help && !allowed.split_whitespace().any(|a| a == option) {
+            return Err(format!("unknown option '{option}' for {cmd}"));
+        }
+        let repeatable = (cmd == "ledger" && option == "--evidence")
+            || (cmd == "status" && option == "--counter");
+        if !seen.insert(option) && !repeatable {
+            return Err(format!("duplicate option '{option}'"));
+        }
+        i += 1;
+        if boolean_option(option) {
+            if inline.is_some() {
+                return Err(format!("{option} does not take a value"));
+            }
+        } else if inline.is_none() {
+            match args.get(i) {
+                Some(value)
+                    if free_text_option(option)
+                        && (allowed.split_whitespace().any(|known| {
+                            value == known || value.starts_with(&format!("{known}="))
+                        }) || matches!(value.as_str(), "--help" | "-h")
+                            || value.starts_with("--help=")) =>
+                {
+                    return Err(format!(
+                        "{option} requires an unambiguous value; use {option}=value for free text beginning with a known option"
+                    ));
+                }
+                Some(value) if free_text_option(option) || !value.starts_with("--") => i += 1,
+                _ => {
+                    return Err(format!(
+                        "{option} requires a value; use {option}=value if it begins with --"
+                    ))
+                }
+            }
+        }
+    }
+    Ok(help_requested)
+}
+
+fn cli_error(error: &str) {
+    eprintln!("error: {}", error.replace(['\r', '\n'], " "));
+    eprintln!("run omgs --help for usage");
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first().map(|s| s.as_str()) else {
-        usage();
+        cli_error("a command is required");
         return ExitCode::from(2);
     };
     let rest = &args[1..];
-    if rest.iter().any(|a| a == "--help" || a == "-h") {
-        usage();
-        return ExitCode::SUCCESS;
-    }
-    // Every option except the switches takes a value; a missing one is an
-    // error rather than being skipped or taking the next option's name.
-    const SWITCHES: [&str; 2] = ["--yes", "--no-sensors"];
-    for (i, a) in rest.iter().enumerate() {
-        if a.starts_with("--") && !SWITCHES.contains(&a.as_str()) {
-            match rest.get(i + 1) {
-                Some(v) if !v.starts_with("--") => {}
-                _ => {
-                    eprintln!("error: {a} requires a value");
-                    return ExitCode::from(2);
-                }
-            }
+    match validate_options(cmd, rest) {
+        Err(e) => {
+            cli_error(&e);
+            return ExitCode::from(2);
         }
+        Ok(true) => {
+            usage();
+            return ExitCode::SUCCESS;
+        }
+        Ok(false) => {}
     }
     let result: Result<(), String> = match cmd {
         "--help" | "-h" | "help" => {
@@ -69,6 +198,7 @@ fn main() -> ExitCode {
         "validate" => cmd_validate(rest),
         "fingerprint" => cmd_fingerprint(rest),
         "prove" => cmd_prove(rest),
+        "approve" => cmd_approve(rest),
         "report" => cmd_report(rest),
         "architecture" => cmd_architecture(rest),
         "ledger" => cmd_ledger(rest),
@@ -79,6 +209,7 @@ fn main() -> ExitCode {
         "route" => cmd_route(rest),
         "intent" => cmd_intent(rest),
         "check" => cmd_check(rest),
+        "doctor" => cmd_doctor(rest),
         other => Err(format!("unknown command '{other}'")),
     };
     match result {
@@ -89,7 +220,7 @@ fn main() -> ExitCode {
             } else if e == "__EXIT1__" {
                 ExitCode::from(1)
             } else {
-                eprintln!("error: {e}");
+                cli_error(&e);
                 ExitCode::from(2)
             }
         }
@@ -101,10 +232,22 @@ fn read_findings(path: &str) -> Result<FindingsFile, String> {
     omgs::shape::findings(&text).map_err(|e| format!("parse {path}: {e}"))
 }
 
+/// Evidence rules plus proof records, which live in `proofs/` beside the
+/// findings file.
+fn validate_at(file: &FindingsFile, path: &str) -> Vec<String> {
+    let dir = Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut errors = validate(file);
+    errors.extend(omgs::proof::validate_proofs(file, dir));
+    errors
+}
+
 fn cmd_validate(args: &[String]) -> Result<(), String> {
     let path = flag(args, "--findings").ok_or("validate requires --findings <path>")?;
     let file = read_findings(&path)?;
-    let errors = validate(&file);
+    let errors = validate_at(&file, &path);
     if errors.is_empty() {
         println!("valid: {} finding(s)", file.findings.len());
         Ok(())
@@ -166,52 +309,800 @@ fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn release_proof_charge(run: &Path) -> Result<(), String> {
+    omgs::runmeta::update(run, |m| {
+        let used = m
+            .get("proof_runs_used")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+        m.insert(
+            "proof_runs_used".into(),
+            serde_json::json!(used.saturating_sub(1)),
+        );
+        Ok(())
+    })
+    .map(|_| ())
+}
+
 fn cmd_prove(args: &[String]) -> Result<(), String> {
-    let command = flag(args, "--cmd").ok_or("prove requires --cmd <command>")?;
-    let timeout: u64 = flag(args, "--timeout-ms")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(120_000);
-    let scratch = flag(args, "--scratch")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/share/omgs/prove-scratch"));
-    let request = ProveRequest {
-        command,
-        timeout_ms: timeout,
-        cwd: flag(args, "--cwd").map(PathBuf::from),
-        scratch,
-    };
-    match prove(&request) {
-        ProveOutcome::BlockedNoSandbox { request_json } => {
-            eprintln!("needs_validation: no sandbox backend found, target code was not executed.");
-            eprintln!("Install an MXC executor (OMGS_MXC_EXEC), Seatbelt (macOS) or bubblewrap (Linux), then rerun. Planned containment request:");
-            eprintln!("{request_json}");
-            Err("__EXIT3__".into())
-        }
-        ProveOutcome::Ran {
-            backend,
-            success,
-            timed_out,
-            output,
-        } => {
-            eprintln!(
-                "sandbox backend: {backend}{}",
-                if timed_out { " (timed out)" } else { "" }
-            );
-            print!("{output}");
-            if success && !timed_out {
-                Ok(())
-            } else {
-                Err("__EXIT1__".into())
+    #[cfg(unix)]
+    let _signals = omgs::supervise::interruption::Guard::install().map_err(|e| e.to_string())?;
+    let run = flag(args, "--run").map(PathBuf::from);
+    // A replay reruns a recorded proof exactly, so an independent evaluator
+    // can check a result instead of trusting the file that claims it.
+    let replay = match flag(args, "--replay") {
+        Some(v) => {
+            let r = run
+                .as_ref()
+                .ok_or("--replay needs --run <run-dir>, the run that holds the record")?;
+            for conflicting in [
+                "--cmd",
+                "--finding",
+                "--test",
+                "--tier",
+                "--target",
+                "--timeout-ms",
+            ] {
+                if flag(args, conflicting).is_some() {
+                    return Err(format!(
+                        "--replay takes everything from the record; drop {conflicting}"
+                    ));
+                }
             }
+            let n: u32 = v
+                .parse()
+                .map_err(|_| format!("--replay takes a proof number, got '{v}'"))?;
+            Some(omgs::proof::load(r, &omgs::proof::reference(n))?)
+        }
+        None => None,
+    };
+    let command = match &replay {
+        Some(r) => omgs::proof::recorded_command(run.as_ref().unwrap(), r)?,
+        None => flag(args, "--cmd").ok_or("prove requires --cmd <command>")?,
+    };
+    let timeout_ms: u64 = match flag(args, "--timeout-ms") {
+        Some(v) => v
+            .parse()
+            .map_err(|_| format!("--timeout-ms must be a whole number, got '{v}'"))?,
+        None => replay.as_ref().map(|r| r.timeout_ms).unwrap_or(120_000),
+    };
+    omgs::sandbox::validate_input(&command, timeout_ms)?;
+    let tier = match (&replay, flag(args, "--tier").as_deref()) {
+        (Some(r), _) if r.tier == "local_app" => Tier::LocalApp,
+        (Some(_), _) | (None, None | Some("1")) => Tier::Test,
+        (None, Some("2")) => Tier::LocalApp,
+        (None, Some(other)) => return Err(format!("--tier must be 1 or 2, got '{other}'")),
+    };
+    let finding = match &replay {
+        Some(r) => r.finding.clone(),
+        None => flag(args, "--finding"),
+    };
+    if let Some(fp) = &finding {
+        if !omgs::model::is_fingerprint(fp) {
+            return Err(format!("--finding '{fp}' is not an omgs fingerprint"));
+        }
+        if run.is_none() {
+            return Err(
+                "--finding needs --run <run-dir> so the proof record lands beside the findings"
+                    .into(),
+            );
         }
     }
+    let test = match &replay {
+        Some(r) => r.test.clone(),
+        None => flag(args, "--test"),
+    };
+    if finding.is_some() && test.is_none() {
+        return Err("--finding requires --test <target-relative path>".into());
+    }
+    if let Some(t) = &test {
+        if t.trim().is_empty() || !omgs::proof::command_names(&command, t) {
+            return Err(format!(
+                "--cmd must name --test {t} as a full path or file name token"
+            ));
+        }
+        if Path::new(t).is_absolute() || t.contains(':') || t.split(['/', '\\']).any(|s| s == "..")
+        {
+            return Err(format!(
+                "--test '{t}' must be a path relative to the target"
+            ));
+        }
+    }
+    let meta = match &run {
+        Some(r) => Some(omgs::runmeta::read(r)?),
+        None => None,
+    };
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let target = match &replay {
+        // A replay never takes a host path from the record: the target must be
+        // this run's own target, so an edited record cannot point it elsewhere.
+        Some(r) => match &r.target {
+            None => None,
+            Some(t) => {
+                let run_target = meta
+                    .as_ref()
+                    .and_then(|m| m.get("target").and_then(|v| v.as_str()))
+                    .ok_or(
+                        "--replay of a record with a target needs a run initialised against it",
+                    )?;
+                if canon(Path::new(t)) != canon(Path::new(run_target)) {
+                    return Err(format!(
+                        "{} names target {t}, not this run's target {run_target}; refusing to replay it",
+                        omgs::proof::reference(r.n)
+                    ));
+                }
+                Some(PathBuf::from(run_target))
+            }
+        },
+        None => flag(args, "--target").map(PathBuf::from).or_else(|| {
+            meta.as_ref()
+                .and_then(|m| m.get("target").and_then(|t| t.as_str()).map(PathBuf::from))
+        }),
+    };
+    let target = match target {
+        Some(t) => {
+            Some(std::fs::canonicalize(&t).map_err(|e| format!("target {}: {e}", t.display()))?)
+        }
+        None => None,
+    };
+    if let Some(run_target) = meta
+        .as_ref()
+        .and_then(|m| m.get("target"))
+        .and_then(|v| v.as_str())
+    {
+        if target.as_deref().map(canon) != Some(canon(Path::new(run_target))) {
+            return Err(format!(
+                "--target must match this run's target {run_target}"
+            ));
+        }
+    }
+    let target_head = target.as_deref().and_then(omgs::proof::git_head);
+    if let Some(r) = &replay {
+        if r.target_head != target_head {
+            return Err(
+                "target commit differs from the recorded target_head; refusing to replay".into(),
+            );
+        }
+        let errors = omgs::proof::runner_evidence(run.as_ref().unwrap(), r);
+        if !errors.is_empty() {
+            return Err(format!(
+                "cannot replay invalid record: {}",
+                errors.join("; ")
+            ));
+        }
+    }
+    // The proof test is either already in the target or a draft kept
+    // outside it (`--test-from`) that the runner stages into the workspace
+    // copy at the `--test` path. Its digest goes on the record so a reader can
+    // tell which test produced the result.
+    let draft = match (&replay, flag(args, "--test-from")) {
+        (Some(_), Some(_)) => {
+            return Err("--replay takes everything from the record; drop --test-from".into())
+        }
+        // The runner kept its own copy of the draft beside the record; the
+        // original path in the record is informational only.
+        (Some(r), None) => r.test_from.as_ref().map(|_| {
+            run.as_ref()
+                .map(|d| d.join("proofs").join(r.n.to_string()).join("test-draft"))
+                .unwrap_or_default()
+        }),
+        (None, d) => d.map(PathBuf::from),
+    };
+    if draft.is_some() && test.is_none() {
+        return Err("--test-from needs --test <target-relative path> to stage it at".into());
+    }
+    let test_sha256 = match (&test, &draft) {
+        (Some(_), Some(d)) => {
+            let digest = omgs::sha256::digest_file(d)
+                .map_err(|e| format!("--test-from {}: {e}", d.display()))?;
+            let d = std::fs::canonicalize(d)
+                .map_err(|e| format!("--test-from {}: {e}", d.display()))?;
+            if target.as_ref().is_some_and(|base| d.starts_with(base)) {
+                return Err("--test-from must be a draft outside the target; drop it to use a test already in the target".into());
+            }
+            if !d.is_file() {
+                return Err(format!("--test-from {} is not a file", d.display()));
+            }
+            Some(digest)
+        }
+        (Some(t), None) => {
+            let base = target
+                .as_ref()
+                .ok_or("--test needs a target to find the test in")?;
+            let path = base.join(t);
+            if !path.is_file() {
+                return Err(format!(
+                    "--test {t} does not resolve to a regular file at {}; stage a draft with --test-from <file>",
+                    omgs::platform::describe_path(&path)
+                ));
+            }
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| omgs::platform::is_link(&m)) {
+                eprintln!("proof test: {}", omgs::platform::describe_path(&path));
+            }
+            Some(
+                omgs::sha256::digest_file(&path)
+                    .map_err(|e| format!("read {}: {e}", omgs::platform::describe_path(&path)))?,
+            )
+        }
+        (None, _) => None,
+    };
+    let draft = match draft {
+        Some(d) => Some(
+            std::fs::canonicalize(&d).map_err(|e| format!("--test-from {}: {e}", d.display()))?,
+        ),
+        None => None,
+    };
+    if let Some(r) = &replay {
+        if r.test_sha256 != test_sha256 {
+            return Err(format!(
+                "the proof test differs from the one {} ran; refusing to replay a different test",
+                omgs::proof::reference(r.n)
+            ));
+        }
+    }
+    if tier == Tier::LocalApp {
+        if let Some(why) = omgs::sandbox::tier2_unavailable(std::env::consts::OS) {
+            eprintln!("needs_validation: target code was not executed. {why}");
+            return Err("__EXIT3__".into());
+        }
+        let t = target
+            .as_ref()
+            .ok_or("--tier 2 needs a target, since approval is per repository")?;
+        if !omgs::approval::is_approved(&data_dir(), t)? {
+            eprintln!("needs_validation: tier 2 runs a locally built app and needs a one-time human approval for {}.", t.display());
+            eprintln!(
+                "Ask the person you are working for to run, at their own terminal: omgs approve --target {}",
+                t.display()
+            );
+            return Err("__EXIT3__".into());
+        }
+    }
+    omgs::supervise::check_interrupted().map_err(|e| e.to_string())?;
+    let proof_dir = match &run {
+        Some(r) => {
+            // Check and charge the budget in one locked step, before anything
+            // runs, so concurrent proofs cannot overspend it. A run that is
+            // interrupted keeps its charge; a blocked one gets it back below.
+            let charged = omgs::runmeta::update(r, |m| {
+                omgs::runmeta::check_numeric_fields(m)?;
+                let used = |k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                let (calls, proofs) = (used("agent_calls_used"), used("proof_runs_used"));
+                if let Some(b) = m.get("budget_agent_calls").and_then(|v| v.as_u64()) {
+                    if u128::from(calls) + u128::from(proofs) >= u128::from(b) {
+                        return Err(format!(
+                            "run budget exhausted: {calls} agent call(s) and {proofs} proof run(s) against a budget of {b}"
+                        ));
+                    }
+                }
+                let next = proofs.checked_add(1).ok_or("proof_runs_used exhausted")?;
+                m.insert("proof_runs_used".into(), serde_json::json!(next));
+                Ok(())
+            });
+            if let Err(e) = charged {
+                if e.starts_with("run budget exhausted") {
+                    eprintln!("needs_validation: target code was not executed. {e}");
+                    return Err("__EXIT3__".into());
+                }
+                return Err(e);
+            }
+            match omgs::proof::reserve(r) {
+                Ok(reserved) => Some(reserved),
+                Err(e) => {
+                    release_proof_charge(r)?;
+                    return Err(e);
+                }
+            }
+        }
+        None => None,
+    };
+    let run_dir = match &proof_dir {
+        Some((_, d)) => d.clone(),
+        None => data_dir().join("prove").join(format!(
+            "{}-{}",
+            omgs::runmeta::now_ms(),
+            std::process::id()
+        )),
+    };
+    // Nothing ran: give the budget charge and the reserved number back.
+    let release = || {
+        let _ = std::fs::remove_dir_all(&run_dir);
+        if let (Some(r), Some(_)) = (&run, &proof_dir) {
+            let _ = release_proof_charge(r);
+        }
+    };
+    // Keep the runner's own copy of the draft beside the record and stage
+    // from it, so what ran is what was hashed and a replay never reads a host
+    // path out of the record.
+    let staged_draft = match &draft {
+        Some(d) => {
+            let copy = run_dir.join("test-draft");
+            let kept = omgs::platform::private_dir(&run_dir)
+                .and_then(|_| omgs::sandbox::stage_file(&run_dir, "test-draft", d))
+                .map_err(|e| e.to_string())
+                .and_then(|_| omgs::sha256::digest_file(&copy).map_err(|e| e.to_string()));
+            if kept.ok() != test_sha256 {
+                release();
+                return Err(format!("could not keep a verified copy of {}", d.display()));
+            }
+            Some(copy)
+        }
+        None => None,
+    };
+    let request = ProveRequest {
+        command: command.clone(),
+        test: test.clone(),
+        timeout_ms,
+        target: target.clone(),
+        run_dir: run_dir.clone(),
+        tier,
+        stage: staged_draft.zip(test.clone()),
+        expected_tree_sha256: replay.as_ref().and_then(|r| r.target_sha256.clone()),
+    };
+    let started_at_ms = omgs::runmeta::now_ms();
+    let result = match prove(&request) {
+        ProveOutcome::Blocked { reason } => {
+            release();
+            eprintln!("needs_validation: target code was not executed. {reason}");
+            return Err("__EXIT3__".into());
+        }
+        ProveOutcome::Ran(r) => r,
+    };
+    let s = &result.run;
+    let output = omgs::proof::redact(&s.output);
+    omgs::runmeta::write_atomic_bytes(&run_dir.join("command.txt"), command.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let record = omgs::proof::ProofRecord {
+        schema: omgs::proof::SCHEMA.into(),
+        n: proof_dir.as_ref().map(|(n, _)| *n).unwrap_or(0),
+        finding,
+        test,
+        test_sha256,
+        test_from: draft.as_ref().map(|d| d.to_string_lossy().to_string()),
+        replays: replay.as_ref().map(|r| r.n),
+        tier: match tier {
+            Tier::Test => "test".into(),
+            Tier::LocalApp => "local_app".into(),
+        },
+        command: omgs::proof::redact(&command),
+        command_sha256: omgs::sha256::digest(command.as_bytes()),
+        wrapped_command_sha256: result.wrapped_command_sha256.clone(),
+        readable_roots: result.readable_roots.clone(),
+        system_root: result.system_root.clone(),
+        target: target.as_ref().map(|t| t.to_string_lossy().to_string()),
+        target_head,
+        target_sha256: result.target_sha256.clone(),
+        proof_dir: std::fs::canonicalize(&run_dir)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into(),
+        marker_nonce: result.marker_nonce.clone(),
+        command_started: s.command_started,
+        command_finished: s.command_finished,
+        test_reachable: s.test_reachable,
+        timeout_ms,
+        started_at_ms,
+        duration_ms: s.duration_ms,
+        exit_code: s.exit_code,
+        timed_out: s.timed_out,
+        capture_complete: s.capture_complete,
+        cleanup_complete: s.cleanup_complete,
+        executor_error: s.executor_error,
+        killed: s.killed,
+        interrupted: s.interrupted,
+        survivors: s
+            .survivors
+            .iter()
+            .map(|v| omgs::proof::Survivor {
+                pid: v.pid,
+                command: omgs::proof::redact(&v.command),
+            })
+            .collect(),
+        mxc_version: omgs::sandbox::MXC_VERSION.into(),
+        containment: result.containment.clone(),
+        executor: result.executor.to_string_lossy().to_string(),
+        executor_sha256: result.executor_sha256.clone(),
+        config_sha256: result.config_sha256.clone(),
+        enforced: result.enforced.clone(),
+        gaps: result.gaps.clone(),
+        output_sha256: omgs::sha256::digest(output.as_bytes()),
+        output_bytes_total: s.output_bytes_total,
+        output,
+        omgs_version: env!("CARGO_PKG_VERSION").into(),
+    };
+    let record_path = match (&run, &proof_dir) {
+        (Some(r), Some(_)) => omgs::proof::write(r, &record)?,
+        _ => {
+            let p = run_dir.join("record.json");
+            let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
+            omgs::runmeta::write_atomic(&p, &format!("{text}\n"))?;
+            p
+        }
+    };
+    {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(record.output.as_bytes())
+            .map_err(|e| e.to_string())?;
+        stdout.flush().map_err(|e| e.to_string())?;
+    }
+    eprintln!(
+        "sandbox: MXC {} ({}), executor {} sha256 {}",
+        omgs::sandbox::MXC_VERSION,
+        result.containment,
+        result.executor.display(),
+        result.executor_sha256
+    );
+    for e in &result.enforced {
+        eprintln!("  enforced: {e}");
+    }
+    for g in &result.gaps {
+        eprintln!("  not enforced: {g}");
+    }
+    for v in &s.survivors {
+        eprintln!(
+            "  survivor killed: pid {} {}",
+            v.pid,
+            omgs::proof::redact(&v.command)
+        );
+    }
+    eprintln!(
+        "exit {}{}{}, {} ms",
+        s.exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "none".into()),
+        if s.executor_error {
+            ", executor error"
+        } else if s.killed {
+            ", killed"
+        } else if s.timed_out {
+            ", timed out"
+        } else {
+            ""
+        },
+        if s.capture_complete {
+            ""
+        } else {
+            ", output capture incomplete"
+        },
+        s.duration_ms
+    );
+    match &proof_dir {
+        Some((n, _)) => eprintln!(
+            "proof record: {} (proof_ref {})",
+            record_path.display(),
+            omgs::proof::reference(*n)
+        ),
+        None => eprintln!(
+            "proof record: {} (not linked to a run)",
+            record_path.display()
+        ),
+    }
+    if record.finding.is_some() {
+        let rejected = run
+            .as_ref()
+            .and_then(|d| std::fs::read_to_string(d.join("findings.json")).ok())
+            .and_then(|t| omgs::shape::findings(&t).ok())
+            .is_some_and(|fs| {
+                fs.findings.iter().any(|f| {
+                    Some(&f.fingerprint) == record.finding.as_ref()
+                        && f.verdict == omgs::model::Verdict::Rejected
+                })
+            });
+        let mut reasons = Vec::new();
+        if !record.command_started {
+            reasons.push("command never started (executor error)");
+        }
+        if !record.command_finished {
+            reasons.push("command did not emit its end marker");
+        }
+        if record.test.is_some() && record.test_reachable != Some(true) {
+            reasons.push("proof test was not reachable inside the sandbox");
+        }
+        if !record.clean() {
+            reasons.push("run did not finish cleanly");
+        }
+        if !matches!(record.exit_code, Some(0..=125)) {
+            reasons.push("exit 126, 127, a signal or an invalid exit cannot support a proof");
+        } else if !rejected && !record.assertion_failure() {
+            reasons.push("a non-rejected finding needs assertion failure exit 1..=125");
+        }
+        let tier_name = if record.tier == "test" {
+            "test_proven"
+        } else {
+            "sandbox_exploited"
+        };
+        eprintln!(
+            "proof support for {tier_name}: {}",
+            if reasons.is_empty() {
+                "yes".into()
+            } else {
+                format!("no: {}", reasons.join("; "))
+            }
+        );
+    }
+    if let Some(orig) = &replay {
+        let code = |c: Option<i32>| c.map(|c| c.to_string()).unwrap_or_else(|| "none".into());
+        let same = record.exit_code == orig.exit_code && record.clean() && orig.clean();
+        eprintln!(
+            "replay of {}: recorded exit {}, replayed exit {}: {}",
+            omgs::proof::reference(orig.n),
+            code(orig.exit_code),
+            code(record.exit_code),
+            if same { "reproduced" } else { "NOT reproduced" }
+        );
+        return if same {
+            Ok(())
+        } else {
+            Err("__EXIT1__".into())
+        };
+    }
+    if s.success {
+        Ok(())
+    } else {
+        Err("__EXIT1__".into())
+    }
+}
+
+/// What this machine can and cannot do for OMGS. Executes no target code;
+/// `--live` runs one fixed command inside MXC to show a denial is enforced.
+fn cmd_doctor(args: &[String]) -> Result<(), String> {
+    use omgs::platform::which;
+    let os = std::env::consts::OS;
+    println!(
+        "omgs {} on {os} {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH
+    );
+    println!("data directory: {}", data_dir().display());
+    let ready = match omgs::sandbox::locate_executor() {
+        Ok(l) => {
+            println!(
+                "sandbox: MXC {} executor {} ({}), SHA-256 matches the pin",
+                omgs::sandbox::MXC_VERSION,
+                l.path.display(),
+                l.executor.containment
+            );
+            true
+        }
+        Err(e) => {
+            println!("sandbox: not ready. {e}");
+            false
+        }
+    };
+    let (enforced, gaps) = omgs::sandbox::declared_controls(os, Tier::Test);
+    println!(
+        "{}",
+        if ready {
+            "proof controls when MXC starts successfully (conditional limits are reported per run):"
+        } else {
+            "planned proof controls if a verified MXC executor becomes available:"
+        }
+    );
+    for e in enforced
+        .iter()
+        .chain(omgs::sandbox::declared_limits(os).iter())
+    {
+        println!("  {e}");
+    }
+    for g in &gaps {
+        println!("  not enforced: {g}");
+    }
+    if let Some(why) = omgs::sandbox::tier2_unavailable(os) {
+        println!("{why}");
+    }
+    let found = |names: &[&str]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|n| which(n).is_some())
+            .map(|n| n.to_string())
+            .collect()
+    };
+    let tools = found(&[
+        "swiftc", "cargo", "clang", "python3", "node", "npm", "pwsh", "go", "dotnet", "java",
+    ]);
+    println!(
+        "toolchains on PATH: {}",
+        if tools.is_empty() {
+            "none".into()
+        } else {
+            tools.join(", ")
+        }
+    );
+    let sensors = found(&["gitleaks", "semgrep", "trufflehog", "osv-scanner"]);
+    println!(
+        "sensors on PATH: {}",
+        if sensors.is_empty() {
+            "none".into()
+        } else {
+            sensors.join(", ")
+        }
+    );
+    if os == "linux"
+        && std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+    {
+        println!("hint: this kernel restricts unprivileged user namespaces (Ubuntu 24.04 and later). MXC needs them; see the README section on Linux for the AppArmor profile.");
+    }
+    if os == "windows" {
+        println!("note: PowerShell under MXC needs an interactive desktop session; over SSH (session 0) pwsh fails to start while cmd works.");
+    }
+    if !ready {
+        if has(args, "--live") {
+            println!("live check: not run, no verified executor");
+        }
+        return Err("__EXIT1__".into());
+    }
+    if has(args, "--live") {
+        let probe = data_dir().join("doctor");
+        let _ = std::fs::remove_dir_all(&probe);
+        let target = probe.join("target");
+        std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+        // Two fresh tokens: one inside the workspace that must be readable
+        // (proves the command really ran), one outside that must not be.
+        // Neither appears in a denial message, which echoes only the path.
+        let token = |tag: &str| {
+            omgs::sha256::digest(
+                format!("{tag}-{}-{}", omgs::runmeta::now_ms(), std::process::id()).as_bytes(),
+            )
+        };
+        let (inside, outside) = (token("inside"), token("outside"));
+        let inside_test = "probe/deep/inside.txt";
+        std::fs::create_dir_all(target.join("probe/deep")).map_err(|e| e.to_string())?;
+        write_out(target.join(inside_test), inside.as_bytes()).map_err(|e| e.to_string())?;
+        let secret = probe.join("outside.txt");
+        write_out(&secret, outside.as_bytes()).map_err(|e| e.to_string())?;
+        let cmd = if os == "windows" {
+            format!(
+                "cmd.exe /d /c type probe\\deep\\inside.txt & type \"{}\"",
+                secret.display()
+            )
+        } else {
+            format!("cat {inside_test}; cat '{}'", secret.display())
+        };
+        let request = ProveRequest {
+            command: cmd,
+            test: Some(inside_test.into()),
+            timeout_ms: 30_000,
+            target: Some(target),
+            run_dir: probe.join("run"),
+            tier: Tier::Test,
+            stage: None,
+            expected_tree_sha256: None,
+        };
+        let outcome = match prove(&request) {
+            ProveOutcome::Ran(r) => r,
+            ProveOutcome::Blocked { reason } => {
+                let _ = std::fs::remove_dir_all(&probe);
+                return Err(reason);
+            }
+        };
+        let out = outcome.run.output.clone();
+        let _ = std::fs::remove_dir_all(&probe);
+        if !out.contains(&inside)
+            || !outcome.run.command_started
+            || !outcome.run.command_finished
+            || outcome.run.test_reachable != Some(true)
+            || outcome.run.timed_out
+            || !outcome.run.capture_complete
+            || !outcome.run.cleanup_complete
+            || !outcome.run.survivors.is_empty()
+        {
+            println!(
+                "live check FAILED: the probe did not run (it could not read its own workspace). Its output:"
+            );
+            println!("{}", omgs::proof::redact(&out));
+            for g in &outcome.gaps {
+                println!("  note: {g}");
+            }
+            return Err("__EXIT1__".into());
+        }
+        if out.contains(&outside) || outcome.run.exit_code == Some(0) {
+            println!(
+                "live check FAILED: the sandboxed command could read a file outside its workspace"
+            );
+            return Err("__EXIT1__".into());
+        }
+        if outcome
+            .gaps
+            .iter()
+            .any(|g| g.starts_with("this Windows version refuses parent directory enumeration"))
+        {
+            println!("live check: the probe read a nested workspace file; outside read not proven on this host");
+        } else {
+            println!("live check: the probe ran, read a nested workspace file, and was denied a file outside it");
+        }
+        println!("applied on that run:");
+        for e in &outcome.enforced {
+            println!("  {e}");
+        }
+        for g in &outcome.gaps {
+            println!("  not enforced: {g}");
+        }
+        // A toolchain on the host PATH may still be out of reach inside, for
+        // example under a version manager in the home directory.
+        let names: Vec<&str> = tools.iter().map(|t| t.as_str()).collect();
+        let cmd = if os == "windows" {
+            format!(
+                "cmd.exe /d /c for %t in ({}) do @where %t && echo omgs-reach %t",
+                names.join(" ")
+            )
+        } else {
+            format!(
+                "for t in {}; do command -v $t >/dev/null 2>&1 && echo omgs-reach $t; done; exit 0",
+                names.join(" ")
+            )
+        };
+        let reach = ProveRequest {
+            command: cmd,
+            test: None,
+            timeout_ms: 30_000,
+            target: None,
+            run_dir: probe.join("reach"),
+            tier: Tier::Test,
+            stage: None,
+            expected_tree_sha256: None,
+        };
+        if let ProveOutcome::Ran(r) = prove(&reach) {
+            let found = |n: &str| {
+                r.run
+                    .output
+                    .lines()
+                    .any(|l| l.trim() == format!("omgs-reach {n}"))
+            };
+            let (inside, outside): (Vec<&str>, Vec<&str>) =
+                names.iter().copied().partition(|n| found(n));
+            println!(
+                "toolchains reachable inside the sandbox: {}",
+                if inside.is_empty() {
+                    "none".into()
+                } else {
+                    inside.join(", ")
+                }
+            );
+            if !outside.is_empty() {
+                println!(
+                    "on PATH here but NOT reachable inside the sandbox: {} (proofs that need them fail; install them system wide)",
+                    outside.join(", ")
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&probe);
+    }
+    Ok(())
+}
+
+fn cmd_approve(args: &[String]) -> Result<(), String> {
+    let raw = flag(args, "--target").ok_or("approve requires --target <repo>")?;
+    let target = std::fs::canonicalize(&raw).map_err(|e| format!("target {raw}: {e}"))?;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .ok_or(
+            "approve requires a target with a folder name; filesystem roots cannot be approved",
+        )?;
+    if let Some(why) = omgs::sandbox::tier2_unavailable(std::env::consts::OS) {
+        eprintln!("needs_validation: target code was not executed. {why}");
+        return Err("__EXIT3__".into());
+    }
+    println!("Tier 2 builds and runs {} as a local app inside MXC, on dummy data, with external network denied.", target.display());
+    println!("Type the folder name '{name}' to approve tier 2 for this repository:");
+    let typed = omgs::approval::read_from_terminal()?;
+    if typed.trim() != name {
+        return Err("not approved: the typed name did not match".into());
+    }
+    omgs::approval::approve(&data_dir(), &target)?;
+    println!("approved tier 2 for {}", target.display());
+    Ok(())
 }
 
 fn cmd_report(args: &[String]) -> Result<(), String> {
     let path = flag(args, "--findings").ok_or("report requires --findings <path>")?;
     let out = flag(args, "--out").ok_or("report requires --out <dir>")?;
     let file = read_findings(&path)?;
-    let errors = validate(&file);
+    let errors = validate_at(&file, &path);
     if !errors.is_empty() {
         for e in &errors {
             eprintln!("invalid: {e}");
@@ -390,7 +1281,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
 /// into the target (or the store file being a link) would let the target
 /// author "recorded" answers.
 fn trusted_store(target: &Path) -> Result<PathBuf, String> {
-    let path = omgs::intent::answers_file(&home().join(".local/share/omgs"), target);
+    let path = omgs::intent::answers_file(&data_dir(), target);
     if resolve_existing_prefix(&path)?.starts_with(target) {
         return Err(format!(
             "the intent answer store {} resolves inside the target {}; refusing to use it",
@@ -410,40 +1301,9 @@ fn trusted_store(target: &Path) -> Result<PathBuf, String> {
 /// Read the reviewer's answer store through a descriptor opened without
 /// following links, and only when it is a regular file with exactly one link,
 /// so neither a symlink nor a hardlink planted in the target can change what
-/// the store says. A missing store means no answers yet. Platforms without a
-/// stable link count fail closed: stored answers are Unix only.
+/// the store says. A missing store means no answers yet.
 fn read_store(path: &Path) -> Result<omgs::intent::Answers, String> {
-    use std::io::Read;
-    if !cfg!(unix) {
-        return Err("stored intent answers are supported on Unix only".into());
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let mut file = match opts.open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-        Err(e) => return Err(format!("open {}: {e}", path.display())),
-    };
-    let meta = file.metadata().map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if !meta.is_file() || meta.nlink() != 1 {
-            return Err(format!(
-                "{} must be a regular file with a single link; refusing to trust it",
-                path.display()
-            ));
-        }
-    }
-    let mut text = String::new();
-    file.read_to_string(&mut text)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    omgs::intent::parse_answers(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+    omgs::intent::load_answers(path)
 }
 
 /// The run's intent answers, only when they belong to the run's target as
@@ -554,8 +1414,17 @@ fn write_out(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> std::io::Res
     omgs::runmeta::write_atomic_bytes(path.as_ref(), contents.as_ref())
 }
 
+/// Never a relative fallback: without a home OMGS would write into the cwd,
+/// which may be the target.
 fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+    omgs::platform::home().unwrap_or_else(|| {
+        eprintln!("error: HOME (USERPROFILE on Windows) must be set to an absolute path");
+        std::process::exit(2)
+    })
+}
+
+fn data_dir() -> PathBuf {
+    omgs::platform::data_dir().unwrap_or_else(|| home().join(".local").join("share").join("omgs"))
 }
 
 fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -700,7 +1569,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         None => {
             // Claim run-N with an exclusive create, so parallel inits (batch
             // mode) never share a run directory.
-            let base = home().join(".local/share/omgs").join(&repo);
+            let base = data_dir().join(&repo);
             std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
             let mut n = 1;
             loop {
@@ -737,19 +1606,8 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     if out_abs.starts_with("/tmp") || out_abs.starts_with("/private/tmp") {
         eprintln!("warning: run output is under a shared temp directory and describes vulnerabilities. Prefer the default runs directory under your home.");
     }
-    let source_ref = std::process::Command::new("git")
-        .args([
-            "-C",
-            &target.to_string_lossy(),
-            "rev-parse",
-            "--short",
-            "HEAD",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    let source_ref = omgs::proof::git_head(&target)
+        .map(|h| h[..7].to_string())
         .unwrap_or_else(|| "working tree".into());
     let mut files = Vec::new();
     walk(&target, 0, &mut files);
@@ -820,7 +1678,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let meta = serde_json::json!({
+    let mut meta = serde_json::json!({
         "repo": repo, "target": target.to_string_lossy(), "source_ref": source_ref,
         "mode": mode, "budget_agent_calls": budget, "profile": "standard",
         "execution_policy": "sandboxed-source-and-local-only", "run_status": "in_progress",
@@ -829,10 +1687,12 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         "files_first_party": first_party.len(),
         "files_vendored_excluded": vendored_count,
         "started_unix": started_unix,
-        "agent_calls_used": null,
         "hunter": flag(rest, "--hunter"),
         "verifier": flag(rest, "--verifier")
     });
+    if budget.is_none() {
+        meta.as_object_mut().unwrap().remove("budget_agent_calls");
+    }
     write_out(
         out_abs.join("run-metadata.json"),
         serde_json::to_string_pretty(&meta).unwrap(),
@@ -877,8 +1737,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     // Bring the reviewer's recorded intent answers for this exact target into
     // the run, so earlier answers resolve matching questions in the report.
     if let Some(answers) = answers {
-        let text = serde_json::to_string_pretty(&answers).map_err(|e| e.to_string())?;
-        write_out(out_abs.join("intent-answers.json"), format!("{text}\n"))
+        omgs::intent::save_answers(&out_abs.join("intent-answers.json"), &answers)
             .map_err(|e| format!("copy intent answers: {e}"))?;
     }
     Ok(out_abs)
@@ -952,11 +1811,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     let target_raw = flag(args, "--target").ok_or("check requires --target <repo>")?;
     let target = std::fs::canonicalize(&target_raw).map_err(|e| e.to_string())?;
     for tool in ["gitleaks", "trufflehog", "osv-scanner", "semgrep"] {
-        let present = std::process::Command::new("which")
-            .arg(tool)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let present = omgs::platform::which(tool).is_some();
         println!(
             "sensor {tool}: {}",
             if present {
@@ -971,7 +1826,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     let proofs = files
         .iter()
         .filter(|f| {
-            let s = f.to_string_lossy();
+            let s = f.to_string_lossy().replace('\\', "/");
             s.contains("/tests/security/")
                 || s.contains(".security.test.")
                 || s.contains(".security.spec.")
@@ -980,7 +1835,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     println!("committed proof tests found: {proofs}");
     let scratch = flag(args, "--out")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/share/omgs/prove-scratch"));
+        .unwrap_or_else(|| data_dir().join("prove-scratch"));
     std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
     let sensors = run_sensors(&target, &scratch);
     for tool in &sensors.tools_run {
@@ -1026,9 +1881,9 @@ fn write_ledger(path: &str, ledger: &Ledger) -> Result<(), String> {
 
 /// Every value given for a repeatable flag, in order.
 fn flags(args: &[String], name: &str) -> Vec<String> {
-    args.windows(2)
-        .filter(|w| w[0] == name && !w[1].starts_with("--"))
-        .map(|w| w[1].clone())
+    options(args)
+        .filter(|(option, _)| *option == name)
+        .filter_map(|(_, value)| value.map(str::to_string))
         .collect()
 }
 
@@ -1117,10 +1972,11 @@ fn cmd_critic(args: &[String]) -> Result<(), String> {
 /// disabled and no prompts; a reused clone must have the same origin.
 fn clone_target(raw_url: &str) -> Result<PathBuf, String> {
     let repo = omgs::batch::parse_repo_url(raw_url)?;
-    let targets = home().join(".local/share/omgs/targets");
+    let targets = data_dir().join("targets");
     let dest = targets.join(&repo.host).join(&repo.owner).join(&repo.name);
+    let git_path = omgs::platform::which("git").ok_or("git not found on an absolute PATH entry")?;
     let git = || {
-        let mut c = std::process::Command::new("git");
+        let mut c = std::process::Command::new(&git_path);
         c.env("GIT_TERMINAL_PROMPT", "0").args([
             "-c",
             "protocol.allow=never",
@@ -1237,7 +2093,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             }
             // The batch output must sit outside the targets area and every
             // target in the list, including ones that later fail to clone.
-            let targets_root = home().join(".local/share/omgs/targets");
+            let targets_root = data_dir().join("targets");
             let dests: Vec<PathBuf> = urls
                 .iter()
                 .filter_map(|u| omgs::batch::parse_repo_url(u).ok())
@@ -1386,7 +2242,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 std::env::current_dir().map_err(|e| e.to_string())?.join(&out)
             };
             let mut targets: Vec<PathBuf> = vec![resolve_existing_prefix(
-                &home().join(".local/share/omgs/targets"),
+                &data_dir().join("targets"),
             )?];
             for r in &batch.runs {
                 if let Some(t) = r.target.as_deref() {
@@ -1489,7 +2345,7 @@ fn cmd_watch(args: &[String]) -> Result<(), String> {
 fn models_path(args: &[String]) -> PathBuf {
     flag(args, "--models")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".local/share/omgs/models.json"))
+        .unwrap_or_else(|| data_dir().join("models.json"))
 }
 
 fn cmd_route(args: &[String]) -> Result<(), String> {
@@ -1651,13 +2507,325 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
             }
             answers.target = target_s;
             omgs::intent::record(&mut answers, answer)?;
-            let text = serde_json::to_string_pretty(&answers).map_err(|e| e.to_string())?;
-            omgs::runmeta::write_atomic(&path, &format!("{text}\n"))?;
+            omgs::intent::save_answers(&path, &answers)?;
             Ok(())
             })?;
             println!("recorded {id} in {}", path.display());
             Ok(())
         }
         _ => Err("usage: omgs intent list [--stack <s>] [--attack-class <c>] | omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]".into()),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn free_text_and_inline_values_cannot_become_options() {
+        for (cmd, sub, name) in [
+            ("prove", "", "--cmd"),
+            ("ledger", "add", "--note"),
+            ("ledger", "set", "--note"),
+            ("intent", "answer", "--answer"),
+            ("status", "", "--detail"),
+            ("status", "", "--log"),
+            ("route", "", "--reason"),
+        ] {
+            for value in ["--version", "--unknown", "--live"] {
+                for inline in [false, true] {
+                    let mut args = Vec::new();
+                    if !sub.is_empty() {
+                        args.push(sub.to_string());
+                    }
+                    if inline {
+                        args.push(format!("{name}={value}"));
+                    } else {
+                        args.extend(strings(&[name, value]));
+                    }
+                    assert_eq!(validate_options(cmd, &args), Ok(false), "{args:?}");
+                    assert_eq!(flag(&args, name).as_deref(), Some(value));
+                    assert!(!has(&args, value), "{args:?}");
+                }
+            }
+        }
+        let args = strings(&["--target=--folder"]);
+        assert_eq!(validate_options("approve", &args), Ok(false));
+        assert_eq!(flag(&args, "--target").as_deref(), Some("--folder"));
+        let error = validate_options("approve", &strings(&["--target", "--folder"])).unwrap_err();
+        assert!(error.contains("use --target=value if it begins with --"));
+        assert!(validate_options("doctor", &strings(&["--live=yes"])).is_err());
+        let args = strings(&["--counter=a=1", "--counter", "b=2"]);
+        assert_eq!(flags(&args, "--counter"), ["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn free_text_values_cannot_swallow_known_options() {
+        for (cmd, sub, name, known) in [
+            ("prove", "", "--cmd", "--timeout-ms"),
+            ("ledger", "add", "--note", "--unit"),
+            ("ledger", "set", "--note", "--evidence"),
+            ("intent", "answer", "--answer", "--scope"),
+            ("status", "", "--detail", "--state"),
+            ("status", "", "--log", "--run"),
+            ("route", "", "--reason", "--role"),
+        ] {
+            for value in [
+                known.to_string(),
+                format!("{known}=5000"),
+                format!("{known}=5000 extra text"),
+                "--help".into(),
+            ] {
+                let mut args = Vec::new();
+                if !sub.is_empty() {
+                    args.push(sub.to_string());
+                }
+                args.extend([name.to_string(), value.clone()]);
+                let error = validate_options(cmd, &args).unwrap_err();
+                assert!(error.contains(&format!("use {name}=value")), "{error}");
+                args.pop();
+                args.pop();
+                args.push(format!("{name}={value}"));
+                assert_eq!(validate_options(cmd, &args), Ok(false));
+                assert_eq!(flag(&args, name), Some(value));
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_answer_store_is_refused() {
+        let path =
+            std::env::temp_dir().join(format!("omgs-answer-large-{}.json", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((1 << 20) + 1).unwrap();
+        assert!(read_store(&path).unwrap_err().contains("byte limit"));
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn function<'a>(source: &'a str, name: &str) -> &'a str {
+        let body = source.split_once(&format!("\nfn {name}(")).unwrap().1;
+        body.split("\nfn ").next().unwrap()
+    }
+
+    fn read_options(body: &str) -> BTreeSet<&str> {
+        let mut names = BTreeSet::new();
+        for helper in ["flag(", "has(", "flags("] {
+            for call in body.split(helper).skip(1) {
+                let arg = call.split_once(',').unwrap().1.trim_start();
+                if let Some(literal) = arg.strip_prefix('"') {
+                    names.insert(literal.split('"').next().unwrap());
+                } else {
+                    let variable = arg.split(')').next().unwrap();
+                    let values = match variable {
+                        "n" => body
+                            .split("get(\"")
+                            .skip(1)
+                            .map(|s| s.split('"').next().unwrap())
+                            .collect::<Vec<_>>(),
+                        "name" | "conflicting" => {
+                            let array = body
+                                .split_once(&format!("for {variable} in ["))
+                                .unwrap()
+                                .1
+                                .split(']')
+                                .next()
+                                .unwrap();
+                            array.split('"').skip(1).step_by(2).collect()
+                        }
+                        other => panic!("unmapped dynamic option read: {other}"),
+                    };
+                    assert!(!values.is_empty());
+                    names.extend(values);
+                }
+            }
+        }
+        names
+    }
+
+    fn accepted(cmd: &str, sub: &str, option: &str) {
+        let mut args = Vec::new();
+        if !sub.is_empty() {
+            args.push(sub.to_string());
+        }
+        args.push(option.to_string());
+        if !boolean_option(option) {
+            args.push("value".into());
+        }
+        assert!(validate_options(cmd, &args).is_ok(), "{cmd} {args:?}");
+    }
+
+    const COMMANDS: &[(&str, &str)] = &[
+        ("setup", ""),
+        ("review", ""),
+        ("audit", "init"),
+        ("batch", "init"),
+        ("batch", "index"),
+        ("validate", ""),
+        ("fingerprint", ""),
+        ("prove", ""),
+        ("approve", ""),
+        ("report", ""),
+        ("architecture", ""),
+        ("ledger", "list"),
+        ("ledger", "add"),
+        ("ledger", "set"),
+        ("critic", ""),
+        ("status", ""),
+        ("watch", ""),
+        ("route", ""),
+        ("intent", "list"),
+        ("intent", "answer"),
+        ("check", ""),
+        ("doctor", ""),
+    ];
+
+    #[test]
+    fn every_option_read_is_in_its_subcommand_allowlist() {
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let mut covered = BTreeMap::<String, BTreeSet<&str>>::new();
+        for &(cmd, sub) in COMMANDS {
+            let name = format!("cmd_{cmd}");
+            let mut sections = vec![(name.as_str(), function(source, &name))];
+            match (cmd, sub) {
+                ("audit", _) => sections.push(("audit_init", function(source, "audit_init"))),
+                ("route", _) => sections.push(("models_path", function(source, "models_path"))),
+                ("ledger", _) => {
+                    let body = function(source, "ledger_locked");
+                    let branch = body.split_once(&format!("\"{sub}\" => {{")).unwrap().1;
+                    sections.push((
+                        "ledger_locked",
+                        branch.split("\n        \"").next().unwrap(),
+                    ));
+                }
+                _ => {}
+            }
+            if cmd == "batch" || cmd == "intent" {
+                let branch = sections[0]
+                    .1
+                    .split_once(&format!("Some(\"{sub}\") => {{"))
+                    .unwrap()
+                    .1;
+                sections[0].1 = branch.split("\n        Some(").next().unwrap();
+            }
+            if cmd == "review" || (cmd == "batch" && sub == "init") {
+                sections.push(("init_args", function(source, "init_args")));
+            }
+            for (name, body) in sections {
+                let names = read_options(body);
+                for option in &names {
+                    accepted(cmd, sub, option);
+                }
+                covered.entry(name.to_string()).or_default().extend(names);
+            }
+        }
+        for declaration in source.split("\nfn ").skip(1) {
+            let name = declaration.split('(').next().unwrap();
+            if ["flag", "has", "flags"].contains(&name) {
+                continue;
+            }
+            if ["flag(", "has(", "flags("]
+                .iter()
+                .any(|call| declaration.contains(call))
+            {
+                assert!(
+                    covered.contains_key(name),
+                    "unmapped option-reading function {name}"
+                );
+                assert!(
+                    read_options(declaration).is_subset(&covered[name]),
+                    "uncovered option read in {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn documented_omgs_options_are_accepted() {
+        for text in [
+            include_str!("../README.md"),
+            include_str!("../skill/SKILL.md"),
+        ] {
+            for part in text.split("--").skip(1) {
+                let end = part
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                    .unwrap_or(part.len());
+                let name = &part[..end];
+                // External commands, root version flag and the syntax placeholder.
+                if name.is_empty()
+                    || name.starts_with('-')
+                    || [
+                        "global",
+                        "skill",
+                        "release",
+                        "ignore-missing",
+                        "version",
+                        "opt",
+                    ]
+                    .contains(&name)
+                {
+                    continue;
+                }
+                let option = format!("--{name}");
+                assert!(
+                    COMMANDS.iter().any(|(cmd, sub)| {
+                        let mut args = Vec::new();
+                        if !sub.is_empty() {
+                            args.push(sub.to_string());
+                        }
+                        args.push(option.clone());
+                        if !boolean_option(&option) {
+                            args.push("value".into());
+                        }
+                        validate_options(cmd, &args).is_ok()
+                    }),
+                    "undocumented CLI option acceptance: {option}"
+                );
+            }
+            let text = text.replace("\\\n", " ");
+            for line in text.lines() {
+                for mention in line.split("omgs ").skip(1) {
+                    let mut words = mention.split_whitespace();
+                    let Some(cmd) = words.next() else { continue };
+                    let sub = if ["audit", "batch", "ledger", "intent"].contains(&cmd) {
+                        words.next().unwrap_or("")
+                    } else {
+                        ""
+                    };
+                    if !COMMANDS.contains(&(cmd, sub)) {
+                        continue;
+                    }
+                    let tail = words.collect::<Vec<_>>().join(" ");
+                    let command = tail.split('`').next().unwrap();
+                    let mut quote = None;
+                    let mut visible = String::new();
+                    for c in command.chars() {
+                        if quote == Some(c) {
+                            quote = None;
+                        } else if quote.is_none() && ['\'', '"'].contains(&c) {
+                            quote = Some(c);
+                        } else if quote.is_none() {
+                            visible.push(c);
+                        }
+                    }
+                    for part in visible.split("--").skip(1) {
+                        let end = part
+                            .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                            .unwrap_or(part.len());
+                        if end > 0 {
+                            accepted(cmd, sub, &format!("--{}", &part[..end]));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

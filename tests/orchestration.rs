@@ -450,6 +450,8 @@ fn open_record(key: &str, intent_id: Option<&str>, path: &str) -> Finding {
         hunted_by: Some("red-1".into()),
         verified_by: Some("blue-1".into()),
         candidates: vec![],
+        proof_ref: None,
+        trace: vec![],
     }
 }
 
@@ -834,6 +836,94 @@ fn answers_files_are_strict_and_bound_to_the_run_target() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn answer_store_writes_enforce_the_limit_without_replacing_valid_answers() {
+    let dir = scratch("answer-write-limit");
+    let target = dir.join("target");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&target).unwrap();
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    let path = omgs::intent::answers_file(&home, &canonical);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut answers = omgs::intent::Answers {
+        target: canonical.to_string_lossy().to_string(),
+        answers: vec![omgs::intent::Answer {
+            id: "web.public-resource".into(),
+            answer: "public".into(),
+            scope: "repo".into(),
+            source: "owner".into(),
+            recorded_unix: 1,
+        }],
+    };
+    let overhead = serde_json::to_string_pretty(&answers).unwrap().len() + 1;
+    answers.answers[0]
+        .answer
+        .push_str(&"x".repeat((1 << 20) - overhead));
+    omgs::intent::save_answers(&path, &answers).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(before.len(), 1 << 20);
+    let loaded = omgs::intent::load_answers(&path).unwrap();
+    assert_eq!(loaded.target, answers.target);
+    assert_eq!(loaded.answers, answers.answers);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "intent",
+            "answer",
+            "--target",
+            target.to_str().unwrap(),
+            "--id",
+            "web.public-resource",
+            "--answer",
+            "private",
+            "--source",
+            "owner",
+            "--scope",
+            "src",
+        ])
+        .env("OMGS_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("1 MiB byte limit"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    answers.answers[0].answer.push('x');
+    assert!(omgs::intent::save_answers(&path, &answers)
+        .unwrap_err()
+        .contains("1 MiB byte limit"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn run_local_answer_snapshots_require_bounded_single_link_files() {
+    let dir = scratch("run-answer-reader");
+    let path = dir.join("intent-answers.json");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len((1 << 20) + 1).unwrap();
+    assert!(omgs::intent::load_answers(&path)
+        .unwrap_err()
+        .contains("byte limit"));
+    drop(file);
+    std::fs::write(&path, r#"{"target":"/x","answers":[]}"#).unwrap();
+    std::fs::hard_link(&path, dir.join("hardlink")).unwrap();
+    assert!(omgs::intent::load_answers(&path).is_err());
+    std::fs::remove_file(dir.join("hardlink")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::fs::rename(&path, dir.join("original")).unwrap();
+        std::os::unix::fs::symlink(dir.join("original"), &path).unwrap();
+        assert!(omgs::intent::load_answers(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let start = std::time::Instant::now();
+        assert!(omgs::intent::load_answers(&path).is_err());
+        assert!(start.elapsed().as_secs() < 1);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn batch_index_follows_symlinks_before_dotdot() {
@@ -911,6 +1001,7 @@ fn concurrent_intent_answers_and_ledger_updates_are_not_lost() {
         kids.push(
             std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
                 .env("HOME", &home)
+                .env_remove("OMGS_HOME")
                 .args(["intent", "answer", "--target", target.to_str().unwrap()])
                 .args([
                     "--id",
@@ -1066,6 +1157,7 @@ fn batch_output_inside_the_targets_area_is_refused_before_cloning() {
     std::fs::write(dir.join("list.txt"), "https://github.com/a/b\n").unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("HOME", &home)
+        .env_remove("OMGS_HOME")
         .args([
             "batch",
             "init",
@@ -1091,6 +1183,7 @@ fn report_shows_only_reviewer_recorded_answers() {
     let run_cmd = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
             .env("HOME", &home)
+            .env_remove("OMGS_HOME")
             .args(args)
             .output()
             .unwrap()
@@ -1329,6 +1422,7 @@ fn batch_init_needs_an_empty_output_directory() {
     std::fs::write(dir.join("list.txt"), "https://github.com/a/b\n").unwrap();
     let res = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("HOME", &home)
+        .env_remove("OMGS_HOME")
         .args([
             "batch",
             "init",
@@ -1432,6 +1526,7 @@ fn concurrent_reviews_of_one_url_never_delete_each_others_clone() {
     let spawn = || {
         std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
             .env("HOME", &home)
+            .env_remove("OMGS_HOME")
             .env("PATH", &path)
             .args([
                 "review",
@@ -1535,6 +1630,7 @@ fn answer_stores_inside_the_target_are_never_trusted() {
     let run = dir.join("run");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("HOME", &home)
+        .env_remove("OMGS_HOME")
         .args(["audit", "init", "--target", target.to_str().unwrap()])
         .args(["--out", run.to_str().unwrap(), "--no-sensors"])
         .output()
@@ -1560,6 +1656,7 @@ fn answer_stores_inside_the_target_are_never_trusted() {
     .unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("HOME", &home2)
+        .env_remove("OMGS_HOME")
         .args(["intent", "answer", "--target", target2.to_str().unwrap()])
         .args([
             "--id",
@@ -1579,6 +1676,7 @@ fn answer_stores_inside_the_target_are_never_trusted() {
     let run2 = dir2.join("run");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("HOME", &home2)
+        .env_remove("OMGS_HOME")
         .args(["audit", "init", "--target", target2.to_str().unwrap()])
         .args(["--out", run2.to_str().unwrap(), "--no-sensors"])
         .output()
@@ -1600,6 +1698,7 @@ fn a_hardlinked_answer_store_is_never_trusted() {
     let run_omgs = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
             .env("HOME", &home)
+            .env_remove("OMGS_HOME")
             .args(args)
             .output()
             .unwrap()
@@ -1703,6 +1802,7 @@ fn a_reused_clone_matches_by_repository_identity_not_spelling() {
     std::fs::set_permissions(bin.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
     let res = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("HOME", &home)
+        .env_remove("OMGS_HOME")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .args([
             "review",
@@ -1753,4 +1853,51 @@ fn markdown_shows_intent_answers_for_every_verdict() {
         "{md}"
     );
     assert_eq!(md.matches("Intent question:").count(), 2);
+}
+
+#[test]
+fn cli_errors_put_the_error_before_a_short_usage_hint() {
+    for args in [vec![], vec!["prove", "--unknown"], vec!["prove"]] {
+        let out = omgs(&args);
+        assert_eq!(out.status.code(), Some(2));
+        let error = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<_> = error.lines().collect();
+        assert_eq!(lines.len(), 2, "{error}");
+        assert!(lines[0].starts_with("error: "), "{error}");
+        assert_eq!(lines[1], "run omgs --help for usage");
+    }
+}
+
+#[test]
+fn audit_init_accepts_hunter_and_verifier_metadata() {
+    let d = scratch("audit-identities");
+    let target = d.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let run = d.join("run");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", d.join("home"))
+        .args([
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--hunter",
+            "hunter-1",
+            "--verifier",
+            "verifier-1",
+            "--no-sensors",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta = omgs::runmeta::read(&run).unwrap();
+    assert_eq!(meta["hunter"], "hunter-1");
+    assert_eq!(meta["verifier"], "verifier-1");
+    std::fs::remove_dir_all(d).unwrap();
 }

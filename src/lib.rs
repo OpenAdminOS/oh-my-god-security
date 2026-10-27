@@ -1,16 +1,21 @@
+pub mod approval;
 pub mod architecture;
 pub mod batch;
 pub mod critic;
 pub mod intent;
 pub mod ledger;
 pub mod model;
+pub mod platform;
+pub mod proof;
 pub mod report;
 pub mod route;
 pub mod runmeta;
 pub mod sandbox;
 pub mod sensors;
+pub mod sha256;
 pub mod shape;
 pub mod status;
+pub mod supervise;
 pub mod watch;
 
 /// Stable, non cryptographic fingerprint for finding identity across runs.

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -17,18 +17,7 @@ pub struct SensorsReport {
     pub hits: Vec<SensorHit>,
 }
 
-fn which(name: &str) -> Option<PathBuf> {
-    let out = Command::new("which").arg(name).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(text))
-    }
-}
+use crate::platform::which;
 
 /// Run deterministic sensor tools against source text. Sensors never execute
 /// target code. Raw scanner output can contain matched secret values, so only
@@ -40,9 +29,9 @@ pub fn run_sensors(target: &Path, scratch_dir: &Path) -> SensorsReport {
         hits: Vec::new(),
     };
     match which("gitleaks") {
-        Some(_) => {
+        Some(executable) => {
             let raw = scratch_dir.join("gitleaks-raw.json");
-            let status = Command::new("gitleaks")
+            let status = Command::new(executable)
                 .args([
                     "detect",
                     "--source",
@@ -107,10 +96,10 @@ pub fn run_sensors(target: &Path, scratch_dir: &Path) -> SensorsReport {
 /// or `OMGS_SEMGREP_ALLOW_REGISTRY=1` opts into the `auto` registry explicitly.
 /// Only rule, file and line metadata is kept; the raw report is deleted.
 fn run_semgrep(target: &Path, scratch_dir: &Path, report: &mut SensorsReport) {
-    if which("semgrep").is_none() {
+    let Some(executable) = which("semgrep") else {
         report.tools_unavailable.push("semgrep".into());
         return;
-    }
+    };
     let registry_ok = std::env::var("OMGS_SEMGREP_ALLOW_REGISTRY").is_ok_and(|v| v == "1");
     // A nonempty OMGS_SEMGREP_CONFIG is only trusted when it names an existing
     // local file or directory. A registry shorthand ("auto", "p/default"), a
@@ -149,7 +138,7 @@ fn run_semgrep(target: &Path, scratch_dir: &Path, report: &mut SensorsReport) {
         }
     };
     let raw = scratch_dir.join("semgrep-raw.json");
-    let status = Command::new("semgrep")
+    let status = Command::new(executable)
         .args([
             "scan",
             "--json",

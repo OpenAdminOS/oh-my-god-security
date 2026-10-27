@@ -1,63 +1,122 @@
-# Pre v0.1.0: workflow gaps and sandbox hardening
+# v0.1.0 public release: nothing deferred
 
-Full plan: four themed PRs, CI first. Each PR gets GPT-6.1-Sol full-diff review rounds plus a
-separate Claude evaluator; merge only when both are green and the user says so.
+Full plan: six themed PRs, then the Awesome Intune benchmark campaign and release readiness. Each PR
+gets Muse Wonder Full review rounds (review partner), a GPT-6.1-Sol full-diff review before merge,
+and a separate Claude evaluator; merge only when all are green.
 
-## PR A: pull request CI (`ci/pr-checks`)
+Decisions: MXC is the only sandbox backend on every OS; one brief per role under `skill/agents/`;
+benchmark is the 26 earlier Awesome Intune targets plus about 6 new, results private; the public
+release uses a fresh squashed history.
 
-- [x] `.github/workflows/ci.yml`: fmt, clippy `-D warnings`, `cargo test` on macos-14 and
-      ubuntu-24.04 (bubblewrap installed), checksum-verified actionlint
-- [x] PR opened, CI green, reviews green, merged (#6)
+Decisions 2026-10-27 (round 2): GPT-6.1-Sol writes the process supervision module
+(`src/supervise.rs`: rlimits, group signal before reap, macOS survivor sweep); `omgs prove` refuses
+on Intel Macs (no MXC executor there), documented in doctor and Known limitations; PR 5 will mirror the five MXC
+executors as OMGS release assets with Microsoft signatures intact, pinned by SHA-256,
+MIT notice included; tier 2 runs only on Linux (decided after testing showed the macOS sandbox
+shares the host loopback in both directions, and Windows blocks loopback inside the container).
 
-## PR B: finding model, verifier separation, ledger, coverage critic (`feat/verifier-ledger-critic`)
+## PR 1: MXC sandbox and runner-attested proofs (`feat/mxc-sandbox-proofs`)
 
-- [x] `Finding.locations` (grouped root cause), rendered in MD/HTML/SARIF, validated
-- [x] `hunted_by` + `verified_by` required and distinct; `candidates` list on findings;
-      `hunter` required in candidates schema
-- [x] typed ledger (`src/ledger.rs`), `ledger add/set/list`, evidence + note, transition rules
-- [x] `omgs critic --run <dir>`; report renders the critic result
-- [x] fixtures, schemas, skill docs, README, usage(), IMPROVEMENTS.md updated
-- [x] tests; reviews green; merged (#9, reopened from #7)
+- [x] Spike MXC 1.0.1 on macOS (Swift fixture, cargo, cc, python3, node, pwsh; denials)
+- [x] Spike on the Lima Ubuntu VM and the Windows mini PC
+- [x] `src/sandbox.rs` emits MXC configs and runs the pinned executor; built-in profiles removed
+- [x] Per-run writable workspace copy of the target; target untouched
+- [x] rlimits, `waitid(WNOWAIT)` group signal, macOS survivor sweep (GPT-6.1-Sol, `src/supervise.rs`)
+- [x] `prove --run --finding` proof records; `proof_ref` and `trace`; `validate` checks proofs
+- [x] Budget enforcement and tier-2 first-run approval
+- [x] `omgs doctor`; Windows portability; Windows CI through Test (round 5 verification below)
+- [x] DECISIONS.md amendment: declared minimum set per OS
+- [x] Tests and docs for rounds 1 through 5
+- [ ] Independent round 5 full-diff re-reviews and merge
+  - Round 2 (2026-10-27): GPT-6.1-Sol implements the round 2 fixes; evidence that the named test ran
+    uses runner start and end markers (not per-stack adapters); windows-2025 CI must be fully green
+    through the Test step before merge.
 
-## PR C: run orchestration (`feat/run-orchestration`)
+## PR 1b: follow-ups from the final PR 1 review (before release)
 
-- [x] report writes run metadata back and marks the run complete
-- [x] hardened `review` clone; `omgs batch init` + `omgs batch index`
-- [x] `omgs status` + `omgs watch` (loopback only, two routes, Host check)
-- [x] `omgs route` model fallbacks recorded in run metadata
-- [x] intent library (`skill/intent/library.json`), `omgs intent list/answer`, `intent_id`
-- [x] tests; docs; reviews green; merged (#8)
+- [ ] Redaction: carry quote state forward in one pass (no quadratic rescans on long lines)
+- [ ] Record absolute or re-entering symlinks that point back into the live target as a gap
+- [ ] Sort skipped special files before listing; escape control characters in printed gap paths
+- [ ] Usage text and README: say `--help`, `-h` and `--help=` are refused as free-text values
+- [ ] Refresh the copy and digest notes in this file to match skipped FIFOs and sockets
 
-## PR D: sandbox hardening (`feat/sandbox-hardening`)
+## PR 2: role briefs, stacks and packs (`feat/role-briefs-packs`)
 
-Dropped from the 0.1 scope by decision on 2026-10-24. Spike results and the three open residuals are
-recorded in IMPROVEMENTS.md under "Deferred past 0.1".
+- [ ] `skill/agents/` briefs: red hunter, blue verifier, evaluator, green fixer
+- [ ] Proof by default with per-stack recipes
+- [ ] Shared path classifier; shell and browser-extension stacks; monorepo detection
+- [ ] Packs: identity binding, fail-closed semantics
+- [ ] Persona modes; host-provided accounting
 
-## Acceptance criteria
+## PR 3: output people can trust and act on (`feat/report-handoff`)
 
-See the plan: every PR green on fmt/clippy/test in CI on macOS and Ubuntu; each feature's
-criteria (grouped locations count once; equal or missing hunter/verifier rejected; critic exits
-1 per gap class; batch index deterministic and offline; watch serves only two loopback routes;
-route records reroutes; unknown intent id rejected).
+- [ ] HANDOFF.md, handoff.json, `omgs handoff`
+- [ ] `omgs stage` proposed-tests.patch
+- [ ] REPORT.md parity, timeline, SARIF rules and levels, metadata defaults
+- [ ] trufflehog and osv-scanner run; sensor hits become candidates
 
-Deferred past 0.1 with PR D, so not part of the 0.1 gate: the deny-by-default profile keeping
-the Swift fixture behaviour, setsid and posix_spawn survivors killed and reported, and no
-`--ro-bind / /`.
+## PR 4: committed policy, gate and setup (`feat/policy-gate-setup`)
+
+- [ ] `.omgs/policy.json` from the base ref only; `intent propose`; `omgs gate`
+- [ ] `omgs setup` wizard per DECISIONS
+
+## PR 5: onboarding, trust and distribution (`feat/onboarding-trust`)
+
+- [ ] README for newcomers; consent text before downloads
+- [ ] Version pin, signature checks, attestations, MXC pinning
+- [ ] Homebrew and winget files; subcommand help; env docs; SECURITY.md; stale docs
+
+## PR 6: benchmark runner, corpus, screenshots, self-audit (`feat/benchmark`)
+
+- [ ] `omgs bench score`; at least 5 post-cutoff CVE pairs
+- [ ] Opt-in screenshots; self-audit; fix round trip on the fixture
+
+## Phase 7: Awesome Intune campaign
+
+- [ ] Pilot 4 repos after PR 3; tune and fix
+- [ ] Full run after PR 6; scored against the 2026-10-16 baseline; anonymized aggregates only
+
+## Phase 8: release readiness
+
+- [ ] Re-sweep all docs for open items; squashed public history and private archive
+- [ ] User steps: visibility, tag ruleset, tag push, tap and winget; fresh-machine install test
 
 ## Review
 
-- #6 CI: one GPT-6.1-Sol round, no findings; Claude evaluator pass.
-- #9 (was #7) verifier separation, grouped locations, ledger, critic, strict parsing: 13 GPT-6.1-Sol
-  rounds. Rounds 1 to 12 found blocking issues that were almost all one class: malformed input
-  (missing or misspelled keys, defaulted fields, arrays for objects, null, duplicate keys, enum
-  objects, wrong types, dangling links) parsing into a silent pass. That class is now closed at the
-  parser (src/shape.rs). Round 13 was clean; a fresh Claude evaluator passed it and its five minor
-  items were fixed. GitHub closed #7 when its stacked base branch was deleted, so it merged as #9
-  with an identical tree.
-- #8 orchestration: 12 GPT-6.1-Sol rounds, hardening containment (symlinks, hardlinks, FIFOs,
-  nested links, target-planted answer stores), concurrency (OS file locks, exclusive claims, clone
-  races), and strict parsing of every run file. Rounds 11 and 12 had no blocking findings; a fresh
-  Claude evaluator passed it and its three items were fixed before merge. The one remaining
-  non-blocking item (Markdown intent answers only on pending records) is fixed in the wrap-up PR.
-- Lesson recorded in tasks/lessons.md: never default a required field in a security input, and
-  sweep every struct on the same input path before asking for re-review.
+PR 1 round 5 fixes all twelve requested review items. The starting head
+`f924e85` passed all four existing CI jobs, including windows-2025 through Test.
+The updated branch adds Rust 1.89.0 build and test coverage as a fifth job.
+
+Content hashing now accepts regular content through symlinks and hardlinks,
+without a snapshot size cap. Small trust files keep bounded, single-link,
+no-follow reads. Linux copies break hardlink relationships. Copy and digest
+both refuse target FIFOs, sockets and devices. Regression coverage includes
+an intra-target hardlink pair, an 8 MiB file, symlinked executor and test paths,
+and prompt FIFO and device refusal. Symlink destinations are disclosed.
+
+Credential flag components are redacted in output, saved command displays and
+survivor lines, including quoted flags and single-dash long names. Every CLI
+subcommand rejects unknown and duplicate options before mutation, preserving the documented repeatable evidence and counter
+options. Shell operators delimit unquoted test names. Validation requires
+bubblewrap for local-app records, forbids proof references on traced findings,
+and avoids a test-name diagnostic after a missing or altered saved command.
+
+Unix proof directories are 0700 and exact command and config artifacts are
+0600. Unix signal guards cover preparation through execution; interrupted
+preparation removes the proof directory and releases a charged reservation. Tests exercise
+SIGINT, SIGTERM and SIGHUP before and after executor launch. Denial tests create
+their home probe directly in the real home, with a scoped skip if unwritable.
+Forged readable roots and extended Windows UNC proof directories have regression
+coverage. README, skill and decision text agree on replay timeout, all `.git`
+content, credential artifacts, Linux PID namespaces and Windows MXC teardown.
+
+Round 5 local verification: macOS passed fmt, clippy with warnings denied and
+all 192 tests; Lima Ubuntu arm64 passed all 188 tests; Windows 11 x64 passed
+all 163 tests. All three live doctor probes passed with the pinned executors.
+The Windows host has no Clippy component; its lint check runs in CI. The workflow
+lint and skill metadata validator passed. Rust 1.89.0 is checked by the new CI job.
+
+All five final PR CI jobs must pass on the pushed head, including windows-2025
+through Test. Independent full-diff reviews and the separate evaluator remain
+pending; implementation is not approval. Nothing from round 5 is deferred out
+of 0.1. No merge is authorized by this implementation task.

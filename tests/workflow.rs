@@ -30,6 +30,8 @@ fn record(key: &str) -> Finding {
         hunted_by: Some("red-1".into()),
         verified_by: Some("blue-1".into()),
         candidates: vec![],
+        proof_ref: None,
+        trace: vec![],
     }
 }
 
@@ -265,6 +267,108 @@ fn candidate_json(c: &Candidate) -> serde_json::Value {
 }
 
 /// A complete run: one unit covered by one verified finding from one candidate.
+/// Write a clean failing-test proof record for every record above traced and
+/// point it there, as `omgs prove --run --finding` would.
+fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
+    for f in findings.findings.iter_mut() {
+        if f.proof_tier == ProofTier::Traced {
+            continue;
+        }
+        let (n, proof_dir) = omgs::proof::reserve(dir).unwrap();
+        let proof_dir = proof_dir.canonicalize().unwrap();
+        let os = std::env::consts::OS;
+        let executor = omgs::sandbox::this_executor().unwrap();
+        let tier = if f.proof_tier == ProofTier::TestProven {
+            omgs::sandbox::Tier::Test
+        } else {
+            omgs::sandbox::Tier::LocalApp
+        };
+        let nonce = "a".repeat(64);
+        let command = "npm test -- tests/security/x.test.ts";
+        let wrapped =
+            omgs::sandbox::wrapped_command(os, command, &nonce, Some("tests/security/x.test.ts"));
+        let allowed_marker = proof_dir.join("markers/allowed");
+        let config = omgs::sandbox::mxc_config(&omgs::sandbox::ConfigInput {
+            os,
+            containment: executor.containment,
+            command: &wrapped,
+            timeout_ms: 1000,
+            workspace: &proof_dir.join("workspace"),
+            scratch: &proof_dir.join("scratch"),
+            allowed_marker: if os == "macos" {
+                Some(allowed_marker.as_path())
+            } else {
+                None
+            },
+            readonly: vec![],
+            denied: if os == "macos" {
+                vec![proof_dir.join("markers/denied")]
+            } else {
+                vec![]
+            },
+            rust: None,
+            list_parents: false,
+        })
+        .to_string();
+        std::fs::write(proof_dir.join("mxc-config.json"), &config).unwrap();
+        std::fs::write(proof_dir.join("command.txt"), command).unwrap();
+        let record = omgs::proof::ProofRecord {
+            schema: omgs::proof::SCHEMA.into(),
+            n,
+            finding: Some(f.fingerprint.clone()),
+            test: Some("tests/security/x.test.ts".into()),
+            test_sha256: Some("0".repeat(64)),
+            test_from: None,
+            replays: None,
+            tier: if f.proof_tier == ProofTier::TestProven {
+                "test"
+            } else {
+                "local_app"
+            }
+            .into(),
+            command: omgs::proof::redact(command),
+            command_sha256: omgs::sha256::digest(command.as_bytes()),
+            wrapped_command_sha256: omgs::sha256::digest(wrapped.as_bytes()),
+            readable_roots: vec![],
+            system_root: (os == "windows")
+                .then(|| std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into())),
+            target: None,
+            target_head: None,
+            target_sha256: None,
+            proof_dir: proof_dir.to_string_lossy().into(),
+            marker_nonce: nonce,
+            command_started: true,
+            command_finished: true,
+            test_reachable: Some(true),
+            timeout_ms: 1000,
+            started_at_ms: 0,
+            duration_ms: 1,
+            exit_code: Some(1),
+            timed_out: false,
+            capture_complete: true,
+            cleanup_complete: true,
+            executor_error: false,
+            killed: false,
+            interrupted: false,
+            survivors: vec![],
+            mxc_version: omgs::sandbox::MXC_VERSION.into(),
+            containment: executor.containment.into(),
+            executor: executor.file.into(),
+            executor_sha256: executor.sha256.into(),
+            config_sha256: omgs::sha256::digest(config.as_bytes()),
+            enforced: omgs::sandbox::declared_controls(os, tier).0,
+            gaps: omgs::sandbox::declared_controls(os, tier).1,
+            output_sha256: omgs::sha256::digest(b""),
+            output_bytes_total: 0,
+            output: String::new(),
+            omgs_version: "test".into(),
+        };
+        omgs::proof::write(dir, &record).unwrap();
+        f.proof_ref = Some(omgs::proof::reference(n));
+    }
+    findings
+}
+
 fn complete_run() -> (Ledger, Vec<SourcedCandidate>, FindingsFile) {
     let f = record("a");
     let mut ledger = Ledger::default();
@@ -447,6 +551,7 @@ fn omgs(args: &[&str]) -> std::process::Output {
 fn cli_ledger_and_critic_end_to_end() {
     let dir = scratch("cli");
     let (ledger, cands, findings) = complete_run();
+    let findings = attest(&dir, findings);
     let mut ledger = ledger;
     ledger.units[0].status = "planned".into();
     ledger.units[0].evidence.clear();
@@ -561,6 +666,7 @@ fn critic_rejects_a_misspelled_candidates_file() {
 fn report_critic_describes_the_rendered_findings() {
     let dir = scratch("selected");
     let (ledger, cands, findings) = complete_run();
+    let findings = attest(&dir, findings);
     std::fs::write(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
@@ -910,6 +1016,7 @@ fn duplicate_keys_and_enum_objects_are_errors() {
 fn report_fails_on_malformed_companion_files() {
     let dir = scratch("report-malformed");
     let (ledger, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
     std::fs::write(
         dir.join("findings.json"),
         serde_json::to_string(&findings).unwrap(),
@@ -962,6 +1069,7 @@ fn zero_lines_and_dangling_ledgers_are_errors() {
     {
         let dir = scratch("dangling-ledger");
         let (_, _, findings) = complete_run();
+        let findings = attest(&dir, findings);
         std::fs::write(
             dir.join("findings.json"),
             serde_json::to_string(&findings).unwrap(),
@@ -1098,4 +1206,776 @@ fn sensors_documents_must_be_objects() {
     ]);
     assert_eq!(out.status.code(), Some(2));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn forged_or_broken_proof_records_are_rejected() {
+    let dir = scratch("forged");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let check = |dir: &std::path::Path| omgs::proof::validate_proofs(&findings, dir);
+    assert!(check(&dir).is_empty(), "{:?}", check(&dir));
+    let record_path = dir.join("proofs/1.json");
+    let original = std::fs::read_to_string(&record_path).unwrap();
+    let edit = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut v: serde_json::Value = serde_json::from_str(&original).unwrap();
+        f(&mut v);
+        std::fs::write(&record_path, v.to_string()).unwrap();
+    };
+    type Change = dyn Fn(&mut serde_json::Value);
+    let cases: [(&str, &Change); 10] = [
+        ("was recorded for finding", &|v| {
+            v["finding"] = "omgs-0000000000000000".into()
+        }),
+        ("cannot support", &|v| v["tier"] = "local_app".into()),
+        ("saved command does not match", &|v| {
+            v["command"] = "exit 1".into()
+        }),
+        ("not a pinned MXC", &|v| {
+            v["executor_sha256"] = "1".repeat(64).into()
+        }),
+        ("claims containment", &|v| v["containment"] = "none".into()),
+        ("does not match the MXC config", &|v| {
+            v["config_sha256"] = "2".repeat(64).into()
+        }),
+        ("no enforced controls", &|v| {
+            v["enforced"] = serde_json::json!([])
+        }),
+        ("never ran", &|v| v["exit_code"] = 127.into()),
+        ("did not finish cleanly", &|v| {
+            v["cleanup_complete"] = false.into()
+        }),
+        ("names no proof test", &|v| {
+            v["test_sha256"] = serde_json::Value::Null
+        }),
+    ];
+    for (needle, change) in cases {
+        edit(change);
+        let errors = check(&dir);
+        assert!(has(&errors, needle), "{needle}: {errors:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn report_and_critic_refuse_a_confirmed_record_without_a_proof() {
+    let dir = scratch("unproven");
+    let (ledger, cands, findings) = complete_run();
+    let w = |name: &str, v: String| std::fs::write(dir.join(name), v).unwrap();
+    w(
+        "coverage-ledger.json",
+        serde_json::to_string(&ledger).unwrap(),
+    );
+    w(
+        "candidates-red-1.json",
+        serde_json::json!({"candidates": [candidate_json(&cands[0].candidate)]}).to_string(),
+    );
+    // Confirmed and test_proven, but no proof record was ever written.
+    w("findings.json", serde_json::to_string(&findings).unwrap());
+    let report = omgs(&[
+        "report",
+        "--findings",
+        dir.join("findings.json").to_str().unwrap(),
+        "--out",
+        dir.join("out").to_str().unwrap(),
+    ]);
+    assert_eq!(report.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&report.stderr).contains("requires proof_ref"));
+    let critic = omgs(&["critic", "--run", dir.to_str().unwrap()]);
+    assert!(!critic.status.success());
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&critic.stdout),
+        String::from_utf8_lossy(&critic.stderr)
+    );
+    assert!(said.contains("requires proof_ref"), "{said}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn saved_configs_are_checked_even_when_their_digest_matches() {
+    let dir = scratch("config-policy");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let config_path = dir.join("proofs/1/mxc-config.json");
+    let original: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    for (pointer, value, needle) in [
+        ("/containment", serde_json::json!("none"), "containment"),
+        (
+            "/process/commandLine",
+            serde_json::json!("exit 1"),
+            "wrapped record.command",
+        ),
+        (
+            "/process/cwd",
+            serde_json::json!("/elsewhere/workspace"),
+            "cwd",
+        ),
+        (
+            "/network/egress/default",
+            serde_json::json!("allow"),
+            "egress",
+        ),
+        (
+            "/network/ingress/default",
+            serde_json::json!("allow"),
+            "ingress",
+        ),
+        (
+            "/network/ingress/hostLoopback",
+            serde_json::json!("allow"),
+            "hostLoopback",
+        ),
+        (
+            "/filesystem/readwritePaths",
+            serde_json::json!(["/"]),
+            "readwritePaths",
+        ),
+        ("/process/timeout", serde_json::json!(0), "timeout"),
+        ("/process/timeout", serde_json::json!(2000), "timeout"),
+        (
+            "/filesystem/readonlyPaths",
+            serde_json::json!(["/"]),
+            "readonlyPaths",
+        ),
+        (
+            "/filesystem/readonlyPaths",
+            serde_json::json!(["/opt/homebrew"]),
+            "readonlyPaths",
+        ),
+        (
+            "/filesystem/deniedPaths",
+            serde_json::json!(null),
+            "deniedPaths",
+        ),
+        (
+            "/filesystem/deniedPaths",
+            serde_json::json!(["/elsewhere/denied"]),
+            "deniedPaths",
+        ),
+        (
+            "/process/env",
+            serde_json::json!(["AWS_SECRET_ACCESS_KEY=secret"]),
+            "allowlisted",
+        ),
+        (
+            "/process/env",
+            serde_json::json!(["PATH=/bin", "PATH=/elsewhere"]),
+            "allowlisted",
+        ),
+    ] {
+        let mut config = original.clone();
+        *config.pointer_mut(pointer).unwrap() = value;
+        let text = config.to_string();
+        record.config_sha256 = omgs::sha256::digest(text.as_bytes());
+        std::fs::write(&config_path, text).unwrap();
+        omgs::proof::write(&dir, &record).unwrap();
+        let errors = omgs::proof::validate_proofs(&findings, &dir);
+        assert!(has(&errors, needle), "{pointer}: {errors:?}");
+    }
+    let text = original.to_string();
+    record.config_sha256 = omgs::sha256::digest(text.as_bytes());
+    std::fs::write(&config_path, &text).unwrap();
+    record.test_from = Some("outside-draft".into());
+    record.test_sha256 = Some(omgs::sha256::digest(b"draft"));
+    std::fs::write(dir.join("proofs/1/test-draft"), b"draft").unwrap();
+    omgs::proof::write(&dir, &record).unwrap();
+    assert!(omgs::proof::validate_proofs(&findings, &dir).is_empty());
+    std::fs::write(dir.join("proofs/1/test-draft"), b"changed").unwrap();
+    assert!(has(
+        &omgs::proof::validate_proofs(&findings, &dir),
+        "test-draft"
+    ));
+    record.test_from = None;
+    record.output = "changed".into();
+    omgs::proof::write(&dir, &record).unwrap();
+    assert!(has(
+        &omgs::proof::validate_proofs(&findings, &dir),
+        "output_sha256"
+    ));
+    record.output.clear();
+    std::fs::write(
+        dir.join("run-metadata.json"),
+        serde_json::json!({"target": dir.join("target")} ).to_string(),
+    )
+    .unwrap();
+    omgs::proof::write(&dir, &record).unwrap();
+    assert!(has(
+        &omgs::proof::validate_proofs(&findings, &dir),
+        "target must be present"
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn every_proven_verdict_requires_a_valid_inner_exit_and_clean_markers() {
+    let dir = scratch("verdict-exits");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let original = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    for verdict in [
+        Verdict::Confirmed,
+        Verdict::NeedsValidation,
+        Verdict::Rejected,
+    ] {
+        for reachable in [None, Some(false)] {
+            for exit in [0, 1] {
+                let mut findings = findings.clone();
+                findings.findings[0].verdict = verdict;
+                let mut record = original.clone();
+                record.test_reachable = reachable;
+                record.exit_code = Some(exit);
+                omgs::proof::write(&dir, &record).unwrap();
+                let errors = omgs::proof::validate_proofs(&findings, &dir);
+                assert!(has(&errors, "did not finish cleanly"), "{errors:?}");
+                assert!(
+                    has(&errors, "not reachable inside the sandbox"),
+                    "{errors:?}"
+                );
+            }
+        }
+        for code in [
+            None,
+            Some(-1),
+            Some(0),
+            Some(1),
+            Some(125),
+            Some(126),
+            Some(127),
+            Some(137),
+        ] {
+            let mut findings = findings.clone();
+            findings.findings[0].verdict = verdict;
+            let mut record = original.clone();
+            record.exit_code = code;
+            omgs::proof::write(&dir, &record).unwrap();
+            let errors = omgs::proof::validate_proofs(&findings, &dir);
+            let allowed =
+                matches!(code, Some(1..=125)) || (verdict == Verdict::Rejected && code == Some(0));
+            assert_eq!(
+                errors.is_empty(),
+                allowed,
+                "{verdict:?} {code:?}: {errors:?}"
+            );
+        }
+    }
+    for field in ["command_started", "command_finished"] {
+        let mut record = serde_json::to_value(&original).unwrap();
+        record[field] = false.into();
+        std::fs::write(dir.join("proofs/1.json"), record.to_string()).unwrap();
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "did not finish cleanly"
+        ));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn proof_and_trace_objects_reject_positional_shapes_and_bad_locations() {
+    let dir = scratch("proof-shapes");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let path = dir.join("proofs/1.json");
+    let original = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, "[]").unwrap();
+    assert!(omgs::proof::load(&dir, "proofs/1.json")
+        .unwrap_err()
+        .contains("JSON object"));
+    let mut record: serde_json::Value = serde_json::from_str(&original).unwrap();
+    record["survivors"] = serde_json::json!([[1, "x"]]);
+    std::fs::write(&path, record.to_string()).unwrap();
+    assert!(omgs::proof::load(&dir, "proofs/1.json")
+        .unwrap_err()
+        .contains("JSON object"));
+    let value = serde_json::to_value(findings).unwrap();
+    for trace in [
+        serde_json::json!([[{"path":"x","line":1}, "note"]]),
+        serde_json::json!([{"location":["x",1], "note":"n"}]),
+        serde_json::json!([{"location":{"path":"x","line":null}, "note":"n"}]),
+        serde_json::json!([{"location":{"path":"x","line":0}, "note":"n"}]),
+        serde_json::json!([{"location":{"path":"x","line":1.5}, "note":"n"}]),
+    ] {
+        let mut f = value.clone();
+        f["findings"][0]["trace"] = trace;
+        assert!(omgs::shape::findings(&f.to_string()).is_err());
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn archived_proofs_validate_with_the_original_config_paths() {
+    let dir = scratch("archive-proof");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let archived = scratch("archived-proof");
+    std::fs::remove_dir_all(&archived).unwrap();
+    std::fs::rename(&dir, &archived).unwrap();
+    let errors = omgs::proof::validate_proofs(&findings, &archived);
+    assert!(errors.is_empty(), "{errors:?}");
+    for reference in [
+        "proofs/+1.json",
+        "proofs/01.json",
+        "proofs/0.json",
+        "proofs/1/../1.json",
+    ] {
+        assert!(
+            omgs::proof::load(&archived, reference).is_err(),
+            "{reference}"
+        );
+    }
+    assert!(omgs::proof::load(&archived, "proofs/1.json").is_ok());
+    std::fs::remove_dir_all(archived).unwrap();
+}
+
+#[test]
+fn proof_validation_checks_target_test_and_declared_gaps() {
+    let dir = scratch("target-test-digest");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    let target = dir.join("target");
+    std::fs::create_dir_all(target.join("tests/security")).unwrap();
+    let test = target.join(record.test.as_ref().unwrap());
+    std::fs::write(&test, b"original test").unwrap();
+    record.target = Some(target.to_string_lossy().into());
+    record.target_sha256 = Some(omgs::proof::tree_digest(&target).unwrap());
+    record.test_sha256 = Some(omgs::sha256::digest(b"original test"));
+    omgs::proof::write(&dir, &record).unwrap();
+    assert!(omgs::proof::validate_proofs(&findings, &dir).is_empty());
+    std::fs::write(&test, b"changed test").unwrap();
+    assert!(has(
+        &omgs::proof::validate_proofs(&findings, &dir),
+        "target test changed"
+    ));
+    std::fs::remove_file(&test).unwrap();
+    assert!(has(
+        &omgs::proof::validate_proofs(&findings, &dir),
+        "target test changed"
+    ));
+    std::fs::write(test, b"original test").unwrap();
+    let gaps = record.gaps.clone();
+    for index in 0..gaps.len() {
+        record.gaps = gaps.clone();
+        record.gaps.remove(index);
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "required gap"
+        ));
+    }
+    record.gaps = gaps;
+    let readable = record
+        .gaps
+        .iter_mut()
+        .find(|g| g.starts_with("readable toolchain"))
+        .unwrap();
+    *readable =
+        "readable toolchain roots and caches (may contain private content): /old-host/cache".into();
+    omgs::proof::write(&dir, &record).unwrap();
+    assert!(omgs::proof::validate_proofs(&findings, &dir).is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn config_paths_cannot_move_independently_of_the_recorded_directory() {
+    let dir = scratch("config-anchor");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    let path = dir.join("proofs/1/mxc-config.json");
+    let config = std::fs::read_to_string(&path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+    let cwd = parsed["process"]["cwd"].as_str().unwrap();
+    let original = cwd
+        .strip_suffix("workspace")
+        .unwrap()
+        .trim_end_matches(['/', '\\']);
+    let replacement = dir.join("unrelated/proofs/1").to_string_lossy().to_string();
+    let original = serde_json::to_string(original).unwrap();
+    let replacement = serde_json::to_string(&replacement).unwrap();
+    let config = config.replace(
+        &original[1..original.len() - 1],
+        &replacement[1..replacement.len() - 1],
+    );
+    record.config_sha256 = omgs::sha256::digest(config.as_bytes());
+    std::fs::write(path, config).unwrap();
+    omgs::proof::write(&dir, &record).unwrap();
+    let errors = omgs::proof::validate_proofs(&findings, &dir);
+    assert!(has(&errors, "cwd"), "{errors:?}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn traced_findings_forbid_proof_references() {
+    let dir = scratch("traced-proof-ref");
+    let (_, _, findings) = complete_run();
+    let mut findings = attest(&dir, findings);
+    findings.findings[0].proof_tier = ProofTier::Traced;
+    for reference in ["proofs/1.json", "proofs/01.json", "", "missing"] {
+        findings.findings[0].proof_ref = Some(reference.into());
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "traced findings must not carry proof_ref"
+        ));
+    }
+    findings.findings[0].proof_ref = None;
+    assert!(omgs::proof::validate_proofs(&findings, &dir).is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn saved_configs_use_recorded_roots_full_env_and_a_closed_schema() {
+    let dir = scratch("recorded-home");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    // Executor names are informational; its verified digest identifies it.
+    record.executor = "renamed-executor".into();
+    let os = std::env::consts::OS;
+    let source_home = if cfg!(windows) {
+        r"C:\Users\source-home"
+    } else {
+        "/source-home"
+    };
+    let cargo = std::path::Path::new(source_home).join(".cargo").join("bin");
+    let rustup = std::path::Path::new(source_home).join(".rustup");
+    record.readable_roots = vec![
+        cargo.to_string_lossy().into(),
+        rustup.to_string_lossy().into(),
+    ];
+    let proof_dir = std::path::PathBuf::from(&record.proof_dir);
+    let command = omgs::proof::recorded_command(&dir, &record).unwrap();
+    let wrapped =
+        omgs::sandbox::wrapped_command(os, &command, &record.marker_nonce, record.test.as_deref());
+    let allowed = proof_dir.join("markers/allowed");
+    let config = omgs::sandbox::mxc_config(&omgs::sandbox::ConfigInput {
+        os,
+        containment: &record.containment,
+        command: &wrapped,
+        timeout_ms: record.timeout_ms,
+        workspace: &proof_dir.join("workspace"),
+        scratch: &proof_dir.join("scratch"),
+        allowed_marker: (os == "macos").then_some(allowed.as_path()),
+        readonly: record
+            .readable_roots
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
+        denied: if os == "macos" {
+            vec![proof_dir.join("markers/denied")]
+        } else {
+            vec![]
+        },
+        rust: Some(omgs::sandbox::RustHomes {
+            bin: cargo,
+            cargo_home: proof_dir.join("scratch").join("cargo-home"),
+            rustup_home: Some(rustup),
+        }),
+        list_parents: false,
+    });
+    let config_path = proof_dir.join("mxc-config.json");
+    let findings_path = dir.join("findings.json");
+    std::fs::write(&findings_path, serde_json::to_vec(&findings).unwrap()).unwrap();
+    let save = |config: &serde_json::Value, record: &mut omgs::proof::ProofRecord| {
+        let bytes = serde_json::to_vec(config).unwrap();
+        record.config_sha256 = omgs::sha256::digest(&bytes);
+        std::fs::write(&config_path, bytes).unwrap();
+        omgs::proof::write(&dir, record).unwrap();
+    };
+    save(&config, &mut record);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["validate", "--findings", findings_path.to_str().unwrap()])
+        .env("HOME", dir.join("different-home"))
+        .env("USERPROFILE", dir.join("different-home"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for key in [if cfg!(windows) { "USERPROFILE" } else { "HOME" }, "PATH"] {
+        let mut forged = config.clone();
+        let env = forged["process"]["env"].as_array_mut().unwrap();
+        let entry = env
+            .iter_mut()
+            .find(|v| v.as_str().unwrap().starts_with(&format!("{key}=")))
+            .unwrap();
+        *entry = format!("{key}=/forged").into();
+        save(&forged, &mut record);
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "KEY=value"
+        ));
+    }
+    for pointer in [
+        "",
+        "/process",
+        "/filesystem",
+        "/network",
+        "/network/egress",
+        "/network/ingress",
+    ] {
+        let mut forged = config.clone();
+        forged
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unknown".into(), true.into());
+        save(&forged, &mut record);
+        assert!(
+            has(
+                &omgs::proof::validate_proofs(&findings, &dir),
+                "closed runner schema"
+            ),
+            "{pointer}"
+        );
+    }
+    save(&config, &mut record);
+    record.survivors.push(omgs::proof::Survivor {
+        pid: 123,
+        command: "tool --client_secret private-value".into(),
+    });
+    omgs::proof::write(&dir, &record).unwrap();
+    assert!(!std::fs::read_to_string(dir.join("proofs/1.json"))
+        .unwrap()
+        .contains("private-value"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn validation_and_replay_reject_special_tests_within_a_second() {
+    let dir = scratch("special-proof-test");
+    let (ledger, cands, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    std::fs::write(
+        dir.join("coverage-ledger.json"),
+        serde_json::to_vec(&ledger).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("candidates-red-1.json"),
+        serde_json::json!({"candidates": [candidate_json(&cands[0].candidate)]}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("findings.json"),
+        serde_json::to_vec(&findings).unwrap(),
+    )
+    .unwrap();
+    let target = dir.join("target");
+    std::fs::create_dir_all(target.join("tests/security")).unwrap();
+    let test = target.join("tests/security/x.test.ts");
+    let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    record.target = Some(target.to_string_lossy().into());
+    record.target_sha256 = Some("0".repeat(64));
+    std::fs::write(
+        dir.join(omgs::runmeta::FILE),
+        serde_json::json!({"target": target}).to_string(),
+    )
+    .unwrap();
+    let draft = dir.join("proofs/1/test-draft");
+    for path in [&test, &draft] {
+        record.test_from = (path == &draft).then(|| "original-draft".into());
+        omgs::proof::write(&dir, &record).unwrap();
+        for special in ["fifo", "zero-link", "directory"] {
+            match special {
+                "fifo" => {
+                    use std::os::unix::ffi::OsStrExt;
+                    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                }
+                "zero-link" => std::os::unix::fs::symlink("/dev/zero", path).unwrap(),
+                "directory" => std::fs::create_dir(path).unwrap(),
+                _ => unreachable!(),
+            }
+            let start = std::time::Instant::now();
+            assert!(!omgs::proof::runner_evidence(&dir, &record).is_empty());
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(1),
+                "{special}"
+            );
+            for args in [
+                vec!["validate", "--findings", "findings.json"],
+                vec!["report", "--findings", "findings.json", "--out", "out"],
+                vec!["critic", "--run", "."],
+                vec!["prove", "--run", ".", "--replay", "1"],
+            ] {
+                let start = std::time::Instant::now();
+                let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                    .args(&args)
+                    .current_dir(&dir)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap();
+                let status = loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        break status;
+                    }
+                    if start.elapsed() >= std::time::Duration::from_secs(1) {
+                        child.kill().unwrap();
+                        child.wait().unwrap();
+                        panic!("{special} blocked {args:?}");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                };
+                assert!(!status.success(), "{special}: {args:?}");
+            }
+            if special == "directory" {
+                std::fs::remove_dir(path).unwrap();
+            } else {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn missing_or_altered_commands_do_not_report_a_test_name_cascade() {
+    let dir = scratch("command-error");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    assert!(omgs::proof::validate_proofs(&findings, &dir).is_empty());
+    let path = dir.join("proofs/1/command.txt");
+    std::fs::remove_file(&path).unwrap();
+    for replacement in [None, Some("altered command")] {
+        if let Some(text) = replacement {
+            std::fs::write(&path, text).unwrap();
+        }
+        let errors = omgs::proof::validate_proofs(&findings, &dir);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(!has(&errors, "does not name"), "{errors:?}");
+        assert!(has(&errors, "command"), "{errors:?}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn local_app_records_require_linux_bubblewrap_containment() {
+    let dir = scratch("local-app-containment");
+    let (_, _, findings) = complete_run();
+    let mut findings = attest(&dir, findings);
+    findings.findings[0].proof_tier = ProofTier::SandboxExploited;
+    let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    record.tier = "local_app".into();
+    for containment in ["seatbelt", "processcontainer"] {
+        record.containment = containment.into();
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "local_app records require bubblewrap"
+        ));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn forged_readable_roots_are_rejected_even_with_matching_config_digests() {
+    let dir = scratch("forged-roots");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    let path = dir.join("proofs/1/mxc-config.json");
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let root = omgs::sandbox::toolchain_roots(std::env::consts::OS, None)[0]
+        .to_string_lossy()
+        .to_string();
+    let absolute = if cfg!(windows) {
+        r"C:\arbitrary"
+    } else {
+        "/arbitrary"
+    };
+    let traversal = if cfg!(windows) {
+        r"C:\fake\..\.cargo\bin"
+    } else {
+        "/fake/../.cargo/bin"
+    };
+    for roots in [
+        vec![absolute.to_string()],
+        vec![traversal.to_string()],
+        vec![root.clone(), root],
+    ] {
+        record.readable_roots = roots.clone();
+        let mut forged = config.clone();
+        let mut readonly = roots;
+        if cfg!(target_os = "macos") {
+            readonly.push(format!("{}/markers/allowed", record.proof_dir));
+        }
+        forged["filesystem"]["readonlyPaths"] = serde_json::json!(readonly);
+        let bytes = serde_json::to_vec(&forged).unwrap();
+        record.config_sha256 = omgs::sha256::digest(&bytes);
+        std::fs::write(&path, bytes).unwrap();
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "recorded readable_roots"
+        ));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn windows_unc_proof_directories_match_writer_and_validator() {
+    let dir = scratch("unc-proof-dir");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    let executor = omgs::sandbox::executor_for("windows", "x86_64").unwrap();
+    record.containment = executor.containment.into();
+    record.executor_sha256 = executor.sha256.into();
+    record.enforced = omgs::sandbox::declared_controls("windows", omgs::sandbox::Tier::Test).0;
+    record.gaps = omgs::sandbox::declared_controls("windows", omgs::sandbox::Tier::Test).1;
+    record.system_root = Some(r"C:\Windows".into());
+    let command = omgs::proof::recorded_command(&dir, &record).unwrap();
+    let wrapped = omgs::sandbox::wrapped_command_at(
+        "windows",
+        &command,
+        &record.marker_nonce,
+        record.test.as_deref(),
+        r"C:\Windows",
+    );
+    record.wrapped_command_sha256 = omgs::sha256::digest(wrapped.as_bytes());
+    for prefix in [
+        r"\\server\share\run\proofs\1",
+        r"\\?\UNC\server\share\run\proofs\1",
+        r"\\?\unc\server\share\run\proofs\1",
+    ] {
+        record.proof_dir = prefix.into();
+        let workspace = std::path::PathBuf::from(format!("{prefix}\\workspace"));
+        let scratch = std::path::PathBuf::from(format!("{prefix}\\scratch"));
+        let config = omgs::sandbox::mxc_config_at(
+            &omgs::sandbox::ConfigInput {
+                os: "windows",
+                containment: &record.containment,
+                command: &wrapped,
+                timeout_ms: record.timeout_ms,
+                workspace: &workspace,
+                scratch: &scratch,
+                allowed_marker: None,
+                readonly: vec![],
+                denied: vec![],
+                rust: None,
+                list_parents: true,
+            },
+            r"C:\Windows",
+        );
+        assert_eq!(
+            config["process"]["cwd"],
+            r"\\server\share\run\proofs\1\workspace"
+        );
+        let bytes = serde_json::to_vec(&config).unwrap();
+        record.config_sha256 = omgs::sha256::digest(&bytes);
+        std::fs::write(dir.join("proofs/1/mxc-config.json"), bytes).unwrap();
+        omgs::proof::write(&dir, &record).unwrap();
+        let errors = omgs::proof::validate_proofs(&findings, &dir);
+        assert!(errors.is_empty(), "{prefix}: {errors:?}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }

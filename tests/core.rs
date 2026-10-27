@@ -31,6 +31,8 @@ fn finding(verdict: Verdict, tier: ProofTier, severity: Option<Severity>) -> Fin
         hunted_by: Some("red-1".into()),
         verified_by: Some("blue-1".into()),
         candidates: vec![],
+        proof_ref: None,
+        trace: vec![],
     }
 }
 
@@ -121,30 +123,69 @@ fn html_report_escapes_target_content() {
 
 #[test]
 fn mxc_config_matches_verified_contract() {
-    use omgs::sandbox::{mxc_config_json, ProveRequest};
-    use std::path::PathBuf;
-    let req = ProveRequest {
-        command: "cmd.exe /d /s /c echo hi".into(),
+    use omgs::sandbox::{declared_controls, mxc_config, tier2_unavailable, ConfigInput, Tier};
+    use std::path::{Path, PathBuf};
+    let input = |os: &'static str| ConfigInput {
+        os,
+        containment: "process",
+        command: "cmd.exe /d /s /c echo hi",
         timeout_ms: 30000,
-        cwd: Some(PathBuf::from("/work/target")),
-        scratch: PathBuf::from("/work/scratch"),
+        workspace: Path::new("/work/run/workspace"),
+        scratch: Path::new("/work/run/scratch"),
+        allowed_marker: Some(Path::new("/work/run/markers/allowed")),
+        readonly: vec![PathBuf::from("/opt/homebrew")],
+        denied: vec![PathBuf::from("/home/u/.cargo/credentials.toml")],
+        rust: None,
+        list_parents: true,
     };
-    let text = mxc_config_json(
-        &req,
-        &PathBuf::from("/work/scratch"),
-        &PathBuf::from("/work/target"),
-    );
-    let v: serde_json::Value = serde_json::from_str(&text).expect("config must parse");
+    let v = mxc_config(&input("windows"));
     assert_eq!(v["version"], "1.0.0");
     assert_eq!(v["containment"], "process");
+    assert_eq!(v["process"]["cwd"], "/work/run/workspace");
     assert_eq!(v["network"]["egress"]["default"], "deny");
+    assert_eq!(v["network"]["ingress"]["default"], "deny");
     assert_eq!(v["network"]["ingress"]["hostLoopback"], "deny");
-    assert_eq!(v["filesystem"]["readwritePaths"][0], "/work/scratch");
-    assert_eq!(v["filesystem"]["readonlyPaths"][0], "/work/target");
-    assert!(v["process"]["env"]
+    assert_eq!(
+        v["filesystem"]["readwritePaths"],
+        serde_json::json!(["/work/run/workspace", "/work/run/scratch"])
+    );
+    assert_eq!(
+        v["filesystem"]["readonlyPaths"],
+        serde_json::json!(["/opt/homebrew", "/work/run/markers/allowed"])
+    );
+    assert_eq!(
+        v["filesystem"]["deniedPaths"][0],
+        "/home/u/.cargo/credentials.toml"
+    );
+    assert_eq!(v["processContainer"]["ui"]["isolation"], "desktop");
+    let env = v["process"]["env"].as_array().expect("env");
+    assert!(env.iter().any(|e| e == "USERPROFILE=/work/run/scratch"));
+    assert!(env.iter().any(|e| e == "LOCALAPPDATA=/work/run/scratch"));
+
+    let mac = mxc_config(&input("macos"));
+    assert_eq!(
+        mac["seatbelt"]["extraMachLookups"][0],
+        "com.apple.system.opendirectoryd.libinfo"
+    );
+    assert!(mac["process"]["env"]
         .as_array()
-        .map(|a| !a.is_empty())
-        .unwrap_or(false));
+        .unwrap()
+        .iter()
+        .any(|e| e == "HOME=/work/run/scratch"));
+
+    // Tier 2 needs a loopback private to the sandbox, which only Linux has.
+    assert!(tier2_unavailable("linux").is_none());
+    for os in ["macos", "windows"] {
+        assert!(tier2_unavailable(os).unwrap().contains("only on Linux"));
+    }
+    let linux = mxc_config(&input("linux"));
+    assert_eq!(linux["network"]["ingress"]["hostLoopback"], "deny");
+    let (enforced, _) = declared_controls("linux", Tier::LocalApp);
+    assert!(enforced.iter().any(|e| e.contains("loopback private")));
+    let (enforced, gaps) = declared_controls("linux", Tier::Test);
+    assert!(gaps.iter().any(|g| g.contains("no total disk quota")));
+    assert!(gaps.iter().any(|g| g.contains("readable toolchain roots")));
+    assert!(enforced.iter().any(|e| e.contains("egress denied")));
 }
 
 #[test]

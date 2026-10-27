@@ -6,7 +6,7 @@
 // function `decide(_:)` provided by the target source in vulnerable/ or fixed/.
 //
 // Run one snapshot through the sandbox, writing the binary to scratch:
-//   omgs prove --cwd benchmark/fixtures/installer-trust \
+//   omgs prove --target benchmark/fixtures/installer-trust \
 //     --cmd 'swiftc main.swift vulnerable/Verifier.swift -o "$TMPDIR/probe" && "$TMPDIR/probe"'
 // The vulnerable snapshot violates the invariants and exits non-zero; swap
 // vulnerable for fixed and it upholds them plus the authorized control and exits
