@@ -730,9 +730,30 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     copy_tree_with_gaps(src, dst).map(|_| ())
 }
 
+const MAX_SPECIAL_PATHS: usize = 20;
+
 fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
     let mut gaps = Vec::new();
-    inspect_target(src, src, &mut gaps)?;
+    let mut specials = 0;
+    let mut outside_links = 0;
+    let root = std::fs::canonicalize(src).map_err(|e| e.to_string())?;
+    inspect_target(&root, &root, &mut gaps, &mut specials, &mut outside_links)?;
+    if specials > MAX_SPECIAL_PATHS {
+        gaps.push(format!(
+            "skipped {} additional target sockets or FIFOs",
+            specials - MAX_SPECIAL_PATHS
+        ));
+    }
+    if outside_links > 0 {
+        let action = if cfg!(unix) {
+            "copied as links, sandbox access rules apply"
+        } else {
+            "dropped from the workspace"
+        };
+        gaps.push(format!(
+            "{outside_links} target link(s) resolve outside the target or do not resolve: {action}"
+        ));
+    }
     supervise::check_interrupted().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
     let from = format!("{}/.", src.display());
@@ -743,7 +764,7 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
     } else {
         vec![]
     };
-    for flags in attempts.into_iter().filter(|_| gaps.is_empty()) {
+    for flags in attempts.into_iter().filter(|_| specials == 0) {
         let child = Command::new("/bin/cp")
             .args(&flags)
             .arg(&from)
@@ -775,33 +796,42 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
         let _ = std::fs::remove_dir_all(dst);
         std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     }
-    let roots = (
-        std::fs::canonicalize(src).map_err(|e| e.to_string())?,
-        dst.to_path_buf(),
-    );
+    let roots = (root, dst.to_path_buf());
     copy_recursive(src, dst, &roots)?;
     Ok(gaps)
 }
 
-fn inspect_target(root: &Path, dir: &Path, gaps: &mut Vec<String>) -> Result<(), String> {
+fn inspect_target(
+    root: &Path,
+    dir: &Path,
+    gaps: &mut Vec<String>,
+    specials: &mut usize,
+    outside_links: &mut usize,
+) -> Result<(), String> {
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         supervise::check_interrupted().map_err(|e| e.to_string())?;
         let entry = entry.map_err(|e| e.to_string())?;
         let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
         if platform::is_link(&meta) {
+            if !std::fs::canonicalize(entry.path()).is_ok_and(|p| p.starts_with(root)) {
+                *outside_links += 1;
+            }
             continue;
         }
         if meta.is_dir() {
-            inspect_target(root, &entry.path(), gaps)?;
+            inspect_target(root, &entry.path(), gaps, specials, outside_links)?;
         } else if platform::contentless(&meta) {
-            gaps.push(format!(
-                "skipped target socket or FIFO: {}",
-                entry
-                    .path()
-                    .strip_prefix(root)
-                    .map_err(|e| e.to_string())?
-                    .display()
-            ));
+            *specials += 1;
+            if *specials <= MAX_SPECIAL_PATHS {
+                gaps.push(format!(
+                    "skipped target socket or FIFO: {}",
+                    entry
+                        .path()
+                        .strip_prefix(root)
+                        .map_err(|e| e.to_string())?
+                        .display()
+                ));
+            }
         } else if !meta.is_file() {
             return Err(format!(
                 "unsupported target file type at {}; devices are refused",
@@ -844,9 +874,15 @@ fn copy_recursive(src: &Path, dst: &Path, roots: &(PathBuf, PathBuf)) -> Result<
     Ok(())
 }
 
-/// Keep a link (pnpm stores, monorepo packages) that resolves inside the
-/// target: a directory becomes a junction to its copy, a file is copied.
-/// Links that leave the target are dropped, never followed out of it.
+/// Preserve the same link text as cp, including dangling and outside links.
+#[cfg(unix)]
+fn copy_link(link: &Path, to: &Path, _roots: &(PathBuf, PathBuf)) -> Result<(), String> {
+    let target = std::fs::read_link(link).map_err(|e| e.to_string())?;
+    std::os::unix::fs::symlink(target, to).map_err(|e| format!("link {}: {e}", to.display()))
+}
+
+/// Windows uses junctions and file copies without following outside links.
+#[cfg(windows)]
 fn copy_link(link: &Path, to: &Path, roots: &(PathBuf, PathBuf)) -> Result<(), String> {
     let Ok(resolved) = std::fs::canonicalize(link) else {
         return Ok(());
@@ -1454,9 +1490,23 @@ mod tests {
         std::fs::hard_link(src.join("a"), src.join("b")).unwrap();
         let data = vec![37u8; 8 << 20];
         std::fs::write(src.join("large"), &data).unwrap();
+        std::fs::create_dir(src.join("dir")).unwrap();
+        for (name, target) in [
+            ("file-link", PathBuf::from("a")),
+            ("directory-link", PathBuf::from("dir")),
+            (
+                "absolute-link",
+                std::fs::canonicalize(src.join("a")).unwrap(),
+            ),
+            ("outside-link", d.join("outside")),
+            ("dangling-link", PathBuf::from("missing")),
+        ] {
+            std::os::unix::fs::symlink(target, src.join(name)).unwrap();
+        }
+        std::fs::write(d.join("outside"), "outside").unwrap();
         let digest = crate::proof::tree_digest(&src).unwrap();
         copy_tree(&src, &dst).unwrap();
-        assert_eq!(crate::proof::tree_digest(&dst).unwrap(), digest);
+        let copied_digest = crate::proof::tree_digest(&dst).unwrap();
         assert_eq!(std::fs::read(dst.join("large")).unwrap(), data);
         assert_ne!(
             std::fs::metadata(dst.join("a")).unwrap().ino(),
@@ -1469,13 +1519,32 @@ mod tests {
         let socket = std::os::unix::net::UnixListener::bind(src.join("socket")).unwrap();
         let special_copy = d.join("special-copy");
         let gaps = copy_tree_with_gaps(&src, &special_copy).unwrap();
-        assert_eq!(gaps.len(), 2);
+        assert_eq!(gaps.len(), 3);
+        assert!(
+            gaps.iter().any(|g| g.starts_with("2 target link(s)")),
+            "{gaps:?}"
+        );
+        for name in [
+            "file-link",
+            "directory-link",
+            "absolute-link",
+            "outside-link",
+            "dangling-link",
+        ] {
+            assert_eq!(
+                std::fs::read_link(dst.join(name)).unwrap(),
+                std::fs::read_link(special_copy.join(name)).unwrap()
+            );
+        }
         for name in ["pipe", "socket"] {
             assert!(gaps.iter().any(|gap| gap.ends_with(name)), "{gaps:?}");
             assert!(!special_copy.join(name).exists());
         }
         assert_eq!(crate::proof::tree_digest(&src).unwrap(), digest);
-        assert_eq!(crate::proof::tree_digest(&special_copy).unwrap(), digest);
+        assert_eq!(
+            crate::proof::tree_digest(&special_copy).unwrap(),
+            copied_digest
+        );
         assert!(crate::sha256::digest_file(&fifo).is_err());
         assert!(crate::sha256::digest_file(Path::new("/dev/zero")).is_err());
         std::os::unix::fs::symlink(&fifo, d.join("fifo-link")).unwrap();
@@ -1484,6 +1553,28 @@ mod tests {
         assert!(crate::sha256::digest_file(&d.join("dir-link")).is_err());
         assert!(start.elapsed().as_secs() < 10);
         drop(socket);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_file_gaps_list_twenty_paths_then_the_remaining_count() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = std::env::temp_dir().join(format!("omgs-gap-cap-{}", std::process::id()));
+        let src = d.join("target");
+        std::fs::create_dir_all(&src).unwrap();
+        for n in 0..27 {
+            let path = src.join(format!("pipe-{n}"));
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        }
+        let gaps = copy_tree_with_gaps(&src, &d.join("copy")).unwrap();
+        assert_eq!(gaps.len(), 21);
+        assert!(gaps[..20]
+            .iter()
+            .all(|g| g.starts_with("skipped target socket or FIFO: pipe-")));
+        assert_eq!(gaps[20], "skipped 7 additional target sockets or FIFOs");
+        assert_eq!(std::fs::read_dir(d.join("copy")).unwrap().count(), 0);
         std::fs::remove_dir_all(d).unwrap();
     }
 

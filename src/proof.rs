@@ -907,7 +907,10 @@ fn redact_line(line: &str, lower: &str) -> String {
         {
             separator += 1;
         }
-        let assigned = matches!(lower.as_bytes().get(separator), Some(b':' | b'='));
+        let assigned = lower.as_bytes().get(separator) == Some(&b'=')
+            || lower.as_bytes().get(separator) == Some(&b':')
+                && lower.as_bytes().get(separator + 1) != Some(&b':')
+                && (flag || name != "pass");
         if !(assigned || flag && spaced && !name.starts_with("--no-")) {
             continue;
         }
@@ -929,9 +932,9 @@ fn redact_line(line: &str, lower: &str) -> String {
             if !assigned && lower[value..].starts_with("--") {
                 continue;
             }
-            let end = value_end(&line, value);
+            let (end, replacement) = value_mask(&line, value);
             if end > value {
-                masks.push((value, end, "[omgs redacted]"));
+                masks.push((value, end, replacement));
                 i = end;
             }
         } else {
@@ -947,7 +950,8 @@ fn redact_line(line: &str, lower: &str) -> String {
     for (at, _) in lower.match_indices("bearer ") {
         let start = at + "bearer ".len();
         if !lower[start..].starts_with("[omgs redacted]") {
-            masks.push((start, value_end(&line, start), "[omgs redacted]"));
+            let (end, replacement) = value_mask(&line, start);
+            masks.push((start, end, replacement));
         }
     }
     masks.sort_unstable_by_key(|(start, _, _)| *start);
@@ -965,9 +969,14 @@ fn redact_line(line: &str, lower: &str) -> String {
     out
 }
 
-/// One shell token, including quoted spans and escaped characters.
-fn value_end(line: &str, start: usize) -> usize {
-    let mut quote = None;
+/// One shell token, preserving a quote opened before the value.
+fn value_mask(line: &str, start: usize) -> (usize, &'static str) {
+    let mut quote = quote_at(line, start);
+    let replacement = match quote {
+        Some('\'') => "[omgs redacted]'",
+        Some('"') => "[omgs redacted]\"",
+        _ => "[omgs redacted]",
+    };
     let mut escaped = false;
     for (offset, c) in line[start..].char_indices() {
         if escaped {
@@ -980,16 +989,94 @@ fn value_end(line: &str, start: usize) -> usize {
             if c == '\'' || c == '"' {
                 quote = Some(c);
             } else if c.is_whitespace() || ";&|()<>".contains(c) {
-                return start + offset;
+                return (start + offset, replacement);
             }
         }
     }
-    line.len()
+    (line.len(), replacement)
+}
+
+/// A value can start inside a quote that opened before the flag name.
+fn quote_at(line: &str, at: usize) -> Option<char> {
+    let mut quote = None;
+    let mut escaped = false;
+    for c in line[..at].chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if quote == Some(c) {
+            quote = None;
+        } else if quote.is_none() && matches!(c, '\'' | '"') {
+            quote = Some(c);
+        }
+    }
+    quote
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quoted_credential_tokens_mask_the_entire_value() {
+        for value in [
+            "\"--password=public SECRET_SUFFIX\"",
+            "'--password=public SECRET_SUFFIX'",
+            "\"--password\" \"public SECRET_SUFFIX\"",
+            "'--password' 'public SECRET_SUFFIX'",
+            "\"--password public SECRET_SUFFIX\"",
+            "'--password public SECRET_SUFFIX'",
+            "\"--password=public SECRET_SUFFIX\"tail",
+            "--password='public SECRET_SUFFIX'",
+            "--password=\"public SECRET_SUFFIX\"",
+        ] {
+            let command = format!("sh proof.sh {value} --verbose following");
+            let masked = redact(&command);
+            assert!(
+                !masked.contains("public") && !masked.contains("SECRET_SUFFIX"),
+                "{masked}"
+            );
+            assert!(masked.ends_with(" --verbose following"), "{masked}");
+            assert_eq!(redact(&masked), masked, "{command}");
+        }
+    }
+
+    #[test]
+    fn namespaces_and_go_pass_output_are_not_credentials() {
+        for line in [
+            "auth::tests token::x session::y",
+            "--- PASS: TestX (0.00s)",
+            "pass: TestX passed",
+            "bypass: fine",
+        ] {
+            assert_eq!(redact(line), line);
+        }
+        for line in [
+            "pass=hidden",
+            "--pass hidden",
+            "--pass:hidden",
+            "token: hidden",
+        ] {
+            assert!(!redact(line).contains("hidden"), "{line}");
+        }
+    }
+
+    #[test]
+    fn quoted_bearer_values_keep_following_arguments_and_idempotence() {
+        for line in [
+            "tool \"Bearer hidden secret\" following",
+            "tool 'Bearer hidden secret' following",
+        ] {
+            let masked = redact(line);
+            assert!(
+                !masked.contains("hidden") && !masked.contains("secret"),
+                "{masked}"
+            );
+            assert!(masked.ends_with(" following"), "{masked}");
+            assert_eq!(redact(&masked), masked);
+        }
+    }
 
     #[test]
     fn redaction_covers_cookie_sessions_and_credential_suffixes() {

@@ -137,6 +137,17 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
             }
         } else if inline.is_none() {
             match args.get(i) {
+                Some(value)
+                    if free_text_option(option)
+                        && (allowed.split_whitespace().any(|known| {
+                            value == known || value.starts_with(&format!("{known}="))
+                        }) || matches!(value.as_str(), "--help" | "-h")
+                            || value.starts_with("--help=")) =>
+                {
+                    return Err(format!(
+                        "{option} requires an unambiguous value; use {option}=value for free text beginning with a known option"
+                    ));
+                }
                 Some(value) if free_text_option(option) || !value.starts_with("--") => i += 1,
                 _ => {
                     return Err(format!(
@@ -1063,16 +1074,19 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_approve(args: &[String]) -> Result<(), String> {
-    if let Some(why) = omgs::sandbox::tier2_unavailable(std::env::consts::OS) {
-        eprintln!("needs_validation: target code was not executed. {why}");
-        return Err("__EXIT3__".into());
-    }
     let raw = flag(args, "--target").ok_or("approve requires --target <repo>")?;
     let target = std::fs::canonicalize(&raw).map_err(|e| format!("target {raw}: {e}"))?;
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+        .filter(|n| !n.is_empty())
+        .ok_or(
+            "approve requires a target with a folder name; filesystem roots cannot be approved",
+        )?;
+    if let Some(why) = omgs::sandbox::tier2_unavailable(std::env::consts::OS) {
+        eprintln!("needs_validation: target code was not executed. {why}");
+        return Err("__EXIT3__".into());
+    }
     println!("Tier 2 builds and runs {} as a local app inside MXC, on dummy data, with external network denied.", target.display());
     println!("Type the folder name '{name}' to approve tier 2 for this repository:");
     let typed = omgs::approval::read_from_terminal()?;
@@ -1289,14 +1303,7 @@ fn trusted_store(target: &Path) -> Result<PathBuf, String> {
 /// so neither a symlink nor a hardlink planted in the target can change what
 /// the store says. A missing store means no answers yet.
 fn read_store(path: &Path) -> Result<omgs::intent::Answers, String> {
-    const MAX_BYTES: u64 = 1 << 20;
-    let bytes = match omgs::platform::read_bounded(path, MAX_BYTES) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-        Err(e) => return Err(format!("{}: {e}; refusing to trust it", path.display())),
-    };
-    let text = std::str::from_utf8(&bytes).map_err(|e| format!("read {}: {e}", path.display()))?;
-    omgs::intent::parse_answers(text).map_err(|e| format!("parse {}: {e}", path.display()))
+    omgs::intent::load_answers(path)
 }
 
 /// The run's intent answers, only when they belong to the run's target as
@@ -1730,8 +1737,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     // Bring the reviewer's recorded intent answers for this exact target into
     // the run, so earlier answers resolve matching questions in the report.
     if let Some(answers) = answers {
-        let text = serde_json::to_string_pretty(&answers).map_err(|e| e.to_string())?;
-        write_out(out_abs.join("intent-answers.json"), format!("{text}\n"))
+        omgs::intent::save_answers(&out_abs.join("intent-answers.json"), &answers)
             .map_err(|e| format!("copy intent answers: {e}"))?;
     }
     Ok(out_abs)
@@ -2501,8 +2507,7 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
             }
             answers.target = target_s;
             omgs::intent::record(&mut answers, answer)?;
-            let text = serde_json::to_string_pretty(&answers).map_err(|e| e.to_string())?;
-            omgs::runmeta::write_atomic(&path, &format!("{text}\n"))?;
+            omgs::intent::save_answers(&path, &answers)?;
             Ok(())
             })?;
             println!("recorded {id} in {}", path.display());
@@ -2532,7 +2537,7 @@ mod cli_tests {
             ("status", "", "--log"),
             ("route", "", "--reason"),
         ] {
-            for value in ["--version", "--run", "--help", "--live"] {
+            for value in ["--version", "--unknown", "--live"] {
                 for inline in [false, true] {
                     let mut args = Vec::new();
                     if !sub.is_empty() {
@@ -2557,6 +2562,39 @@ mod cli_tests {
         assert!(validate_options("doctor", &strings(&["--live=yes"])).is_err());
         let args = strings(&["--counter=a=1", "--counter", "b=2"]);
         assert_eq!(flags(&args, "--counter"), ["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn free_text_values_cannot_swallow_known_options() {
+        for (cmd, sub, name, known) in [
+            ("prove", "", "--cmd", "--timeout-ms"),
+            ("ledger", "add", "--note", "--unit"),
+            ("ledger", "set", "--note", "--evidence"),
+            ("intent", "answer", "--answer", "--scope"),
+            ("status", "", "--detail", "--state"),
+            ("status", "", "--log", "--run"),
+            ("route", "", "--reason", "--role"),
+        ] {
+            for value in [
+                known.to_string(),
+                format!("{known}=5000"),
+                format!("{known}=5000 extra text"),
+                "--help".into(),
+            ] {
+                let mut args = Vec::new();
+                if !sub.is_empty() {
+                    args.push(sub.to_string());
+                }
+                args.extend([name.to_string(), value.clone()]);
+                let error = validate_options(cmd, &args).unwrap_err();
+                assert!(error.contains(&format!("use {name}=value")), "{error}");
+                args.pop();
+                args.pop();
+                args.push(format!("{name}={value}"));
+                assert_eq!(validate_options(cmd, &args), Ok(false));
+                assert_eq!(flag(&args, name), Some(value));
+            }
+        }
     }
 
     #[test]

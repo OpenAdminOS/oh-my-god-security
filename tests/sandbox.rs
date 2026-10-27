@@ -1442,16 +1442,23 @@ fn executable_drafts_keep_their_mode_and_commands_are_redacted() {
             "--test-from",
             draft.to_str().unwrap(),
             "--cmd",
-            "./tests/x.sh --access-token private-value && echo tool --secret-key=inline-private --client_secret following-private",
+            "./tests/x.sh --access-token private-value \"--password=public SECRET_SUFFIX\" visible-argument && echo tool --secret-key=inline-private --client_secret following-private",
         ],
     );
     assert!(out.status.success(), "{}", text(&out));
-    for value in ["private-value", "inline-private", "following-private"] {
+    for value in [
+        "private-value",
+        "inline-private",
+        "following-private",
+        "SECRET_SUFFIX",
+    ] {
         assert!(!text(&out).contains(value), "{}", text(&out));
     }
     let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
     assert!(record.output.contains("executable-draft"));
     assert!(!record.command.contains("private-value"));
+    assert!(!record.command.contains("SECRET_SUFFIX"));
+    assert!(record.command.contains("visible-argument"));
     assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
     let replay = omgs(
         &d,
@@ -1489,6 +1496,10 @@ fn cli_rejects_unknown_and_duplicate_options_before_charging_budget() {
         vec!["--cmd", "exit 0", "--tier", "1", "--tier", "2"],
         vec!["--cmd", "exit 0", "--timeout-ms", "1", "--timeout-ms", "2"],
         vec!["--cmd", "exit 0", "unexpected"],
+        vec!["--cmd", "--timeout-ms=5000"],
+        vec!["--cmd", "--timeout-ms=5000 trailing text"],
+        vec!["--cmd", "--tier"],
+        vec!["--cmd", "--run"],
     ] {
         let mut args = vec!["prove", "--run", run.to_str().unwrap()];
         args.extend(tail);
@@ -1744,5 +1755,94 @@ fn socket_and_fifo_gaps_survive_validation_and_replay() {
         }
     }
     drop(socket);
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn approve_refuses_filesystem_roots_before_prompting() {
+    let d = scratch("approve-root");
+    let canonical = std::fs::canonicalize(&d).unwrap();
+    let root = canonical.ancestors().last().unwrap();
+    let home = d.join("home");
+    let out = omgs(&home, &["approve", "--target", root.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(text(&out).contains("filesystem roots cannot be approved"));
+    assert!(!text(&out).contains("Type the folder name"));
+    assert!(!home.exists());
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_proofs_replay_when_sockets_appear_or_disappear() {
+    use std::os::unix::fs::symlink;
+    if !mxc_ready() {
+        return;
+    }
+    let d = PathBuf::from("/tmp").join(format!("omgs-sl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let target = d.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        target.join("real.sh"),
+        "test -L proof.sh && test ! -e socket\n",
+    )
+    .unwrap();
+    symlink("real.sh", target.join("proof.sh")).unwrap();
+    for with_socket in [true, false] {
+        let home = d.join(format!("home-{with_socket}"));
+        let run = d.join(format!("run-{with_socket}"));
+        let mut socket = with_socket
+            .then(|| std::os::unix::net::UnixListener::bind(target.join("socket")).unwrap());
+        let out = omgs(
+            &home,
+            &[
+                "audit",
+                "init",
+                "--target",
+                target.to_str().unwrap(),
+                "--out",
+                run.to_str().unwrap(),
+                "--no-sensors",
+            ],
+        );
+        assert!(out.status.success(), "{}", text(&out));
+        let out = omgs(
+            &home,
+            &[
+                "prove",
+                "--run",
+                run.to_str().unwrap(),
+                "--test",
+                "proof.sh",
+                "--cmd",
+                "sh proof.sh",
+            ],
+        );
+        assert!(out.status.success(), "{}", text(&out));
+        if with_socket {
+            drop(socket.take());
+            std::fs::remove_file(target.join("socket")).unwrap();
+        } else {
+            socket = Some(std::os::unix::net::UnixListener::bind(target.join("socket")).unwrap());
+        }
+        let out = omgs(
+            &home,
+            &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+        );
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(text(&out).contains("reproduced"));
+        let mut digests = Vec::new();
+        for n in [1, 2] {
+            let record = omgs::proof::load(&run, &format!("proofs/{n}.json")).unwrap();
+            assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+            digests.push(record.target_sha256);
+        }
+        assert_eq!(digests[0], digests[1]);
+        drop(socket);
+        if target.join("socket").exists() {
+            std::fs::remove_file(target.join("socket")).unwrap();
+        }
+    }
     std::fs::remove_dir_all(d).unwrap();
 }

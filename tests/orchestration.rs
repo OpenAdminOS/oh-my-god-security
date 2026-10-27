@@ -836,6 +836,94 @@ fn answers_files_are_strict_and_bound_to_the_run_target() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn answer_store_writes_enforce_the_limit_without_replacing_valid_answers() {
+    let dir = scratch("answer-write-limit");
+    let target = dir.join("target");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&target).unwrap();
+    let canonical = std::fs::canonicalize(&target).unwrap();
+    let path = omgs::intent::answers_file(&home, &canonical);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut answers = omgs::intent::Answers {
+        target: canonical.to_string_lossy().to_string(),
+        answers: vec![omgs::intent::Answer {
+            id: "web.public-resource".into(),
+            answer: "public".into(),
+            scope: "repo".into(),
+            source: "owner".into(),
+            recorded_unix: 1,
+        }],
+    };
+    let overhead = serde_json::to_string_pretty(&answers).unwrap().len() + 1;
+    answers.answers[0]
+        .answer
+        .push_str(&"x".repeat((1 << 20) - overhead));
+    omgs::intent::save_answers(&path, &answers).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(before.len(), 1 << 20);
+    let loaded = omgs::intent::load_answers(&path).unwrap();
+    assert_eq!(loaded.target, answers.target);
+    assert_eq!(loaded.answers, answers.answers);
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "intent",
+            "answer",
+            "--target",
+            target.to_str().unwrap(),
+            "--id",
+            "web.public-resource",
+            "--answer",
+            "private",
+            "--source",
+            "owner",
+            "--scope",
+            "src",
+        ])
+        .env("OMGS_HOME", &home)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("1 MiB byte limit"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    answers.answers[0].answer.push('x');
+    assert!(omgs::intent::save_answers(&path, &answers)
+        .unwrap_err()
+        .contains("1 MiB byte limit"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn run_local_answer_snapshots_require_bounded_single_link_files() {
+    let dir = scratch("run-answer-reader");
+    let path = dir.join("intent-answers.json");
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len((1 << 20) + 1).unwrap();
+    assert!(omgs::intent::load_answers(&path)
+        .unwrap_err()
+        .contains("byte limit"));
+    drop(file);
+    std::fs::write(&path, r#"{"target":"/x","answers":[]}"#).unwrap();
+    std::fs::hard_link(&path, dir.join("hardlink")).unwrap();
+    assert!(omgs::intent::load_answers(&path).is_err());
+    std::fs::remove_file(dir.join("hardlink")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::fs::rename(&path, dir.join("original")).unwrap();
+        std::os::unix::fs::symlink(dir.join("original"), &path).unwrap();
+        assert!(omgs::intent::load_answers(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let start = std::time::Instant::now();
+        assert!(omgs::intent::load_answers(&path).is_err());
+        assert!(start.elapsed().as_secs() < 1);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn batch_index_follows_symlinks_before_dotdot() {

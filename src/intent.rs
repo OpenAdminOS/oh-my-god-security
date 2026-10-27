@@ -87,12 +87,27 @@ pub fn answers_file(omgs_home: &Path, canonical_target: &Path) -> std::path::Pat
         .join(format!("target-{hash:016x}.json"))
 }
 
+const MAX_ANSWER_BYTES: u64 = 1 << 20;
+
 pub fn load_answers(path: &Path) -> Result<Answers, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => parse_answers(&text).map_err(|e| format!("parse {}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Answers::default()),
-        Err(e) => Err(format!("read {}: {e}", path.display())),
+    let bytes = match crate::platform::read_bounded(path, MAX_ANSWER_BYTES) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Answers::default()),
+        Err(e) => return Err(format!("{}: {e}; refusing to trust it", path.display())),
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|e| format!("read {}: {e}", path.display()))?;
+    parse_answers(text).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+pub fn save_answers(path: &Path, answers: &Answers) -> Result<(), String> {
+    let text = format!(
+        "{}\n",
+        serde_json::to_string_pretty(answers).map_err(|e| e.to_string())?
+    );
+    if text.len() as u64 > MAX_ANSWER_BYTES {
+        return Err("intent answer store exceeds the 1 MiB byte limit".into());
     }
+    crate::runmeta::write_atomic(path, &text)
 }
 
 /// Strictly parse an answers file: an object with a string `target` and an
