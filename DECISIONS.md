@@ -37,7 +37,7 @@ Target controlled code, including builds, tests and the running app at level 2, 
 - No external network. Local client and server traffic stays on an isolated loopback.
 - An empty environment built from an explicit allowlist, with scratch local home, temp and cache directories. Dummy principals and dummy secrets only.
 - A read only target and toolchain. The target process writes only inside its assigned scratch directory and a per-run copy of the target; the original target is never mounted.
-- Explicit limits on CPU, memory, processes, file size, disk and wall clock time.
+- Explicit limits on CPU, memory, processes, per-file size and wall clock time where supported. There is no total disk quota. Unix limits each file to 1 GiB; Windows has no per-file limit.
 - No dependency installation and no network fetching during proof execution. Only tools and dependencies already present locally are used.
 - Execution stops at the minimum local effect that proves the boundary violation.
 
@@ -47,6 +47,8 @@ Declared minimum set per OS (amended on 2026-10-27, replacing the rule that ever
 - Linux: the same, plus memory and task limits through a systemd user scope where one exists; descendants die with MXC's PID namespace.
 - Windows 11: MXC ProcessContainer with the same filesystem, network and environment policy and the wall clock; no per-process CPU, file size or open file limits, which every proof record states. The container may list (not read) the parent directories of the workspace and toolchains, which runtimes such as Node need to resolve paths.
 - Tier 2 runs only on Linux, decided on 2026-10-27: there the sandbox has its own network namespace, so the app and its client talk over a private loopback while host services stay unreachable (verified). On macOS the sandbox shares the host loopback (a Seatbelt app could reach services on the host loopback, observed), and on Windows the container blocks loopback even within itself unless the host loopback is exempted, so `omgs prove --tier 2` refuses on both and names the reason. Tier 2 also requires the per-repository human approval given at a terminal with `omgs approve`.
+
+System directories and the installed toolchain roots remain readable, including `~/.cargo/{bin,registry,git}` and `~/.rustup` when present. Doctor and every proof record disclose the actual roots and conditional gaps. Target hardlinks to outside content become readable workspace content; git checkouts cannot create them. Runner start and end markers with a fresh random nonce attest only that a command started and finished with its inner exit code, not that the named test executed. Replay checks the target commit, copied-tree digest excluding `.git`, inner exit code and cleanliness, consumes proof budget, and is paired with the independent evaluator.
 
 If any control in the declared set cannot be enforced on the current platform, OMGS does not execute the target code. The finding stays at the highest tier already earned, the missing sandbox capability is recorded as the exact blocker, and the report gives a safe manual validation plan. Degrading honestly beats running unsandboxed silently.
 

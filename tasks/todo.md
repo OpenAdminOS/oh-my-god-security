@@ -27,6 +27,9 @@ shares the host loopback in both directions, and Windows blocks loopback inside 
 - [x] `omgs doctor`; Windows portability; Windows CI (CI run pending)
 - [x] DECISIONS.md amendment: declared minimum set per OS
 - [ ] Tests, docs, reviews, merge
+  - Round 2 (2026-10-27): GPT-6.1-Sol implements the round 2 fixes; evidence that the named test ran
+    uses runner start and end markers (not per-stack adapters); windows-2025 CI must be fully green
+    through the Test step before merge.
 
 ## PR 2: role briefs, stacks and packs (`feat/role-briefs-packs`)
 

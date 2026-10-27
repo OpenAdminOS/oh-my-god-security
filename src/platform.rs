@@ -52,14 +52,22 @@ fn is_executable(p: &Path) -> bool {
 
 /// Find `name` on PATH. On Windows each PATHEXT extension is tried when the
 /// name has none. Relative PATH entries are ignored so the current directory
-/// can never supply a tool.
+/// can never supply a tool. Windows batch scripts are excluded to avoid
+/// implicit cmd.exe execution with target-controlled arguments.
 pub fn which(name: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    if Path::new(name)
+        .extension()
+        .is_some_and(|e| !["exe", "com"].iter().any(|x| e.eq_ignore_ascii_case(x)))
+    {
+        return None;
+    }
     let path = std::env::var_os("PATH")?;
     let exts: Vec<String> = if cfg!(windows) && Path::new(name).extension().is_none() {
         std::env::var("PATHEXT")
             .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
             .split(';')
-            .filter(|e| !e.is_empty())
+            .filter(|e| [".exe", ".com"].iter().any(|x| e.eq_ignore_ascii_case(x)))
             .map(|e| e.to_ascii_lowercase())
             .collect()
     } else {
@@ -161,6 +169,54 @@ fn link_count(_file: &std::fs::File) -> std::io::Result<u64> {
     ))
 }
 
+/// A fresh nonce from the OS CSPRNG, never the clock or process id.
+pub fn random_nonce() -> std::io::Result<String> {
+    let mut bytes = [0u8; 32];
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "bcrypt")]
+        extern "system" {
+            fn BCryptGenRandom(
+                algorithm: *mut core::ffi::c_void,
+                buffer: *mut u8,
+                length: u32,
+                flags: u32,
+            ) -> i32;
+        }
+        // SAFETY: the system RNG writes exactly the supplied buffer length.
+        if unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                2,
+            )
+        } < 0
+        {
+            return Err(std::io::Error::other("system RNG failed"));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    return Err(std::io::Error::other("system RNG unavailable"));
+    Ok(crate::sha256::hex(&bytes))
+}
+
+pub fn is_link(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

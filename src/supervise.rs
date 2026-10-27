@@ -31,6 +31,9 @@ pub struct Survivor {
 #[derive(Debug, Clone)]
 pub struct Supervised {
     pub exit_code: Option<i32>,
+    pub command_started: bool,
+    pub command_finished: bool,
+    pub enumerate_rejected: bool,
     pub success: bool,
     pub timed_out: bool,
     pub duration_ms: u64,
@@ -61,12 +64,72 @@ struct Capture {
     healthy: bool,
     total: u64,
     cap: usize,
+    evidence: MarkerScan,
+}
+
+#[derive(Default)]
+struct MarkerScan {
+    nonce: Option<String>,
+    lines: [Vec<u8>; 2],
+    overflow: [bool; 2],
+    started: bool,
+    finished: bool,
+    exit_code: Option<i32>,
+    invalid: bool,
+    enumerate_rejected: bool,
+    mxc_timed_out: bool,
+}
+
+impl MarkerScan {
+    fn receive(&mut self, stream: usize, bytes: &[u8]) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                self.line(stream);
+            } else if self.lines[stream].len() < 4096 {
+                self.lines[stream].push(byte);
+            } else {
+                self.overflow[stream] = true;
+            }
+        }
+    }
+
+    fn line(&mut self, stream: usize) {
+        let bytes = std::mem::take(&mut self.lines[stream]);
+        let overflow = std::mem::replace(&mut self.overflow[stream], false);
+        if overflow {
+            return;
+        }
+        let line = String::from_utf8_lossy(&bytes);
+        let line = line.trim_end_matches('\r');
+        let lower = line.to_ascii_lowercase();
+        if stream == 1
+            && lower.contains("enumeratepaths")
+            && (lower.starts_with("request error")
+                || lower.starts_with("error:")
+                || lower.starts_with("{\"error\":"))
+        {
+            self.enumerate_rejected = true;
+        }
+        self.mxc_timed_out |= lower.contains("script timed out after");
+        let Some(nonce) = &self.nonce else { return };
+        if line == format!("OMGS_START_{nonce}") {
+            self.invalid |= self.started || self.finished;
+            self.started = true;
+        }
+        if let Some(code) = line.strip_prefix(&format!("OMGS_END_{nonce}:")) {
+            self.invalid |= !self.started || self.finished;
+            self.finished = true;
+            self.exit_code = code.parse::<i32>().ok();
+            self.invalid |= self.exit_code.is_none();
+        }
+    }
 }
 
 impl Capture {
     fn receive(&mut self, message: Message, notes: &mut Vec<String>) {
         match message {
             Message::Data(stream, bytes) => {
+                self.evidence.receive(stream, &bytes);
                 self.total = self.total.saturating_add(bytes.len() as u64);
                 // Retain the stdout prefix first, irrespective of reader scheduling.
                 let available = if stream == 0 {
@@ -455,7 +518,7 @@ mod cgroup {
             return unavailable(cmd, notes, "systemd-run version unreadable");
         };
         let mut probe = Command::new(&systemd);
-        probe.args(["--user", "--scope", "--quiet", "true"]);
+        probe.args(["--user", "--scope", "--quiet", "/bin/true"]);
         let result = run(
             probe,
             &Limits {
@@ -790,10 +853,31 @@ mod sweep {
 /// Callers must use env_clear before supplying an explicit environment. Command
 /// does not expose whether it inherits the host environment; Linux scope wrapping
 /// reconstructs only get_envs and clears bus credentials before the executor.
-pub fn run(mut cmd: Command, limits: &Limits, markers: Option<&SweepMarkers>) -> Supervised {
+pub fn run(cmd: Command, limits: &Limits, markers: Option<&SweepMarkers>) -> Supervised {
+    run_inner(cmd, limits, markers, None)
+}
+
+pub fn run_marked(
+    cmd: Command,
+    limits: &Limits,
+    markers: Option<&SweepMarkers>,
+    nonce: &str,
+) -> Supervised {
+    run_inner(cmd, limits, markers, Some(nonce))
+}
+
+fn run_inner(
+    mut cmd: Command,
+    limits: &Limits,
+    markers: Option<&SweepMarkers>,
+    nonce: Option<&str>,
+) -> Supervised {
     let start = Instant::now();
     let mut result = Supervised {
         exit_code: None,
+        command_started: false,
+        command_finished: false,
+        enumerate_rejected: false,
         success: false,
         timed_out: false,
         duration_ms: 0,
@@ -874,6 +958,10 @@ pub fn run(mut cmd: Command, limits: &Limits, markers: Option<&SweepMarkers>) ->
         healthy: true,
         total: 0,
         cap: limits.output_cap_bytes,
+        evidence: MarkerScan {
+            nonce: nonce.map(String::from),
+            ..MarkerScan::default()
+        },
     };
     let (tx, rx) = mpsc::sync_channel(16);
     let stop = Arc::new(AtomicBool::new(false));
@@ -939,6 +1027,16 @@ pub fn run(mut cmd: Command, limits: &Limits, markers: Option<&SweepMarkers>) ->
             "output capture incomplete after bounded drain; a descendant may hold the pipes".into(),
         );
     }
+    for stream in 0..2 {
+        capture.evidence.line(stream);
+    }
+    result.enumerate_rejected = capture.evidence.enumerate_rejected;
+    result.timed_out |= capture.evidence.mxc_timed_out;
+    if nonce.is_some() {
+        result.command_started = capture.evidence.started;
+        result.command_finished = capture.evidence.finished && !capture.evidence.invalid;
+        result.exit_code = capture.evidence.exit_code;
+    }
     result.output_bytes_total = capture.total;
     result.output = capture.text();
     #[cfg(target_os = "linux")]
@@ -972,6 +1070,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn markers_survive_output_flood_and_chunk_boundaries() {
+        let nonce = "a".repeat(64);
+        let mut capture = Capture {
+            streams: [Vec::new(), Vec::new()],
+            done: [false; 2],
+            healthy: true,
+            total: 0,
+            cap: 10,
+            evidence: MarkerScan {
+                nonce: Some(nonce.clone()),
+                ..MarkerScan::default()
+            },
+        };
+        let mut bytes = format!("OMGS_START_{nonce}\r\n").into_bytes();
+        bytes.extend(vec![b'x'; 300_000]);
+        bytes.extend(format!("\nOMGS_END_{nonce}:17\r\n").as_bytes());
+        for chunk in bytes.chunks(7) {
+            capture.receive(Message::Data(0, chunk.to_vec()), &mut Vec::new());
+        }
+        assert!(capture.evidence.started && capture.evidence.finished);
+        assert!(!capture.evidence.invalid);
+        assert_eq!(capture.evidence.exit_code, Some(17));
+        assert_eq!(capture.text().len(), 10);
+    }
+
+    #[test]
+    fn errors_wrong_nonce_and_missing_or_duplicate_markers_never_finish_cleanly() {
+        let mut scan = MarkerScan {
+            nonce: Some("nonce".into()),
+            ..MarkerScan::default()
+        };
+        scan.receive(1, b"Request error: configuration parse error\n");
+        scan.receive(0, b"OMGS_START_wrong\nOMGS_END_wrong:1\n");
+        assert!(!scan.started && !scan.finished);
+        scan.receive(0, b"OMGS_START_nonce\n");
+        assert!(scan.started && !scan.finished);
+        scan.receive(0, b"OMGS_END_nonce:127\n");
+        assert_eq!(scan.exit_code, Some(127));
+        scan.receive(0, b"OMGS_END_nonce:0\n");
+        assert!(scan.invalid);
+        let mut reversed = MarkerScan {
+            nonce: Some("n".into()),
+            ..MarkerScan::default()
+        };
+        reversed.receive(0, b"OMGS_END_n:1\nOMGS_START_n\n");
+        assert!(reversed.invalid);
+    }
+
+    #[test]
+    fn enumeration_rejection_must_be_an_executor_error_line_on_stderr() {
+        let mut scan = MarkerScan::default();
+        scan.receive(
+            0,
+            b"Request error: enumeratePaths is not supported by this version of Windows\n",
+        );
+        scan.receive(
+            1,
+            b"target says enumeratePaths is not supported by this version of Windows\n",
+        );
+        assert!(!scan.enumerate_rejected);
+        scan.receive(
+            1,
+            b"Request error: enumeratePaths is not supported by this version of Windows\n",
+        );
+        assert!(scan.enumerate_rejected);
+    }
+
+    #[test]
     fn output_prefix_is_stdout_then_stderr() {
         let mut capture = Capture {
             streams: [Vec::new(), Vec::new()],
@@ -979,6 +1145,7 @@ mod tests {
             healthy: true,
             total: 0,
             cap: 6,
+            evidence: MarkerScan::default(),
         };
         let mut notes = Vec::new();
         capture.receive(Message::Data(1, b"error".to_vec()), &mut notes);
@@ -995,6 +1162,7 @@ mod tests {
             healthy: true,
             total: 0,
             cap: 2,
+            evidence: MarkerScan::default(),
         };
         capture.receive(Message::Data(0, vec![255, 255, 255]), &mut Vec::new());
         assert_eq!(capture.total, 3);

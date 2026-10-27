@@ -282,3 +282,37 @@ fn cgroup_limits_are_applied_or_explained_without_environment_leaks() {
         }
     }
 }
+
+#[test]
+fn executor_text_errors_and_outer_exit_codes_cannot_substitute_for_markers() {
+    use omgs::supervise::run_marked;
+    let scripts = if cfg!(windows) {
+        [
+            "echo Request error: invalid configuration & exit /b 1",
+            "exit /b 0",
+        ]
+    } else {
+        [
+            "echo 'Request error: invalid configuration' >&2; exit 1",
+            "exit 0",
+        ]
+    };
+    for script in scripts {
+        #[cfg(unix)]
+        let cmd = shell(script);
+        #[cfg(windows)]
+        let cmd = {
+            let mut cmd = Command::new(omgs::platform::which("cmd").unwrap());
+            cmd.args(["/d", "/c", script]);
+            cmd
+        };
+        let result = run_marked(cmd, &limits(), None, "nonce");
+        assert!(!result.command_started && !result.command_finished);
+        assert_eq!(result.exit_code, None);
+        assert!(!result.success);
+        assert!(
+            result.capture_complete && result.cleanup_complete,
+            "{result:?}"
+        );
+    }
+}

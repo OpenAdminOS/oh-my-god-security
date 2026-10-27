@@ -142,6 +142,16 @@ pub fn findings(text: &str) -> Result<crate::model::FindingsFile, String> {
             if let Some(l) = f.get("location") {
                 location(l, &format!("findings[{i}].location"))?;
             }
+            if let Some(trace) = f.get("trace") {
+                for (j, step) in objects(trace, &format!("{at}.trace"))?
+                    .into_iter()
+                    .enumerate()
+                {
+                    if let Some(l) = step.get("location") {
+                        location(l, &format!("{at}.trace[{j}].location"))?;
+                    }
+                }
+            }
             if let Some(ls) = f.get("locations") {
                 let arr = ls
                     .as_array()
@@ -201,6 +211,18 @@ pub fn sensors(text: &str) -> Result<crate::sensors::SensorsReport, String> {
             }
         }
         objects(top.get("hits").ok_or("hits is required")?, "hits")?;
+        Ok(())
+    })
+}
+
+/// Proof records and every nested survivor must be objects, never positional arrays.
+pub fn proof(text: &str) -> Result<crate::proof::ProofRecord, String> {
+    parse(text, "proof", |v| {
+        let top = object(v, "document")?;
+        objects(
+            top.get("survivors").ok_or("survivors is required")?,
+            "survivors",
+        )?;
         Ok(())
     })
 }

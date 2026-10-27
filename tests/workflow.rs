@@ -275,8 +275,25 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             continue;
         }
         let (n, proof_dir) = omgs::proof::reserve(dir).unwrap();
-        let config = br#"{"version":"1.0.0"}"#;
-        std::fs::write(proof_dir.join("mxc-config.json"), config).unwrap();
+        let proof_dir = proof_dir.canonicalize().unwrap();
+        let nonce = "a".repeat(64);
+        let command = "npm test -- tests/security/x.test.ts";
+        let wrapped = omgs::sandbox::wrapped_command("macos", command, &nonce);
+        let config = omgs::sandbox::mxc_config(&omgs::sandbox::ConfigInput {
+            os: "macos",
+            containment: "seatbelt",
+            command: &wrapped,
+            timeout_ms: 1000,
+            workspace: &proof_dir.join("workspace"),
+            scratch: &proof_dir.join("scratch"),
+            allowed_marker: None,
+            readonly: vec![],
+            denied: vec![],
+            rust: None,
+            list_parents: false,
+        })
+        .to_string();
+        std::fs::write(proof_dir.join("mxc-config.json"), &config).unwrap();
         let mac = omgs::sandbox::executor_for("macos", "aarch64").unwrap();
         let record = omgs::proof::ProofRecord {
             schema: omgs::proof::SCHEMA.into(),
@@ -292,9 +309,13 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
                 "local_app"
             }
             .into(),
-            command: "npm test -- tests/security/x.test.ts".into(),
+            command: command.into(),
             target: None,
             target_head: None,
+            target_sha256: None,
+            marker_nonce: nonce,
+            command_started: true,
+            command_finished: true,
             started_at_ms: 0,
             duration_ms: 1,
             exit_code: Some(1),
@@ -307,10 +328,10 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             containment: mac.containment.into(),
             executor: mac.file.into(),
             executor_sha256: mac.sha256.into(),
-            config_sha256: omgs::sha256::digest(config),
+            config_sha256: omgs::sha256::digest(config.as_bytes()),
             enforced: omgs::sandbox::declared_controls("macos", omgs::sandbox::Tier::Test).0,
             gaps: vec![],
-            output_sha256: "0".repeat(64),
+            output_sha256: omgs::sha256::digest(b""),
             output_bytes_total: 0,
             output: String::new(),
             omgs_version: "test".into(),
@@ -1242,4 +1263,170 @@ fn report_and_critic_refuse_a_confirmed_record_without_a_proof() {
     );
     assert!(said.contains("requires proof_ref"), "{said}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn saved_configs_are_checked_even_when_their_digest_matches() {
+    let dir = scratch("config-policy");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let config_path = dir.join("proofs/1/mxc-config.json");
+    let original: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    for (pointer, value, needle) in [
+        ("/containment", serde_json::json!("none"), "containment"),
+        (
+            "/process/commandLine",
+            serde_json::json!("exit 1"),
+            "wrapped record.command",
+        ),
+        (
+            "/process/cwd",
+            serde_json::json!("/elsewhere/workspace"),
+            "cwd",
+        ),
+        (
+            "/network/egress/default",
+            serde_json::json!("allow"),
+            "egress",
+        ),
+        (
+            "/network/ingress/default",
+            serde_json::json!("allow"),
+            "ingress",
+        ),
+        (
+            "/network/ingress/hostLoopback",
+            serde_json::json!("allow"),
+            "hostLoopback",
+        ),
+        (
+            "/filesystem/readwritePaths",
+            serde_json::json!(["/"]),
+            "readwritePaths",
+        ),
+        ("/process/timeout", serde_json::json!(0), "timeout"),
+    ] {
+        let mut config = original.clone();
+        *config.pointer_mut(pointer).unwrap() = value;
+        let text = config.to_string();
+        record.config_sha256 = omgs::sha256::digest(text.as_bytes());
+        std::fs::write(&config_path, text).unwrap();
+        omgs::proof::write(&dir, &record).unwrap();
+        let errors = omgs::proof::validate_proofs(&findings, &dir);
+        assert!(has(&errors, needle), "{pointer}: {errors:?}");
+    }
+    let text = original.to_string();
+    record.config_sha256 = omgs::sha256::digest(text.as_bytes());
+    std::fs::write(&config_path, &text).unwrap();
+    record.test_from = Some("outside-draft".into());
+    record.test_sha256 = Some(omgs::sha256::digest(b"draft"));
+    std::fs::write(dir.join("proofs/1/test-draft"), b"draft").unwrap();
+    omgs::proof::write(&dir, &record).unwrap();
+    assert!(omgs::proof::validate_proofs(&findings, &dir).is_empty());
+    std::fs::write(dir.join("proofs/1/test-draft"), b"changed").unwrap();
+    assert!(has(
+        &omgs::proof::validate_proofs(&findings, &dir),
+        "test-draft"
+    ));
+    record.test_from = None;
+    record.output = "changed".into();
+    omgs::proof::write(&dir, &record).unwrap();
+    assert!(has(
+        &omgs::proof::validate_proofs(&findings, &dir),
+        "output_sha256"
+    ));
+    record.output.clear();
+    std::fs::write(
+        dir.join("run-metadata.json"),
+        serde_json::json!({"target": dir.join("target")} ).to_string(),
+    )
+    .unwrap();
+    omgs::proof::write(&dir, &record).unwrap();
+    assert!(has(
+        &omgs::proof::validate_proofs(&findings, &dir),
+        "target must be present"
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn every_proven_verdict_requires_a_valid_inner_exit_and_clean_markers() {
+    let dir = scratch("verdict-exits");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let original = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    for verdict in [
+        Verdict::Confirmed,
+        Verdict::NeedsValidation,
+        Verdict::Rejected,
+    ] {
+        for code in [
+            None,
+            Some(-1),
+            Some(0),
+            Some(1),
+            Some(125),
+            Some(126),
+            Some(127),
+            Some(137),
+        ] {
+            let mut findings = findings.clone();
+            findings.findings[0].verdict = verdict;
+            let mut record = original.clone();
+            record.exit_code = code;
+            omgs::proof::write(&dir, &record).unwrap();
+            let errors = omgs::proof::validate_proofs(&findings, &dir);
+            let allowed =
+                matches!(code, Some(1..=125)) || (verdict == Verdict::Rejected && code == Some(0));
+            assert_eq!(
+                errors.is_empty(),
+                allowed,
+                "{verdict:?} {code:?}: {errors:?}"
+            );
+        }
+    }
+    for field in ["command_started", "command_finished"] {
+        let mut record = serde_json::to_value(&original).unwrap();
+        record[field] = false.into();
+        std::fs::write(dir.join("proofs/1.json"), record.to_string()).unwrap();
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "did not finish cleanly"
+        ));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn proof_and_trace_objects_reject_positional_shapes_and_bad_locations() {
+    let dir = scratch("proof-shapes");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let path = dir.join("proofs/1.json");
+    let original = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, "[]").unwrap();
+    assert!(omgs::proof::load(&dir, "proofs/1.json")
+        .unwrap_err()
+        .contains("JSON object"));
+    let mut record: serde_json::Value = serde_json::from_str(&original).unwrap();
+    record["survivors"] = serde_json::json!([[1, "x"]]);
+    std::fs::write(&path, record.to_string()).unwrap();
+    assert!(omgs::proof::load(&dir, "proofs/1.json")
+        .unwrap_err()
+        .contains("JSON object"));
+    let value = serde_json::to_value(findings).unwrap();
+    for trace in [
+        serde_json::json!([[{"path":"x","line":1}, "note"]]),
+        serde_json::json!([{"location":["x",1], "note":"n"}]),
+        serde_json::json!([{"location":{"path":"x","line":null}, "note":"n"}]),
+        serde_json::json!([{"location":{"path":"x","line":0}, "note":"n"}]),
+        serde_json::json!([{"location":{"path":"x","line":1.5}, "note":"n"}]),
+    ] {
+        let mut f = value.clone();
+        f["findings"][0]["trace"] = trace;
+        assert!(omgs::shape::findings(&f.to_string()).is_err());
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }

@@ -180,6 +180,21 @@ fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn release_proof_charge(run: &Path) -> Result<(), String> {
+    omgs::runmeta::update(run, |m| {
+        let used = m
+            .get("proof_runs_used")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+        m.insert(
+            "proof_runs_used".into(),
+            serde_json::json!(used.saturating_sub(1)),
+        );
+        Ok(())
+    })
+    .map(|_| ())
+}
+
 fn cmd_prove(args: &[String]) -> Result<(), String> {
     let run = flag(args, "--run").map(PathBuf::from);
     // A replay reruns a recorded proof exactly, so an independent evaluator
@@ -213,6 +228,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             .map_err(|_| format!("--timeout-ms must be a whole number, got '{v}'"))?,
         None => 120_000,
     };
+    omgs::sandbox::validate_input(&command, timeout_ms)?;
     let tier = match (&replay, flag(args, "--tier").as_deref()) {
         (Some(r), _) if r.tier == "local_app" => Tier::LocalApp,
         (Some(_), _) | (None, None | Some("1")) => Tier::Test,
@@ -238,7 +254,15 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         Some(r) => r.test.clone(),
         None => flag(args, "--test"),
     };
+    if finding.is_some() && test.is_none() {
+        return Err("--finding requires --test <target-relative path>".into());
+    }
     if let Some(t) = &test {
+        if t.trim().is_empty() || !omgs::proof::command_names(&command, t) {
+            return Err(format!(
+                "--cmd must name --test {t} as a full path or file name token"
+            ));
+        }
         if Path::new(t).is_absolute() || t.contains(':') || t.split(['/', '\\']).any(|s| s == "..")
         {
             return Err(format!(
@@ -283,6 +307,24 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         }
         None => None,
     };
+    let target_head = target.as_deref().and_then(omgs::proof::git_head);
+    if let Some(r) = &replay {
+        if r.target_head != target_head {
+            return Err(
+                "target commit differs from the recorded target_head; refusing to replay".into(),
+            );
+        }
+        if meta.as_ref().and_then(|m| m.get("target")).is_some() && target.is_none() {
+            return Err("--replay record must name this run's target".into());
+        }
+        let errors = omgs::proof::runner_evidence(run.as_ref().unwrap(), r);
+        if !errors.is_empty() {
+            return Err(format!(
+                "cannot replay invalid record: {}",
+                errors.join("; ")
+            ));
+        }
+    }
     // The proof test is either already in the target or a draft kept
     // outside it (`--test-from`) that the runner stages into the workspace
     // copy at the `--test` path. Its digest goes on the record so a reader can
@@ -386,7 +428,13 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
                 }
                 return Err(e);
             }
-            Some(omgs::proof::reserve(r)?)
+            match omgs::proof::reserve(r) {
+                Ok(reserved) => Some(reserved),
+                Err(e) => {
+                    release_proof_charge(r)?;
+                    return Err(e);
+                }
+            }
         }
         None => None,
     };
@@ -402,17 +450,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     let release = || {
         if let (Some(r), Some((_, d))) = (&run, &proof_dir) {
             let _ = std::fs::remove_dir_all(d);
-            let _ = omgs::runmeta::update(r, |m| {
-                let used = m
-                    .get("proof_runs_used")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1);
-                m.insert(
-                    "proof_runs_used".into(),
-                    serde_json::json!(used.saturating_sub(1)),
-                );
-                Ok(())
-            });
+            let _ = release_proof_charge(r);
         }
     };
     // Keep the runner's own copy of the draft beside the record and stage
@@ -440,9 +478,8 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         run_dir: run_dir.clone(),
         tier,
         stage: staged_draft.zip(test.clone()),
+        expected_tree_sha256: replay.as_ref().and_then(|r| r.target_sha256.clone()),
     };
-    // Read before the copy, so the commit describes the tree that was copied.
-    let target_head = target.as_deref().and_then(omgs::proof::git_head);
     let started_at_ms = omgs::runmeta::now_ms();
     let result = match prove(&request) {
         ProveOutcome::Blocked { reason } => {
@@ -453,6 +490,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         ProveOutcome::Ran(r) => r,
     };
     let s = &result.run;
+    let output = omgs::proof::redact(&s.output);
     let record = omgs::proof::ProofRecord {
         schema: omgs::proof::SCHEMA.into(),
         n: proof_dir.as_ref().map(|(n, _)| *n).unwrap_or(0),
@@ -468,25 +506,17 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         command,
         target: target.as_ref().map(|t| t.to_string_lossy().to_string()),
         target_head,
+        target_sha256: result.target_sha256.clone(),
+        marker_nonce: result.marker_nonce.clone(),
+        command_started: s.command_started,
+        command_finished: s.command_finished,
         started_at_ms,
         duration_ms: s.duration_ms,
         exit_code: s.exit_code,
-        // MXC enforces the config timeout first and reports it as an error,
-        // which a large output can push past the capture cap; the duration
-        // tells it too.
-        timed_out: s.timed_out
-            || s.duration_ms >= timeout_ms
-            || s.output.contains("script timed out after"),
+        timed_out: s.timed_out,
         capture_complete: s.capture_complete,
         cleanup_complete: s.cleanup_complete,
-        // MXC reports its own failures as a JSON error object on a stderr
-        // line; systemd-run reports a scope it could not start. Either way the
-        // command may never have run.
-        executor_error: s.output.lines().any(|l| {
-            let l = l.trim_start();
-            l.starts_with("{\"error\":{\"code\":")
-                || l.starts_with("Failed to start transient scope")
-        }),
+        executor_error: !s.command_started,
         survivors: s
             .survivors
             .iter()
@@ -502,9 +532,9 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         config_sha256: result.config_sha256.clone(),
         enforced: result.enforced.clone(),
         gaps: result.gaps.clone(),
-        output_sha256: omgs::sha256::digest(s.output.as_bytes()),
+        output_sha256: omgs::sha256::digest(output.as_bytes()),
         output_bytes_total: s.output_bytes_total,
-        output: omgs::proof::redact(&s.output),
+        output,
         omgs_version: env!("CARGO_PKG_VERSION").into(),
     };
     let record_path = match (&run, &proof_dir) {
@@ -555,6 +585,46 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             "proof record: {} (not linked to a run)",
             record_path.display()
         ),
+    }
+    if record.finding.is_some() {
+        let rejected = run
+            .as_ref()
+            .and_then(|d| std::fs::read_to_string(d.join("findings.json")).ok())
+            .and_then(|t| omgs::shape::findings(&t).ok())
+            .is_some_and(|fs| {
+                fs.findings.iter().any(|f| {
+                    Some(&f.fingerprint) == record.finding.as_ref()
+                        && f.verdict == omgs::model::Verdict::Rejected
+                })
+            });
+        let mut reasons = Vec::new();
+        if !record.command_started {
+            reasons.push("command never started (executor error)");
+        }
+        if !record.command_finished {
+            reasons.push("command did not emit its end marker");
+        }
+        if !record.clean() {
+            reasons.push("run did not finish cleanly");
+        }
+        if !matches!(record.exit_code, Some(0..=125)) {
+            reasons.push("exit 126, 127, a signal or an invalid exit cannot support a proof");
+        } else if !rejected && !record.assertion_failure() {
+            reasons.push("a non-rejected finding needs assertion failure exit 1..=125");
+        }
+        let tier_name = if record.tier == "test" {
+            "test_proven"
+        } else {
+            "sandbox_exploited"
+        };
+        eprintln!(
+            "proof support for {tier_name}: {}",
+            if reasons.is_empty() {
+                "yes".into()
+            } else {
+                format!("no: {}", reasons.join("; "))
+            }
+        );
     }
     print!("{}", record.output);
     if let Some(orig) = &replay {
@@ -607,7 +677,14 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         }
     };
     let (enforced, gaps) = omgs::sandbox::declared_controls(os, Tier::Test);
-    println!("every proof run here enforces the following (a limit marked as conditional is reported per run):");
+    println!(
+        "{}",
+        if ready {
+            "proof controls when MXC starts successfully (conditional limits are reported per run):"
+        } else {
+            "planned proof controls if a verified MXC executor becomes available:"
+        }
+    );
     for e in enforced
         .iter()
         .chain(omgs::sandbox::declared_limits(os).iter())
@@ -692,6 +769,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             run_dir: probe.join("run"),
             tier: Tier::Test,
             stage: None,
+            expected_tree_sha256: None,
         };
         let outcome = match prove(&request) {
             ProveOutcome::Ran(r) => r,
@@ -702,7 +780,14 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         };
         let out = outcome.run.output.clone();
         let _ = std::fs::remove_dir_all(&probe);
-        if !out.contains(&inside) {
+        if !out.contains(&inside)
+            || !outcome.run.command_started
+            || !outcome.run.command_finished
+            || outcome.run.timed_out
+            || !outcome.run.capture_complete
+            || !outcome.run.cleanup_complete
+            || !outcome.run.survivors.is_empty()
+        {
             println!(
                 "live check FAILED: the probe did not run (it could not read its own workspace). Its output:"
             );
@@ -747,6 +832,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             run_dir: probe.join("reach"),
             tier: Tier::Test,
             stage: None,
+            expected_tree_sha256: None,
         };
         if let ProveOutcome::Ran(r) = prove(&reach) {
             let found = |n: &str| {
@@ -1315,19 +1401,8 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     if out_abs.starts_with("/tmp") || out_abs.starts_with("/private/tmp") {
         eprintln!("warning: run output is under a shared temp directory and describes vulnerabilities. Prefer the default runs directory under your home.");
     }
-    let source_ref = std::process::Command::new("git")
-        .args([
-            "-C",
-            &target.to_string_lossy(),
-            "rev-parse",
-            "--short",
-            "HEAD",
-        ])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    let source_ref = omgs::proof::git_head(&target)
+        .map(|h| h[..7].to_string())
         .unwrap_or_else(|| "working tree".into());
     let mut files = Vec::new();
     walk(&target, 0, &mut files);
@@ -1530,11 +1605,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     let target_raw = flag(args, "--target").ok_or("check requires --target <repo>")?;
     let target = std::fs::canonicalize(&target_raw).map_err(|e| e.to_string())?;
     for tool in ["gitleaks", "trufflehog", "osv-scanner", "semgrep"] {
-        let present = std::process::Command::new("which")
-            .arg(tool)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let present = omgs::platform::which(tool).is_some();
         println!(
             "sensor {tool}: {}",
             if present {
@@ -1697,8 +1768,9 @@ fn clone_target(raw_url: &str) -> Result<PathBuf, String> {
     let repo = omgs::batch::parse_repo_url(raw_url)?;
     let targets = data_dir().join("targets");
     let dest = targets.join(&repo.host).join(&repo.owner).join(&repo.name);
+    let git_path = omgs::platform::which("git").ok_or("git not found on an absolute PATH entry")?;
     let git = || {
-        let mut c = std::process::Command::new("git");
+        let mut c = std::process::Command::new(&git_path);
         c.env("GIT_TERMINAL_PROMPT", "0").args([
             "-c",
             "protocol.allow=never",

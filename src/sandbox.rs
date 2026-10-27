@@ -209,6 +209,7 @@ pub struct ProveRequest {
     /// A draft test kept outside the target, copied into the workspace at
     /// the given target-relative path before the command runs.
     pub stage: Option<(PathBuf, String)>,
+    pub expected_tree_sha256: Option<String>,
 }
 
 pub struct ProveResult {
@@ -216,6 +217,8 @@ pub struct ProveResult {
     pub executor_sha256: String,
     pub containment: String,
     pub config_sha256: String,
+    pub marker_nonce: String,
+    pub target_sha256: Option<String>,
     pub enforced: Vec<String>,
     pub gaps: Vec<String>,
     pub run: supervise::Supervised,
@@ -308,18 +311,80 @@ fn link_dir(to: &Path, link: &Path) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        let ok = Command::new("cmd.exe")
-            .args(["/d", "/c", "mklink", "/J"])
-            .arg(link)
-            .arg(to)
-            .stdout(std::process::Stdio::null())
-            .status()?
-            .success();
-        if ok {
-            Ok(())
-        } else {
-            Err(std::io::Error::other("mklink /J failed"))
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        extern "system" {
+            fn DeviceIoControl(
+                handle: *mut core::ffi::c_void,
+                code: u32,
+                input: *const u8,
+                input_len: u32,
+                output: *mut u8,
+                output_len: u32,
+                returned: *mut u32,
+                overlapped: *mut core::ffi::c_void,
+            ) -> i32;
         }
+        let target = std::fs::canonicalize(to)?;
+        let print = mxc_path(&target);
+        let substitute = if let Some(unc) = print.strip_prefix(r"\\") {
+            format!(r"\??\UNC\{unc}")
+        } else {
+            format!(r"\??\{print}")
+        };
+        let wide = |s: &str| std::ffi::OsStr::new(s).encode_wide().collect::<Vec<_>>();
+        let (sub, print) = (wide(&substitute), wide(&print));
+        let data_len = 8 + (sub.len() + print.len() + 2) * 2;
+        if data_len + 8 > 16 * 1024 || sub.contains(&0) || print.contains(&0) {
+            return Err(std::io::Error::other(
+                "junction target is too long or contains NUL",
+            ));
+        }
+        let mut data = Vec::with_capacity(data_len + 8);
+        data.extend_from_slice(&0xa000_0003u32.to_le_bytes());
+        for n in [
+            data_len,
+            0,
+            0,
+            sub.len() * 2,
+            (sub.len() + 1) * 2,
+            print.len() * 2,
+        ] {
+            data.extend_from_slice(&(n as u16).to_le_bytes());
+        }
+        for c in sub.into_iter().chain([0]).chain(print).chain([0]) {
+            data.extend_from_slice(&c.to_le_bytes());
+        }
+        std::fs::create_dir(link)?;
+        let result = (|| {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(0x0020_0000 | 0x0200_0000)
+                .open(link)?;
+            let mut returned = 0;
+            // SAFETY: the directory handle and reparse buffer live through the call.
+            let ok = unsafe {
+                DeviceIoControl(
+                    file.as_raw_handle(),
+                    0x0009_00a4,
+                    data.as_ptr(),
+                    data.len() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir(link);
+        }
+        result
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -461,7 +526,20 @@ pub fn declared_controls(os: &str, tier: Tier) -> (Vec<String>, Vec<String>) {
         "external network egress denied".to_string(),
         "environment cleared to an allowlist with scratch home, temp and cache".to_string(),
     ];
-    let mut gaps = Vec::new();
+    let mut gaps = vec![
+        "no total disk quota; only a 1 GiB per-file size limit on Unix, no file size limit on Windows".into(),
+        "a target file hardlinked to outside content is copied as readable workspace content; git checkouts cannot create such a hardlink".into(),
+    ];
+    let readable: Vec<_> = toolchain_roots(os, platform::home().as_deref())
+        .into_iter()
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .collect();
+    gaps.push(format!(
+        "readable toolchain roots and caches (may contain private content): {}",
+        readable.join(", ")
+    ));
+    gaps.extend(conditional_gaps(os));
     enforced.push("inbound network and host loopback denied".into());
     if tier == Tier::LocalApp {
         enforced.push(
@@ -472,6 +550,72 @@ pub fn declared_controls(os: &str, tier: Tier) -> (Vec<String>, Vec<String>) {
         gaps.push("process tree owned by the MXC ProcessContainer; no per-process CPU, file size or open file limits on Windows".into());
     }
     (enforced, gaps)
+}
+
+pub fn conditional_gaps(os: &str) -> Vec<String> {
+    let mut gaps = Vec::new();
+    if os != "linux" {
+        gaps.push("memory and task limits not applied: Linux cgroups required".into());
+    } else {
+        gaps.push("memory and task limits conditional on an available systemd user scope".into());
+    }
+    if os == "windows" {
+        gaps.push("parent directory enumeration conditional on Windows support; runtimes that resolve paths from the drive root may fail without it".into());
+    }
+    gaps
+}
+
+/// MXC's timeout is an unsigned 32-bit millisecond count; zero is unbounded.
+pub fn validate_input(command: &str, timeout_ms: u64) -> Result<(), String> {
+    if command.trim().is_empty() || command.contains('\0') {
+        return Err("--cmd must be nonempty and contain no NUL".into());
+    }
+    if !(1..=u64::from(u32::MAX)).contains(&timeout_ms) {
+        return Err(format!("--timeout-ms must be in 1..={}", u32::MAX));
+    }
+    Ok(())
+}
+
+fn wrapper_name(command: &str, nonce: &str) -> String {
+    format!(
+        ".omgs-{}",
+        sha256::digest(format!("{nonce}\0{command}").as_bytes())
+    )
+}
+
+pub fn wrapped_command(os: &str, command: &str, nonce: &str) -> String {
+    if os == "windows" {
+        let root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into());
+        format!(
+            r#""{root}\System32\cmd.exe" /d /v:off /c {}.cmd"#,
+            wrapper_name(command, nonce)
+        )
+    } else {
+        let quoted = command.replace('\'', "'\"'\"'");
+        format!("printf '\\nOMGS_START_{nonce}\\n'; /bin/sh -c '{quoted}'; omgs_exit=$?; printf '\\nOMGS_END_{nonce}:%s\\n' \"$omgs_exit\"; exit \"$omgs_exit\"")
+    }
+}
+
+fn write_wrapper(os: &str, workspace: &Path, command: &str, nonce: &str) -> std::io::Result<()> {
+    if os == "windows" {
+        let name = wrapper_name(command, nonce);
+        let root = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into());
+        // Explicit exit preserves cmd's 9009 for a missing command.
+        let command = format!("({}) & exit /b", command.replace('%', "%%"));
+        let wrapper = format!("@echo off\r\necho OMGS_START_{nonce}\r\n\"{root}\\System32\\cmd.exe\" /d /v:off /s /c \"{command}\"\r\nset \"omgs_exit=%errorlevel%\"\r\necho(\r\necho OMGS_END_{nonce}:%omgs_exit%\r\nexit /b %omgs_exit%\r\n");
+        std::fs::write(workspace.join(format!("{name}.cmd")), wrapper)?;
+    }
+    Ok(())
+}
+
+fn retry_without_enumeration(os: &str, run: &supervise::Supervised) -> bool {
+    os == "windows"
+        && !run.command_started
+        && run.enumerate_rejected
+        && !run.timed_out
+        && run.capture_complete
+        && run.cleanup_complete
+        && run.survivors.is_empty()
 }
 
 /// What the supervisor adds around MXC on this OS, for `omgs doctor`. Each
@@ -503,17 +647,13 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
         vec![]
     };
     for flags in attempts {
-        let ok = Command::new(if cfg!(target_os = "macos") {
-            "/bin/cp"
-        } else {
-            "cp"
-        })
-        .args(&flags)
-        .arg(&from)
-        .arg(dst)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        let ok = Command::new("/bin/cp")
+            .args(&flags)
+            .arg(&from)
+            .arg(dst)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
         if ok {
             return Ok(());
         }
@@ -534,7 +674,9 @@ fn copy_recursive(src: &Path, dst: &Path, roots: &(PathBuf, PathBuf)) -> Result<
         let entry = entry.map_err(|e| e.to_string())?;
         let ty = entry.file_type().map_err(|e| e.to_string())?;
         let to = dst.join(entry.file_name());
-        if ty.is_dir() {
+        if platform::is_link(&entry.metadata().map_err(|e| e.to_string())?) {
+            copy_link(&entry.path(), &to, roots)?;
+        } else if ty.is_dir() {
             std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
             copy_recursive(&entry.path(), &to, roots)?;
         } else if ty.is_file() {
@@ -602,7 +744,7 @@ pub fn stage_file(workspace: &Path, rel: &str, draft: &Path) -> std::io::Result<
     for part in dirs {
         dir.push(part);
         match std::fs::symlink_metadata(&dir) {
-            Ok(m) if m.file_type().is_dir() => {}
+            Ok(m) if m.file_type().is_dir() && !platform::is_link(&m) => {}
             Ok(_) => {
                 return Err(Error::other(format!(
                     "{} is a link or file in the target, not a directory",
@@ -615,7 +757,7 @@ pub fn stage_file(workspace: &Path, rel: &str, draft: &Path) -> std::io::Result<
     }
     let dest = dir.join(file);
     match std::fs::symlink_metadata(&dest) {
-        Ok(m) if m.file_type().is_file() => std::fs::remove_file(&dest)?,
+        Ok(m) if m.file_type().is_file() && !platform::is_link(&m) => std::fs::remove_file(&dest)?,
         Ok(_) => {
             return Err(Error::other(format!(
                 "{} is a link or directory in the target",
@@ -642,6 +784,18 @@ fn overlapping_root<'a>(run_dir: &Path, readonly: &'a [PathBuf]) -> Option<&'a P
 }
 
 pub fn prove(req: &ProveRequest) -> ProveOutcome {
+    if let Err(reason) = validate_input(&req.command, req.timeout_ms) {
+        return ProveOutcome::Blocked { reason };
+    }
+    let nonce = match platform::random_nonce() {
+        Ok(n) => n,
+        Err(e) => {
+            return ProveOutcome::Blocked {
+                reason: format!("cannot create command nonce: {e}"),
+            }
+        }
+    };
+    let wrapped = wrapped_command(std::env::consts::OS, &req.command, &nonce);
     if req.tier == Tier::LocalApp {
         if let Some(reason) = tier2_unavailable(std::env::consts::OS) {
             return ProveOutcome::Blocked { reason };
@@ -679,6 +833,23 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         }
     } else if let Err(e) = std::fs::create_dir_all(&workspace) {
         return blocked(e.to_string());
+    }
+    let target_sha256 = if req.target.is_some() {
+        match crate::proof::tree_digest(&workspace) {
+            Ok(d) => Some(d),
+            Err(e) => return blocked(format!("cannot digest target snapshot: {e}")),
+        }
+    } else {
+        None
+    };
+    if req
+        .expected_tree_sha256
+        .as_ref()
+        .is_some_and(|d| Some(d) != target_sha256.as_ref())
+    {
+        return blocked(
+            "target snapshot differs from the recorded tree; refusing to replay".into(),
+        );
     }
     if let Some((draft, rel)) = &req.stage {
         if let Err(e) = stage_file(&workspace, rel, draft) {
@@ -783,10 +954,13 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         }
         _ => None,
     };
+    if let Err(e) = write_wrapper(os, &workspace, &req.command, &nonce) {
+        return blocked(format!("cannot write command wrapper: {e}"));
+    }
     let mut input = ConfigInput {
         os,
         containment: located.executor.containment,
-        command: &req.command,
+        command: &wrapped,
         timeout_ms: req.timeout_ms,
         workspace: &workspace,
         scratch: &scratch,
@@ -808,7 +982,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         output_cap_bytes: 256 * 1024,
     };
     let mut extra_gaps = Vec::new();
-    let (config_text, run) = loop {
+    let (config_text, mut run) = loop {
         let config = mxc_config(&input);
         let config_text = serde_json::to_string_pretty(&config).unwrap_or_default();
         let config_path = run_dir.join("mxc-config.json");
@@ -819,27 +993,77 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         cmd.arg("--config").arg(&config_path);
         cmd.env_clear();
         if os == "windows" {
-            for k in ["SYSTEMROOT", "WINDIR", "TEMP", "TMP"] {
+            for k in [
+                "SYSTEMROOT",
+                "WINDIR",
+                "TEMP",
+                "TMP",
+                "USERPROFILE",
+                "LOCALAPPDATA",
+            ] {
                 if let Some(v) = std::env::var_os(k) {
                     cmd.env(k, v);
                 }
             }
         }
         cmd.current_dir(&run_dir);
-        let run = supervise::run(cmd, &limits, markers.as_ref());
+        let run = supervise::run_marked(cmd, &limits, markers.as_ref(), &nonce);
         // MXC rejects the policy before starting anything, so nothing ran and
         // retrying without the setting is safe.
-        if input.list_parents
-            && run
-                .output
-                .contains("enumeratePaths is not supported by this version of Windows")
-        {
+        if input.list_parents && retry_without_enumeration(os, &run) {
+            for dir in [&workspace, &scratch] {
+                if let Err(e) = std::fs::remove_dir_all(dir) {
+                    return blocked(format!("cannot reset retry workspace: {e}"));
+                }
+            }
+            if let Some(target) = &req.target {
+                if let Err(e) = copy_tree(target, &workspace) {
+                    return blocked(e);
+                }
+                if crate::proof::tree_digest(&workspace).ok() != target_sha256 {
+                    return blocked("target changed before MXC retry".into());
+                }
+            } else if let Err(e) = std::fs::create_dir_all(&workspace) {
+                return blocked(e.to_string());
+            }
+            if let Some((draft, rel)) = &req.stage {
+                if let Err(e) = stage_file(&workspace, rel, draft) {
+                    return blocked(e.to_string());
+                }
+            }
+            for d in [
+                scratch.clone(),
+                scratch.join("cache"),
+                scratch.join("clang-cache"),
+            ] {
+                if let Err(e) = std::fs::create_dir_all(d) {
+                    return blocked(e.to_string());
+                }
+            }
+            if let Some(r) = &input.rust {
+                if let Err(e) = std::fs::create_dir_all(&r.cargo_home) {
+                    return blocked(e.to_string());
+                }
+                for sub in RUST_CACHES {
+                    let real = r.bin.parent().unwrap_or(&r.bin).join(sub);
+                    if input.readonly.contains(&real) {
+                        if let Err(e) = link_dir(&real, &r.cargo_home.join(sub)) {
+                            return blocked(e.to_string());
+                        }
+                    }
+                }
+            }
+            if let Err(e) = write_wrapper(os, &workspace, &req.command, &nonce) {
+                return blocked(e.to_string());
+            }
             input.list_parents = false;
             extra_gaps.push("this Windows version cannot let the sandbox list parent directories; runtimes that resolve real paths from the drive root (such as Node) may fail to start".to_string());
             continue;
         }
         break (config_text, run);
     };
+    run.timed_out |= !run.command_finished;
+    run.success &= run.command_started && run.command_finished && !run.timed_out;
     let (mut enforced, mut gaps) = declared_controls(os, req.tier);
     enforced.extend(run.enforced.iter().cloned());
     gaps.extend(extra_gaps);
@@ -859,6 +1083,8 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         executor_sha256: located.executor.sha256.to_string(),
         containment: located.executor.containment.to_string(),
         config_sha256: sha256::digest(config_text.as_bytes()),
+        marker_nonce: nonce,
+        target_sha256,
         enforced,
         gaps,
         run,
@@ -868,6 +1094,76 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_commands_and_mxc_timeouts_are_refused() {
+        for (command, timeout) in [
+            ("", 100),
+            ("  ", 100),
+            ("echo ok", 0),
+            ("echo ok", u64::from(u32::MAX) + 1),
+        ] {
+            assert!(validate_input(command, timeout).is_err());
+        }
+        assert!(validate_input("echo ok", u64::from(u32::MAX)).is_ok());
+    }
+
+    #[test]
+    fn enumeration_retry_requires_a_clean_windows_executor_refusal() {
+        let mut run = supervise::Supervised {
+            exit_code: None,
+            command_started: false,
+            command_finished: false,
+            enumerate_rejected: true,
+            success: false,
+            timed_out: false,
+            duration_ms: 1,
+            output: String::new(),
+            output_bytes_total: 0,
+            capture_complete: true,
+            cleanup_complete: true,
+            survivors: vec![],
+            enforced: vec![],
+            notes: vec![],
+        };
+        assert!(retry_without_enumeration("windows", &run));
+        assert!(!retry_without_enumeration("linux", &run));
+        run.command_started = true;
+        assert!(!retry_without_enumeration("windows", &run));
+        run.command_started = false;
+        run.cleanup_complete = false;
+        assert!(!retry_without_enumeration("windows", &run));
+        run.cleanup_complete = true;
+        run.capture_complete = false;
+        assert!(!retry_without_enumeration("windows", &run));
+        run.capture_complete = true;
+        run.timed_out = true;
+        assert!(!retry_without_enumeration("windows", &run));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junctions_accept_metacharacters_without_a_shell_and_staging_refuses_them() {
+        let d = std::env::temp_dir().join(format!("omgs-junction-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let to = d.join("cache & echo injected ^ % ! (x)");
+        let link = d.join("link & echo injected ^ % ! (x)");
+        std::fs::create_dir_all(&to).unwrap();
+        std::fs::write(to.join("file"), b"content").unwrap();
+        link_dir(&to, &link).unwrap();
+        assert_eq!(std::fs::read(link.join("file")).unwrap(), b"content");
+        assert!(platform::is_link(
+            &std::fs::symlink_metadata(&link).unwrap()
+        ));
+        assert!(stage_file(
+            &d,
+            &format!("{}/new", link.file_name().unwrap().to_string_lossy()),
+            &to.join("file")
+        )
+        .is_err());
+        assert!(!to.join("new").exists());
+        let _ = std::fs::remove_dir_all(d);
+    }
 
     #[cfg(unix)]
     #[test]

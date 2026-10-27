@@ -160,6 +160,7 @@ fn mxc_config_matches_verified_contract() {
     assert_eq!(v["processContainer"]["ui"]["isolation"], "desktop");
     let env = v["process"]["env"].as_array().expect("env");
     assert!(env.iter().any(|e| e == "USERPROFILE=/work/run/scratch"));
+    assert!(env.iter().any(|e| e == "LOCALAPPDATA=/work/run/scratch"));
 
     let mac = mxc_config(&input("macos"));
     assert_eq!(
@@ -182,7 +183,8 @@ fn mxc_config_matches_verified_contract() {
     let (enforced, _) = declared_controls("linux", Tier::LocalApp);
     assert!(enforced.iter().any(|e| e.contains("loopback private")));
     let (enforced, gaps) = declared_controls("linux", Tier::Test);
-    assert!(gaps.is_empty());
+    assert!(gaps.iter().any(|g| g.contains("no total disk quota")));
+    assert!(gaps.iter().any(|g| g.contains("readable toolchain roots")));
     assert!(enforced.iter().any(|e| e.contains("egress denied")));
 }
 

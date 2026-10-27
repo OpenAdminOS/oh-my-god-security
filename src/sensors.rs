@@ -29,9 +29,9 @@ pub fn run_sensors(target: &Path, scratch_dir: &Path) -> SensorsReport {
         hits: Vec::new(),
     };
     match which("gitleaks") {
-        Some(_) => {
+        Some(executable) => {
             let raw = scratch_dir.join("gitleaks-raw.json");
-            let status = Command::new("gitleaks")
+            let status = Command::new(executable)
                 .args([
                     "detect",
                     "--source",
@@ -96,10 +96,10 @@ pub fn run_sensors(target: &Path, scratch_dir: &Path) -> SensorsReport {
 /// or `OMGS_SEMGREP_ALLOW_REGISTRY=1` opts into the `auto` registry explicitly.
 /// Only rule, file and line metadata is kept; the raw report is deleted.
 fn run_semgrep(target: &Path, scratch_dir: &Path, report: &mut SensorsReport) {
-    if which("semgrep").is_none() {
+    let Some(executable) = which("semgrep") else {
         report.tools_unavailable.push("semgrep".into());
         return;
-    }
+    };
     let registry_ok = std::env::var("OMGS_SEMGREP_ALLOW_REGISTRY").is_ok_and(|v| v == "1");
     // A nonempty OMGS_SEMGREP_CONFIG is only trusted when it names an existing
     // local file or directory. A registry shorthand ("auto", "p/default"), a
@@ -138,7 +138,7 @@ fn run_semgrep(target: &Path, scratch_dir: &Path, report: &mut SensorsReport) {
         }
     };
     let raw = scratch_dir.join("semgrep-raw.json");
-    let status = Command::new("semgrep")
+    let status = Command::new(executable)
         .args([
             "scan",
             "--json",

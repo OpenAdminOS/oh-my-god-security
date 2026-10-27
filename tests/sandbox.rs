@@ -83,7 +83,8 @@ fn denials_hold_and_the_target_is_untouched() {
     std::fs::write(&outside, b"outside-secret-value").unwrap();
     let real_home = omgs::platform::home().unwrap();
     // A real file in the real home, so a denied read is not just a missing file.
-    let home_probe = real_home.join(format!(".omgs-sbx-probe-{}", std::process::id()));
+    let home_probe = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!(".omgs-sbx-probe-{}", std::process::id()));
     std::fs::write(&home_probe, b"home-secret-value").unwrap();
     // A host loopback service answering HTTP, reachable from the test itself
     // (positive control) and expected unreachable from inside.
@@ -190,7 +191,6 @@ fn setsid_escape_is_killed_reported_and_fails_the_run() {
 }
 
 /// The unlinked record a prove run printed the path of.
-#[cfg(target_os = "macos")]
 fn record_from(output: &str) -> serde_json::Value {
     let line = output
         .lines()
@@ -285,6 +285,7 @@ fn proof_records_back_confirmed_findings() {
     let t = text(&out);
     assert_eq!(out.status.code(), Some(1), "{t}");
     assert!(t.contains("proof_ref proofs/1.json"), "{t}");
+    assert!(t.contains("proof support for test_proven: yes"), "{t}");
     let record: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(run.join("proofs/1.json")).unwrap()).unwrap();
     assert_eq!(record["finding"], fp.as_str());
@@ -407,6 +408,41 @@ fn proof_records_back_confirmed_findings() {
     assert!(text(&redirected).contains("not this run's target"));
     std::fs::write(run.join("proofs/1.json"), original).unwrap();
 
+    // Dirty content and commit changes refuse replay without spending budget.
+    let used = || {
+        omgs::runmeta::read(&run).unwrap()["proof_runs_used"]
+            .as_u64()
+            .unwrap()
+    };
+    let before = used();
+    std::fs::write(target.join("check.txt"), b"dirty").unwrap();
+    let dirty = omgs(
+        &home,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert_eq!(dirty.status.code(), Some(3), "{}", text(&dirty));
+    assert!(
+        text(&dirty).contains("snapshot differs"),
+        "{}",
+        text(&dirty)
+    );
+    assert_eq!(used(), before);
+    std::fs::write(target.join("check.txt"), b"vulnerable").unwrap();
+    std::fs::create_dir_all(target.join(".git")).unwrap();
+    std::fs::write(target.join(".git/HEAD"), "a".repeat(40)).unwrap();
+    let commit = omgs(
+        &home,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert_eq!(commit.status.code(), Some(2), "{}", text(&commit));
+    assert!(
+        text(&commit).contains("target commit differs"),
+        "{}",
+        text(&commit)
+    );
+    assert_eq!(used(), before);
+    std::fs::remove_dir_all(target.join(".git")).unwrap();
+
     // A rejected record may rest on a control test that passes.
     std::fs::write(target.join("check.txt"), b"fixed").unwrap();
     let control = omgs(
@@ -470,6 +506,25 @@ fn proof_records_back_confirmed_findings() {
         text(&never_ran).contains("never ran"),
         "{}",
         text(&never_ran)
+    );
+    assert!(
+        text(&broken).contains("proof support for test_proven: no"),
+        "{}",
+        text(&broken)
+    );
+    // Equal inner exits cannot reproduce an originally unclean record.
+    let mut original = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    original.command_finished = false;
+    omgs::proof::write(&run, &original).unwrap();
+    let unclean = omgs(
+        &home,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert_eq!(unclean.status.code(), Some(1), "{}", text(&unclean));
+    assert!(
+        text(&unclean).contains("NOT reproduced"),
+        "{}",
+        text(&unclean)
     );
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -729,4 +784,159 @@ fn linux_tier2_has_a_private_loopback() {
     );
     drop(host);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn invalid_proof_inputs_and_failed_reservation_do_not_spend_budget() {
+    let d = scratch("invalid-budget");
+    let home = d.join("home");
+    let target = d.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("test.txt"), b"proof").unwrap();
+    let run = d.join("run");
+    let init = omgs(
+        &home,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let fp = omgs::fingerprint("x", "x", "x", "x");
+    let base = ["prove", "--run", run.to_str().unwrap()];
+    for extra in [
+        vec!["--cmd", " "],
+        vec!["--cmd", "echo ok", "--timeout-ms", "0"],
+        vec!["--cmd", "echo ok", "--timeout-ms", "4294967296"],
+        vec!["--cmd", "echo ok", "--finding", &fp],
+        vec![
+            "--cmd",
+            "echo wrong-test.txt",
+            "--finding",
+            &fp,
+            "--test",
+            "test.txt",
+        ],
+    ] {
+        let out = omgs(&home, &[base.as_slice(), &extra].concat());
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+        assert_eq!(
+            omgs::runmeta::read(&run)
+                .unwrap()
+                .get("proof_runs_used")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            0
+        );
+        assert!(!run.join("proofs").exists());
+    }
+    std::fs::write(run.join("proofs"), b"cannot reserve a directory").unwrap();
+    let out = omgs(&home, &[base.as_slice(), &["--cmd", "echo ok"]].concat());
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert_eq!(omgs::runmeta::read(&run).unwrap()["proof_runs_used"], 0);
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn markers_survive_a_real_mxc_output_flood() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("marker-flood");
+    let cmd = if cfg!(windows) {
+        "for /l %i in (1,1,20000) do @echo 0123456789abcdef0123456789abcdef"
+    } else {
+        "i=0; while [ $i -lt 20000 ]; do echo 0123456789abcdef0123456789abcdef; i=$((i+1)); done; exit 17"
+    };
+    let out = omgs(&d, &["prove", "--cmd", cmd]);
+    let record = record_from(&text(&out));
+    assert_eq!(record["command_started"], true, "{record}");
+    assert_eq!(record["command_finished"], true, "{record}");
+    assert_eq!(record["executor_error"], false, "{record}");
+    assert_eq!(record["timed_out"], false, "{record}");
+    assert_eq!(record["exit_code"], if cfg!(windows) { 0 } else { 17 });
+    assert!(record["output_bytes_total"].as_u64().unwrap() > 256 * 1024);
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[cfg(unix)]
+#[test]
+fn sensors_execute_resolved_paths_even_with_a_poisoned_current_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = scratch("sensor-paths");
+    let safe = d.join("safe");
+    let poisoned = d.join("poisoned");
+    let target = d.join("target");
+    for dir in [&safe, &poisoned, &target] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let calls = d.join("calls");
+    for tool in ["gitleaks", "semgrep"] {
+        let script = format!("#!/bin/sh\necho \"$0\" >> '{}'\nwhile [ $# -gt 0 ]; do case \"$1\" in --output|--report-path) shift; out=$1;; esac; shift; done\nprintf '%s' '{{\"results\":[],\"errors\":[]}}' > \"$out\"\n", calls.display());
+        std::fs::write(safe.join(tool), script).unwrap();
+        std::fs::set_permissions(safe.join(tool), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            poisoned.join(tool),
+            format!(
+                "#!/bin/sh\necho poisoned > '{}'\n",
+                d.join("poisoned-ran").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(poisoned.join(tool), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let rules = d.join("rules.yaml");
+    std::fs::write(&rules, "rules: []").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "check",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            d.join("reports").to_str().unwrap(),
+        ])
+        .env("PATH", format!(".:{}:/usr/bin:/bin", safe.display()))
+        .env("OMGS_SEMGREP_CONFIG", rules)
+        .current_dir(poisoned)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!d.join("poisoned-ran").exists());
+    let calls = std::fs::read_to_string(calls).unwrap();
+    for tool in ["gitleaks", "semgrep"] {
+        assert!(calls.contains(safe.join(tool).to_str().unwrap()), "{calls}");
+    }
+    let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn doctor_discloses_planned_controls_and_gaps_without_an_executor() {
+    let d = scratch("doctor-missing");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .arg("doctor")
+        .env("OMGS_HOME", &d)
+        .env("OMGS_MXC_EXEC", d.join("missing"))
+        .output()
+        .unwrap();
+    let t = text(&out);
+    assert!(!out.status.success());
+    assert!(
+        t.contains("planned proof controls if a verified MXC executor becomes available"),
+        "{t}"
+    );
+    for gap in [
+        "readable toolchain roots",
+        "no total disk quota",
+        "hardlinked",
+        "memory and task limits",
+    ] {
+        assert!(t.contains(gap), "{gap}: {t}");
+    }
+    let _ = std::fs::remove_dir_all(d);
 }
