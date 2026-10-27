@@ -9,19 +9,17 @@ use std::io::BufRead;
 use std::path::Path;
 
 const FILE: &str = "tier2-approvals.json";
+const MAX_BYTES: u64 = 1 << 20;
 
 fn read(data: &Path) -> Result<Vec<serde_json::Value>, String> {
-    use std::io::Read;
     let path = data.join(FILE);
-    let Some(mut file) = crate::platform::open_single_link(&path)
-        .map_err(|e| format!("{}: {e}; refusing to trust it", path.display()))?
-    else {
-        return Ok(Vec::new());
+    let bytes = match crate::platform::read_bounded(&path, MAX_BYTES) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}; refusing to trust it", path.display())),
     };
-    let mut text = String::new();
-    file.read_to_string(&mut text)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    serde_json::from_str::<serde_json::Value>(&text)
+    let text = std::str::from_utf8(&bytes).map_err(|e| format!("read {}: {e}", path.display()))?;
+    serde_json::from_str::<serde_json::Value>(text)
         .ok()
         .and_then(|v| v.get("approvals").and_then(|a| a.as_array()).cloned())
         .ok_or_else(|| format!("{} is malformed", path.display()))
@@ -68,6 +66,23 @@ pub fn read_from_terminal() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_approval_store_is_refused() {
+        let data = std::env::temp_dir().join(format!("omgs-approval-large-{}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        let file = std::fs::File::create(data.join(FILE)).unwrap();
+        file.set_len(MAX_BYTES + 1).unwrap();
+        assert!(is_approved(&data, Path::new("/work/a"))
+            .unwrap_err()
+            .contains("byte limit"));
+        assert!(approve(&data, Path::new("/work/a"))
+            .unwrap_err()
+            .contains("byte limit"));
+        assert_eq!(file.metadata().unwrap().len(), MAX_BYTES + 1);
+        drop(file);
+        std::fs::remove_dir_all(data).unwrap();
+    }
 
     #[test]
     fn approval_is_per_canonical_target() {

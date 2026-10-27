@@ -82,28 +82,14 @@ fn denials_hold_and_the_target_is_untouched() {
     let outside = d.join("outside.txt");
     std::fs::write(&outside, b"outside-secret-value").unwrap();
     let real_home = omgs::platform::home().unwrap();
-    let home_probe = real_home.join(format!(".omgs-home-probe-{}", std::process::id()));
-    let home_probe_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&home_probe);
-    let home_check = match home_probe_file {
-        Ok(mut file) => {
-            use std::io::Write;
-            file.write_all(b"home-probe").unwrap();
-            format!(
-                "cat '{}' >/dev/null 2>&1 && echo READ_HOME;",
-                home_probe.display()
-            )
-        }
-        Err(error) => {
-            eprintln!(
-                "skipping home-file read subprobe: cannot create probe directly in {}: {error}",
-                real_home.display()
-            );
-            String::new()
-        }
-    };
+    let home_probe = std::fs::read_dir(&real_home)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.is_file() && std::fs::File::open(p).is_ok());
+    let home_check = home_probe
+        .map(|p| format!("cat '{}' >/dev/null 2>&1 && echo READ_HOME;", p.display()))
+        .unwrap_or_default();
     // A host loopback service answering HTTP, reachable from the test itself
     // (positive control) and expected unreachable from inside.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -142,9 +128,6 @@ fn denials_hold_and_the_target_is_untouched() {
         &home,
         &["prove", "--target", target.to_str().unwrap(), "--cmd", &cmd],
     );
-    if !home_check.is_empty() {
-        let _ = std::fs::remove_file(&home_probe);
-    }
     let t = text(&out);
     assert!(curl_works, "host loopback positive control must answer");
     assert!(
@@ -1082,8 +1065,9 @@ fn approve_refuses_tier2_before_prompting_or_writing() {
         &d.join("home"),
         &["approve", "--target", d.to_str().unwrap()],
     );
-    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out));
     assert!(text(&out).contains("tier 2 runs only on Linux"));
+    assert!(text(&out).contains("target code was not executed"));
     assert!(!d.join("home/tier2-approvals.json").exists());
     std::fs::remove_dir_all(d).unwrap();
 }
@@ -1405,7 +1389,7 @@ fn linux_new_session_descendants_die_with_the_pid_namespace() {
 }
 
 #[test]
-fn doctor_rejects_unknown_arguments_with_usage() {
+fn doctor_rejects_unknown_arguments_with_usage_hint() {
     let d = scratch("doctor-args");
     for args in [
         vec!["doctor", "--bogus"],
@@ -1416,7 +1400,11 @@ fn doctor_rejects_unknown_arguments_with_usage() {
     ] {
         let out = omgs(&d, &args);
         assert_eq!(out.status.code(), Some(2), "{}", text(&out));
-        assert!(text(&out).contains("Usage:"), "{}", text(&out));
+        assert!(
+            text(&out).contains("run omgs --help for usage"),
+            "{}",
+            text(&out)
+        );
     }
     std::fs::remove_dir_all(d).unwrap();
 }
@@ -1506,7 +1494,11 @@ fn cli_rejects_unknown_and_duplicate_options_before_charging_budget() {
         args.extend(tail);
         let out = omgs(&d.join("home"), &args);
         assert_eq!(out.status.code(), Some(2), "{}", text(&out));
-        assert!(text(&out).contains("Usage:"), "{}", text(&out));
+        assert!(
+            text(&out).contains("run omgs --help for usage"),
+            "{}",
+            text(&out)
+        );
         assert_eq!(std::fs::read(run.join(omgs::runmeta::FILE)).unwrap(), bytes);
         assert!(!run.join("proofs").exists());
     }
@@ -1520,7 +1512,7 @@ fn cli_rejects_unknown_and_duplicate_options_before_charging_budget() {
     ] {
         let out = omgs(&d.join("home"), &args);
         assert_eq!(out.status.code(), Some(2), "{}", text(&out));
-        assert!(text(&out).contains("Usage:"));
+        assert!(text(&out).contains("run omgs --help for usage"));
     }
     std::fs::remove_dir_all(d).unwrap();
 }
@@ -1651,4 +1643,106 @@ fn preparation_signals_release_the_reservation_and_remove_the_workspace() {
         assert_eq!(omgs::runmeta::read(&run).unwrap()["proof_runs_used"], 0);
         std::fs::remove_dir_all(d).unwrap();
     }
+}
+
+#[test]
+fn missing_executor_is_explicit_in_live_doctor_and_free_text_prove() {
+    let d = scratch("no-executor");
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .args(args)
+            .env("OMGS_HOME", &d)
+            .env("OMGS_MXC_EXEC", d.join("missing-executor"))
+            .output()
+            .unwrap()
+    };
+    let out = run(&["doctor", "--live"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("live check: not run, no verified executor"));
+    for args in [
+        vec!["prove", "--cmd", "--version"],
+        vec!["prove", "--cmd=--version"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+        assert!(text(&out).contains("target code was not executed"));
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn socket_and_fifo_gaps_survive_validation_and_replay() {
+    use std::os::unix::ffi::OsStrExt;
+    if !mxc_ready() {
+        return;
+    }
+    let d = PathBuf::from("/tmp").join(format!("omgs-s-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let target = d.join("t");
+    std::fs::create_dir_all(&target).unwrap();
+    let socket = std::os::unix::net::UnixListener::bind(target.join("socket")).unwrap();
+    let fifo = std::ffi::CString::new(target.join("pipe").as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    std::fs::write(
+        target.join("proof.sh"),
+        "test ! -e socket && test ! -e pipe\n",
+    )
+    .unwrap();
+    let run = d.join("run");
+    let home = d.join("home");
+    let out = omgs(
+        &home,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let out = omgs(
+        &home,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "proof.sh",
+            "--cmd",
+            "sh proof.sh",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    for n in [1, 2] {
+        if n == 2 {
+            let out = omgs(
+                &home,
+                &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+            );
+            assert!(out.status.success(), "{}", text(&out));
+            assert!(text(&out).contains("reproduced"));
+        }
+        let record = omgs::proof::load(&run, &format!("proofs/{n}.json")).unwrap();
+        assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+        assert_eq!(
+            record.target_sha256.as_deref(),
+            Some(omgs::proof::tree_digest(&target).unwrap().as_str())
+        );
+        for path in ["socket", "pipe"] {
+            assert!(
+                record
+                    .gaps
+                    .iter()
+                    .any(|g| g == &format!("skipped target socket or FIFO: {path}")),
+                "{:?}",
+                record.gaps
+            );
+        }
+    }
+    drop(socket);
+    std::fs::remove_dir_all(d).unwrap();
 }

@@ -717,8 +717,11 @@ pub fn tree_digest(root: &Path) -> std::io::Result<String> {
             crate::supervise::check_interrupted()?;
             let path = entry.path();
             let rel = path.strip_prefix(root).map_err(std::io::Error::other)?;
-            field(h, rel.as_os_str().as_encoded_bytes());
             let meta = std::fs::symlink_metadata(&path)?;
+            if crate::platform::contentless(&meta) {
+                continue;
+            }
+            field(h, rel.as_os_str().as_encoded_bytes());
             if crate::platform::is_link(&meta) {
                 field(h, b"link");
                 let link = std::fs::canonicalize(&path)
@@ -799,8 +802,8 @@ fn is_hex40(s: &str) -> bool {
 }
 
 /// Mask values that look like credentials before output lands in a record:
-/// the rest of a line after a credential keyword and its separator, and PEM
-/// private key bodies. Proof runs use dummy secrets, so this is a backstop.
+/// credential flag values, assignments and PEM private key bodies.
+/// Proof runs use dummy secrets, so this is a backstop.
 pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_pem = false;
@@ -825,7 +828,12 @@ pub fn redact(text: &str) -> String {
 /// One line: credential URLs lose their user info, bearer tokens and the
 /// value after a credential keyword (quoted or bare, `:` or `=`) are masked.
 fn redact_line(line: &str, lower: &str) -> String {
-    const KEYS: [&str; 14] = [
+    const KEYS: [&str; 19] = [
+        "pass",
+        "pwd",
+        "passcode",
+        "auth",
+        "credentials",
         "credential",
         "password",
         "passwd",
@@ -858,64 +866,125 @@ fn redact_line(line: &str, lower: &str) -> String {
         }
         from = i.min(lower.len());
     }
-    let cut = KEYS
-        .iter()
-        .flat_map(|k| lower.match_indices(k).map(|(i, _)| i + k.len()))
-        .filter_map(|after| {
-            lower[after..]
-                .find([':', '='])
-                .filter(|j| {
-                    lower[after..after + j].chars().all(|c| {
-                        c.is_whitespace()
-                            || c == '"'
-                            || c == '\''
-                            || c.is_alphanumeric()
-                            || c == '_'
-                    })
-                })
-                .map(|j| after + j + 1)
+    let sensitive = |name: &str| {
+        let components: Vec<_> = name.split(['-', '_']).collect();
+        KEYS.iter().any(|key| {
+            let keyword: Vec<_> = key.split(['-', '_']).collect();
+            components
+                .windows(keyword.len())
+                .any(|parts| parts == keyword)
         })
-        .chain(lower.match_indices('-').filter_map(|(i, _)| {
-            if lower[..i]
-                .chars()
-                .next_back()
-                .is_some_and(|c| !c.is_whitespace() && !"\"';&|()<>".contains(c))
-            {
-                return None;
-            }
-            let start = i + lower[i..].bytes().take_while(|b| *b == b'-').count();
-            let end = lower[start..]
-                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-                .map(|n| start + n)
-                .unwrap_or(lower.len());
-            let name = &lower[start..end];
-            let components: Vec<_> = name.split(['-', '_']).collect();
-            let sensitive = KEYS.iter().any(|key| {
-                let keyword: Vec<_> = key.split(['-', '_']).collect();
-                components
-                    .windows(keyword.len())
-                    .any(|parts| parts == keyword)
-            });
-            let separator =
-                end + usize::from(matches!(lower.as_bytes().get(end), Some(b'\'' | b'"')));
-            let next = lower.as_bytes().get(separator)?;
-            (sensitive && (*next == b'=' || next.is_ascii_whitespace()))
-                .then_some(separator + usize::from(*next == b'='))
-        }))
-        .chain(lower.find("bearer ").map(|i| i + "bearer ".len()))
-        .min();
-    match cut {
-        Some(c) if line.is_char_boundary(c) => {
-            let newline = line.ends_with('\n');
-            line.truncate(c);
-            line.push_str(" [omgs redacted]");
-            if newline {
-                line.push('\n');
-            }
-            line
+    };
+    let mut masks = Vec::new();
+    let mut i = 0;
+    while i < lower.len() {
+        let name_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+        if !name_byte(lower.as_bytes()[i]) {
+            i += 1;
+            continue;
         }
-        _ => line,
+        let start = i;
+        while i < lower.len() && name_byte(lower.as_bytes()[i]) {
+            i += 1;
+        }
+        let name = &lower[start..i];
+        if !sensitive(name) {
+            continue;
+        }
+        let flag = name.starts_with('-');
+        let mut separator = i;
+        if matches!(lower.as_bytes().get(separator), Some(b'\'' | b'"')) {
+            separator += 1;
+        }
+        let spaced = lower
+            .as_bytes()
+            .get(separator)
+            .is_some_and(u8::is_ascii_whitespace);
+        while lower
+            .as_bytes()
+            .get(separator)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            separator += 1;
+        }
+        let assigned = matches!(lower.as_bytes().get(separator), Some(b':' | b'='));
+        if !(assigned || flag && spaced && !name.starts_with("--no-")) {
+            continue;
+        }
+        let value = separator + usize::from(assigned);
+        if flag {
+            let mut value = value;
+            while !assigned
+                && lower
+                    .as_bytes()
+                    .get(value)
+                    .is_some_and(u8::is_ascii_whitespace)
+            {
+                value += 1;
+            }
+            if lower[value..].starts_with("[omgs redacted]") {
+                i = value + "[omgs redacted]".len();
+                continue;
+            }
+            if !assigned && lower[value..].starts_with("--") {
+                continue;
+            }
+            let end = value_end(&line, value);
+            if end > value {
+                masks.push((value, end, "[omgs redacted]"));
+                i = end;
+            }
+        } else {
+            // Headers and assignments may contain whitespace within the secret.
+            masks.push((
+                value,
+                line.trim_end_matches(['\r', '\n']).len(),
+                " [omgs redacted]",
+            ));
+            break;
+        }
     }
+    for (at, _) in lower.match_indices("bearer ") {
+        let start = at + "bearer ".len();
+        if !lower[start..].starts_with("[omgs redacted]") {
+            masks.push((start, value_end(&line, start), "[omgs redacted]"));
+        }
+    }
+    masks.sort_unstable_by_key(|(start, _, _)| *start);
+    let mut out = String::new();
+    let mut from = 0;
+    for (start, end, replacement) in masks {
+        if start < from || end <= start {
+            continue;
+        }
+        out.push_str(&line[from..start]);
+        out.push_str(replacement);
+        from = end;
+    }
+    out.push_str(&line[from..]);
+    out
+}
+
+/// One shell token, including quoted spans and escaped characters.
+fn value_end(line: &str, start: usize) -> usize {
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, c) in line[start..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if quote == Some(c) {
+            quote = None;
+        } else if quote.is_none() {
+            if c == '\'' || c == '"' {
+                quote = Some(c);
+            } else if c.is_whitespace() || ";&|()<>".contains(c) {
+                return start + offset;
+            }
+        }
+    }
+    line.len()
 }
 
 #[cfg(test)]
@@ -970,6 +1039,47 @@ mod tests {
             redact("tool --tokenizer value -p visible"),
             "tool --tokenizer value -p visible"
         );
+    }
+
+    #[test]
+    fn redaction_preserves_flag_suffixes_and_is_idempotent() {
+        for line in [
+            "--pass=v",
+            "--pwd=v",
+            "PASS=v",
+            "MY_PWD=v",
+            "passcode: v",
+            "--auth=v",
+        ] {
+            let masked = redact(line);
+            assert!(!masked.contains('v'), "{line}: {masked}");
+            assert!(masked.contains("[omgs redacted]"), "{masked}");
+            assert_eq!(redact(&masked), masked);
+        }
+        for line in [
+            "jest --no-session tests/x.test.ts",
+            "tool --passage value --author writer --passwordless yes -pVALUE tests/x.ts",
+            "PASSAGE=v AUTHOR=v PASSWORDLESS=v",
+            "jest --auth= tests/x.ts",
+        ] {
+            assert_eq!(redact(line), line);
+        }
+        for line in [
+            "jest --session-timeout 30 tests/x.ts",
+            "jest --token hidden tests/x.ts",
+            "jest --auth=hidden tests/x.ts",
+            "jest --auth=--hidden tests/x.ts",
+            "jest --no-session=hidden tests/x.ts",
+            "jest --pass 'hidden credential' tests/x.ts",
+            "jest \"--pwd\"=\"hidden credential\" tests/x.ts",
+            "jest --token hidden --pwd hidden tests/x.ts\n",
+            "jest --auth hidden; echo tests/x.ts",
+        ] {
+            let masked = redact(line);
+            assert!(masked.contains("tests/x.ts"), "{line}: {masked}");
+            assert!(!masked.contains("hidden"), "{line}: {masked}");
+            assert_eq!(redact(&masked), masked, "{line}");
+        }
     }
 
     #[test]

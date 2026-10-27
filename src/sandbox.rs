@@ -727,7 +727,12 @@ pub fn declared_limits(os: &str) -> Vec<String> {
 /// Copy `src` into the empty directory `dst`: an APFS clone on macOS, a
 /// reflink where the filesystem supports it on Linux, a plain copy otherwise.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
-    refuse_special_files(src)?;
+    copy_tree_with_gaps(src, dst).map(|_| ())
+}
+
+fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
+    let mut gaps = Vec::new();
+    inspect_target(src, src, &mut gaps)?;
     supervise::check_interrupted().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
     let from = format!("{}/.", src.display());
@@ -738,7 +743,7 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     } else {
         vec![]
     };
-    for flags in attempts {
+    for flags in attempts.into_iter().filter(|_| gaps.is_empty()) {
         let child = Command::new("/bin/cp")
             .args(&flags)
             .arg(&from)
@@ -764,7 +769,7 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
             Err(_) => false,
         };
         if ok {
-            return Ok(());
+            return Ok(gaps);
         }
         // A partial clone must not be mixed with the next attempt.
         let _ = std::fs::remove_dir_all(dst);
@@ -774,11 +779,11 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
         std::fs::canonicalize(src).map_err(|e| e.to_string())?,
         dst.to_path_buf(),
     );
-    copy_recursive(src, dst, &roots)
+    copy_recursive(src, dst, &roots)?;
+    Ok(gaps)
 }
 
-/// Match digest policy before invoking platform copy tools, which differ on FIFOs.
-fn refuse_special_files(dir: &Path) -> Result<(), String> {
+fn inspect_target(root: &Path, dir: &Path, gaps: &mut Vec<String>) -> Result<(), String> {
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         supervise::check_interrupted().map_err(|e| e.to_string())?;
         let entry = entry.map_err(|e| e.to_string())?;
@@ -787,10 +792,19 @@ fn refuse_special_files(dir: &Path) -> Result<(), String> {
             continue;
         }
         if meta.is_dir() {
-            refuse_special_files(&entry.path())?;
+            inspect_target(root, &entry.path(), gaps)?;
+        } else if platform::contentless(&meta) {
+            gaps.push(format!(
+                "skipped target socket or FIFO: {}",
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|e| e.to_string())?
+                    .display()
+            ));
         } else if !meta.is_file() {
             return Err(format!(
-                "unsupported target file type at {}; FIFOs, sockets and devices are refused",
+                "unsupported target file type at {}; devices are refused",
                 entry.path().display()
             ));
         }
@@ -810,11 +824,21 @@ fn copy_recursive(src: &Path, dst: &Path, roots: &(PathBuf, PathBuf)) -> Result<
         } else if ty.is_dir() {
             std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
             copy_recursive(&entry.path(), &to, roots)?;
+            std::fs::set_permissions(
+                &to,
+                entry.metadata().map_err(|e| e.to_string())?.permissions(),
+            )
+            .map_err(|e| e.to_string())?;
         } else if ty.is_file() {
             std::fs::copy(entry.path(), &to)
                 .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
         } else if ty.is_symlink() {
             copy_link(&entry.path(), &to, roots)?;
+        } else if !platform::contentless(&entry.metadata().map_err(|e| e.to_string())?) {
+            return Err(format!(
+                "unsupported target file type at {}; devices are refused",
+                entry.path().display()
+            ));
         }
     }
     Ok(())
@@ -948,13 +972,20 @@ impl Drop for BlockedCleanup {
     }
 }
 
+struct StagedWorkspace {
+    digest: Option<String>,
+    rust: Option<RustHomes>,
+    gaps: Vec<String>,
+}
+
 fn stage_workspace(
     req: &ProveRequest,
     workspace: &Path,
     scratch: &Path,
     readonly: &[PathBuf],
     nonce: &str,
-) -> Result<(Option<String>, Option<RustHomes>), String> {
+) -> Result<StagedWorkspace, String> {
+    let mut gaps = Vec::new();
     if let Some(target) = &req.target {
         let target = std::fs::canonicalize(target).map_err(|e| format!("target: {e}"))?;
         if !target.is_dir() {
@@ -963,7 +994,7 @@ fn stage_workspace(
         if workspace.starts_with(&target) {
             return Err("the proof directory must be outside the target tree".into());
         }
-        copy_tree(&target, workspace)?;
+        gaps = copy_tree_with_gaps(&target, workspace)?;
     } else {
         std::fs::create_dir_all(workspace).map_err(|e| e.to_string())?;
     }
@@ -1026,7 +1057,7 @@ fn stage_workspace(
         req.test.as_deref(),
     )
     .map_err(|e| format!("cannot write command wrapper: {e}"))?;
-    Ok((digest, rust))
+    Ok(StagedWorkspace { digest, rust, gaps })
 }
 
 pub fn prove(req: &ProveRequest) -> ProveOutcome {
@@ -1170,8 +1201,11 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     // (allowed marker) next to one it denies; deny it explicitly so no
     // readable root can ever grant it.
     let denied: Vec<PathBuf> = markers.iter().map(|m| m.denied.clone()).collect();
-    let (target_sha256, rust) = match stage_workspace(req, &workspace, &scratch, &readonly, &nonce)
-    {
+    let StagedWorkspace {
+        digest: target_sha256,
+        rust,
+        gaps: mut extra_gaps,
+    } = match stage_workspace(req, &workspace, &scratch, &readonly, &nonce) {
         Ok(staged) => staged,
         Err(reason) => return blocked(reason),
     };
@@ -1202,7 +1236,6 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         tasks: Some(512),
         output_cap_bytes: 256 * 1024,
     };
-    let mut extra_gaps = Vec::new();
     for path in std::iter::once(located.path.clone()).chain(
         req.test
             .as_ref()
@@ -1246,14 +1279,18 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
                     return blocked(format!("cannot reset retry workspace: {e}"));
                 }
             }
-            let (digest, rust) =
-                match stage_workspace(req, &workspace, &scratch, &input.readonly, &nonce) {
-                    Ok(staged) => staged,
-                    Err(reason) => return blocked(reason),
-                };
+            let StagedWorkspace {
+                digest,
+                rust,
+                gaps: retry_gaps,
+            } = match stage_workspace(req, &workspace, &scratch, &input.readonly, &nonce) {
+                Ok(staged) => staged,
+                Err(reason) => return blocked(reason),
+            };
             if digest != target_sha256 {
                 return blocked("target changed before MXC retry".into());
             }
+            extra_gaps.extend(retry_gaps);
             input.rust = rust;
             input.list_parents = false;
             extra_gaps.push("this Windows version refuses parent directory enumeration; relative nested file access is supported, but directory listing, absolute path resolution and NUL device redirection may fail; denied CMD redirection can retain exit 0".to_string());
@@ -1405,10 +1442,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn copies_hardlinks_and_large_content_and_refuses_special_files() {
+    fn copies_content_and_skips_sockets_and_fifos() {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::MetadataExt;
-        let d = std::env::temp_dir().join(format!("omgs-copy-content-{}", std::process::id()));
+        let d = PathBuf::from("/tmp").join(format!("omgs-c-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let src = d.join("target");
         let dst = d.join("copy");
@@ -1429,13 +1466,16 @@ mod tests {
         let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         let start = std::time::Instant::now();
-        assert!(copy_tree(&src, &d.join("fifo-copy"))
-            .unwrap_err()
-            .contains("FIFOs"));
-        assert!(crate::proof::tree_digest(&src)
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported target file type"));
+        let socket = std::os::unix::net::UnixListener::bind(src.join("socket")).unwrap();
+        let special_copy = d.join("special-copy");
+        let gaps = copy_tree_with_gaps(&src, &special_copy).unwrap();
+        assert_eq!(gaps.len(), 2);
+        for name in ["pipe", "socket"] {
+            assert!(gaps.iter().any(|gap| gap.ends_with(name)), "{gaps:?}");
+            assert!(!special_copy.join(name).exists());
+        }
+        assert_eq!(crate::proof::tree_digest(&src).unwrap(), digest);
+        assert_eq!(crate::proof::tree_digest(&special_copy).unwrap(), digest);
         assert!(crate::sha256::digest_file(&fifo).is_err());
         assert!(crate::sha256::digest_file(Path::new("/dev/zero")).is_err());
         std::os::unix::fs::symlink(&fifo, d.join("fifo-link")).unwrap();
@@ -1443,12 +1483,6 @@ mod tests {
         std::os::unix::fs::symlink(&src, d.join("dir-link")).unwrap();
         assert!(crate::sha256::digest_file(&d.join("dir-link")).is_err());
         assert!(start.elapsed().as_secs() < 10);
-        std::fs::remove_file(&fifo).unwrap();
-        let socket = std::os::unix::net::UnixListener::bind(src.join("socket")).unwrap();
-        assert!(copy_tree(&src, &d.join("socket-copy"))
-            .unwrap_err()
-            .contains("sockets"));
-        assert!(crate::proof::tree_digest(&src).is_err());
         drop(socket);
         std::fs::remove_dir_all(d).unwrap();
     }

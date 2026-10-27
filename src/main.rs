@@ -10,21 +10,54 @@ use omgs::sensors::run_sensors;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// The value after `name`. A following token that is itself an option means
-/// the value is missing, never that the option name is the value.
+fn boolean_option(name: &str) -> bool {
+    ["--yes", "--no-sensors", "--live", "--help", "-h"].contains(&name)
+}
+
+fn free_text_option(name: &str) -> bool {
+    [
+        "--cmd", "--note", "--answer", "--detail", "--log", "--reason",
+    ]
+    .contains(&name)
+}
+
+/// Walk option/value pairs so a free-text value cannot become another option.
+fn options(args: &[String]) -> impl Iterator<Item = (&str, Option<&str>)> {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while let Some(arg) = args.get(i) {
+            i += 1;
+            if !arg.starts_with('-') {
+                continue;
+            }
+            if let Some((name, value)) = arg.split_once('=') {
+                return Some((name, Some(value)));
+            }
+            let value = if boolean_option(arg) {
+                None
+            } else {
+                let value = args.get(i).map(String::as_str);
+                i += usize::from(value.is_some());
+                value
+            };
+            return Some((arg.as_str(), value));
+        }
+        None
+    })
+}
+
 fn flag(args: &[String], name: &str) -> Option<String> {
-    args.windows(2)
-        .find(|w| w[0] == name)
-        .map(|w| w[1].clone())
-        .filter(|v| !v.starts_with("--"))
+    options(args)
+        .find(|(option, _)| *option == name)
+        .and_then(|(_, value)| value.map(str::to_string))
 }
 fn has(args: &[String], name: &str) -> bool {
-    args.iter().any(|a| a == name)
+    options(args).any(|(option, _)| option == name)
 }
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value, and a value may not begin with --.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--hunter <id>] [--verifier <id>]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -34,9 +67,10 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
     let (allowed, positional): (&str, bool) = match cmd {
         "setup" => ("--yes --from", false),
         "review" => ("--repo-url --mode --budget --no-sensors", false),
-        "audit" if args.first().is_some_and(|a| a == "init") => {
-            ("--target --out --mode --budget --no-sensors", true)
-        }
+        "audit" if args.first().is_some_and(|a| a == "init") => (
+            "--target --out --mode --budget --no-sensors --hunter --verifier",
+            true,
+        ),
         "batch" if args.first().is_some_and(|a| a == "init") => {
             ("--list --out --mode --budget --no-sensors", true)
         }
@@ -83,7 +117,9 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
     let mut seen = std::collections::HashSet::new();
     let mut i = usize::from(positional);
     while i < args.len() {
-        let option = args[i].as_str();
+        let (option, inline) = args[i]
+            .split_once('=')
+            .map_or((args[i].as_str(), None), |(k, v)| (k, Some(v)));
         let help = option == "--help" || option == "-h";
         help_requested |= help;
         if !help && !allowed.split_whitespace().any(|a| a == option) {
@@ -95,27 +131,39 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
             return Err(format!("duplicate option '{option}'"));
         }
         i += 1;
-        if !help && !["--yes", "--no-sensors", "--live"].contains(&option) {
+        if boolean_option(option) {
+            if inline.is_some() {
+                return Err(format!("{option} does not take a value"));
+            }
+        } else if inline.is_none() {
             match args.get(i) {
-                Some(value) if !value.starts_with("--") => i += 1,
-                _ => return Err(format!("{option} requires a value")),
+                Some(value) if free_text_option(option) || !value.starts_with("--") => i += 1,
+                _ => {
+                    return Err(format!(
+                        "{option} requires a value; use {option}=value if it begins with --"
+                    ))
+                }
             }
         }
     }
     Ok(help_requested)
 }
 
+fn cli_error(error: &str) {
+    eprintln!("error: {}", error.replace(['\r', '\n'], " "));
+    eprintln!("run omgs --help for usage");
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first().map(|s| s.as_str()) else {
-        usage();
+        cli_error("a command is required");
         return ExitCode::from(2);
     };
     let rest = &args[1..];
     match validate_options(cmd, rest) {
         Err(e) => {
-            usage();
-            eprintln!("error: {e}");
+            cli_error(&e);
             return ExitCode::from(2);
         }
         Ok(true) => {
@@ -161,7 +209,7 @@ fn main() -> ExitCode {
             } else if e == "__EXIT1__" {
                 ExitCode::from(1)
             } else {
-                eprintln!("error: {e}");
+                cli_error(&e);
                 ExitCode::from(2)
             }
         }
@@ -788,10 +836,6 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
 /// What this machine can and cannot do for OMGS. Executes no target code;
 /// `--live` runs one fixed command inside MXC to show a denial is enforced.
 fn cmd_doctor(args: &[String]) -> Result<(), String> {
-    if args.iter().any(|arg| arg != "--live") {
-        usage();
-        return Err("doctor accepts only --live".into());
-    }
     use omgs::platform::which;
     let os = std::env::consts::OS;
     println!(
@@ -874,6 +918,9 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         println!("note: PowerShell under MXC needs an interactive desktop session; over SSH (session 0) pwsh fails to start while cmd works.");
     }
     if !ready {
+        if has(args, "--live") {
+            println!("live check: not run, no verified executor");
+        }
         return Err("__EXIT1__".into());
     }
     if has(args, "--live") {
@@ -1017,7 +1064,8 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
 
 fn cmd_approve(args: &[String]) -> Result<(), String> {
     if let Some(why) = omgs::sandbox::tier2_unavailable(std::env::consts::OS) {
-        return Err(why);
+        eprintln!("needs_validation: target code was not executed. {why}");
+        return Err("__EXIT3__".into());
     }
     let raw = flag(args, "--target").ok_or("approve requires --target <repo>")?;
     let target = std::fs::canonicalize(&raw).map_err(|e| format!("target {raw}: {e}"))?;
@@ -1241,16 +1289,14 @@ fn trusted_store(target: &Path) -> Result<PathBuf, String> {
 /// so neither a symlink nor a hardlink planted in the target can change what
 /// the store says. A missing store means no answers yet.
 fn read_store(path: &Path) -> Result<omgs::intent::Answers, String> {
-    use std::io::Read;
-    let Some(mut file) = omgs::platform::open_single_link(path)
-        .map_err(|e| format!("{}: {e}; refusing to trust it", path.display()))?
-    else {
-        return Ok(Default::default());
+    const MAX_BYTES: u64 = 1 << 20;
+    let bytes = match omgs::platform::read_bounded(path, MAX_BYTES) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(format!("{}: {e}; refusing to trust it", path.display())),
     };
-    let mut text = String::new();
-    file.read_to_string(&mut text)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
-    omgs::intent::parse_answers(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+    let text = std::str::from_utf8(&bytes).map_err(|e| format!("read {}: {e}", path.display()))?;
+    omgs::intent::parse_answers(text).map_err(|e| format!("parse {}: {e}", path.display()))
 }
 
 /// The run's intent answers, only when they belong to the run's target as
@@ -1829,9 +1875,9 @@ fn write_ledger(path: &str, ledger: &Ledger) -> Result<(), String> {
 
 /// Every value given for a repeatable flag, in order.
 fn flags(args: &[String], name: &str) -> Vec<String> {
-    args.windows(2)
-        .filter(|w| w[0] == name && !w[1].starts_with("--"))
-        .map(|w| w[1].clone())
+    options(args)
+        .filter(|(option, _)| *option == name)
+        .filter_map(|(_, value)| value.map(str::to_string))
         .collect()
 }
 
@@ -2463,5 +2509,285 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err("usage: omgs intent list [--stack <s>] [--attack-class <c>] | omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]".into()),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn free_text_and_inline_values_cannot_become_options() {
+        for (cmd, sub, name) in [
+            ("prove", "", "--cmd"),
+            ("ledger", "add", "--note"),
+            ("ledger", "set", "--note"),
+            ("intent", "answer", "--answer"),
+            ("status", "", "--detail"),
+            ("status", "", "--log"),
+            ("route", "", "--reason"),
+        ] {
+            for value in ["--version", "--run", "--help", "--live"] {
+                for inline in [false, true] {
+                    let mut args = Vec::new();
+                    if !sub.is_empty() {
+                        args.push(sub.to_string());
+                    }
+                    if inline {
+                        args.push(format!("{name}={value}"));
+                    } else {
+                        args.extend(strings(&[name, value]));
+                    }
+                    assert_eq!(validate_options(cmd, &args), Ok(false), "{args:?}");
+                    assert_eq!(flag(&args, name).as_deref(), Some(value));
+                    assert!(!has(&args, value), "{args:?}");
+                }
+            }
+        }
+        let args = strings(&["--target=--folder"]);
+        assert_eq!(validate_options("approve", &args), Ok(false));
+        assert_eq!(flag(&args, "--target").as_deref(), Some("--folder"));
+        let error = validate_options("approve", &strings(&["--target", "--folder"])).unwrap_err();
+        assert!(error.contains("use --target=value if it begins with --"));
+        assert!(validate_options("doctor", &strings(&["--live=yes"])).is_err());
+        let args = strings(&["--counter=a=1", "--counter", "b=2"]);
+        assert_eq!(flags(&args, "--counter"), ["a=1", "b=2"]);
+    }
+
+    #[test]
+    fn oversized_answer_store_is_refused() {
+        let path =
+            std::env::temp_dir().join(format!("omgs-answer-large-{}.json", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((1 << 20) + 1).unwrap();
+        assert!(read_store(&path).unwrap_err().contains("byte limit"));
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn function<'a>(source: &'a str, name: &str) -> &'a str {
+        let body = source.split_once(&format!("\nfn {name}(")).unwrap().1;
+        body.split("\nfn ").next().unwrap()
+    }
+
+    fn read_options(body: &str) -> BTreeSet<&str> {
+        let mut names = BTreeSet::new();
+        for helper in ["flag(", "has(", "flags("] {
+            for call in body.split(helper).skip(1) {
+                let arg = call.split_once(',').unwrap().1.trim_start();
+                if let Some(literal) = arg.strip_prefix('"') {
+                    names.insert(literal.split('"').next().unwrap());
+                } else {
+                    let variable = arg.split(')').next().unwrap();
+                    let values = match variable {
+                        "n" => body
+                            .split("get(\"")
+                            .skip(1)
+                            .map(|s| s.split('"').next().unwrap())
+                            .collect::<Vec<_>>(),
+                        "name" | "conflicting" => {
+                            let array = body
+                                .split_once(&format!("for {variable} in ["))
+                                .unwrap()
+                                .1
+                                .split(']')
+                                .next()
+                                .unwrap();
+                            array.split('"').skip(1).step_by(2).collect()
+                        }
+                        other => panic!("unmapped dynamic option read: {other}"),
+                    };
+                    assert!(!values.is_empty());
+                    names.extend(values);
+                }
+            }
+        }
+        names
+    }
+
+    fn accepted(cmd: &str, sub: &str, option: &str) {
+        let mut args = Vec::new();
+        if !sub.is_empty() {
+            args.push(sub.to_string());
+        }
+        args.push(option.to_string());
+        if !boolean_option(option) {
+            args.push("value".into());
+        }
+        assert!(validate_options(cmd, &args).is_ok(), "{cmd} {args:?}");
+    }
+
+    const COMMANDS: &[(&str, &str)] = &[
+        ("setup", ""),
+        ("review", ""),
+        ("audit", "init"),
+        ("batch", "init"),
+        ("batch", "index"),
+        ("validate", ""),
+        ("fingerprint", ""),
+        ("prove", ""),
+        ("approve", ""),
+        ("report", ""),
+        ("architecture", ""),
+        ("ledger", "list"),
+        ("ledger", "add"),
+        ("ledger", "set"),
+        ("critic", ""),
+        ("status", ""),
+        ("watch", ""),
+        ("route", ""),
+        ("intent", "list"),
+        ("intent", "answer"),
+        ("check", ""),
+        ("doctor", ""),
+    ];
+
+    #[test]
+    fn every_option_read_is_in_its_subcommand_allowlist() {
+        let source = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let mut covered = BTreeMap::<String, BTreeSet<&str>>::new();
+        for &(cmd, sub) in COMMANDS {
+            let name = format!("cmd_{cmd}");
+            let mut sections = vec![(name.as_str(), function(source, &name))];
+            match (cmd, sub) {
+                ("audit", _) => sections.push(("audit_init", function(source, "audit_init"))),
+                ("route", _) => sections.push(("models_path", function(source, "models_path"))),
+                ("ledger", _) => {
+                    let body = function(source, "ledger_locked");
+                    let branch = body.split_once(&format!("\"{sub}\" => {{")).unwrap().1;
+                    sections.push((
+                        "ledger_locked",
+                        branch.split("\n        \"").next().unwrap(),
+                    ));
+                }
+                _ => {}
+            }
+            if cmd == "batch" || cmd == "intent" {
+                let branch = sections[0]
+                    .1
+                    .split_once(&format!("Some(\"{sub}\") => {{"))
+                    .unwrap()
+                    .1;
+                sections[0].1 = branch.split("\n        Some(").next().unwrap();
+            }
+            if cmd == "review" || (cmd == "batch" && sub == "init") {
+                sections.push(("init_args", function(source, "init_args")));
+            }
+            for (name, body) in sections {
+                let names = read_options(body);
+                for option in &names {
+                    accepted(cmd, sub, option);
+                }
+                covered.entry(name.to_string()).or_default().extend(names);
+            }
+        }
+        for declaration in source.split("\nfn ").skip(1) {
+            let name = declaration.split('(').next().unwrap();
+            if ["flag", "has", "flags"].contains(&name) {
+                continue;
+            }
+            if ["flag(", "has(", "flags("]
+                .iter()
+                .any(|call| declaration.contains(call))
+            {
+                assert!(
+                    covered.contains_key(name),
+                    "unmapped option-reading function {name}"
+                );
+                assert!(
+                    read_options(declaration).is_subset(&covered[name]),
+                    "uncovered option read in {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn documented_omgs_options_are_accepted() {
+        for text in [
+            include_str!("../README.md"),
+            include_str!("../skill/SKILL.md"),
+        ] {
+            for part in text.split("--").skip(1) {
+                let end = part
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                    .unwrap_or(part.len());
+                let name = &part[..end];
+                // External commands, root version flag and the syntax placeholder.
+                if name.is_empty()
+                    || name.starts_with('-')
+                    || [
+                        "global",
+                        "skill",
+                        "release",
+                        "ignore-missing",
+                        "version",
+                        "opt",
+                    ]
+                    .contains(&name)
+                {
+                    continue;
+                }
+                let option = format!("--{name}");
+                assert!(
+                    COMMANDS.iter().any(|(cmd, sub)| {
+                        let mut args = Vec::new();
+                        if !sub.is_empty() {
+                            args.push(sub.to_string());
+                        }
+                        args.push(option.clone());
+                        if !boolean_option(&option) {
+                            args.push("value".into());
+                        }
+                        validate_options(cmd, &args).is_ok()
+                    }),
+                    "undocumented CLI option acceptance: {option}"
+                );
+            }
+            let text = text.replace("\\\n", " ");
+            for line in text.lines() {
+                for mention in line.split("omgs ").skip(1) {
+                    let mut words = mention.split_whitespace();
+                    let Some(cmd) = words.next() else { continue };
+                    let sub = if ["audit", "batch", "ledger", "intent"].contains(&cmd) {
+                        words.next().unwrap_or("")
+                    } else {
+                        ""
+                    };
+                    if !COMMANDS.contains(&(cmd, sub)) {
+                        continue;
+                    }
+                    let tail = words.collect::<Vec<_>>().join(" ");
+                    let command = tail.split('`').next().unwrap();
+                    let mut quote = None;
+                    let mut visible = String::new();
+                    for c in command.chars() {
+                        if quote == Some(c) {
+                            quote = None;
+                        } else if quote.is_none() && ['\'', '"'].contains(&c) {
+                            quote = Some(c);
+                        } else if quote.is_none() {
+                            visible.push(c);
+                        }
+                    }
+                    for part in visible.split("--").skip(1) {
+                        let end = part
+                            .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                            .unwrap_or(part.len());
+                        if end > 0 {
+                            accepted(cmd, sub, &format!("--{}", &part[..end]));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

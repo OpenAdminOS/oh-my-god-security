@@ -122,6 +122,20 @@ pub fn open_single_link(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     Ok(Some(file))
 }
 
+/// Sockets and FIFOs have no snapshot content; devices remain unsupported.
+pub fn contentless(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        meta.file_type().is_socket() || meta.file_type().is_fifo()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
 /// Open content through links, rejecting special files before reading them.
 pub fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
