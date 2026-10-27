@@ -27,17 +27,25 @@ impl WindowsProbe {
         serde_json::from_str(text).map_err(|e| format!("invalid Windows MXC probe JSON: {e}"))
     }
 
-    pub fn require_process(&self) -> Result<(), String> {
-        if self.tier != "base-container" || !self.probes.base_container_api_present {
-            return Err(format!(
-                "Windows MXC probe cannot affirm ProcessContainer support (tier {})",
+    pub fn require_supported_tier(&self) -> Result<(), String> {
+        let p = &self.probes;
+        let supported = match self.tier.as_str() {
+            "base-container" => p.base_container_api_present,
+            "appcontainer-dacl" => {
+                !p.base_container_supports_enumerate_paths
+                    && !p.base_container_supports_deny_paths
+                    && !p.base_container_supports_ingress_host_loopback_allow
+            }
+            _ => false,
+        };
+        if supported {
+            Ok(())
+        } else {
+            Err(format!(
+                "Windows MXC probe reports an unknown or inconsistent process tier: {}",
                 self.tier
-            ));
+            ))
         }
-        if self.needs_dacl_augmentation {
-            return Err("Windows MXC probe requires administrator DACL preparation; OMGS does not run wxc-host-prep.exe".into());
-        }
-        Ok(())
     }
 
     pub fn notes(&self) -> Vec<String> {
@@ -62,9 +70,12 @@ pub fn windows_policy(
 ) -> Result<(bool, bool, Vec<String>), String> {
     match probe {
         Ok(p) => {
-            p.require_process()?;
+            p.require_supported_tier()?;
             let enumerate = p.probes.base_container_supports_enumerate_paths;
             let mut notes = p.notes();
+            if p.needs_dacl_augmentation {
+                notes.push("Windows MXC advises administrator DACL preparation; OMGS does not run wxc-host-prep.exe; metadata or NUL access may fail".into());
+            }
             notes.push("Windows capability selection: probe; enumeration retry disabled".into());
             if !enumerate {
                 notes.push(enumeration_gap());
@@ -266,10 +277,10 @@ mod tests {
             "baseContainerSupportsIngressHostLoopbackAllow":false, "nativeCaptureAvailable":false}})
     }
     #[test]
-    fn windows_probe_parses_strict_types_and_requires_process_support() {
+    fn windows_probe_parses_strict_types_and_requires_a_known_consistent_tier() {
         let value = probe();
         let p = WindowsProbe::parse(&value.to_string()).unwrap();
-        assert!(p.require_process().is_ok());
+        assert!(p.require_supported_tier().is_ok());
         assert!(p.probes.base_container_supports_enumerate_paths);
         assert!(p.notes()[0].contains("ingressHostLoopbackAllow=false"));
         for bad in ["{}", "null", "[]", "warning\n{}"] {
@@ -287,24 +298,40 @@ mod tests {
             bad["probes"].as_object_mut().unwrap().remove(key);
             assert!(WindowsProbe::parse(&bad.to_string()).is_err());
         }
-        for (key, bad) in [
-            ("tier", serde_json::json!("unknown")),
-            ("needsDaclAugmentation", serde_json::json!(true)),
-        ] {
-            let mut v = value.clone();
-            v[key] = bad;
-            assert!(WindowsProbe::parse(&v.to_string())
-                .unwrap()
-                .require_process()
-                .is_err());
-        }
+        let mut v = value.clone();
+        v["tier"] = "unknown".into();
+        assert!(WindowsProbe::parse(&v.to_string())
+            .unwrap()
+            .require_supported_tier()
+            .is_err());
         let mut v = value;
         v["probes"]["baseContainerApiPresent"] = false.into();
         assert!(WindowsProbe::parse(&v.to_string())
             .unwrap()
-            .require_process()
+            .require_supported_tier()
             .is_err());
     }
+    #[test]
+    fn observed_server_dacl_tier_runs_without_claiming_base_container_capabilities() {
+        let value = serde_json::json!({"tier":"appcontainer-dacl", "needsDaclAugmentation":true,
+            "warnings":["metadata and NUL preparation advised"], "probes": {
+            "baseContainerApiPresent":false, "baseContainerSupportsEnumeratePaths":false,
+            "baseContainerSupportsDenyPaths":false,
+            "baseContainerSupportsIngressHostLoopbackAllow":false, "nativeCaptureAvailable":false}});
+        let (enumerate, fallback, notes) =
+            windows_policy(WindowsProbe::parse(&value.to_string())).unwrap();
+        assert!(!enumerate && !fallback);
+        assert!(notes
+            .iter()
+            .any(|n| n.contains("metadata and NUL preparation advised")));
+        assert!(notes
+            .iter()
+            .any(|n| n.contains("does not run wxc-host-prep.exe")));
+        let mut inconsistent = value;
+        inconsistent["probes"]["baseContainerSupportsEnumeratePaths"] = true.into();
+        assert!(windows_policy(WindowsProbe::parse(&inconsistent.to_string())).is_err());
+    }
+
     #[test]
     fn probe_selects_enumeration_and_only_failures_enable_retry() {
         for enumerate in [false, true] {

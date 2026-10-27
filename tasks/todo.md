@@ -48,11 +48,14 @@ shares the host loopback in both directions, and Windows blocks loopback inside 
 Decided 2026-10-27: the four MXC items above are in 0.1; Windows Learning Mode capture is not.
 
 PR 1b local verification: macOS passed fmt, Clippy with warnings denied and all
-221 tests; Lima Ubuntu arm64 passed all 217 tests; Windows 11 x64 passed all
-189 tests. All three pinned executors accepted valid dry-runs, rejected invalid
+222 tests; Lima Ubuntu arm64 passed all 218 tests; Windows 11 x64 passed all
+190 tests. All three pinned executors accepted valid dry-runs, rejected invalid
 configs without starting a workload, and passed the live doctor check. The Lima
 host has no rustfmt; no toolchain components were installed. Windows 11 reported
 build 10.0.26200.9711 and base-container probe capabilities, including enumeration.
+The initial windows-2025 CI probe reported appcontainer-dacl, DACL preparation
+advice, and false BaseContainer capabilities. That observed tier is supported
+without administrator preparation, with warnings recorded and enumeration omitted.
 The five push CI jobs, including windows-2025 through Test, remain the head check;
 parent-owned full-diff reviews and PR creation are separate from this implementation.
 

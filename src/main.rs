@@ -872,7 +872,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
                         for note in p.notes() {
                             println!("{}", omgs::platform::escape_controls(&note));
                         }
-                        if let Err(reason) = p.require_process() {
+                        if let Err(reason) = p.require_supported_tier() {
                             println!("sandbox: not ready. {reason}");
                             return Err("__EXIT1__".into());
                         }
