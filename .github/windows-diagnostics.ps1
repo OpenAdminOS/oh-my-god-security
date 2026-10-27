@@ -18,6 +18,15 @@ echo NESTED_DIR
 dir tests\security
 echo NESTED_READ
 type tests\security\nested.cmd
+echo NUL_ONLY
+echo NUL_WRITE >nul
+echo NUL_ONLY_EXIT=%errorlevel%
+echo FINDSTR_NO_REDIRECT
+findstr /m vulnerable check.txt
+echo FINDSTR_NO_REDIRECT_EXIT=%errorlevel%
+echo FINDSTR_STDIN_ONLY
+findstr vulnerable <check.txt
+echo FINDSTR_STDIN_ONLY_EXIT=%errorlevel%
 echo FINDSTR_RELATIVE
 findstr /m vulnerable check.txt >nul
 echo FINDSTR_EXIT=%errorlevel%
