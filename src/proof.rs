@@ -24,6 +24,15 @@ pub struct ProofRecord {
     /// Proof test path relative to the target, when the run executes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test: Option<String>,
+    /// SHA-256 of the proof test as it existed in the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_sha256: Option<String>,
+    /// Draft the test was staged from, when it was not already in the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_from: Option<String>,
+    /// The record this run replayed, when it was `omgs prove --replay`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replays: Option<u32>,
     /// `test` (tier 1) or `local_app` (tier 2).
     pub tier: String,
     pub command: String,
@@ -37,6 +46,13 @@ pub struct ProofRecord {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub capture_complete: bool,
+    /// Every signal, reap and survivor scan succeeded.
+    #[serde(default)]
+    pub cleanup_complete: bool,
+    /// The executor itself reported an error (bad policy, backend failure),
+    /// so the command may never have started.
+    #[serde(default)]
+    pub executor_error: bool,
     pub survivors: Vec<Survivor>,
     pub mxc_version: String,
     pub containment: String,
@@ -56,7 +72,18 @@ impl ProofRecord {
     /// A run whose result can be trusted at all: it finished on its own, the
     /// output was fully captured and nothing escaped.
     pub fn clean(&self) -> bool {
-        !self.timed_out && self.capture_complete && self.survivors.is_empty()
+        !self.timed_out
+            && self.capture_complete
+            && self.cleanup_complete
+            && !self.executor_error
+            && self.survivors.is_empty()
+    }
+
+    /// A nonzero exit that a failing assertion can produce, as opposed to a
+    /// shell that could not find or execute the command (126, 127) or a
+    /// process killed by a signal (above 128, or no code at all).
+    pub fn assertion_failure(&self) -> bool {
+        matches!(self.exit_code, Some(c) if (1..=125).contains(&c))
     }
 }
 
@@ -164,19 +191,71 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
         }
         if !record.clean() {
             errors.push(format!(
-                "{at}: {r} did not finish cleanly (timed out, incomplete capture or surviving processes)"
+                "{at}: {r} did not finish cleanly (timeout, executor error, incomplete capture or cleanup, or surviving processes)"
             ));
         }
+        errors.extend(
+            runner_evidence(run, &record)
+                .into_iter()
+                .map(|e| format!("{at}: {r} {e}")),
+        );
         // A tier 1 proof is a security test that fails on the vulnerable code.
-        if want == "test" && !matches!(record.exit_code, Some(c) if c != 0) {
-            errors.push(format!(
-                "{at}: {r} exited {}, a test_proven record needs the proof test failing on the target",
-                record
-                    .exit_code
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "without a code".into())
-            ));
+        if want == "test" {
+            if record.test.is_none() || record.test_sha256.is_none() {
+                errors.push(format!(
+                    "{at}: {r} names no proof test; run omgs prove with --test <path in the target>"
+                ));
+            }
+            if !record.assertion_failure() {
+                errors.push(format!(
+                    "{at}: {r} exited {}, a test_proven record needs the proof test failing on the target (126, 127 and signals mean the test never ran)",
+                    record
+                        .exit_code
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "without a code".into())
+                ));
+            }
         }
+    }
+    errors
+}
+
+/// Cross-checks against what the runner wrote beside the record: the
+/// executor digest is one OMGS pins, the containment matches it, the MXC
+/// config saved for this run hashes to the recorded digest, and controls
+/// were recorded. This catches hand-written or edited records; it is not a
+/// defence against a process that runs as the user and forges every file.
+fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
+    let mut errors = Vec::new();
+    match crate::sandbox::pinned_executors()
+        .into_iter()
+        .find(|e| e.sha256 == record.executor_sha256)
+    {
+        None => errors.push(format!(
+            "names executor digest {}, which is not a pinned MXC {} executor",
+            record.executor_sha256,
+            crate::sandbox::MXC_VERSION
+        )),
+        Some(e) if e.containment != record.containment => errors.push(format!(
+            "claims containment {} for an executor that provides {}",
+            record.containment, e.containment
+        )),
+        Some(_) => {}
+    }
+    let config = run
+        .join(DIR)
+        .join(record.n.to_string())
+        .join("mxc-config.json");
+    match std::fs::read(&config) {
+        Ok(bytes) if crate::sha256::digest(&bytes) == record.config_sha256 => {}
+        Ok(_) => errors.push(format!(
+            "does not match the MXC config the runner saved at {}",
+            config.display()
+        )),
+        Err(e) => errors.push(format!("has no runner config at {}: {e}", config.display())),
+    }
+    if record.enforced.is_empty() {
+        errors.push("lists no enforced controls".into());
     }
     errors
 }

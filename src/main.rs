@@ -24,7 +24,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value, and a value may not begin with --.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value, and a value may not begin with --.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -181,20 +181,48 @@ fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_prove(args: &[String]) -> Result<(), String> {
-    let command = flag(args, "--cmd").ok_or("prove requires --cmd <command>")?;
+    let run = flag(args, "--run").map(PathBuf::from);
+    // A replay reruns a recorded proof exactly, so an independent evaluator
+    // can check a result instead of trusting the file that claims it.
+    let replay = match flag(args, "--replay") {
+        Some(v) => {
+            let r = run
+                .as_ref()
+                .ok_or("--replay needs --run <run-dir>, the run that holds the record")?;
+            for conflicting in ["--cmd", "--finding", "--test", "--tier", "--target"] {
+                if flag(args, conflicting).is_some() {
+                    return Err(format!(
+                        "--replay takes everything from the record; drop {conflicting}"
+                    ));
+                }
+            }
+            let n: u32 = v
+                .parse()
+                .map_err(|_| format!("--replay takes a proof number, got '{v}'"))?;
+            Some(omgs::proof::load(r, &omgs::proof::reference(n))?)
+        }
+        None => None,
+    };
+    let command = match &replay {
+        Some(r) => r.command.clone(),
+        None => flag(args, "--cmd").ok_or("prove requires --cmd <command>")?,
+    };
     let timeout_ms: u64 = match flag(args, "--timeout-ms") {
         Some(v) => v
             .parse()
             .map_err(|_| format!("--timeout-ms must be a whole number, got '{v}'"))?,
         None => 120_000,
     };
-    let tier = match flag(args, "--tier").as_deref() {
-        None | Some("1") => Tier::Test,
-        Some("2") => Tier::LocalApp,
-        Some(other) => return Err(format!("--tier must be 1 or 2, got '{other}'")),
+    let tier = match (&replay, flag(args, "--tier").as_deref()) {
+        (Some(r), _) if r.tier == "local_app" => Tier::LocalApp,
+        (Some(_), _) | (None, None | Some("1")) => Tier::Test,
+        (None, Some("2")) => Tier::LocalApp,
+        (None, Some(other)) => return Err(format!("--tier must be 1 or 2, got '{other}'")),
     };
-    let run = flag(args, "--run").map(PathBuf::from);
-    let finding = flag(args, "--finding");
+    let finding = match &replay {
+        Some(r) => r.finding.clone(),
+        None => flag(args, "--finding"),
+    };
     if let Some(fp) = &finding {
         if !omgs::model::is_fingerprint(fp) {
             return Err(format!("--finding '{fp}' is not an omgs fingerprint"));
@@ -206,9 +234,13 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             );
         }
     }
-    let test = flag(args, "--test");
+    let test = match &replay {
+        Some(r) => r.test.clone(),
+        None => flag(args, "--test"),
+    };
     if let Some(t) = &test {
-        if Path::new(t).is_absolute() || t.split(['/', '\\']).any(|s| s == "..") {
+        if Path::new(t).is_absolute() || t.contains(':') || t.split(['/', '\\']).any(|s| s == "..")
+        {
             return Err(format!(
                 "--test '{t}' must be a path relative to the target"
             ));
@@ -218,16 +250,74 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         Some(r) => Some(omgs::runmeta::read(r)?),
         None => None,
     };
-    let target = flag(args, "--target").map(PathBuf::from).or_else(|| {
-        meta.as_ref()
-            .and_then(|m| m.get("target").and_then(|t| t.as_str()).map(PathBuf::from))
-    });
+    let target = match &replay {
+        Some(r) => r.target.clone().map(PathBuf::from),
+        None => flag(args, "--target").map(PathBuf::from).or_else(|| {
+            meta.as_ref()
+                .and_then(|m| m.get("target").and_then(|t| t.as_str()).map(PathBuf::from))
+        }),
+    };
     let target = match target {
         Some(t) => {
             Some(std::fs::canonicalize(&t).map_err(|e| format!("target {}: {e}", t.display()))?)
         }
         None => None,
     };
+    // The proof test is either already in the target or a draft kept
+    // outside it (`--test-from`) that the runner stages into the workspace
+    // copy at the `--test` path. Its digest goes on the record so a reader can
+    // tell which test produced the result.
+    let draft = match (&replay, flag(args, "--test-from")) {
+        (Some(_), Some(_)) => {
+            return Err("--replay takes everything from the record; drop --test-from".into())
+        }
+        (Some(r), None) => r.test_from.clone().map(PathBuf::from),
+        (None, d) => d.map(PathBuf::from),
+    };
+    if draft.is_some() && test.is_none() {
+        return Err("--test-from needs --test <target-relative path> to stage it at".into());
+    }
+    let test_sha256 = match (&test, &draft) {
+        (Some(t), Some(d)) => {
+            let d = std::fs::canonicalize(d)
+                .map_err(|e| format!("--test-from {}: {e}", d.display()))?;
+            if target.as_ref().is_some_and(|base| d.starts_with(base)) {
+                return Err("--test-from must be a draft outside the target; drop it to use a test already in the target".into());
+            }
+            if !d.is_file() {
+                return Err(format!("--test-from {} is not a file", d.display()));
+            }
+            Some(omgs::sha256::digest_file(&d).map_err(|e| format!("read {t}: {e}"))?)
+        }
+        (Some(t), None) => {
+            let base = target
+                .as_ref()
+                .ok_or("--test needs a target to find the test in")?;
+            let path = base.join(t);
+            if !path.is_file() {
+                return Err(format!(
+                    "--test {t} is not a file in the target {}; stage a draft with --test-from <file>",
+                    base.display()
+                ));
+            }
+            Some(omgs::sha256::digest_file(&path).map_err(|e| format!("read {t}: {e}"))?)
+        }
+        (None, _) => None,
+    };
+    let draft = match draft {
+        Some(d) => Some(
+            std::fs::canonicalize(&d).map_err(|e| format!("--test-from {}: {e}", d.display()))?,
+        ),
+        None => None,
+    };
+    if let (Some(r), Some(now)) = (&replay, &test_sha256) {
+        if r.test_sha256.as_ref() != Some(now) {
+            eprintln!(
+                "note: the proof test changed since record {} was written",
+                r.n
+            );
+        }
+    }
     if tier == Tier::LocalApp {
         if let Some(why) = omgs::sandbox::tier2_unavailable(std::env::consts::OS) {
             eprintln!("needs_validation: target code was not executed. {why}");
@@ -245,27 +335,26 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             return Err("__EXIT3__".into());
         }
     }
-    if let Some(m) = &meta {
-        // Every proof run counts against the run budget, like an agent call.
-        let budget = m.get("budget_agent_calls").and_then(|v| v.as_u64());
-        let calls = m
-            .get("agent_calls_used")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let proofs = m
-            .get("proof_runs_used")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        if let Some(b) = budget {
-            if calls + proofs >= b {
-                return Err(format!(
-                    "run budget exhausted: {calls} agent call(s) and {proofs} proof run(s) against a budget of {b}"
-                ));
-            }
-        }
-    }
     let proof_dir = match &run {
-        Some(r) => Some(omgs::proof::reserve(r)?),
+        Some(r) => {
+            // Check and charge the budget in one locked step, before anything
+            // runs, so concurrent proofs cannot overspend it. A run that is
+            // interrupted or blocked keeps its charge.
+            omgs::runmeta::update(r, |m| {
+                let used = |k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                let (calls, proofs) = (used("agent_calls_used"), used("proof_runs_used"));
+                if let Some(b) = m.get("budget_agent_calls").and_then(|v| v.as_u64()) {
+                    if calls + proofs >= b {
+                        return Err(format!(
+                            "run budget exhausted: {calls} agent call(s) and {proofs} proof run(s) against a budget of {b}"
+                        ));
+                    }
+                }
+                m.insert("proof_runs_used".into(), serde_json::json!(proofs + 1));
+                Ok(())
+            })?;
+            Some(omgs::proof::reserve(r)?)
+        }
         None => None,
     };
     let run_dir = match &proof_dir {
@@ -282,6 +371,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         target: target.clone(),
         run_dir: run_dir.clone(),
         tier,
+        stage: draft.clone().zip(test.clone()),
     };
     let started_at_ms = omgs::runmeta::now_ms();
     let result = match prove(&request) {
@@ -291,22 +381,15 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         }
         ProveOutcome::Ran(r) => r,
     };
-    if let Some(r) = &run {
-        omgs::runmeta::update(r, |m| {
-            let used = m
-                .get("proof_runs_used")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            m.insert("proof_runs_used".into(), serde_json::json!(used + 1));
-            Ok(())
-        })?;
-    }
     let s = &result.run;
     let record = omgs::proof::ProofRecord {
         schema: omgs::proof::SCHEMA.into(),
         n: proof_dir.as_ref().map(|(n, _)| *n).unwrap_or(0),
         finding,
         test,
+        test_sha256,
+        test_from: draft.as_ref().map(|d| d.to_string_lossy().to_string()),
+        replays: replay.as_ref().map(|r| r.n),
         tier: match tier {
             Tier::Test => "test".into(),
             Tier::LocalApp => "local_app".into(),
@@ -319,6 +402,9 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         exit_code: s.exit_code,
         timed_out: s.timed_out,
         capture_complete: s.capture_complete,
+        cleanup_complete: s.cleanup_complete,
+        // MXC reports its own failures as a JSON error object on stderr.
+        executor_error: s.output.contains("{\"error\":{\"code\":"),
         survivors: s
             .survivors
             .iter()
@@ -389,6 +475,22 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         ),
     }
     print!("{}", record.output);
+    if let Some(orig) = &replay {
+        let code = |c: Option<i32>| c.map(|c| c.to_string()).unwrap_or_else(|| "none".into());
+        let same = record.exit_code == orig.exit_code && record.clean() && orig.clean();
+        eprintln!(
+            "replay of {}: recorded exit {}, replayed exit {}: {}",
+            omgs::proof::reference(orig.n),
+            code(orig.exit_code),
+            code(record.exit_code),
+            if same { "reproduced" } else { "NOT reproduced" }
+        );
+        return if same {
+            Ok(())
+        } else {
+            Err("__EXIT1__".into())
+        };
+    }
     if s.success {
         Ok(())
     } else {
@@ -478,38 +580,56 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
     }
     if has(args, "--live") {
         let probe = data_dir().join("doctor");
-        std::fs::create_dir_all(&probe).map_err(|e| e.to_string())?;
-        let secret = probe.join("outside-marker");
-        // The content must not appear in a denial message, which echoes the path.
-        let token = omgs::sha256::digest(
-            format!("{}-{}", omgs::runmeta::now_ms(), std::process::id()).as_bytes(),
-        );
-        write_out(&secret, token.as_bytes()).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_dir_all(&probe);
+        let target = probe.join("target");
+        std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+        // Two fresh tokens: one inside the workspace that must be readable
+        // (proves the command really ran), one outside that must not be.
+        // Neither appears in a denial message, which echoes only the path.
+        let token = |tag: &str| {
+            omgs::sha256::digest(
+                format!("{tag}-{}-{}", omgs::runmeta::now_ms(), std::process::id()).as_bytes(),
+            )
+        };
+        let (inside, outside) = (token("inside"), token("outside"));
+        write_out(target.join("inside.txt"), inside.as_bytes()).map_err(|e| e.to_string())?;
+        let secret = probe.join("outside.txt");
+        write_out(&secret, outside.as_bytes()).map_err(|e| e.to_string())?;
         let cmd = if os == "windows" {
-            format!("cmd.exe /d /c type \"{}\"", secret.display())
+            format!(
+                "cmd.exe /d /c type inside.txt & type \"{}\"",
+                secret.display()
+            )
         } else {
-            format!("cat '{}'", secret.display())
+            format!("cat inside.txt; cat '{}'", secret.display())
         };
         let request = ProveRequest {
             command: cmd,
             timeout_ms: 30_000,
-            target: None,
-            run_dir: probe.join(format!("live-{}", omgs::runmeta::now_ms())),
+            target: Some(target),
+            run_dir: probe.join("run"),
             tier: Tier::Test,
+            stage: None,
         };
-        let denied = match prove(&request) {
-            ProveOutcome::Ran(r) => !r.run.success && !r.run.output.contains(&token),
+        let outcome = match prove(&request) {
+            ProveOutcome::Ran(r) => r,
             ProveOutcome::Blocked { reason } => return Err(reason),
         };
+        let out = outcome.run.output.clone();
         let _ = std::fs::remove_dir_all(&probe);
-        if denied {
-            println!("live check: reading a file outside the sandbox was denied");
-        } else {
+        if !out.contains(&inside) {
+            println!(
+                "live check FAILED: the probe did not run (it could not read its own workspace)"
+            );
+            return Err("__EXIT1__".into());
+        }
+        if out.contains(&outside) || outcome.run.exit_code == Some(0) {
             println!(
                 "live check FAILED: the sandboxed command could read a file outside its workspace"
             );
             return Err("__EXIT1__".into());
         }
+        println!("live check: the probe ran, read its workspace, and was denied a file outside it");
     }
     Ok(())
 }

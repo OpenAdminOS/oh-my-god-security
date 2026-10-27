@@ -274,12 +274,18 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
         if f.proof_tier == ProofTier::Traced {
             continue;
         }
-        let (n, _) = omgs::proof::reserve(dir).unwrap();
+        let (n, proof_dir) = omgs::proof::reserve(dir).unwrap();
+        let config = br#"{"version":"1.0.0"}"#;
+        std::fs::write(proof_dir.join("mxc-config.json"), config).unwrap();
+        let mac = omgs::sandbox::executor_for("macos", "aarch64").unwrap();
         let record = omgs::proof::ProofRecord {
             schema: omgs::proof::SCHEMA.into(),
             n,
             finding: Some(f.fingerprint.clone()),
             test: Some("tests/security/x.test.ts".into()),
+            test_sha256: Some("0".repeat(64)),
+            test_from: None,
+            replays: None,
             tier: if f.proof_tier == ProofTier::TestProven {
                 "test"
             } else {
@@ -294,13 +300,15 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             exit_code: Some(1),
             timed_out: false,
             capture_complete: true,
+            cleanup_complete: true,
+            executor_error: false,
             survivors: vec![],
             mxc_version: omgs::sandbox::MXC_VERSION.into(),
-            containment: "seatbelt".into(),
-            executor: "mxc-exec-mac".into(),
-            executor_sha256: "0".repeat(64),
-            config_sha256: "0".repeat(64),
-            enforced: vec![],
+            containment: mac.containment.into(),
+            executor: mac.file.into(),
+            executor_sha256: mac.sha256.into(),
+            config_sha256: omgs::sha256::digest(config),
+            enforced: vec!["mxc deny-by-default filesystem".into()],
             gaps: vec![],
             output_sha256: "0".repeat(64),
             output_bytes_total: 0,
@@ -1149,5 +1157,47 @@ fn sensors_documents_must_be_objects() {
         dir.join("out").to_str().unwrap(),
     ]);
     assert_eq!(out.status.code(), Some(2));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn forged_or_broken_proof_records_are_rejected() {
+    let dir = scratch("forged");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let check = |dir: &std::path::Path| omgs::proof::validate_proofs(&findings, dir);
+    assert!(check(&dir).is_empty(), "{:?}", check(&dir));
+    let record_path = dir.join("proofs/1.json");
+    let original = std::fs::read_to_string(&record_path).unwrap();
+    let edit = |f: &dyn Fn(&mut serde_json::Value)| {
+        let mut v: serde_json::Value = serde_json::from_str(&original).unwrap();
+        f(&mut v);
+        std::fs::write(&record_path, v.to_string()).unwrap();
+    };
+    type Change = dyn Fn(&mut serde_json::Value);
+    let cases: [(&str, &Change); 7] = [
+        ("not a pinned MXC", &|v| {
+            v["executor_sha256"] = "1".repeat(64).into()
+        }),
+        ("claims containment", &|v| v["containment"] = "none".into()),
+        ("does not match the MXC config", &|v| {
+            v["config_sha256"] = "2".repeat(64).into()
+        }),
+        ("no enforced controls", &|v| {
+            v["enforced"] = serde_json::json!([])
+        }),
+        ("never ran", &|v| v["exit_code"] = 127.into()),
+        ("did not finish cleanly", &|v| {
+            v["cleanup_complete"] = false.into()
+        }),
+        ("names no proof test", &|v| {
+            v["test_sha256"] = serde_json::Value::Null
+        }),
+    ];
+    for (needle, change) in cases {
+        edit(change);
+        let errors = check(&dir);
+        assert!(has(&errors, needle), "{needle}: {errors:?}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -168,6 +168,12 @@ fn proof_records_back_confirmed_findings() {
     let target = d.join("target");
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("check.txt"), b"vulnerable").unwrap();
+    std::fs::create_dir_all(target.join("tests/security")).unwrap();
+    std::fs::write(
+        target.join("tests/security/x.test.sh"),
+        b"grep -q vulnerable check.txt",
+    )
+    .unwrap();
     let run = d.join("run");
     let init = omgs(
         &home,
@@ -258,6 +264,154 @@ fn proof_records_back_confirmed_findings() {
         &["validate", "--findings", findings.to_str().unwrap()],
     );
     assert_eq!(dangling.status.code(), Some(1));
+
+    // A draft kept outside the target is staged into the workspace copy only.
+    let (draft_name, staged_rel, staged_cmd, body): (&str, &str, &str, &[u8]) = if cfg!(windows) {
+        (
+            "draft.test.cmd",
+            "tests/security/new.test.cmd",
+            "cmd.exe /d /c tests\\security\\new.test.cmd",
+            b"@findstr /m vulnerable check.txt >nul && exit /b 1\r\n@exit /b 0\r\n",
+        )
+    } else {
+        (
+            "draft.test.sh",
+            "tests/security/new.test.sh",
+            "sh tests/security/new.test.sh",
+            b"grep -q vulnerable check.txt && exit 1; exit 0",
+        )
+    };
+    let draft = d.join(draft_name);
+    std::fs::write(&draft, body).unwrap();
+    let staged = omgs(
+        &home,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--finding",
+            &fp,
+            "--test",
+            staged_rel,
+            "--test-from",
+            draft.to_str().unwrap(),
+            "--cmd",
+            staged_cmd,
+        ],
+    );
+    assert_eq!(staged.status.code(), Some(1), "{}", text(&staged));
+    assert!(!target.join(staged_rel).exists());
+    let staged_record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run.join("proofs/2.json")).unwrap()).unwrap();
+    assert_eq!(staged_record["exit_code"], 1);
+    assert_eq!(staged_record["executor_error"], false);
+    assert!(staged_record["test_from"]
+        .as_str()
+        .unwrap()
+        .ends_with(draft_name));
+
+    // An independent replay of the recorded proof reproduces it.
+    let replay = omgs(
+        &home,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(replay.status.success(), "{}", text(&replay));
+    assert!(text(&replay).contains("reproduced"));
+    let replayed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run.join("proofs/3.json")).unwrap()).unwrap();
+    assert_eq!(replayed["replays"], 1);
+
+    // A command that never ran (127) is not a failing proof test.
+    let broken = omgs(
+        &home,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--finding",
+            &fp,
+            "--test",
+            "tests/security/x.test.sh",
+            "--cmd",
+            "omgs-no-such-command-xyz",
+        ],
+    );
+    assert!(
+        text(&broken).contains("proof_ref proofs/4.json"),
+        "{}",
+        text(&broken)
+    );
+    std::fs::write(&findings, finding(Some("proofs/4.json"))).unwrap();
+    let never_ran = omgs(
+        &home,
+        &["validate", "--findings", findings.to_str().unwrap()],
+    );
+    assert_eq!(never_ran.status.code(), Some(1));
+    assert!(
+        text(&never_ran).contains("never ran"),
+        "{}",
+        text(&never_ran)
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn posix_spawn_setsid_escape_is_killed_and_fails_the_run() {
+    if !mxc_ready() {
+        return;
+    }
+    let Some(py) = omgs::platform::which("python3") else {
+        eprintln!("skipping: python3 not found");
+        return;
+    };
+    let d = scratch("spawn-setsid");
+    let cmd = format!(
+        "'{}' -I -c 'import os\nos.posix_spawn(\"/bin/sleep\", [\"sleep\", \"300\"], {{}}, setsid=True)\nprint(\"spawned\")'",
+        py.display()
+    );
+    let out = omgs(&d, &["prove", "--cmd", &cmd]);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert!(t.contains("survivor killed"), "{t}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn concurrent_or_repeated_proofs_cannot_overspend_the_budget() {
+    let d = scratch("budget");
+    let home = d.join("home");
+    let target = d.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let run = d.join("run");
+    let init = omgs(
+        &home,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--budget",
+            "1",
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    // The charge lands before anything runs, so this holds with or without
+    // MXC installed: the first proof spends the budget, the second is refused.
+    let prove = || {
+        omgs(
+            &home,
+            &["prove", "--run", run.to_str().unwrap(), "--cmd", "true"],
+        )
+    };
+    let first = prove();
+    assert_ne!(first.status.code(), Some(2), "{}", text(&first));
+    let second = prove();
+    assert_eq!(second.status.code(), Some(2), "{}", text(&second));
+    assert!(text(&second).contains("budget exhausted"));
     let _ = std::fs::remove_dir_all(&d);
 }
 

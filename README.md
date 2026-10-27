@@ -67,6 +67,12 @@ To run tier 1 or tier 2 proofs OMGS uses Microsoft MXC, the only sandbox it trus
 
 On Ubuntu 24.04 and later the kernel restricts unprivileged user namespaces, which MXC's bubblewrap backend needs; `omgs doctor` says so when it applies. Either allow them for bubblewrap with an AppArmor profile, or set `kernel.apparmor_restrict_unprivileged_userns=0` on a machine you use for proofs. On Windows, PowerShell under MXC needs an interactive desktop session; over SSH only `cmd` workloads run.
 
+## What a proof record does and does not prove
+
+`omgs prove` writes `proofs/<n>.json` itself, beside the findings. Code under test cannot touch it: inside MXC it can write only its workspace copy and scratch. `omgs validate`, `report` and `critic` accept a confirmed finding only when its record names a pinned MXC executor, matches the MXC config the runner saved, ran a named proof test that failed with an assertion, and finished cleanly with no surviving processes.
+
+These checks catch mistakes and hand-edited records. They do not defend against a program running as you that sets out to forge every file, because nothing on your own machine can. The defence is that every proof is reproducible: anyone can rerun a record with `omgs prove --run <run-dir> --replay <n>`, and the evaluator stage does exactly that before a verdict stands. In the same way, `omgs approve` records your consent to tier 2; it is not a lock an agent could not pick, and the app under test stays inside MXC either way.
+
 ## Releases and verifying your download
 
 Releases are built and signed by a reproducible GitHub Actions pipeline and carry a `SHA256SUMS` manifest:

@@ -135,7 +135,7 @@ fn mxc_config_matches_verified_contract() {
         allowed_marker: Some(Path::new("/work/run/markers/allowed")),
         readonly: vec![PathBuf::from("/opt/homebrew")],
         denied: vec![PathBuf::from("/home/u/.cargo/credentials.toml")],
-        cargo_home: None,
+        rust: None,
     };
     let v = mxc_config(&input("windows"));
     assert_eq!(v["version"], "1.0.0");

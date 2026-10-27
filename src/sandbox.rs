@@ -61,6 +61,20 @@ pub fn executor_for(os: &str, arch: &str) -> Result<Executor, String> {
     }
 }
 
+/// Every executor OMGS pins, across platforms.
+pub fn pinned_executors() -> Vec<Executor> {
+    [
+        ("macos", "aarch64"),
+        ("linux", "aarch64"),
+        ("linux", "x86_64"),
+        ("windows", "aarch64"),
+        ("windows", "x86_64"),
+    ]
+    .into_iter()
+    .filter_map(|(os, arch)| executor_for(os, arch).ok())
+    .collect()
+}
+
 pub fn this_executor() -> Result<Executor, String> {
     executor_for(std::env::consts::OS, std::env::consts::ARCH)
 }
@@ -137,6 +151,9 @@ pub struct ProveRequest {
     /// Per-proof directory: holds workspace, scratch, markers and the config.
     pub run_dir: PathBuf,
     pub tier: Tier,
+    /// A draft test kept outside the target, copied into the workspace at
+    /// the given target-relative path before the command runs.
+    pub stage: Option<(PathBuf, String)>,
 }
 
 pub struct ProveResult {
@@ -204,22 +221,56 @@ fn toolchain_roots(os: &str, home: Option<&Path>) -> Vec<PathBuf> {
         ],
         _ => vec![],
     };
+    // Only the parts of ~/.cargo a build needs: tools and the crate caches.
+    // ~/.cargo itself holds config.toml and credentials, which stay unreadable;
+    // cargo gets a fresh CARGO_HOME in scratch that links to the caches.
     if let Some(h) = home {
-        roots.push(h.join(".cargo"));
+        for sub in RUST_CACHES.iter().chain(["bin"].iter()) {
+            roots.push(h.join(".cargo").join(sub));
+        }
         roots.push(h.join(".rustup"));
     }
     roots
 }
 
-/// Secrets inside readable toolchain roots, denied explicitly.
-fn denied_inside_roots(home: Option<&Path>) -> Vec<PathBuf> {
-    home.map(|h| {
-        vec![
-            h.join(".cargo").join("credentials"),
-            h.join(".cargo").join("credentials.toml"),
-        ]
-    })
-    .unwrap_or_default()
+const RUST_CACHES: [&str; 2] = ["registry", "git"];
+
+/// Rust locations for the sandboxed environment.
+pub struct RustHomes {
+    /// The real `~/.cargo/bin`, put first on PATH.
+    pub bin: PathBuf,
+    /// A per-run CARGO_HOME in scratch, linking to the readable caches.
+    pub cargo_home: PathBuf,
+    pub rustup_home: Option<PathBuf>,
+}
+
+/// Link `link` to the directory `to`: a symlink on Unix, a junction on
+/// Windows (which needs no privilege).
+fn link_dir(to: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(to, link)
+    }
+    #[cfg(windows)]
+    {
+        let ok = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(to)
+            .stdout(std::process::Stdio::null())
+            .status()?
+            .success();
+        if ok {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("mklink /J failed"))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (to, link);
+        Err(std::io::Error::other("directory links unsupported"))
+    }
 }
 
 /// Everything that varies per run, kept separate from probing the host so
@@ -234,7 +285,7 @@ pub struct ConfigInput<'a> {
     pub allowed_marker: Option<&'a Path>,
     pub readonly: Vec<PathBuf>,
     pub denied: Vec<PathBuf>,
-    pub cargo_home: Option<PathBuf>,
+    pub rust: Option<RustHomes>,
 }
 
 pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
@@ -257,8 +308,8 @@ pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
         } else {
             "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
         };
-        if let Some(c) = &input.cargo_home {
-            path = format!("{}:{path}", c.join("bin").display());
+        if let Some(r) = &input.rust {
+            path = format!("{}:{path}", r.bin.display());
         }
         vec![
             format!("HOME={scratch}"),
@@ -269,14 +320,16 @@ pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
             "LANG=C.UTF-8".into(),
         ]
     };
-    if let Some(c) = &input.cargo_home {
-        env.push(format!("CARGO_HOME={}", mxc_path(c)));
-        env.push("CARGO_NET_OFFLINE=true".into());
-        if let Some(parent) = c.parent() {
-            let rustup = parent.join(".rustup");
-            if input.readonly.contains(&rustup) {
-                env.push(format!("RUSTUP_HOME={}", mxc_path(&rustup)));
+    if let Some(r) = &input.rust {
+        if input.os == "windows" {
+            if let Some(p) = env.iter_mut().find(|e| e.starts_with("PATH=")) {
+                *p = format!("PATH={};{}", mxc_path(&r.bin), &p[5..]);
             }
+        }
+        env.push(format!("CARGO_HOME={}", mxc_path(&r.cargo_home)));
+        env.push("CARGO_NET_OFFLINE=true".into());
+        if let Some(rh) = &r.rustup_home {
+            env.push(format!("RUSTUP_HOME={}", mxc_path(rh)));
         }
     }
     let mut readonly: Vec<String> = input.readonly.iter().map(|p| mxc_path(p)).collect();
@@ -348,7 +401,9 @@ pub fn declared_controls(os: &str, tier: Tier) -> (Vec<String>, Vec<String>) {
     let mut gaps = Vec::new();
     enforced.push("inbound network and host loopback denied".into());
     if tier == Tier::LocalApp {
-        enforced.push("loopback private to the sandbox network namespace; host services unreachable".into());
+        enforced.push(
+            "loopback private to the sandbox network namespace; host services unreachable".into(),
+        );
     }
     if os == "windows" {
         gaps.push("process tree owned by the MXC ProcessContainer; no per-process CPU, file size or open file limits on Windows".into());
@@ -433,6 +488,13 @@ pub fn tier2_unavailable(os: &str) -> Option<String> {
     })
 }
 
+/// A readable root that contains, or is contained in, the run directory.
+fn overlapping_root<'a>(run_dir: &Path, readonly: &'a [PathBuf]) -> Option<&'a PathBuf> {
+    readonly
+        .iter()
+        .find(|r| run_dir.starts_with(r) || r.starts_with(run_dir))
+}
+
 pub fn prove(req: &ProveRequest) -> ProveOutcome {
     if req.tier == Tier::LocalApp {
         if let Some(reason) = tier2_unavailable(std::env::consts::OS) {
@@ -472,6 +534,17 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     } else if let Err(e) = std::fs::create_dir_all(&workspace) {
         return blocked(e.to_string());
     }
+    if let Some((draft, rel)) = &req.stage {
+        let dest = workspace.join(rel);
+        let staged = dest
+            .parent()
+            .map(std::fs::create_dir_all)
+            .unwrap_or(Ok(()))
+            .and_then(|_| std::fs::copy(draft, &dest).map(|_| ()));
+        if let Err(e) = staged {
+            return blocked(format!("cannot stage the draft test at {rel}: {e}"));
+        }
+    }
     for d in [
         scratch.clone(),
         scratch.join("cache"),
@@ -480,6 +553,50 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         if let Err(e) = std::fs::create_dir_all(&d) {
             return blocked(format!("cannot create {}: {e}", d.display()));
         }
+    }
+
+    let home = platform::home();
+    let readonly: Vec<PathBuf> = toolchain_roots(os, home.as_deref())
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect();
+    // A run directory under a readable root would make the workspace, the
+    // config and both sweep markers readable to every sandbox.
+    if let Some(root) = overlapping_root(&run_dir, &readonly) {
+        return blocked(format!(
+            "the proof directory {} overlaps the readable toolchain root {}; put OMGS_HOME or --run elsewhere",
+            run_dir.display(),
+            root.display()
+        ));
+    }
+
+    // Run a private copy verified after copying, so the file that executes is
+    // the file that was hashed, not whatever later sits at the shared path.
+    let exec_dir = run_dir.join("executor");
+    let executor = exec_dir.join(located.executor.file);
+    let copied = std::fs::create_dir_all(&exec_dir)
+        .and_then(|_| std::fs::copy(&located.path, &executor).map(|_| ()));
+    if let Err(e) = copied {
+        return blocked(format!("cannot stage the MXC executor: {e}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&exec_dir, std::fs::Permissions::from_mode(0o700));
+        if let Err(e) = std::fs::set_permissions(&executor, std::fs::Permissions::from_mode(0o700))
+        {
+            return blocked(format!("cannot stage the MXC executor: {e}"));
+        }
+    }
+    match sha256::digest_file(&executor) {
+        Ok(d) if d == located.executor.sha256 => {}
+        Ok(d) => {
+            return blocked(format!(
+                "the staged MXC executor hashed to {d}, not the pin {}; refusing to run",
+                located.executor.sha256
+            ))
+        }
+        Err(e) => return blocked(format!("cannot hash the staged MXC executor: {e}")),
     }
 
     let markers = if os == "macos" {
@@ -499,19 +616,33 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         None
     };
 
-    let home = platform::home();
-    let readonly: Vec<PathBuf> = toolchain_roots(os, home.as_deref())
-        .into_iter()
-        .filter(|p| p.exists())
-        .collect();
-    let denied: Vec<PathBuf> = denied_inside_roots(home.as_deref())
-        .into_iter()
-        .filter(|p| p.exists())
-        .collect();
-    let cargo_home = home
-        .as_ref()
-        .map(|h| h.join(".cargo"))
-        .filter(|c| readonly.contains(c));
+    // The sweep tells this run's processes apart by a read the policy allows
+    // (allowed marker) next to one it denies; deny it explicitly so no
+    // readable root can ever grant it.
+    let denied: Vec<PathBuf> = markers.iter().map(|m| m.denied.clone()).collect();
+    let rust = match home.as_ref().map(|h| h.join(".cargo")) {
+        Some(cargo) if readonly.contains(&cargo.join("bin")) => {
+            let cargo_home = scratch.join("cargo-home");
+            if let Err(e) = std::fs::create_dir_all(&cargo_home) {
+                return blocked(format!("cannot create {}: {e}", cargo_home.display()));
+            }
+            for sub in RUST_CACHES {
+                let real = cargo.join(sub);
+                if readonly.contains(&real) {
+                    if let Err(e) = link_dir(&real, &cargo_home.join(sub)) {
+                        return blocked(format!("cannot link the cargo {sub} cache: {e}"));
+                    }
+                }
+            }
+            let rustup = home.as_ref().map(|h| h.join(".rustup"));
+            Some(RustHomes {
+                bin: cargo.join("bin"),
+                cargo_home,
+                rustup_home: rustup.filter(|r| readonly.contains(r)),
+            })
+        }
+        _ => None,
+    };
     let config = mxc_config(&ConfigInput {
         os,
         containment: located.executor.containment,
@@ -522,7 +653,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         allowed_marker: markers.as_ref().map(|m| m.allowed.as_path()),
         readonly,
         denied,
-        cargo_home,
+        rust,
     });
     let config_text = serde_json::to_string_pretty(&config).unwrap_or_default();
     let config_path = run_dir.join("mxc-config.json");
@@ -530,7 +661,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         return blocked(format!("failed to write MXC config: {e}"));
     }
 
-    let mut cmd = Command::new(&located.path);
+    let mut cmd = Command::new(&executor);
     cmd.arg("--config").arg(&config_path);
     cmd.env_clear();
     if os == "windows" {
@@ -560,6 +691,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     // config stays as part of the proof evidence.
     let _ = std::fs::remove_dir_all(&workspace);
     let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(&exec_dir);
     if let Some(m) = &markers {
         if let Some(dir) = m.allowed.parent() {
             let _ = std::fs::remove_dir_all(dir);
@@ -579,6 +711,15 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_directories_inside_readable_roots_are_refused() {
+        let roots = vec![PathBuf::from("/home/u/.cargo/bin"), PathBuf::from("/opt")];
+        assert!(overlapping_root(Path::new("/home/u/.cargo/bin/omgs/run"), &roots).is_some());
+        assert!(overlapping_root(Path::new("/opt/x"), &roots).is_some());
+        assert!(overlapping_root(Path::new("/home/u"), &roots).is_some());
+        assert!(overlapping_root(Path::new("/home/u/.local/share/omgs/run"), &roots).is_none());
+    }
 
     #[test]
     fn parent_dirs_cover_windows_and_unix_paths() {

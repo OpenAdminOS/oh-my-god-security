@@ -37,6 +37,9 @@ pub struct Supervised {
     pub output: String,
     pub output_bytes_total: u64,
     pub capture_complete: bool,
+    /// Every group signal, reap and survivor scan succeeded. False means the
+    /// run cannot vouch that nothing it started is still running.
+    pub cleanup_complete: bool,
     pub survivors: Vec<Survivor>,
     pub enforced: Vec<String>,
     pub notes: Vec<String>,
@@ -797,6 +800,7 @@ pub fn run(mut cmd: Command, limits: &Limits, markers: Option<&SweepMarkers>) ->
         output: String::new(),
         output_bytes_total: 0,
         capture_complete: false,
+        cleanup_complete: false,
         survivors: Vec::new(),
         enforced: Vec::new(),
         notes: Vec::new(),
@@ -942,6 +946,7 @@ pub fn run(mut cmd: Command, limits: &Limits, markers: Option<&SweepMarkers>) ->
     }
     result.output_bytes_total = capture.total;
     result.output = capture.text();
+    result.cleanup_complete = cleanup_complete;
     result.success = result.exit_code == Some(0)
         && !result.timed_out
         && result.capture_complete

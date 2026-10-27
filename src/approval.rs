@@ -1,5 +1,9 @@
 //! One-time human approval of tier 2 proofs per repository, kept in the
-//! per-user data directory, never in the target or the run.
+//! per-user data directory, never in the target or the run. This records
+//! consent from a person following the documented flow. It is not a security
+//! boundary against a process running as the same user, which could write
+//! this file or drive a terminal; containment of the app under test comes
+//! from MXC alone.
 
 use std::io::BufRead;
 use std::path::Path;
@@ -7,15 +11,20 @@ use std::path::Path;
 const FILE: &str = "tier2-approvals.json";
 
 fn read(data: &Path) -> Result<Vec<serde_json::Value>, String> {
+    use std::io::Read;
     let path = data.join(FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| v.get("approvals").and_then(|a| a.as_array()).cloned())
-            .ok_or_else(|| format!("{} is malformed", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(format!("read {}: {e}", path.display())),
-    }
+    let Some(mut file) = crate::platform::open_single_link(&path)
+        .map_err(|e| format!("{}: {e}; refusing to trust it", path.display()))?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("approvals").and_then(|a| a.as_array()).cloned())
+        .ok_or_else(|| format!("{} is malformed", path.display()))
 }
 
 /// `target` must already be canonical.
