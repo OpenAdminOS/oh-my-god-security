@@ -409,6 +409,37 @@ fn complete_run() -> (Ledger, Vec<SourcedCandidate>, FindingsFile) {
     (ledger, vec![sc], file(vec![f]))
 }
 
+fn relocate_replay_fixture(value: &mut serde_json::Value, old: &str, new: &str) {
+    let old_mxc = omgs::platform::mxc_path(std::path::Path::new(old));
+    let new_mxc = omgs::platform::mxc_path(std::path::Path::new(new));
+    match value {
+        serde_json::Value::String(text) => {
+            let forms = [
+                (old.to_string(), new.to_string()),
+                (old_mxc.clone(), new_mxc.clone()),
+                (old.replace('\\', "/"), new.replace('\\', "/")),
+                (old_mxc.replace('\\', "/"), new_mxc.replace('\\', "/")),
+            ];
+            // Replace exactly one representation, including MXC's prefix-stripped
+            // Windows form. A second pass could turn proofs/1001 into 1001001.
+            if let Some((from, to)) = forms.iter().find(|(from, _)| text.contains(from)) {
+                *text = text.replace(from, to);
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for value in array {
+                relocate_replay_fixture(value, old, new);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for value in object.values_mut() {
+                relocate_replay_fixture(value, old, new);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn adjudicate_fixture(dir: &std::path::Path, findings: &FindingsFile) {
     let mut decisions = Vec::new();
     for f in &findings.findings {
@@ -431,29 +462,7 @@ fn adjudicate_fixture(dir: &std::path::Path, findings: &FindingsFile) {
                 .unwrap(),
             )
             .unwrap();
-            fn relocate(v: &mut serde_json::Value, old: &str, new: &str) {
-                match v {
-                    serde_json::Value::String(s) => {
-                        *s = if s.contains(old) {
-                            s.replace(old, new)
-                        } else {
-                            s.replace(&old.replace('\\', "/"), &new.replace('\\', "/"))
-                        };
-                    }
-                    serde_json::Value::Array(a) => {
-                        for v in a {
-                            relocate(v, old, new);
-                        }
-                    }
-                    serde_json::Value::Object(o) => {
-                        for v in o.values_mut() {
-                            relocate(v, old, new);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            relocate(&mut config, &original_dir, &replay.proof_dir);
+            relocate_replay_fixture(&mut config, &original_dir, &replay.proof_dir);
             let config = config.to_string();
             replay.config_sha256 = omgs::sha256::digest(config.as_bytes());
             write_private_fixture(config_path, config).unwrap();
@@ -3593,4 +3602,41 @@ fn evaluator_cannot_judge_an_absorbed_hunters_candidate() {
         .iter()
         .any(|g| g.contains("evaluator hunted absorbed candidate")));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn replay_fixture_relocates_windows_and_unix_paths_exactly_once() {
+    for (old, new, input, expected) in [
+        (
+            r"\\?\C:\fixture\proofs\1",
+            r"\\?\C:\fixture\proofs\1001",
+            r"C:\fixture\proofs\1\workspace",
+            r"C:\fixture\proofs\1001\workspace",
+        ),
+        (
+            r"\\?\UNC\server\share\proofs\1",
+            r"\\?\UNC\server\share\proofs\1001",
+            r"\\server\share\proofs\1\workspace",
+            r"\\server\share\proofs\1001\workspace",
+        ),
+        (
+            r"\\?\C:\fixture\proofs\1",
+            r"\\?\C:\fixture\proofs\1001",
+            "C:/fixture/proofs/1/workspace",
+            "C:/fixture/proofs/1001/workspace",
+        ),
+        (
+            "/fixture/proofs/1",
+            "/fixture/proofs/1001",
+            "/fixture/proofs/1/workspace",
+            "/fixture/proofs/1001/workspace",
+        ),
+    ] {
+        let mut config =
+            serde_json::json!({"process":{"cwd":input,"env":[format!("HOME={input}")]}});
+        relocate_replay_fixture(&mut config, old, new);
+        assert_eq!(config["process"]["cwd"], expected);
+        assert_eq!(config["process"]["env"][0], format!("HOME={expected}"));
+        assert!(!config.to_string().contains("1001001"));
+    }
 }
