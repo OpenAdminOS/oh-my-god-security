@@ -3,11 +3,17 @@ use crate::platform;
 use std::io::{Error, Result};
 use std::path::{Path, PathBuf};
 
-/// Install the running, verified executable and optional verified MXC files.
-/// Authenticity is established by the bootstrap before invoking this command.
-pub fn install_self(to: &Path, mxc: Option<&Path>, license: Option<&Path>) -> Result<()> {
-    let executable = std::env::current_exe()?;
-    publish_bundle(to, &executable, mxc, license)
+/// Publish only bytes read through the retained staging handle and matching
+/// the checksums supplied by the bootstrap after signature verification.
+pub fn install_self(
+    to: &Path,
+    staging: &Path,
+    binary: (&Path, &str),
+    mxc: Option<(&Path, &str)>,
+    license: Option<(&Path, &str)>,
+) -> Result<()> {
+    let source = platform::StagingDir::open(staging)?;
+    publish_verified(to, &source, binary, mxc, license)
 }
 
 fn install_tree(path: &Path) -> Result<()> {
@@ -51,10 +57,15 @@ impl Drop for Staged {
     }
 }
 
-fn stage(source: &Path, destination: &Path, executable: bool) -> Result<Staged> {
+fn stage(
+    source: &platform::StagingDir,
+    name: &Path,
+    expected: &str,
+    destination: &Path,
+    executable: bool,
+) -> Result<Staged> {
     use std::io::Write;
-    let source = platform::open_single_link(source)?
-        .ok_or_else(|| Error::other(format!("verified source {} missing", source.display())))?;
+    let bytes = source.read_verified(name, expected)?;
     let tmp = destination.with_file_name(format!(".omgs-{}", platform::random_nonce()?));
     #[cfg(windows)]
     let mut file = platform::open_private_write(&tmp, true)?;
@@ -73,11 +84,6 @@ fn stage(source: &Path, destination: &Path, executable: bool) -> Result<Staged> 
     platform::check_private_file(&file)?;
     // Read only regular, bounded verified files. Compare the copied bytes before
     // any destination is replaced, including after write/sync/close.
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut std::io::Read::take(source, 104857601), &mut bytes)?;
-    if bytes.len() > 104857600 {
-        return Err(Error::other("verified source exceeds byte limit"));
-    }
     file.write_all(&bytes)?;
     file.sync_all()?;
     drop(file);
@@ -87,11 +93,12 @@ fn stage(source: &Path, destination: &Path, executable: bool) -> Result<Staged> 
     Ok(staged)
 }
 
-fn publish_bundle(
+fn publish_verified(
     to: &Path,
-    binary: &Path,
-    mxc: Option<&Path>,
-    license: Option<&Path>,
+    source_dir: &platform::StagingDir,
+    binary: (&Path, &str),
+    mxc: Option<(&Path, &str)>,
+    license: Option<(&Path, &str)>,
 ) -> Result<()> {
     if !to.is_absolute() {
         return Err(Error::other("installation root must be absolute"));
@@ -103,7 +110,11 @@ fn publish_bundle(
     }
     let mut files = Vec::new();
     if let (Some(mxc), Some(license)) = (mxc, license) {
-        let name = mxc.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let name = mxc
+            .0
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         let executor = include_str!("../skill/mxc-pins.txt")
             .lines()
             .find_map(|line| {
@@ -130,7 +141,13 @@ fn publish_bundle(
     let mut staged = Vec::new();
     for (source, destination, executable) in &files {
         install_tree(destination.parent().unwrap())?;
-        staged.push(stage(source, destination, *executable)?);
+        staged.push(stage(
+            source_dir,
+            source.0,
+            source.1,
+            destination,
+            *executable,
+        )?);
     }
     for ((_, destination, _), source) in files.iter().zip(&staged) {
         platform::safe_path(destination.parent().unwrap())?;
@@ -167,13 +184,43 @@ fn publish_bundle(
 }
 
 #[cfg(test)]
+pub(crate) fn publish_bundle(
+    to: &Path,
+    binary: &Path,
+    mxc: Option<&Path>,
+    license: Option<&Path>,
+) -> Result<()> {
+    let hash = |p: &Path| crate::sha256::digest_file(p).unwrap_or_default();
+    let binary_hash = hash(binary);
+    let mxc_hash = mxc.map(hash);
+    let license_hash = license.map(hash);
+    install_self(
+        to,
+        binary.parent().unwrap(),
+        (Path::new(binary.file_name().unwrap()), &binary_hash),
+        mxc.map(|p| {
+            (
+                Path::new(p.file_name().unwrap()),
+                mxc_hash.as_deref().unwrap(),
+            )
+        }),
+        license.map(|p| {
+            (
+                Path::new(p.file_name().unwrap()),
+                license_hash.as_deref().unwrap(),
+            )
+        }),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
-            let base = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+            let base = std::fs::canonicalize(crate::platform::temp_root().unwrap()).unwrap();
             let root = base.join(format!(
                 "omgs-install-{}",
                 platform::random_nonce().unwrap()
@@ -202,6 +249,37 @@ mod tests {
     fn destination(home: &Path) -> PathBuf {
         home.join("bin")
             .join(if cfg!(windows) { "omgs.exe" } else { "omgs" })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_staging_handle_never_reopens_swapped_ancestor() {
+        let fixture = Fixture::new();
+        let parent = fixture.0.join("parent");
+        let stage = parent.join("stage");
+        platform::create_private_tree(&stage).unwrap();
+        std::fs::write(stage.join("binary"), b"verified").unwrap();
+        let expected = crate::sha256::digest(b"verified");
+        let held = platform::StagingDir::open(&stage).unwrap();
+        let moved = fixture.0.join("moved");
+        std::fs::rename(&parent, &moved).unwrap();
+        platform::create_private_tree(&stage).unwrap();
+        std::fs::write(stage.join("binary"), b"substituted").unwrap();
+        assert_eq!(
+            held.read_verified(Path::new("binary"), &expected).unwrap(),
+            b"verified"
+        );
+        // Even a change inside the retained directory after verification must
+        // fail before any destination is published.
+        std::fs::write(moved.join("stage/binary"), b"changed in retained directory").unwrap();
+        let home = fixture.0.join("home");
+        assert!(
+            publish_verified(&home, &held, (Path::new("binary"), &expected), None, None).is_err()
+        );
+        assert!(!destination(&home).exists());
+        std::fs::remove_file(moved.join("stage/binary")).unwrap();
+        std::os::unix::fs::symlink(stage.join("binary"), moved.join("stage/binary")).unwrap();
+        assert!(held.read_verified(Path::new("binary"), &expected).is_err());
     }
 
     #[test]

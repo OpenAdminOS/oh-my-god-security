@@ -15,9 +15,10 @@ fn write_private_fixture(
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let base = std::env::temp_dir()
+    let base = omgs::platform::temp_root()
+        .unwrap()
         .canonicalize()
-        .unwrap_or_else(|_| std::env::temp_dir());
+        .unwrap_or_else(|_| omgs::platform::temp_root().unwrap());
     static BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let base = BASE.get_or_init(|| {
         let base = base.join(format!("omgs-private-fixtures-{}", std::process::id()));

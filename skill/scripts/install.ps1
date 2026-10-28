@@ -40,7 +40,34 @@ Download and install these files? Type yes to consent:
 '@
 Write-Output "Resolved: OMGS $Version; source $Base; destination $DestRoot; binary $asset; executor $mxcAsset"
 if ((Read-Host) -cne 'yes') { throw 'Installation cancelled before downloads' }
-$tmp = Join-Path ([IO.Path]::GetTempPath()) ('omgs-bootstrap-' + [guid]::NewGuid().ToString('N'))
+$tmp = Join-Path $env:LOCALAPPDATA ('omgs-bootstrap-' + [guid]::NewGuid().ToString('N'))
+# Admit the complete profile-local chain before creating or verifying staging.
+function Admit-Staging([string]$Path) {
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $trusted = @($user, 'S-1-5-18', 'S-1-5-32-544', 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')
+    $entry = Get-Item -LiteralPath $Path -Force
+    $leaf = $true
+    while ($null -ne $entry) {
+        if (-not $entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Unsafe staging ancestor: $($entry.FullName)" }
+        $a = Get-Acl -LiteralPath $entry.FullName
+        $owner = $a.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($owner -notin $trusted) { throw "Unsafe staging owner: $($entry.FullName)" }
+        $rules = $a.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+        foreach ($r in $rules) {
+            if ($r.AccessControlType -eq 'Deny') { continue }
+            if ($r.AccessControlType -ne 'Allow') { throw 'Unsupported staging ACL' }
+            if ($r.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+            # Ancestors may allow entry creation but never replacement of the
+            # trusted child. The staging leaf must reject all foreign writes.
+            $mask = if ($leaf) { 0x500d0156 } else { 0x500d0140 }
+            if (($r.FileSystemRights.value__ -band $mask) -ne 0 -and $r.IdentityReference.Value -notin $trusted) { throw "Unsafe staging ancestor ACL: $($entry.FullName)" }
+        }
+        $leaf = $false
+        $entry = $entry.Parent
+    }
+}
+if (-not $env:LOCALAPPDATA -or -not [IO.Path]::IsPathRooted($env:LOCALAPPDATA)) { throw 'LOCALAPPDATA must be absolute' }
+Admit-Staging $env:LOCALAPPDATA
 # Create staging with an owner-only protected DACL supplied at creation.
 $StorageUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $acl = [Security.AccessControl.DirectorySecurity]::new()
@@ -48,6 +75,7 @@ $acl.SetOwner($StorageUser)
 $acl.SetAccessRuleProtection($true, $false)
 $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($StorageUser, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
 [IO.DirectoryInfo]::new($tmp).Create($acl)
+Admit-Staging $tmp
 function Fetch([string]$Name, [long]$Limit) {
     $to = Join-Path $tmp $Name
     if ($Base.StartsWith('https://', [StringComparison]::Ordinal)) {
@@ -93,6 +121,7 @@ function Checksum([string]$Name, [string]$Path = (Join-Path $tmp $Name)) {
     })
     if ($entries.Count -ne 1 -or $entries[0] -cnotmatch '^[0-9a-f]{64}$') { throw "missing or invalid checksum: $Name" }
     if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $entries[0]) { throw "checksum mismatch: $Name" }
+    $script:ExpectedHash = $entries[0]
     Write-Output "SHA256SUMS verified: $Name"
 }
 function Signature([string]$Path, [string]$Subject) {
@@ -121,21 +150,26 @@ try {
     Fetch 'SHA256SUMS' 1048576
     Fetch $asset 104857600
     Checksum $asset
+    $binaryHash = $ExpectedHash
     Signature (Join-Path $tmp $asset) $OmgsSubject
     Fetch $mxcAsset 104857600
     Checksum $mxcAsset
+    $executorHash = $ExpectedHash
     if ((Get-FileHash -LiteralPath (Join-Path $tmp $mxcAsset) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $pin[3]) { throw 'MXC pin mismatch' }
     Signature (Join-Path $tmp $mxcAsset) $MicrosoftSubject
     Fetch 'MXC-LICENSE.txt' 1048576
     Checksum 'MXC-LICENSE.txt'
+    $licenseHash = $ExpectedHash
     Write-Output "MXC 1.0.1 pin verified: $($pin[3])"
     $verified = Provenance (Join-Path $tmp $asset)
     if ($verified) { Write-Output 'OMGS provenance: verified' }
     else { Write-Output 'OMGS provenance: unverified (unavailable or failed; this alone is not evidence of tampering)' }
+    Admit-Staging $tmp
+    if ((Get-FileHash -LiteralPath (Join-Path $tmp $asset) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $binaryHash) { throw 'checksum mismatch before execution' }
     $actual = & (Join-Path $tmp $asset) --version
     if ($LASTEXITCODE -ne 0 -or $actual -cne "omgs $Version") { throw "version mismatch: skill expects omgs $Version; binary reports $actual" }
     # The verified executable owns admission and exact-path publication.
-    & (Join-Path $tmp $asset) install-self --to $DestRoot --mxc (Join-Path $tmp $mxcAsset) --license (Join-Path $tmp 'MXC-LICENSE.txt')
+    & (Join-Path $tmp $asset) install-self --to $DestRoot --staging $tmp --binary $asset --binary-sha256 $binaryHash --mxc $mxcAsset --mxc-sha256 $executorHash --license MXC-LICENSE.txt --license-sha256 $licenseHash
     if ($LASTEXITCODE -ne 0) { throw 'Verified install-self failed' }
 } finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

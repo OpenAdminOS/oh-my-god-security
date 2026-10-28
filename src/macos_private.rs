@@ -164,7 +164,7 @@ mod tests {
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!(
+            let dir = crate::platform::temp_root().unwrap().join(format!(
                 "omgs-macos-acl-{}",
                 platform::random_nonce().unwrap()
             ));

@@ -63,6 +63,10 @@ Set-Acl -LiteralPath '{escaped}' -AclObject $acl
         self.env = dict(os.environ, OMGS_HOME=str(self.root / 'home'), OMGS_RELEASE_BASE=str(self.bundle),
                         RUSTUP_AUTO_INSTALL='0', GH_TOKEN='', GITHUB_TOKEN='',
                         GH_CONFIG_DIR=str(self.root / 'gh-config'))
+        # Exercise profile staging only inside this disposable fixture.
+        profile = self.root / 'profile'
+        profile.mkdir(mode=0o700)
+        self.env['LOCALAPPDATA' if self.windows else 'HOME'] = str(profile)
         self.script = self.skill / 'scripts' / ('install.ps1' if self.windows else 'install.sh')
 
     def checksums(self):
@@ -124,6 +128,74 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         for text in ['Installed omgs 0.1.0:', 'Installed MXC 1.0.1:', 'SHA256SUMS verified:', 'Publisher signature verified:', 'provenance: unverified']:
             self.assertIn(text, out.stdout + out.stderr)
+
+    def test_unsafe_staging_ancestor_is_refused_before_download(self):
+        self.fake_verifiers()
+        profile = Path(self.env['LOCALAPPDATA' if self.windows else 'HOME'])
+        self.make_staging_unsafe(profile)
+        self.env['OMGS_RELEASE_BASE'] = str(self.root / 'missing-bundle')
+        self.assert_failed(self.run_install(), 'Unsafe staging')
+
+    def make_staging_unsafe(self, path):
+        if self.windows:
+            escaped = str(path).replace("'", "''")
+            command = f"""
+$ErrorActionPreference = 'Stop'
+$a = Get-Acl -LiteralPath '{escaped}'
+$s = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+$a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($s, 'DeleteSubdirectoriesAndFiles', 'Allow'))
+Set-Acl -LiteralPath '{escaped}' -AclObject $a
+"""
+            subprocess.run(['powershell', '-NoProfile', '-Command', command], check=True, capture_output=True)
+        else:
+            path.chmod(0o777)
+
+    @unittest.skipUnless(platform.system() == 'Darwin', 'macOS ACLs')
+    def test_staging_ancestor_mutation_acl_is_refused(self):
+        self.fake_verifiers()
+        profile = Path(self.env['HOME'])
+        subprocess.run(['/bin/chmod', '+a', 'everyone allow delete_child', str(profile)], check=True)
+        try:
+            self.assert_failed(self.run_install(), 'Unsafe staging')
+        finally:
+            subprocess.run(['/bin/chmod', '-N', str(profile)], check=True)
+
+    def test_staging_ancestor_swap_after_verification_is_refused(self):
+        self.fake_verifiers()
+        text = self.script.read_text()
+        if self.windows:
+            marker = '    Admit-Staging $tmp'
+            injection = """    $parent = Split-Path $tmp -Parent
+    $moved = $parent + '-moved'
+    Move-Item -LiteralPath $parent -Destination $moved
+    [IO.Directory]::CreateDirectory($parent) | Out-Null
+    $a = Get-Acl -LiteralPath $parent
+    $s = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+    $a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($s, 'DeleteSubdirectoriesAndFiles', 'Allow'))
+    Set-Acl -LiteralPath $parent -AclObject $a
+    Move-Item -LiteralPath (Join-Path $moved (Split-Path $tmp -Leaf)) -Destination $tmp
+"""
+        else:
+            marker = 'admit_staging "$tmp"\n[ "$(digest'
+            injection = '''mv "$staging_parent" "$staging_parent-moved"
+mkdir "$staging_parent"
+chmod 0777 "$staging_parent"
+mv "$staging_parent-moved/$(basename "$tmp")" "$tmp"
+'''
+        self.assertEqual(text.count(marker), 1)
+        self.script.write_text(text.replace(marker, injection + marker))
+        self.assert_failed(self.run_install(), 'Unsafe staging')
+
+    def test_source_mutation_after_verification_is_refused_by_install_self(self):
+        self.fake_verifiers()
+        text = self.script.read_text()
+        marker = ('    # The verified executable owns admission' if self.windows else
+                  '# The verified executable owns admission')
+        injection = ("    [IO.File]::WriteAllText((Join-Path $tmp 'MXC-LICENSE.txt'), 'changed after verification')\n"
+                     if self.windows else
+                     "printf 'changed after verification' > \"$tmp/MXC-LICENSE.txt\"\n")
+        self.script.write_text(text.replace(marker, injection + marker))
+        self.assert_failed(self.run_install(), 'verified source checksum mismatch')
 
     def assert_existing_install_survives(self, failure):
         self.fake_verifiers()

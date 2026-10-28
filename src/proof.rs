@@ -1398,7 +1398,9 @@ mod tests {
 
     #[test]
     fn tree_digest_includes_dirty_changes_and_git_behavior() {
-        let d = std::env::temp_dir().join(format!("omgs-digest-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-digest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join("nested/.git/hooks")).unwrap();
         for name in ["a", "nested/.git/config", "nested/.git/hooks/pre-commit"] {
@@ -1460,7 +1462,9 @@ mod tests {
 
     #[test]
     fn reserve_numbers_are_unique_and_refs_stay_inside_the_run() {
-        let run = std::env::temp_dir().join(format!("omgs-proof-test-{}", std::process::id()));
+        let run = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-proof-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&run);
         let (a, _) = reserve(&run).unwrap();
         let (b, _) = reserve(&run).unwrap();

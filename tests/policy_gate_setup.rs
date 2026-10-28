@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn scratch(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("omgs-policy-{}-{name}", std::process::id()));
+    let path = omgs::platform::temp_root()
+        .unwrap()
+        .join(format!("omgs-policy-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     omgs::platform::create_private_tree(&path).unwrap();
     std::fs::canonicalize(path).unwrap()
@@ -216,6 +218,29 @@ fn evidence(run: &Path, target: &Path) {
         "{:?}",
         omgs::proof::validate_proofs(&file, run)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_os_temp_supports_gate_and_run_storage() {
+    let root = scratch("temp-alias");
+    let physical = root.join("physical");
+    omgs::platform::create_private_dir_new(&physical).unwrap();
+    let alias = root.join("alias");
+    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "registered_gate_executes_immutable_head_and_ignores_advisory_artifacts",
+            "--nocapture",
+        ])
+        .env("TMPDIR", &alias)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", output(&out));
+    // Installation and explicit run destinations retain strict admission.
+    assert!(omgs::platform::create_private_tree(&alias.join("explicit-run")).is_err());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

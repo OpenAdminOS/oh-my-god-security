@@ -172,6 +172,19 @@ The skill carries `skill/VERSION`. It requires `omgs --version` to match exactly
 including an already installed binary. A mismatch stops the review with both
 versions shown. The scripts download that exact tag, never `latest`.
 
+Installer staging uses a fresh private directory under the physical user home
+on Unix, or under `LOCALAPPDATA` on Windows. The bootstrap admits the complete
+ancestor chain before verification and again before execution. Unsafe ownership,
+replacement permissions, macOS mutation ACLs and Windows reparse points cause
+refusal. Ambient temporary-directory settings cannot choose executable staging.
+The verified binary's hidden `install-self` retains one staging directory handle,
+opens only relative leaf names without following links, and checks every source
+against the SHA-256 supplied from the verified bundle before publishing any file.
+Internally selected OS temporary roots are resolved to physical paths for gate
+storage. Proof and sensor scratch stays under admitted run storage; macOS capture
+already resolves Darwin's private temporary root. Explicit storage and install
+destinations still reject symlink ancestors.
+
 Before either download, the skill and scripts show the identical consent text in
 [SKILL.md](skill/SKILL.md#setup), including source, maximum sizes, verification and
 install location. A typed `yes` authorizes the downloads. The scripts print resolved
@@ -272,7 +285,7 @@ secrets are listed separately in [SECURITY.md](SECURITY.md#release-owner-configu
 | `HOME`, `USERPROFILE` | Host home discovery; HOME wins, then USERPROFILE on Windows. Sandboxed values point to scratch. |
 | `PATH`, `PATHEXT` | Host tool lookup, absolute entries only. Sandboxed PATH is rebuilt; Windows PATHEXT is explicit. |
 | `SYSTEMROOT`, `WINDIR` | Windows host helpers and MXC bootstrap. SYSTEMROOT defaults to `C:\Windows` where applicable; never a target-controlled grant. |
-| `TEMP`, `TMP`, `TMPDIR` | Host temporary staging (including the standard-library temp directory). Replaced with scratch in proof workloads. |
+| `TEMP`, `TMP`, `TMPDIR` | OS-selected internal temporary storage, resolved to its physical root before admission. Installer executable staging ignores these settings. Replaced with scratch in proof workloads. |
 | `LOCALAPPDATA` | Windows executor bootstrap; replaced with scratch in workloads. |
 | `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` | Linux systemd wrapper bus access only; stripped before target execution. |
 | `XDG_CACHE_HOME`, `CLANG_MODULE_CACHE_PATH` | Generated scratch cache directories for proof workloads. |

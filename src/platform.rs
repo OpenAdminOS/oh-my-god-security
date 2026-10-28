@@ -87,6 +87,93 @@ pub fn which(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Resolve only OS-selected internal temporary roots. User-supplied storage
+/// and installation paths must still pass strict, non-resolving admission.
+pub fn temp_root() -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(std::env::temp_dir())
+}
+
+/// One retained staging directory. Sources are leaf names, never caller paths.
+pub struct StagingDir(std::fs::File);
+impl StagingDir {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        check_private_dir(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options
+                .share_mode(0x1 | 0x2)
+                .custom_flags(0x0200_0000 | 0x0020_0000);
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_dir() || is_link(&file.metadata()?) {
+            return Err(std::io::Error::other("staging must be a real directory"));
+        }
+        Ok(Self(file))
+    }
+
+    pub fn read_verified(&self, name: &Path, expected: &str) -> std::io::Result<Vec<u8>> {
+        use std::io::Error;
+        if name.components().count() != 1
+            || !matches!(
+                name.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+            || expected.len() != 64
+            || !expected
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Error::other(
+                "source must be a leaf name with a lowercase SHA-256",
+            ));
+        }
+        #[cfg(unix)]
+        let file = {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+            let name = std::ffi::CString::new(name.as_os_str().as_bytes())?;
+            // SAFETY: the retained directory and NUL-terminated leaf stay live.
+            let fd = unsafe {
+                libc::openat(
+                    self.0.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(Error::last_os_error());
+            }
+            // SAFETY: openat returned a new descriptor owned by this File.
+            unsafe { std::fs::File::from_raw_fd(fd) }
+        };
+        #[cfg(windows)]
+        let file = windows_private::open_relative(&self.0, name)?;
+        #[cfg(not(any(unix, windows)))]
+        return Err(Error::other("staging handles unavailable"));
+        if !is_single_link_file(&file)? {
+            return Err(Error::other(
+                "staging source must be a single-link regular file",
+            ));
+        }
+        let bytes = read_bounded_file(file, 104857600)?;
+        if crate::sha256::digest(&bytes) != expected {
+            return Err(Error::other(format!(
+                "verified source checksum mismatch: {}",
+                name.display()
+            )));
+        }
+        Ok(bytes)
+    }
+}
+
 /// Open `path` for reading without following a final symlink (or reparse
 /// point on Windows) and without blocking on a FIFO, and accept it only when
 /// it is a regular file without hardlink aliases. An opened file may have
@@ -488,7 +575,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn pinned_metadata_reader_allows_concurrent_atomic_publication() {
-        let dir = std::env::temp_dir().join(format!("omgs-share-delete-{}", std::process::id()));
+        let dir = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-share-delete-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         create_private_dir(&dir).unwrap();
         let run = dir.join("run");
@@ -529,7 +618,9 @@ mod tests {
     #[test]
     fn writable_metadata_and_lock_modes_are_refused_without_repair() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let dir = std::env::temp_dir().join(format!("omgs-leaf-mode-{}", random_nonce().unwrap()));
+        let dir = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-leaf-mode-{}", random_nonce().unwrap()));
         create_private_dir_new(&dir).unwrap();
         let run = dir.join("run");
         create_private_dir_new(&run).unwrap();
@@ -566,7 +657,9 @@ mod tests {
 
     #[test]
     fn single_link_open_refuses_hardlinks_and_accepts_plain_files() {
-        let d = std::env::temp_dir().join(format!("omgs-link-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let a = d.join("a");

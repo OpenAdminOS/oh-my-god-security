@@ -77,7 +77,7 @@ fn usage() {
 fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
     let (allowed, positional): (&str, bool) = match cmd {
         "setup" => ("--yes --from --dry-run --install-skills --replace --verify-mxc --write-policy --mode", false),
-        "install-self" => ("--to --mxc --license", false),
+        "install-self" => ("--to --staging --binary --binary-sha256 --mxc --mxc-sha256 --license --license-sha256", false),
         "review" => ("--repo-url --mode --budget --no-sensors", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
             "--target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of",
@@ -254,9 +254,29 @@ fn main() -> ExitCode {
 
 fn cmd_install_self(rest: &[String]) -> Result<(), String> {
     let to = PathBuf::from(flag(rest, "--to").ok_or("install-self requires --to")?);
-    let mxc = flag(rest, "--mxc").map(PathBuf::from);
-    let license = flag(rest, "--license").map(PathBuf::from);
-    omgs::install::install_self(&to, mxc.as_deref(), license.as_deref()).map_err(|e| e.to_string())
+    let staging = PathBuf::from(flag(rest, "--staging").ok_or("install-self requires --staging")?);
+    let source =
+        |name: Option<String>, hash: Option<String>| -> Result<(PathBuf, String), String> {
+            Ok((
+                PathBuf::from(name.ok_or("install-self requires a source name")?),
+                hash.ok_or("install-self requires a source SHA-256")?,
+            ))
+        };
+    let binary = source(flag(rest, "--binary"), flag(rest, "--binary-sha256"))?;
+    let mxc = flag(rest, "--mxc")
+        .map(|n| source(Some(n), flag(rest, "--mxc-sha256")))
+        .transpose()?;
+    let license = flag(rest, "--license")
+        .map(|n| source(Some(n), flag(rest, "--license-sha256")))
+        .transpose()?;
+    omgs::install::install_self(
+        &to,
+        &staging,
+        (&binary.0, &binary.1),
+        mxc.as_ref().map(|s| (s.0.as_path(), s.1.as_str())),
+        license.as_ref().map(|s| (s.0.as_path(), s.1.as_str())),
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn cmd_gate(args: &[String]) -> Result<(), String> {
@@ -3364,8 +3384,9 @@ mod cli_tests {
 
     #[test]
     fn oversized_answer_store_is_refused() {
-        let path =
-            std::env::temp_dir().join(format!("omgs-answer-large-{}.json", std::process::id()));
+        let path = omgs::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-answer-large-{}.json", std::process::id()));
         let file = std::fs::File::create(&path).unwrap();
         file.set_len((1 << 20) + 1).unwrap();
         assert!(read_store(&path).unwrap_err().contains("byte limit"));
@@ -3620,7 +3641,9 @@ mod cli_tests {
 mod inventory_regressions {
     #[test]
     fn size_limit_is_persisted_as_a_coverage_gap() {
-        let dir = std::env::temp_dir().join(format!("omgs-inventory-limit-{}", std::process::id()));
+        let dir = omgs::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-inventory-limit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let target = dir.join("repo");
         let run = dir.join("run");
@@ -3664,7 +3687,9 @@ mod inventory_regressions {
     }
     #[test]
     fn omissions_are_bounded_sorted_and_directory_read_failures_are_recorded() {
-        let root = std::env::temp_dir().join("omgs-nonexistent-inventory-root");
+        let root = omgs::platform::temp_root()
+            .unwrap()
+            .join("omgs-nonexistent-inventory-root");
         let mut gaps = super::InventoryGaps::default();
         let mut files = Vec::new();
         super::walk_limited(&root, &root.join("missing"), 0, &mut files, 100, &mut gaps);
@@ -3680,8 +3705,9 @@ mod inventory_regressions {
 
     #[test]
     fn linked_javascript_and_deep_python_remain_explicit_report_gaps() {
-        let dir =
-            std::env::temp_dir().join(format!("omgs-inventory-omissions-{}", std::process::id()));
+        let dir = omgs::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-inventory-omissions-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         omgs::platform::create_private_dir(&dir).unwrap();
         let target = dir.join("repo");

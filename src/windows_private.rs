@@ -119,6 +119,93 @@ fn wide(path: &Path) -> Result<Vec<u16>> {
     Ok(text)
 }
 
+/// Open exactly one leaf relative to the retained staging directory handle.
+/// NtCreateFile avoids reopening any ancestor by pathname. Reparse points,
+/// directories and alternate data streams are excluded.
+pub(super) fn open_relative(dir: &std::fs::File, name: &Path) -> Result<std::fs::File> {
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root: Ptr,
+        name: *mut UnicodeString,
+        attributes: u32,
+        security: Ptr,
+        qos: Ptr,
+    }
+    #[repr(C)]
+    struct IoStatus {
+        status: usize,
+        information: usize,
+    }
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtCreateFile(
+            handle: *mut Ptr,
+            access: u32,
+            attributes: *mut ObjectAttributes,
+            status: *mut IoStatus,
+            allocation: *mut i64,
+            file_attributes: u32,
+            share: u32,
+            disposition: u32,
+            options: u32,
+            ea: Ptr,
+            ea_length: u32,
+        ) -> i32;
+        fn RtlNtStatusToDosError(status: i32) -> u32;
+    }
+    let mut text: Vec<u16> = name.as_os_str().encode_wide().collect();
+    if text.iter().any(|c| [0, 58, 47, 92].contains(c)) || text.len() > 32767 {
+        return Err(Error::other("invalid staging leaf"));
+    }
+    let mut name = UnicodeString {
+        length: (text.len() * 2) as u16,
+        maximum_length: (text.len() * 2) as u16,
+        buffer: text.as_mut_ptr(),
+    };
+    let mut attributes = ObjectAttributes {
+        length: std::mem::size_of::<ObjectAttributes>() as u32,
+        root: dir.as_raw_handle(),
+        name: &mut name,
+        attributes: 0x40,
+        security: null_mut(),
+        qos: null_mut(),
+    };
+    let mut status = IoStatus {
+        status: 0,
+        information: 0,
+    };
+    let mut handle = null_mut();
+    // SAFETY: all pointers reference live correctly sized buffers. A successful
+    // handle is transferred to File exactly once. FILE_OPEN_REPARSE_POINT and
+    // FILE_NON_DIRECTORY_FILE exclude traversal and directories.
+    unsafe {
+        let code = NtCreateFile(
+            &mut handle,
+            0x0012_0089,
+            &mut attributes,
+            &mut status,
+            null_mut(),
+            0,
+            0x1,
+            1,
+            0x0020_0060,
+            null_mut(),
+            0,
+        );
+        if code < 0 {
+            return Err(Error::from_raw_os_error(RtlNtStatusToDosError(code) as i32));
+        }
+        Ok(std::fs::File::from_raw_handle(handle))
+    }
+}
+
 /// Supply the owner and protected DACL at creation, even for elevated tokens
 /// whose default owner is Administrators. OPEN_ALWAYS leaves existing ACLs alone.
 pub(super) fn open_write(path: &Path, create_new: bool) -> Result<std::fs::File> {
@@ -352,7 +439,9 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("omgs-acl-{name}-{}", std::process::id()));
+        let path = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-acl-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
         crate::platform::create_private_dir(&path).unwrap();
         path
@@ -441,17 +530,21 @@ mod tests {
     fn existing_install_executable_with_users_write_is_refused() {
         let dir = scratch("install-leaf");
         // Exercise the real publication leaf under an otherwise safe tree.
-        crate::install::install_self(&dir, None, None).unwrap();
+        let source_dir = scratch("install-source");
+        let source = source_dir.join("verified.exe");
+        std::fs::write(&source, b"verified fixture").unwrap();
+        crate::install::publish_bundle(&dir, &source, None, None).unwrap();
         let installed = dir.join("bin").join("omgs.exe");
         set_acl(&installed, "(A;;FW;;;BU)");
         let before = std::fs::read(&installed).unwrap();
-        let error = crate::install::install_self(&dir, None, None)
+        let error = crate::install::publish_bundle(&dir, &source, None, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains(&installed.display().to_string()), "{error}");
         assert!(error.contains("writable by another principal"), "{error}");
         assert_eq!(std::fs::read(&installed).unwrap(), before);
         std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(source_dir).unwrap();
     }
 
     #[test]

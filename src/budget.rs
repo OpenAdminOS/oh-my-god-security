@@ -374,7 +374,9 @@ mod regressions {
     use std::time::Duration;
 
     fn family(name: &str) -> (PathBuf, PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("omgs-budget-{name}-{}", std::process::id()));
+        let dir = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-budget-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         crate::platform::create_private_dir(&dir).unwrap();
         let dir = std::fs::canonicalize(dir).unwrap();

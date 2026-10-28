@@ -50,12 +50,40 @@ printf 'Resolved: OMGS %s; source %s; destination %s; binary %s; executor %s\n' 
 IFS= read -r answer || answer=''
 [ "$answer" = yes ] || { echo 'Installation cancelled before downloads' >&2; exit 1; }
 umask 077
-tmp=$(mktemp -d)
+# Never execute from ambient TMPDIR. Resolve the home alias once, then admit
+# its entire physical chain before creating or verifying executable content.
+staging_error() { echo "Unsafe staging ancestor: $1" >&2; exit 1; }
+admit_staging() {
+  entry=$1
+  while :; do
+    [ -d "$entry" ] && [ ! -L "$entry" ] || staging_error "$entry"
+    if [ "$(uname -s)" = Darwin ]; then
+      owner=$(stat -f %u "$entry"); mode=$(stat -f %Lp "$entry")
+      # Reject mutation grants to any principal except this user or root.
+      acl=$(LC_ALL=C ls -led "$entry") || staging_error "$entry"
+      if printf '%s\n' "$acl" | awk -v u="$(id -un)" '
+        / allow / && $2 != "user:" u && $2 != "user:root" {
+          sub(/^.* allow /, "")
+          if ($0 ~ /(^|,)(write[^,]*|delete[^,]*|add_file|add_subdirectory|append|chown)(,|$)/) bad=1
+        } END {exit !bad}'; then staging_error "$entry"; fi
+    else
+      owner=$(stat -c %u "$entry"); mode=$(stat -c %a "$entry")
+    fi
+    [ "$owner" = "$(id -u)" ] || [ "$owner" = 0 ] || staging_error "$entry"
+    [ $((0$mode & 0022)) -eq 0 ] || [ $((0$mode & 01000)) -ne 0 ] || staging_error "$entry"
+    [ "$entry" != / ] || break
+    entry=$(dirname "$entry")
+  done
+}
+staging_parent=$(CDPATH='' cd -- "$HOME" && pwd -P)
+admit_staging "$staging_parent"
+tmp=$(mktemp -d "$staging_parent/.omgs-bootstrap.XXXXXXXX")
 # Clear inherited ACLs only on this exclusively created disposable directory.
 if [ "$(uname -s)" = Darwin ]; then chmod -N "$tmp"; fi
 cleanup() { rm -rf "$tmp"; }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+admit_staging "$tmp"
 fetch() {
   case "$BASE" in
     /*) cp "$BASE/$1" "$tmp/$1" ;;
@@ -85,14 +113,17 @@ verify_signature() {
 fetch SHA256SUMS 1048576
 fetch "$asset" 104857600
 checksum "$asset"
+binary_hash=$expected
 verify_signature "$tmp/$asset" "$OMGS_TEAM_ID"
 if [ -n "$mxc_asset" ]; then
   fetch "$mxc_asset" 104857600
   checksum "$mxc_asset"
+  executor_hash=$expected
   [ "$(digest "$tmp/$mxc_asset")" = "$mxc_hash" ] || { echo 'MXC pin mismatch' >&2; exit 1; }
   verify_signature "$tmp/$mxc_asset" "$MICROSOFT_TEAM_ID"
   fetch MXC-LICENSE.txt 1048576
   checksum MXC-LICENSE.txt
+  license_hash=$expected
   echo "MXC 1.0.1 pin verified: $mxc_hash"
 fi
 if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
@@ -104,6 +135,8 @@ if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
 else
   echo 'OMGS provenance: unverified (authenticated gh unavailable)'
 fi
+admit_staging "$tmp"
+[ "$(digest "$tmp/$asset")" = "$binary_hash" ] || { echo 'checksum mismatch before execution' >&2; exit 1; }
 chmod 0755 "$tmp/$asset"
 if ! actual_version=$("$tmp/$asset" --version); then
   echo "version mismatch: skill expects omgs $VERSION; binary --version failed" >&2; exit 1
@@ -111,7 +144,7 @@ fi
 [ "$actual_version" = "omgs $VERSION" ] || { echo "version mismatch: skill expects omgs $VERSION; binary reports $actual_version" >&2; exit 1; }
 # The verified executable owns admission and exact-path publication.
 if [ -n "$mxc_asset" ]; then
-  "$tmp/$asset" install-self --to "$DEST_ROOT" --mxc "$tmp/$mxc_asset" --license "$tmp/MXC-LICENSE.txt"
+  "$tmp/$asset" install-self --to "$DEST_ROOT" --staging "$tmp" --binary "$asset" --binary-sha256 "$binary_hash" --mxc "$mxc_asset" --mxc-sha256 "$executor_hash" --license MXC-LICENSE.txt --license-sha256 "$license_hash"
 else
-  "$tmp/$asset" install-self --to "$DEST_ROOT"
+  "$tmp/$asset" install-self --to "$DEST_ROOT" --staging "$tmp" --binary "$asset" --binary-sha256 "$binary_hash"
 fi

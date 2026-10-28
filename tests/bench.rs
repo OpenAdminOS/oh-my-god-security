@@ -192,7 +192,7 @@ struct SavedRuns(PathBuf);
 impl SavedRuns {
     fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
+        let dir = omgs::platform::temp_root().unwrap().join(format!(
             "omgs-score-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

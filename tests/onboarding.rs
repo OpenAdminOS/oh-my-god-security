@@ -62,7 +62,9 @@ fn every_subcommand_has_help_without_initializing_state() {
 
 #[test]
 fn route_without_configuration_uses_host_and_records_refusal() {
-    let home = std::env::temp_dir().join(format!("omgs-route-default-{}", std::process::id()));
+    let home = omgs::platform::temp_root()
+        .unwrap()
+        .join(format!("omgs-route-default-{}", std::process::id()));
     let run = home.join("run");
     omgs::platform::create_private_tree(&run).unwrap();
     omgs::runmeta::write_atomic(&run.join("run-metadata.json"), "{}").unwrap();
