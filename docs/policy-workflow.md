@@ -2,7 +2,7 @@
 
 Use the same workflow for gate and advisory. Commit the policy described in the
 [README](../README.md#committed-policy-and-gate) on the base branch. Choose
-`"mode": "gate"` to fail on eligible proof-backed findings, or
+`"mode": "gate"` to fail on failing registered security tests, or
 `"mode": "advisory"` to print what would fail. A pull request changing that field
 cannot change its own gate. Missing policy defaults to advisory; enforce policy
 presence separately if your organization requires opt-in before every review.
@@ -56,14 +56,23 @@ jobs:
           "$OMGS_BIN" validate --findings "$OMGS_RUN/findings.json"
           "$OMGS_BIN" critic --run "$OMGS_RUN"
       - name: Evaluate committed policy
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         shell: bash
-        run: '"$OMGS_BIN" gate --run "$OMGS_RUN"'
+        run: |
+          "$OMGS_BIN" gate --target "$GITHUB_WORKSPACE" \
+            --base "$BASE_SHA" --head "$HEAD_SHA" --run "$OMGS_RUN"
 ```
 
-Do not add `continue-on-error` for advisory. Advisory is selected by the trusted
-base policy and valid runs exit 0; invalid runs still exit 3 so broken review
-infrastructure remains visible. Gate exits 1 for eligible findings only. Target
-code, including proof tests, must execute only through `omgs prove` inside MXC.
+Do not add `continue-on-error` for advisory. Advisory is selected by valid base
+policy and always exits 0, printing test failures and infrastructure errors.
+Invalid base policy cannot establish advisory mode and returns 3. In gate mode,
+exit 1 requires a registered committed security test to fail with its recipe
+contract; infrastructure errors return 3. The optional review run is advisory
+only. Gate reads base policy independently and executes active registered tests
+from committed head files through MXC with fresh nonces. Keep gate as a separate
+required check if review completeness should be reported separately.
 Never use `pull_request_target` to run an untrusted checkout with elevated
 credentials. Avoid interpolation of PR titles, branch names or bodies into shell
 scripts. Keep findings and policy proposals outside the checkout and restrict

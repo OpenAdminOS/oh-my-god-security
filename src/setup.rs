@@ -21,21 +21,9 @@ pub fn detected(home: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
-pub fn source(explicit: Option<PathBuf>, executable: &Path, cwd: &Path) -> Result<PathBuf, String> {
-    if let Some(path) = explicit {
-        return Ok(path);
-    }
-    let bin = executable.parent().ok_or("executable has no parent")?;
-    // Both direct binary + skill/ and bootstrap bin/omgs + ../skill/ layouts.
-    [
-        bin.join("skill"),
-        bin.parent().unwrap_or(bin).join("skill"),
-        cwd.join("skill"),
-    ]
-    .into_iter()
-    .find(|p| p.join("SKILL.md").is_file())
-    .ok_or_else(|| "skill not found beside binary; pass --from <skill-dir>".into())
-}
+// The verified release binary carries the complete pack. No working-directory
+// lookup is used for the default installation.
+include!(concat!(env!("OUT_DIR"), "/skill.rs"));
 
 fn unlinked(path: &Path) -> Result<(), String> {
     for parent in path.ancestors() {
@@ -50,47 +38,130 @@ fn unlinked(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-fn copy(src: &Path, dst: &Path) -> Result<(), String> {
-    unlinked(src)?;
-    unlinked(dst)?;
-    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
-        if crate::platform::is_link(&meta) {
-            return Err("skill source contains a link".into());
+fn manifest(root: &Path) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>, String> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    ) -> Result<(), String> {
+        unlinked(dir)?;
+        for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+            if crate::platform::is_link(&meta) {
+                return Err("skill tree contains a link".into());
+            }
+            let rel = entry.path().strip_prefix(root).unwrap().to_owned();
+            if meta.is_dir() {
+                walk(root, &entry.path(), out)?;
+            } else if meta.is_file() {
+                out.insert(
+                    rel.clone(),
+                    crate::platform::read_bounded_in(root, &rel, 16 << 20)
+                        .map_err(|e| e.to_string())?,
+                );
+            } else {
+                return Err("skill tree contains a special file".into());
+            }
         }
-        let to = dst.join(entry.file_name());
-        if meta.is_dir() {
-            copy(&entry.path(), &to)?;
-        } else if meta.is_file() {
-            unlinked(&to)?;
-            let bytes = std::fs::read(entry.path()).map_err(|e| e.to_string())?;
-            crate::runmeta::write_atomic_bytes(&to, &bytes).map_err(|e| e.to_string())?;
-        } else {
-            return Err("skill source contains a special file".into());
+        Ok(())
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out)?;
+    Ok(out)
+}
+
+/// Stage a complete sibling tree, then rename. A replacement retains the old
+/// tree as a named backup; failed final renames restore it without mixing files.
+pub fn install(from: Option<&Path>, targets: &[PathBuf], replace: bool) -> Result<(), String> {
+    let files = match from {
+        Some(from) => manifest(from)?,
+        None => BUNDLED
+            .iter()
+            .map(|(p, b)| (PathBuf::from(p), b.to_vec()))
+            .collect(),
+    };
+    let text = std::str::from_utf8(
+        files
+            .get(Path::new("SKILL.md"))
+            .ok_or("skill requires SKILL.md")?,
+    )
+    .map_err(|e| e.to_string())?;
+    if !text.lines().any(|l| l == format!("name: {SKILL_NAME}")) {
+        return Err("skill source has an unexpected name".into());
+    }
+    // Preflight every destination before writing any of them.
+    let mut changed = Vec::new();
+    for to in targets {
+        unlinked(to)?;
+        if to.exists() {
+            let old = manifest(to)?;
+            let differences: std::collections::BTreeSet<_> = old
+                .keys()
+                .chain(files.keys())
+                .filter(|p| old.get(*p) != files.get(*p))
+                .collect();
+            if differences.is_empty() {
+                println!("already installed: {}", to.display());
+                continue;
+            }
+            if !replace {
+                return Err(format!(
+                    "skill files differ in {}: {}; use --replace to back up and replace",
+                    to.display(),
+                    differences
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
         }
+        changed.push(to);
+    }
+    for to in changed {
+        let parent = to.parent().ok_or("skill destination has no parent")?;
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let nonce = crate::platform::random_nonce().map_err(|e| e.to_string())?;
+        let staged = parent.join(format!(".{SKILL_NAME}.stage-{nonce}"));
+        let backup = parent.join(format!("{SKILL_NAME}.backup-{nonce}"));
+        std::fs::create_dir(&staged).map_err(|e| e.to_string())?;
+        let stage = || -> Result<(), String> {
+            for (rel, bytes) in &files {
+                let file = staged.join(rel);
+                std::fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
+                std::fs::write(file, bytes).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        };
+        if let Err(e) = stage() {
+            let _ = std::fs::remove_dir_all(&staged);
+            return Err(e);
+        }
+        publish(&staged, to, &backup)?;
+        println!("installed: {}", to.display());
     }
     Ok(())
 }
 
-pub fn install(from: &Path, targets: &[PathBuf]) -> Result<(), String> {
-    let text = std::fs::read_to_string(from.join("SKILL.md")).map_err(|e| e.to_string())?;
-    if !text.lines().any(|l| l == format!("name: {SKILL_NAME}")) {
-        return Err("skill source has an unexpected name".into());
+fn publish(staged: &Path, to: &Path, backup: &Path) -> Result<(), String> {
+    let had_old = to.exists();
+    if had_old {
+        if let Err(e) = std::fs::rename(to, backup) {
+            let _ = std::fs::remove_dir_all(staged);
+            return Err(e.to_string());
+        }
     }
-    let from = std::fs::canonicalize(from).map_err(|e| e.to_string())?;
-    for to in targets {
-        if to == &from {
-            println!("already installed: {}", to.display());
-            continue;
-        }
-        // Physical ancestor identity also prevents copying a source into itself.
-        if to.starts_with(&from) || from.starts_with(to) {
-            return Err("skill source and destination overlap".into());
-        }
-        copy(&from, to)?;
-        println!("installed: {}", to.display());
+    if let Err(e) = std::fs::rename(staged, to) {
+        let restored = !had_old || std::fs::rename(backup, to).is_ok();
+        let _ = std::fs::remove_dir_all(staged);
+        return Err(format!(
+            "install rename failed: {e}; restored old tree: {restored}; backup {}",
+            backup.display()
+        ));
+    }
+    if had_old {
+        println!("skill backup: {}", backup.display());
     }
     Ok(())
 }
@@ -120,4 +191,28 @@ pub fn write_policy(repo: &Path, mode: crate::policy::Mode) -> Result<PathBuf, S
         })?;
     file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn failed_publish_restores_complete_original_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "omgs-install-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let old = root.join("installed");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("original"), "owner content").unwrap();
+        // A vanished staged tree makes the actual final rename fail after backup.
+        let backup = root.join("backup");
+        assert!(super::publish(&root.join("vanished-stage"), &old, &backup).is_err());
+        assert_eq!(
+            std::fs::read_to_string(old.join("original")).unwrap(),
+            "owner content"
+        );
+        assert!(!backup.exists());
+        assert_eq!(std::fs::read_dir(&old).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

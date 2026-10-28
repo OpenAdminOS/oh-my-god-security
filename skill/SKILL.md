@@ -136,26 +136,44 @@ policy fixes mode, persona and budget. Excluded paths are literal relative path
 prefixes and create planned ledger units with counts and sorted path samples.
 Review and resolve them with evidence; do not silently discard them or treat an
 exclusion as suppression. Accepted intent records require id, answer, scope and
-source. Suppressions require fingerprint and reason, with optional expires_unix
-in UTC Unix seconds.
+source. Suppressions require fingerprint, reason and expires_unix in UTC Unix
+seconds through year 9999, at most 365 days after the commit that last changed
+policy. Missing, null or out-of-range expiry is invalid. Expired entries do not apply.
 
 After recording an owner's answers with `omgs intent answer`, run
 `omgs intent propose --run OUTPUT_DIR` to write `OUTPUT_DIR/policy.patch` for owner
 review. It never changes the target and never changes this run's gate. Only
 reviewed, committed base policy can accept those answers or suppress future runs.
 
-Run `omgs gate --run OUTPUT_DIR` after verification and adjudication. Exit 1
-requires an unsuppressed confirmed finding at or above threshold with a valid
-runner-attested omgs-proof/2 record, including declared recipe contracts. Missing
-or invalid proof is printed as ineligible, never promoted to blocking evidence.
-Advisory prints what would block and exits 0 for valid input. Exit 3 means invalid
-run or policy in either mode. Surface the error rather than describing a pass.
-Gate does not replace validate, independent replay or evaluation.
+Use `omgs intent propose --run OUTPUT_DIR` or `omgs stage --run OUTPUT_DIR` to
+propose registered gate tests from validated test-proven findings. The patch
+includes tests and policy entries with id, committed test path, exact command,
+expect_marker, severity, timeout_ms and optional finding fingerprint. Owner
+review of that patch authorizes tests only for later base commits.
+
+Run `omgs gate --target TARGET --base BASE_SHA --head HEAD_SHA [--run OUTPUT_DIR]`
+with full immutable event SHAs. Gate reads policy directly from the base commit,
+checks HEAD safely and exports only committed head files. It executes active
+registered tests inside MXC with fresh nonces. Exit 1 requires a registered test
+at or above threshold to exit 1 with both nonce-qualified recipe markers.
+Passing tests exit 0. Missing tests, contract errors, unavailable MXC, head
+mismatch and invalid policy return 3. Valid advisory policy makes all execution
+results display-only and exits 0, including infrastructure errors. Invalid base
+policy cannot establish advisory mode and returns 3. Optional run findings are
+advisory only; edited findings, proofs or metadata cannot affect the exit code.
+Gate refuses redirected Git directories and config includes, uses bounded Git
+children with cleanup, and currently exports regular files only, refusing
+symlinks and submodules. Gate installs no dependencies. It does not replace
+independent proof replay or evaluation.
 
 For setup scripts, `omgs setup --install-skills --verify-mxc` installs only into
 detected home directories under the Skills CLI name omgs-security-review and
-runs the same live deny probe as doctor --live. Use --from to select the source,
-or place skill/ beside the binary (also supported at ../skill/ for bin layouts).
+runs the same live deny probe as doctor --live. The verified binary embeds the
+complete skill, including bootstrap installs launched from unrelated directories.
+Use --from only to explicitly select another local source. Identical installs
+are no-ops. Differing files are named and refused unless --replace is explicit;
+replacement stages a complete tree and retains the old tree at a printed backup
+path. Failed publishing restores the old tree without mixing files.
 `omgs setup --dry-run` lists only detected destinations and changes nothing.
 `omgs setup --write-policy TARGET --mode gate|advisory` creates default policy
 only on explicit request and refuses replacement. `omgs setup --yes` installs

@@ -15,6 +15,7 @@ fn boolean_option(name: &str) -> bool {
         "--yes",
         "--dry-run",
         "--install-skills",
+        "--replace",
         "--verify-mxc",
         "--no-sensors",
         "--live",
@@ -67,7 +68,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes | --dry-run] [--from <skill-dir>] [--install-skills] [--verify-mxc] [--write-policy <repo> --mode gate|advisory]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--base <ref>] [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>]\n  omgs gate --run <run-dir>\n  omgs intent propose --run <run-dir>\n  omgs budget --run <run-dir>\n  omgs bench score --cases <manifest> --runs <run-dir> [--runs <run-dir>]...\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nBoolean options: --yes, --dry-run, --install-skills, --verify-mxc, --no-sensors and --live. Every other option takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes | --dry-run] [--from <skill-dir>] [--install-skills] [--replace] [--verify-mxc] [--write-policy <repo> --mode gate|advisory]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--base <ref>] [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>]\n  omgs gate --target <checkout> --base <base-sha> --head <head-sha> [--run <dir>]\n  omgs stage --run <run-dir>\n  omgs intent propose --run <run-dir>\n  omgs budget --run <run-dir>\n  omgs bench score --cases <manifest> --runs <run-dir> [--runs <run-dir>]...\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nBoolean options: --replace, --yes, --dry-run, --install-skills, --verify-mxc, --no-sensors and --live. Every other option takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -75,7 +76,7 @@ fn usage() {
 /// Validate the complete option list before any command can mutate run state.
 fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
     let (allowed, positional): (&str, bool) = match cmd {
-        "setup" => ("--yes --from --dry-run --install-skills --verify-mxc --write-policy --mode", false),
+        "setup" => ("--yes --from --dry-run --install-skills --replace --verify-mxc --write-policy --mode", false),
         "review" => ("--repo-url --mode --budget --no-sensors", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
             "--target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of",
@@ -105,7 +106,8 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "ledger" if args.first().is_some_and(|a| a == "set") => {
             ("--ledger --unit --status --evidence --note", true)
         }
-        "gate" | "critic" | "budget" => ("--run", false),
+        "gate" => ("--target --base --head --run", false),
+        "stage" | "critic" | "budget" => ("--run", false),
         "status" => (
             "--run --stage --state --label --parent --detail --counter --log --accounting",
             false,
@@ -208,6 +210,7 @@ fn main() -> ExitCode {
         }
         "gate" => cmd_gate(rest),
         "setup" => cmd_setup(rest),
+        "stage" => cmd_stage(rest),
         "review" => cmd_review(rest),
         "audit" => cmd_audit(rest),
         "validate" => cmd_validate(rest),
@@ -244,10 +247,19 @@ fn main() -> ExitCode {
     }
 }
 
+fn cmd_stage(args: &[String]) -> Result<(), String> {
+    let run = flag(args, "--run").ok_or("stage requires --run")?;
+    intent_propose(Path::new(&run))
+}
+
 fn cmd_gate(args: &[String]) -> Result<(), String> {
-    let outcome = flag(args, "--run")
-        .ok_or("gate requires --run <run-dir>".into())
-        .and_then(|run| omgs::policy::gate(Path::new(&run)));
+    let outcome = (|| {
+        let target = flag(args, "--target").ok_or("gate requires --target")?;
+        let base = flag(args, "--base").ok_or("gate requires --base")?;
+        let head = flag(args, "--head").ok_or("gate requires --head")?;
+        let run = flag(args, "--run").map(PathBuf::from);
+        omgs::policy::gate(Path::new(&target), &base, &head, run.as_deref())
+    })();
     match outcome {
         Ok(0) => Ok(()),
         Ok(_) => Err("__EXIT1__".into()),
@@ -2325,12 +2337,8 @@ fn cmd_setup(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     if install && !targets.is_empty() {
-        let from = omgs::setup::source(
-            flag(args, "--from").map(PathBuf::from),
-            &std::env::current_exe().map_err(|e| e.to_string())?,
-            &std::env::current_dir().map_err(|e| e.to_string())?,
-        )?;
-        omgs::setup::install(&from, &targets)?;
+        let from = flag(args, "--from").map(PathBuf::from);
+        omgs::setup::install(from.as_deref(), &targets, has(args, "--replace"))?;
     }
     if let Some(repo) = repo {
         let path = omgs::setup::write_policy(Path::new(&repo), policy_mode)?;
@@ -3285,6 +3293,7 @@ mod cli_tests {
     const COMMANDS: &[(&str, &str)] = &[
         ("setup", ""),
         ("gate", ""),
+        ("stage", ""),
         ("review", ""),
         ("audit", "init"),
         ("batch", "init"),

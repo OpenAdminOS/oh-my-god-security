@@ -114,13 +114,60 @@ fn commit_policy(repo: &Path, p: &Policy) -> String {
     git(repo, &["commit", "--allow-empty", "-m", "Policy"]);
     git(repo, &["rev-parse", "HEAD"])
 }
-fn gate(root: &Path, run: &Path, code: i32) -> Output {
-    let o = cli(
-        &root.join("home"),
-        &["gate", "--run", run.to_str().unwrap()],
-    );
+fn gate(root: &Path, repo: &Path, base: &str, head: &str, run: Option<&Path>, code: i32) -> Output {
+    let mut args = vec![
+        "gate",
+        "--target",
+        repo.to_str().unwrap(),
+        "--base",
+        base,
+        "--head",
+        head,
+    ];
+    if let Some(run) = run {
+        args.extend(["--run", run.to_str().unwrap()]);
+    }
+    let o = cli(&root.join("home"), &args);
     assert_eq!(o.status.code(), Some(code), "{}", output(&o));
     o
+}
+fn registered() -> policy::GateTest {
+    policy::GateTest {
+        id: "boundary-test".into(),
+        test: if cfg!(windows) {
+            "security.cmd"
+        } else {
+            "security.sh"
+        }
+        .into(),
+        command: if cfg!(windows) {
+            "call security.cmd"
+        } else {
+            "sh security.sh"
+        }
+        .into(),
+        expect_marker: "BOUNDARY".into(),
+        severity: omgs::model::Severity::High,
+        timeout_ms: 10_000,
+        fingerprint: Some("omgs-0123456789abcdef".into()),
+    }
+}
+fn test_source(failing: bool) -> &'static str {
+    match (cfg!(windows), failing) {
+        (true, true) => "@echo off\r\necho OMGS_CONTROL_%OMGS_PROOF_NONCE%\r\necho OMGS_BOUNDARY_%OMGS_PROOF_NONCE%_BOUNDARY\r\nexit /b 1\r\n",
+        (true, false) => "@exit /b 0\r\n",
+        (false, true) => "printf 'OMGS_CONTROL_%s\\nOMGS_BOUNDARY_%s_BOUNDARY\\n' \"$OMGS_PROOF_NONCE\" \"$OMGS_PROOF_NONCE\"\nexit 1\n",
+        (false, false) => "exit 0\n",
+    }
+}
+fn mxc_ready(root: &Path) -> bool {
+    let o = cli(&root.join("home"), &["doctor", "--live"]);
+    if o.status.success() {
+        true
+    } else {
+        eprintln!("SKIP live gate tests: {}", output(&o));
+        false
+    }
 }
 
 /// An archived, internally consistent runner fixture. It needs no installed
@@ -166,58 +213,137 @@ fn evidence(run: &Path, target: &Path) {
 }
 
 #[test]
-fn base_policy_controls_gate_despite_head_and_worktree_changes() {
-    let root = scratch("base");
+fn registered_gate_executes_immutable_head_and_ignores_advisory_artifacts() {
+    let root = scratch("gate-live");
+    if !mxc_ready(&root) {
+        std::fs::remove_dir_all(root).unwrap();
+        return;
+    }
     let repo = repo(&root);
+    let t = registered();
+    std::fs::write(repo.join(&t.test), test_source(true)).unwrap();
     let p = Policy {
         mode: Mode::Gate,
+        gate_tests: vec![t.clone()],
         ..Default::default()
     };
     let base = commit_policy(&repo, &p);
-    let mut head = p.clone();
-    head.mode = Mode::Advisory;
-    head.severity_threshold = omgs::model::Severity::Critical;
-    commit_policy(&repo, &head);
+    gate(&root, &repo, &base, &base, None, 1);
     let run = root.join("run");
-    let out = init(&root, &repo, &run, Some(&base));
-    assert!(out.status.success(), "{}", output(&out));
-    evidence(&run, &repo);
-    gate(&root, &run, 1);
-    let m = read(&run.join("run-metadata.json"));
-    assert_eq!(m["policy"]["base_commit"], base);
-    assert_eq!(m["policy"]["source"], format!("{base}:.omgs/policy.json"));
-    assert_eq!(
-        m["policy"]["sha256"],
-        omgs::sha256::digest(policy::text(&p).unwrap().as_bytes())
-    );
-    std::fs::write(repo.join(policy::PATH), "malformed head").unwrap();
-    gate(&root, &run, 1);
-    let out = cli(
-        &root.join("home"),
-        &[
-            "audit",
-            "init",
+    assert!(init(&root, &repo, &run, Some(&base)).status.success());
+    evidence(&run, &repo); // A different, unregistered confirmed finding is advisory.
+    let advisory = gate(&root, &repo, &base, &base, Some(&run), 1);
+    assert!(output(&advisory).contains("not yet a registered gate test"));
+    std::fs::write(run.join("findings.json"), "corrupt").unwrap();
+    std::fs::write(run.join("run-metadata.json"), "corrupt").unwrap();
+    std::fs::remove_dir_all(run.join("proofs")).unwrap();
+    // A dirty fixed test also cannot bypass the committed failure.
+    std::fs::write(repo.join(&t.test), test_source(false)).unwrap();
+    gate(&root, &repo, &base, &base, Some(&run), 1);
+    std::fs::write(repo.join(&t.test), test_source(true)).unwrap();
+    let unavailable = Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "gate",
             "--target",
             repo.to_str().unwrap(),
             "--base",
             &base,
-            "--mode",
-            "advisory",
-            "--out",
-            root.join("override").to_str().unwrap(),
-        ],
+            "--head",
+            &base,
+        ])
+        .env("OMGS_MXC_EXEC", root.join("missing-executor"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        unavailable.status.code(),
+        Some(3),
+        "{}",
+        output(&unavailable)
     );
-    assert!(!out.status.success());
-    assert!(!root.join("override").exists());
+    let head = commit_policy(&repo, &Policy::default());
+    gate(&root, &repo, &base, &head, Some(&run), 1); // Head-only policy cannot disable gate.
+    std::fs::write(repo.join(&t.test), test_source(false)).unwrap();
+    let fixed = commit_policy(&repo, &Policy::default());
+    gate(&root, &repo, &base, &fixed, None, 0);
+    // A failing draft exists only in run storage and cannot add a gate test.
+    std::fs::write(run.join("draft"), test_source(true)).unwrap();
+    gate(&root, &repo, &base, &fixed, Some(&run), 0);
+    gate(&root, &repo, &base, &head, None, 3);
+    std::fs::remove_file(repo.join(&t.test)).unwrap();
+    let missing = commit_policy(&repo, &Policy::default());
+    gate(&root, &repo, &base, &missing, None, 3);
+    std::fs::write(repo.join(&t.test), test_source(true)).unwrap();
+    let mut suppressed = p.clone();
+    suppressed.suppressions.push(policy::Suppression {
+        fingerprint: t.fingerprint.unwrap(),
+        reason: "Accepted until fix".into(),
+        expires_unix: omgs::runmeta::now_unix() + 3600,
+    });
+    let suppressed = commit_policy(&repo, &suppressed);
+    gate(&root, &repo, &suppressed, &suppressed, None, 0);
+    let mut below = p.clone();
+    below.severity_threshold = omgs::model::Severity::Critical;
+    let below = commit_policy(&repo, &below);
+    gate(&root, &repo, &below, &below, None, 0);
+    for source in [
+        if cfg!(windows) {
+            "@exit /b 1\r\n"
+        } else {
+            "exit 1\n"
+        },
+        if cfg!(windows) {
+            "@exit /b 2\r\n"
+        } else {
+            "exit 2\n"
+        },
+    ] {
+        std::fs::write(repo.join(&t.test), source).unwrap();
+        let invalid_contract = commit_policy(&repo, &p);
+        gate(&root, &repo, &invalid_contract, &invalid_contract, None, 3);
+    }
+    std::fs::write(repo.join(&t.test), test_source(true)).unwrap();
+    let mut advisory = p;
+    advisory.mode = Mode::Advisory;
+    let advisory = commit_policy(&repo, &advisory);
+    assert!(output(&gate(&root, &repo, &advisory, &advisory, None, 0)).contains("would block"));
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn head_only_policy_is_ignored_and_defaults_are_recorded() {
-    let root = scratch("absent");
+fn gate_missing_test_wrong_head_invalid_policy_and_unregistered_draft_without_mxc() {
+    let root = scratch("gate-static");
     let repo = repo(&root);
-    let base = git(&repo, &["rev-parse", "HEAD"]);
-    commit_policy(
+    let base = commit_policy(
+        &repo,
+        &Policy {
+            mode: Mode::Gate,
+            gate_tests: vec![registered()],
+            ..Default::default()
+        },
+    );
+    assert!(output(&gate(&root, &repo, &base, &base, None, 3)).contains("missing"));
+    // Case-insensitive host filesystems cannot satisfy a different committed path.
+    std::fs::write(
+        repo.join(if cfg!(windows) {
+            "Security.cmd"
+        } else {
+            "Security.sh"
+        }),
+        test_source(false),
+    )
+    .unwrap();
+    let case_head = commit_policy(
+        &repo,
+        &Policy {
+            mode: Mode::Gate,
+            gate_tests: vec![registered()],
+            ..Default::default()
+        },
+    );
+    assert!(output(&gate(&root, &repo, &case_head, &case_head, None, 3)).contains("missing"));
+    let head = commit_policy(&repo, &Policy::default());
+    assert!(output(&gate(&root, &repo, &base, &base, None, 3)).contains("does not match"));
+    let base = commit_policy(
         &repo,
         &Policy {
             mode: Mode::Gate,
@@ -225,93 +351,56 @@ fn head_only_policy_is_ignored_and_defaults_are_recorded() {
         },
     );
     let run = root.join("run");
-    assert!(init(&root, &repo, &run, Some(&base)).status.success());
-    evidence(&run, &repo);
-    assert!(output(&gate(&root, &run, 0)).contains("would block"));
-    assert_eq!(
-        read(&run.join("run-metadata.json"))["policy"]["source"],
-        "defaults:no-base-policy"
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("draft"), test_source(true)).unwrap();
+    std::fs::write(run.join("findings.json"), "corrupt").unwrap();
+    gate(&root, &repo, &base, &base, Some(&run), 0);
+    std::fs::write(repo.join(policy::PATH), "invalid").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "Invalid policy"]);
+    let invalid = git(&repo, &["rev-parse", "HEAD"]);
+    gate(&root, &repo, &invalid, &invalid, None, 3);
+    let advisory = commit_policy(
+        &repo,
+        &Policy {
+            gate_tests: vec![registered()],
+            ..Default::default()
+        },
     );
-    assert!(
-        !init(&root, &repo, &root.join("missing"), Some("does-not-exist"))
-            .status
-            .success()
-    );
+    gate(&root, &repo, &advisory, &advisory, None, 0);
+    gate(&root, &repo, &advisory, &head, None, 0);
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn gate_exit_codes_threshold_suppression_contracts_and_invalid_runs() {
-    let root = scratch("exits");
+fn suppression_expiry_is_required_bounded_and_anchored_to_policy_change() {
+    let root = scratch("expiry");
     let repo = repo(&root);
-    let fp = "omgs-d7c7756a1f68ec92";
-    for (name, mode, severity, suppress, expiry, code) in [
-        ("at", Mode::Gate, "high", false, None, 1),
-        ("above", Mode::Gate, "critical", false, None, 1),
-        ("below", Mode::Gate, "medium", false, None, 0),
-        ("suppressed", Mode::Gate, "high", true, None, 0),
-        ("future", Mode::Gate, "high", true, Some(u64::MAX), 0),
-        ("expired", Mode::Gate, "high", true, Some(0), 1),
-        ("advisory", Mode::Advisory, "high", false, None, 0),
+    let mut p: Value = serde_json::from_str(&policy::text(&Policy::default()).unwrap()).unwrap();
+    p["suppressions"] = json!([{"fingerprint":"omgs-0123456789abcdef", "reason":"accepted"}]);
+    assert!(policy::parse(&p.to_string()).is_err());
+    for expiry in [
+        json!(null),
+        json!(-1),
+        json!(u64::MAX),
+        json!(policy::MAX_EXPIRY + 1),
     ] {
-        let mut p = Policy {
-            mode,
-            ..Default::default()
-        };
-        if suppress {
-            p.suppressions.push(policy::Suppression {
-                fingerprint: fp.into(),
-                reason: "Owner accepted".into(),
-                expires_unix: expiry,
-            });
-        }
-        let base = commit_policy(&repo, &p);
-        let run = root.join(name);
-        assert!(init(&root, &repo, &run, Some(&base)).status.success());
-        evidence(&run, &repo);
-        let mut findings = read(&run.join("findings.json"));
-        findings["findings"][0]["severity"] = json!(severity);
-        write(&run.join("findings.json"), &findings);
-        let out = gate(&root, &run, code);
-        if mode == Mode::Advisory {
-            assert!(output(&out).contains("would block"));
-        }
+        p["suppressions"][0]["expires_unix"] = expiry;
+        assert!(policy::parse(&p.to_string()).is_err());
     }
-    let run = root.join("at");
-    let proof_path = run.join("proofs/1.json");
-    let proof = read(&proof_path);
-    for pointer in [
-        "/contract/boundary_marker_seen",
-        "/contract/authorized_control_seen",
-        "/command_started",
-        "/command_finished",
-        "/cleanup_complete",
-    ] {
-        let mut bad = proof.clone();
-        *bad.pointer_mut(pointer).unwrap() = json!(false);
-        write(&proof_path, &bad);
-        assert!(output(&gate(&root, &run, 0)).contains("ineligible"));
-    }
-    let mut bad = proof.clone();
-    bad["schema"] = json!("omgs-proof/1");
-    write(&proof_path, &bad);
-    gate(&root, &run, 0);
-    std::fs::remove_file(&proof_path).unwrap();
-    gate(&root, &run, 0);
-    let mut findings = read(&run.join("findings.json"));
-    findings["findings"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("proof_ref");
-    write(&run.join("findings.json"), &findings);
-    gate(&root, &run, 0);
-    std::fs::write(run.join("findings.json"), "{}").unwrap();
-    gate(&root, &run, 3);
-    let mut m = read(&run.join("run-metadata.json"));
-    m["policy"]["sha256"] = json!("0".repeat(64));
-    write(&run.join("run-metadata.json"), &m);
-    gate(&root, &run, 3);
-    gate(&root, &root.join("missing-run"), 3);
+    p["suppressions"][0]["expires_unix"] =
+        json!(omgs::runmeta::now_unix() + policy::MAX_SUPPRESSION_SECONDS + 86400);
+    let p = policy::parse(&p.to_string()).unwrap();
+    let base = commit_policy(&repo, &p);
+    assert!(policy::load_base(&repo, Some(&base))
+        .unwrap_err()
+        .contains("365 days"));
+    // Unrelated commits must not reset the policy's maximum lifetime.
+    std::fs::write(repo.join("later"), "later").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "Later"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    assert!(policy::load_base(&repo, Some(&head)).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -338,7 +427,8 @@ fn strict_policy_rejects_required_unknown_duplicate_and_nested_keys() {
         assert!(policy::parse(&p.to_string()).is_err());
     }
     let answer = json!({"id":omgs::intent::library().questions[0].id,"answer":"yes","scope":"repo","source":"owner"});
-    let suppression = json!({"fingerprint":"omgs-0123456789abcdef","reason":"accepted"});
+    let suppression =
+        json!({"fingerprint":"omgs-0123456789abcdef","reason":"accepted","expires_unix":1234});
     for (container, record) in [("accepted_intent", answer), ("suppressions", suppression)] {
         for key in record.as_object().unwrap().keys() {
             let mut bad = record.clone();
@@ -355,6 +445,38 @@ fn strict_policy_rejects_required_unknown_duplicate_and_nested_keys() {
         p[container] = json!([record.as_object().unwrap().values().collect::<Vec<_>>()]);
         assert!(policy::parse(&p.to_string()).is_err());
     }
+    let contract = serde_json::to_value(registered()).unwrap();
+    for key in [
+        "id",
+        "test",
+        "command",
+        "expect_marker",
+        "severity",
+        "timeout_ms",
+    ] {
+        let mut bad = contract.clone();
+        bad.as_object_mut().unwrap().remove(key);
+        let mut p = default.clone();
+        p["gate_tests"] = json!([bad]);
+        assert!(policy::parse(&p.to_string()).is_err(), "{key}");
+    }
+    for (key, value) in [
+        ("severity", json!({"high":null})),
+        ("fingerprint", json!(null)),
+        ("test", json!("../outside")),
+        ("command", json!("sh other-test.sh")),
+        ("expect_marker", json!("OMGS_RESERVED")),
+        ("timeout_ms", json!(0)),
+    ] {
+        let mut bad = contract.clone();
+        bad[key] = value;
+        let mut p = default.clone();
+        p["gate_tests"] = json!([bad]);
+        assert!(policy::parse(&p.to_string()).is_err(), "{key}");
+    }
+    let mut duplicates = default.clone();
+    duplicates["gate_tests"] = json!([contract, contract]);
+    assert!(policy::parse(&duplicates.to_string()).is_err());
     for path in ["../src", "/src", "a/../src", "a\\src", "a//b", "a/", "."] {
         let mut p = default.clone();
         p["excluded_paths"] = json!([path]);
@@ -466,21 +588,13 @@ fn setup_detects_only_existing_agents_and_writes_policy_only_on_request() {
     assert!(!refused.status.success());
     assert_eq!(read(&repo.join(policy::PATH))["mode"], "gate");
     let bootstrap = root.join("bootstrap");
-    std::fs::create_dir_all(bootstrap.join("skill")).unwrap();
-    std::fs::write(bootstrap.join("skill/SKILL.md"), "bundled").unwrap();
-    assert_eq!(
-        omgs::setup::source(None, &bootstrap.join("omgs"), &root).unwrap(),
-        bootstrap.join("skill")
-    );
     std::fs::create_dir_all(bootstrap.join("bin")).unwrap();
-    assert_eq!(
-        omgs::setup::source(None, &bootstrap.join("bin/omgs"), &root).unwrap(),
-        bootstrap.join("skill")
-    );
-    let executable = bootstrap.join(if cfg!(windows) { "omgs.exe" } else { "omgs" });
+    let executable = bootstrap
+        .join("bin")
+        .join(if cfg!(windows) { "omgs.exe" } else { "omgs" });
     std::fs::copy(env!("CARGO_BIN_EXE_omgs"), &executable).unwrap();
-    std::fs::copy(source.join("SKILL.md"), bootstrap.join("skill/SKILL.md")).unwrap();
-    let launched = Command::new(executable)
+    // Actual bootstrap layout: only the verified binary, launched from elsewhere.
+    let launched = Command::new(&executable)
         .current_dir(&root)
         .args(["setup", "--install-skills"])
         .env("HOME", &home)
@@ -488,6 +602,46 @@ fn setup_detects_only_existing_agents_and_writes_policy_only_on_request() {
         .output()
         .unwrap();
     assert!(launched.status.success(), "{}", output(&launched));
+    assert!(output(&launched).contains("already installed"));
+    let installed = home.join(".codex/skills").join(omgs::setup::SKILL_NAME);
+    std::fs::write(installed.join("SKILL.md"), "Owner changes").unwrap();
+    std::fs::write(installed.join("custom.txt"), "keep in backup").unwrap();
+    let refused = cli(&home, &["setup", "--install-skills"]);
+    assert!(!refused.status.success());
+    assert!(output(&refused).contains("SKILL.md") && output(&refused).contains("custom.txt"));
+    assert_eq!(
+        std::fs::read_to_string(installed.join("SKILL.md")).unwrap(),
+        "Owner changes"
+    );
+    let replaced = cli(&home, &["setup", "--install-skills", "--replace"]);
+    assert!(replaced.status.success(), "{}", output(&replaced));
+    assert!(!installed.join("custom.txt").exists());
+    assert_eq!(
+        std::fs::read(installed.join("SKILL.md")).unwrap(),
+        std::fs::read(source.join("SKILL.md")).unwrap()
+    );
+    let backup = std::fs::read_dir(installed.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(".backup-")
+        })
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(backup.join("custom.txt")).unwrap(),
+        "keep in backup"
+    );
+    let bad = root.join("bad-source");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("SKILL.md"), "invalid name").unwrap();
+    assert!(omgs::setup::install(Some(&bad), std::slice::from_ref(&installed), true).is_err());
+    assert_eq!(
+        std::fs::read(installed.join("SKILL.md")).unwrap(),
+        std::fs::read(source.join("SKILL.md")).unwrap()
+    );
     let missing = Command::new(env!("CARGO_BIN_EXE_omgs"))
         .args(["setup", "--verify-mxc"])
         .env("HOME", &home)
@@ -589,5 +743,142 @@ fn accepted_base_intent_seeds_answers_and_missing_policy_proposes_a_new_file() {
     assert!(patch.contains("--- /dev/null") && patch.contains("@@ -0,0 +1,"));
     std::fs::remove_file(repo.join(policy::PATH)).unwrap();
     check_patch(&repo, &empty.join("policy.patch"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+fn fifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: path is a valid NUL-terminated path; no writer is ever started.
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+#[cfg(unix)]
+fn bounded_gate(repo: &Path, base: &str) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "gate",
+            "--target",
+            repo.to_str().unwrap(),
+            "--base",
+            base,
+            "--head",
+            base,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if start.elapsed().as_secs() >= 12 {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("gate exceeded outer fixture deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+#[cfg(unix)]
+#[test]
+fn fifo_config_includes_are_rejected_and_git_object_reads_have_a_deadline() {
+    let root = scratch("git-fifo");
+    let repo = repo(&root);
+    let base = commit_policy(
+        &repo,
+        &Policy {
+            mode: Mode::Gate,
+            ..Default::default()
+        },
+    );
+    let pipe = root.join("include-fifo");
+    fifo(&pipe);
+    let config = repo.join(".git/config");
+    let original = std::fs::read_to_string(&config).unwrap();
+    for section in ["include", "includeIf \"gitdir:**\""] {
+        std::fs::write(
+            &config,
+            format!("{original}\n[{section}]\npath = {}\n", pipe.display()),
+        )
+        .unwrap();
+        let o = bounded_gate(&repo, &base);
+        assert_eq!(o.status.code(), Some(3), "{}", output(&o));
+        assert!(output(&o).contains("includes are blocked"));
+    }
+    std::fs::write(&config, &original).unwrap();
+    std::fs::write(
+        repo.join(".git/config.worktree"),
+        format!("[include]\npath = {}\n", pipe.display()),
+    )
+    .unwrap();
+    assert_eq!(bounded_gate(&repo, &base).status.code(), Some(3));
+    std::fs::remove_file(repo.join(".git/config.worktree")).unwrap();
+    let head_ref = std::fs::read_to_string(repo.join(".git/HEAD")).unwrap();
+    let reference = repo
+        .join(".git")
+        .join(head_ref.trim().strip_prefix("ref: ").unwrap());
+    std::fs::remove_file(&reference).unwrap();
+    fifo(&reference);
+    let start = std::time::Instant::now();
+    let o = bounded_gate(&repo, &base);
+    assert_eq!(o.status.code(), Some(3), "{}", output(&o));
+    assert!(output(&o).contains("deadline"), "{}", output(&o));
+    assert!(start.elapsed().as_secs() < 12);
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn redirected_git_directory_is_blocked() {
+    let root = scratch("redirect");
+    let repo = repo(&root);
+    let base = commit_policy(
+        &repo,
+        &Policy {
+            mode: Mode::Gate,
+            ..Default::default()
+        },
+    );
+    std::fs::rename(repo.join(".git"), root.join("outside.git")).unwrap();
+    std::fs::write(
+        repo.join(".git"),
+        format!("gitdir: {}\n", root.join("outside.git").display()),
+    )
+    .unwrap();
+    assert!(output(&gate(&root, &repo, &base, &base, None, 3)).contains("redirected"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn stage_and_intent_propose_patch_validated_tests_and_registry_together() {
+    let root = scratch("test-proposal");
+    let repo = repo(&root);
+    let base = commit_policy(&repo, &Policy::default());
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, Some(&base)).status.success());
+    evidence(&run, &repo);
+    for args in [
+        vec!["stage", "--run", run.to_str().unwrap()],
+        vec!["intent", "propose", "--run", run.to_str().unwrap()],
+    ] {
+        let o = cli(&root.join("home"), &args);
+        assert!(o.status.success(), "{}", output(&o));
+        let patch = std::fs::read_to_string(run.join("policy.patch")).unwrap();
+        assert!(
+            patch.contains("tests/security/x.test.ts")
+                && patch.contains("gate_tests")
+                && patch.contains("FIXTURE_BOUNDARY")
+        );
+        check_patch(&repo, &run.join("policy.patch"));
+    }
+    let mut proof = read(&run.join("proofs/1.json"));
+    proof["cleanup_complete"] = json!(false);
+    write(&run.join("proofs/1.json"), &proof);
+    assert!(!cli(
+        &root.join("home"),
+        &["stage", "--run", run.to_str().unwrap()]
+    )
+    .status
+    .success());
     std::fs::remove_dir_all(root).unwrap();
 }

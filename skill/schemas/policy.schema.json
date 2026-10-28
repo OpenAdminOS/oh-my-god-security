@@ -12,7 +12,8 @@
     "severity_threshold",
     "excluded_paths",
     "accepted_intent",
-    "suppressions"
+    "suppressions",
+    "gate_tests"
   ],
   "properties": {
     "schema": {
@@ -105,7 +106,8 @@
         "additionalProperties": false,
         "required": [
           "fingerprint",
-          "reason"
+          "reason",
+          "expires_unix"
         ],
         "properties": {
           "fingerprint": {
@@ -120,7 +122,62 @@
           "expires_unix": {
             "type": "integer",
             "minimum": 0,
-            "description": "UTC Unix seconds; inactive at or after this instant."
+            "description": "Required UTC Unix seconds through year 9999, at most 365 days after the commit that last changed policy. Inactive at or after this instant. The CLI enforces the commit-relative bound.",
+            "maximum": 253402300799
+          }
+        }
+      }
+    },
+    "gate_tests": {
+      "type": "array",
+      "description": "Owner-reviewed security tests authorized by committed base policy. Duplicate ids or test paths are refused.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "test",
+          "command",
+          "expect_marker",
+          "severity",
+          "timeout_ms"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "test": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Safe repository-relative committed regular test path, named by command."
+          },
+          "command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expect_marker": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_]{1,128}$",
+            "description": "Same contract as prove --expect-marker; reserved markers are refused."
+          },
+          "severity": {
+            "enum": [
+              "informational",
+              "low",
+              "medium",
+              "high",
+              "critical"
+            ]
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4294967295
+          },
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^omgs-[0-9a-f]{16}$"
           }
         }
       }

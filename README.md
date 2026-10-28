@@ -226,7 +226,8 @@ invalid intent IDs and duplicate intent/suppression identities are errors.
   "severity_threshold": "high",
   "excluded_paths": [],
   "accepted_intent": [],
-  "suppressions": []
+  "suppressions": [],
+  "gate_tests": []
 }
 ```
 
@@ -239,7 +240,7 @@ order. Use `mode: "gate"` to enable blocking.
 
 ```sh
 omgs audit init --target /path/to/repo --base origin/main --out /private/run --no-sensors
-omgs gate --run /private/run
+omgs gate --target /path/to/repo --base "$BASE_SHA" --head "$HEAD_SHA" --run /private/run
 omgs intent propose --run /private/run
 ```
 
@@ -248,8 +249,8 @@ commit's `.omgs/policy.json`, never HEAD's policy or the working tree. Omit
 `--base` for an explicit local run using defaults and optional CLI overrides.
 A missing blob uses the defaults; a bad ref or malformed committed blob is an
 error. The resolved commit, source, exact blob, parsed policy and SHA-256 are
-saved in `run-metadata.json` under `policy`. Gate uses that snapshot, checks its
-digest and never reloads a head policy. Conflicting mode, persona or budget flags
+saved in `run-metadata.json` under `policy` for review. Gate independently reads
+base policy from Git at invocation time; run metadata cannot authorize tests. Conflicting mode, persona or budget flags
 cannot override committed policy. Fix runs inherit the original snapshot and
 spend only the computed remaining budget.
 
@@ -268,7 +269,12 @@ cat-file blob <blob-object-id>
 `GIT_TERMINAL_PROMPT=0` are set. Git environment redirections and config injection
 are removed. These built-ins read objects without hooks, fsmonitor, checkout,
 filters, external diff or textconv. Transport is disabled, symlink/tree policy
-entries are rejected and output is bounded to 1 MiB. Missing objects fail locally.
+entries are rejected. Policy is bounded to 1 MiB, Git output to 64 MiB per call,
+and each Git child has a three-second deadline with process cleanup. Local
+`include` and `includeIf` sections are rejected before Git opens them, including
+FIFO includes. Redirected `.git` files, linked Git directories and common-dir
+redirection are rejected; use a standalone checkout. Explicit Git directory and
+worktree arguments override local worktree redirection. Missing objects fail locally.
 
 Excluded paths are literal relative file or directory prefixes using `/`, with
 no leading slash, trailing slash, traversal or backslash. They do not hide files
@@ -285,20 +291,50 @@ merges the reviewer's stored answers into the base policy and writes
 Review and apply the patch separately, then commit it for future runs. A policy
 proposal has no effect on the current gate.
 
-Suppressions contain a finding `fingerprint`, a nonempty `reason` and optionally
-`expires_unix` as UTC Unix seconds. Expired suppressions do not apply. Suppressions
-come only from the base snapshot, never the findings or a head policy.
+Suppressions require a finding `fingerprint`, a nonempty `reason` and
+`expires_unix` as UTC Unix seconds through year 9999. Missing, null and out-of-range
+expiries are invalid. Expiry cannot be more than 365 days after the commit that
+last changed policy, so unrelated commits cannot extend it. Expired suppressions
+do not apply. Only the base policy supplies suppressions.
 
-Gate exits 1 only for unsuppressed confirmed findings at or above the threshold
-whose runner records validate against all `omgs-proof/2` evidence and recipe
-contracts. A declaration of confirmation cannot block by itself. Missing,
-altered, unclean or unsupported proofs are printed as ineligible and do not
-block. Below-threshold and suppressed findings return 0. Advisory returns 0 for
-a valid run and prints each finding that would block. Malformed findings, invalid
-run storage, missing policy metadata or invalid policy return 3 in either mode.
-Gate does not run proofs or replace independent proof replay and evaluation.
-Treat exit 3 as an infrastructure failure, never as a clean review. See the
-[GitHub workflow example](docs/policy-workflow.md) for both modes.
+`gate_tests` is the owner-reviewed registry. Each entry specifies `id`, committed
+`test` path, exact `command`, `expect_marker` (the `prove --expect-marker` recipe
+contract), `severity`, `timeout_ms`, and optional originating `fingerprint`.
+`omgs intent propose` and `omgs stage --run <dir>` add validated test-proven
+findings and their tests to a reviewable patch. Review the command, contract and
+test together. Applying a patch requires normal owner review before a future
+base commit can authorize the test.
+
+```json
+{
+  "id": "tenant-boundary",
+  "test": "tests/security/tenant.sh",
+  "command": "sh tests/security/tenant.sh",
+  "expect_marker": "TENANT_BOUNDARY",
+  "severity": "high",
+  "timeout_ms": 10000
+}
+```
+
+`omgs gate --target <checkout> --base <base-sha> --head <head-sha> [--run <dir>]`
+requires full immutable SHAs and checks the checkout's HEAD with safe Git reads.
+It exports committed head files into a fresh temporary checkout, ignoring dirty
+and untracked files. Registered tests at or above threshold that are not
+suppressed execute through the same MXC machinery as `omgs prove`, each with a
+fresh nonce. Exit 1 requires exit 1 plus both nonce-qualified boundary and control
+markers. Exit 0 means every active test passed (exit 0), or no tests were active.
+Invalid policy, missing tests, contract errors, unclean runs, unavailable MXC and
+head mismatch return 3. Gate currently requires regular committed files and
+refuses symlinks and submodules in the exported tree. Each blob is limited to
+64 MiB. Dependencies must already be part of the committed tree or available in
+the existing sandbox toolchain; gate installs nothing.
+
+Once valid base policy establishes advisory mode, execution and infrastructure
+results are display-only and exit 0. Invalid base policy still returns 3 because
+it cannot establish advisory mode. Optional `--run` prints confirmed findings not
+yet registered as gate tests. Missing, corrupt or edited run artifacts never
+change the result. Only owner-authorized deterministic tests can block. See the
+[GitHub workflow example](docs/policy-workflow.md).
 
 ## Setup wizard and scripts
 
@@ -325,5 +361,10 @@ without step flags or `--yes` is also a dry run. The live test has the same
 fail-closed exit behavior as `doctor --live`, including exit 3 when MXC cannot
 establish its controls. Policy creation requires `--write-policy` or an explicit
 wizard repository choice, and refuses to overwrite existing policy even with
-`--yes`. Source lookup prefers `skill/` beside the binary, then `../skill/` for
-bootstrap `bin/omgs` layouts, then `./skill`; `--from` selects it explicitly.
+`--yes`. The complete skill pack is embedded in the release binary, so bootstrap
+checksum verification covers it and setup works from any working directory.
+`--from` explicitly selects a local source instead. Identical installs are
+no-ops. Differing content is refused with the file names. `--replace` stages a
+complete sibling tree, renames the old tree to a printed backup path, then
+publishes the replacement. A failed publish restores the backup without mixing
+trees; retain backups until you are satisfied with the install.
