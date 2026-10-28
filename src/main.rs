@@ -57,7 +57,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>]\n  omgs budget --run <run-dir>\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>]\n  omgs budget --run <run-dir>\n  omgs bench score --cases <manifest> --runs <run-dir> [--runs <run-dir>]...\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
         env!("CARGO_PKG_VERSION")
     );
     eprintln!("Sensors: trufflehog uses --no-verification --no-update; osv-scanner uses --offline-vulnerabilities and --offline with OMGS_OSV_DB (default: <OMGS data dir>/osv-db). No database download is automatic. See README for the explicit download step.");
@@ -76,6 +76,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
             ("--list --out --mode --budget --no-sensors", true)
         }
         "batch" if args.first().is_some_and(|a| a == "index") => ("--batch --out", true),
+        "bench" if args.first().is_some_and(|a| a == "score") => ("--cases --runs", true),
         "validate" => ("--findings", false),
         "fingerprint" => ("--attack-class --entry-point --sink --boundary", false),
         "prove" => (
@@ -109,7 +110,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "check" => ("--target --out", false),
         "doctor" => ("--live", false),
         "help" | "--help" | "-h" | "--version" | "-V" => ("", false),
-        "audit" | "batch" | "ledger" | "intent" if args == ["--help"] || args == ["-h"] => {
+        "audit" | "batch" | "ledger" | "intent" | "bench" if args == ["--help"] || args == ["-h"] => {
             ("", false)
         }
         _ => return Err(format!("unknown command or subcommand '{cmd}'")),
@@ -128,6 +129,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         }
         let repeatable = (cmd == "ledger" && option == "--evidence")
             || (cmd == "status" && option == "--counter")
+            || (cmd == "bench" && option == "--runs")
             || (["status", "report"].contains(&cmd) && option == "--accounting");
         if !seen.insert(option) && !repeatable {
             return Err(format!("duplicate option '{option}'"));
@@ -199,6 +201,7 @@ fn main() -> ExitCode {
         "audit" => cmd_audit(rest),
         "validate" => cmd_validate(rest),
         "fingerprint" => cmd_fingerprint(rest),
+        "bench" => cmd_bench(rest),
         "prove" => cmd_prove(rest),
         "approve" => cmd_approve(rest),
         "report" => cmd_report(rest),
@@ -306,6 +309,21 @@ fn cmd_architecture(args: &[String]) -> Result<(), String> {
         dir.join("ARCHITECTURE.md").display(),
         dir.join("ARCHITECTURE.html").display()
     );
+    Ok(())
+}
+
+fn cmd_bench(args: &[String]) -> Result<(), String> {
+    let cases = flag(args, "--cases").ok_or("bench score requires --cases <manifest>")?;
+    let dirs: Vec<PathBuf> = flags(args, "--runs")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let result = omgs::bench::score(Path::new(&cases), &dirs)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
+    );
+    eprint!("{}", omgs::bench::markdown(&result));
     Ok(())
 }
 
@@ -3125,6 +3143,7 @@ mod cli_tests {
         ("batch", "index"),
         ("validate", ""),
         ("fingerprint", ""),
+        ("bench", "score"),
         ("prove", ""),
         ("approve", ""),
         ("report", ""),

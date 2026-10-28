@@ -160,6 +160,8 @@ cargo build --release
 ./target/release/omgs check --target /path/to/your/repo
 ```
 
+Offline benchmark scoring: `omgs bench score --cases <manifest> --runs <run-dir>` reads saved artifacts and emits JSON plus Markdown. See the [benchmark guide](benchmark/README.md#score-saved-runs-offline) and [corpus research inventory](benchmark/corpus/README.md).
+
 ## Optional local sensors
 
 `audit init` and `check` look for installed sensors on PATH (PATH plus native
@@ -192,7 +194,8 @@ supported OS. Offline flags do not substitute for this enforcement.
   builds, tests or package scripts are requested.
 
 OSV database downloads remain a separate explicit network opt-in. The download
-runs outside MXC only because it is a network fetch the user has opted into. After approving that network access, run the following command
+runs outside MXC only because it is a network fetch the user has opted into.
+After approving that network access, run the following command
 with your already installed OSV-Scanner outside an OMGS audit. Replace CACHE
 with an absolute cache directory and TARGET with the local repository:
 
