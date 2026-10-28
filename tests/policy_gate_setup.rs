@@ -19,6 +19,29 @@ fn cli(home: &Path, args: &[&str]) -> Output {
         .output()
         .unwrap()
 }
+// Linux can briefly retain a copied executable's write handle in another
+// thread's fork child, even after fs::copy closes the parent's handle. Retry
+// only ETXTBSY before exec; never retry a started program or hide its status.
+fn copied_binary_output(command: &mut Command) -> Output {
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match command.output() {
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => return result.expect("could not execute copied fixture binary"),
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    command.output().unwrap()
+}
+
 fn output(o: &Output) -> String {
     format!(
         "{}{}",
@@ -604,13 +627,13 @@ fn setup_detects_only_existing_agents_and_writes_policy_only_on_request() {
         .join(if cfg!(windows) { "omgs.exe" } else { "omgs" });
     std::fs::copy(env!("CARGO_BIN_EXE_omgs"), &executable).unwrap();
     // Actual bootstrap layout: only the verified binary, launched from elsewhere.
-    let launched = Command::new(&executable)
-        .current_dir(&root)
-        .args(["setup", "--install-skills"])
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .output()
-        .unwrap();
+    let launched = copied_binary_output(
+        Command::new(&executable)
+            .current_dir(&root)
+            .args(["setup", "--install-skills"])
+            .env("HOME", &home)
+            .env("USERPROFILE", &home),
+    );
     assert!(launched.status.success(), "{}", output(&launched));
     assert!(output(&launched).contains("already installed"));
     let installed = home.join(".codex/skills").join(omgs::setup::SKILL_NAME);
@@ -1035,14 +1058,14 @@ fn default_setup_ignores_adjacent_and_checkout_sidecars() {
     }
     let binary = binary_dir.join(if cfg!(windows) { "omgs.exe" } else { "omgs" });
     std::fs::copy(env!("CARGO_BIN_EXE_omgs"), &binary).unwrap();
-    let result = Command::new(&binary)
-        .args(["setup", "--install-skills"])
-        .current_dir(&checkout)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("RUSTUP_AUTO_INSTALL", "0")
-        .output()
-        .unwrap();
+    let result = copied_binary_output(
+        Command::new(&binary)
+            .args(["setup", "--install-skills"])
+            .current_dir(&checkout)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("RUSTUP_AUTO_INSTALL", "0"),
+    );
     assert!(result.status.success(), "{}", output(&result));
     let installed = home.join(".agents/skills").join(omgs::setup::SKILL_NAME);
     for (path, bytes) in omgs::setup::BUNDLED {
