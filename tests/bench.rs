@@ -1,8 +1,33 @@
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+fn copy_private(from: &std::path::Path, to: &std::path::Path) {
+    omgs::platform::create_private_tree(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_private(&entry.path(), &dest);
+        } else {
+            omgs::runmeta::write_atomic_bytes(&dest, &std::fs::read(entry.path()).unwrap())
+                .unwrap();
+        }
+    }
+}
+
 fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score")
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        // Checked-out files can be owned by Administrators on Windows. Build
+        // valid archived run fixtures using the same private writer as the CLI.
+        let dir = std::env::temp_dir().join(format!("omgs-score-source-{}", std::process::id()));
+        copy_private(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score"),
+            &dir,
+        );
+        dir
+    })
+    .clone()
 }
 fn fixture() -> Value {
     serde_json::from_str(include_str!("../benchmark/fixtures/score/cases.json")).unwrap()
@@ -197,19 +222,7 @@ impl SavedRuns {
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        fn copy(from: &std::path::Path, to: &std::path::Path) {
-            std::fs::create_dir_all(to).unwrap();
-            for entry in std::fs::read_dir(from).unwrap() {
-                let entry = entry.unwrap();
-                let dest = to.join(entry.file_name());
-                if entry.file_type().unwrap().is_dir() {
-                    copy(&entry.path(), &dest);
-                } else {
-                    std::fs::copy(entry.path(), dest).unwrap();
-                }
-            }
-        }
-        copy(&root(), &dir);
+        copy_private(&root(), &dir);
         Self(dir)
     }
     fn edit(&self, path: &str, mutate: impl FnOnce(&mut Value)) {

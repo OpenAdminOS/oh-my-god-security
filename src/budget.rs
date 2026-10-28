@@ -302,12 +302,15 @@ fn charge_proof_checked(run: &Path, after_check: impl FnOnce()) -> Result<(), St
 /// the caller. The original lock spans calculation, creation and registration.
 pub fn init_fix(
     parent: &Path,
+    family_cap: impl FnOnce(&Path) -> Result<Option<u64>, String>,
     init: impl FnOnce(&Path, &Map<String, Value>, Option<u64>) -> Result<PathBuf, String>,
 ) -> Result<PathBuf, String> {
     let root = original(parent)?;
     runmeta::with_lock(&root, || {
         let mut meta = read_run(&root)?;
-        let remaining = allowance(&root)?.remaining;
+        let cap = family_cap(&root)?;
+        let used = allowance(&root)?.calls_and_proofs_used;
+        let remaining = cap.map(|cap| cap.saturating_sub(used));
         run_id(&meta)?;
         let child = run_path(&init(&root, &meta, remaining)?)?;
         if child.parent() != root.parent() || child == root {

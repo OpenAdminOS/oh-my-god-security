@@ -224,6 +224,64 @@ pub fn open_single_link(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     Ok(Some(file))
 }
 
+/// Physical directory identity, independent of editable run identifiers.
+pub fn directory_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0200_0000 | 0x0020_0000);
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_dir() || is_link(&meta) {
+        return Err(std::io::Error::other(
+            "run must be a directory without links",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok((meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        windows_file_identity(&file).map(|(volume, index)| (u64::from(volume), index))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::other("directory identity unavailable"))
+    }
+}
+
+/// Publish a private trust record exclusively. Existing entries are never replaced.
+pub fn write_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(windows)]
+    let mut file = open_private_write(path, true)?;
+    #[cfg(not(windows))]
+    let mut file = {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(path)?
+    };
+    // Leave failed publications reserved. Partial records must fail closed.
+    check_private_file(&file)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
 /// Sockets and FIFOs have no snapshot content; devices remain unsupported.
 pub fn contentless(meta: &std::fs::Metadata) -> bool {
     #[cfg(unix)]
@@ -304,7 +362,6 @@ pub fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Error, ErrorKind};
     let file =
         open_single_link(path)?.ok_or_else(|| Error::new(ErrorKind::NotFound, "file missing"))?;
-    #[cfg(unix)]
     check_private_file(&file)
         .map_err(|e| Error::other(format!("storage {}: {e}", path.display())))?;
     read_bounded_file(file, limit)

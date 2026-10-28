@@ -72,8 +72,12 @@ mod tests {
         let data = crate::platform::temp_root()
             .unwrap()
             .join(format!("omgs-approval-large-{}", std::process::id()));
-        std::fs::create_dir_all(&data).unwrap();
-        let file = std::fs::File::create(data.join(FILE)).unwrap();
+        crate::platform::create_private_tree(&data).unwrap();
+        crate::platform::write_private_new(&data.join(FILE), b"").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(data.join(FILE))
+            .unwrap();
         file.set_len(MAX_BYTES + 1).unwrap();
         assert!(is_approved(&data, Path::new("/work/a"))
             .unwrap_err()
