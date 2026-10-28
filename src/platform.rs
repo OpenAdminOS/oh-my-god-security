@@ -537,12 +537,14 @@ pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
 
 /// Reserve a new directory exclusively with owner-private permissions.
 pub fn create_private_dir_new(path: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
+    let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = builder;
         builder.mode(0o700);
-    }
+        builder
+    };
     builder.create(path)?;
     #[cfg(windows)]
     windows_private::restrict(path)?;

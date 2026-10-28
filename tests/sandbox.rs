@@ -1361,7 +1361,7 @@ fn interrupting_prove_cleans_the_executor_group_and_marks_the_record_unclean() {
     for number in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         let d = scratch(&format!("signal-{number}"));
         let run = d.join("run");
-        std::fs::create_dir_all(&run).unwrap();
+        omgs::platform::private_dir(&run).unwrap();
         std::fs::write(run.join(omgs::runmeta::FILE), "{}").unwrap();
         // The detached child also exercises the macOS survivor sweep.
         let command = if cfg!(target_os = "macos") {
@@ -1510,7 +1510,7 @@ fn linux_new_session_descendants_die_with_the_pid_namespace() {
     for method in ["setsid", "spawn"] {
         let d = scratch(&format!("linux-escape-{method}"));
         let run = d.join("run");
-        std::fs::create_dir_all(&run).unwrap();
+        omgs::platform::private_dir(&run).unwrap();
         std::fs::write(run.join(omgs::runmeta::FILE), "{}").unwrap();
         let marker = format!("omgs-r4-{method}-{}", std::process::id());
         let args = format!(
@@ -1612,7 +1612,7 @@ fn executable_drafts_keep_their_mode_and_commands_are_redacted() {
     let target = d.join("target");
     let run = d.join("run");
     std::fs::create_dir_all(&target).unwrap();
-    std::fs::create_dir_all(&run).unwrap();
+    omgs::platform::private_dir(&run).unwrap();
     std::fs::write(
         run.join(omgs::runmeta::FILE),
         serde_json::json!({"target": target}).to_string(),
@@ -1678,7 +1678,7 @@ fn executable_drafts_keep_their_mode_and_commands_are_redacted() {
 fn cli_rejects_unknown_and_duplicate_options_before_charging_budget() {
     let d = scratch("cli-options");
     let run = d.join("run");
-    std::fs::create_dir_all(&run).unwrap();
+    omgs::platform::private_dir(&run).unwrap();
     let meta = serde_json::json!({"budget_agent_calls": 1, "proof_runs_used": 0});
     let bytes = serde_json::to_vec(&meta).unwrap();
     std::fs::write(run.join(omgs::runmeta::FILE), &bytes).unwrap();
@@ -1731,7 +1731,7 @@ fn symlinked_executor_and_proof_test_run_with_private_artifacts() {
     let target = d.join("target");
     let run = d.join("run");
     std::fs::create_dir_all(&target).unwrap();
-    std::fs::create_dir_all(&run).unwrap();
+    omgs::platform::private_dir(&run).unwrap();
     std::fs::write(target.join("real.sh"), "exit 1\n").unwrap();
     symlink("real.sh", target.join("proof.sh")).unwrap();
     let executor = d.join("executor-link");
@@ -1800,7 +1800,7 @@ fn preparation_signals_release_the_reservation_and_remove_the_workspace() {
         let target = d.join("target");
         let run = d.join("run");
         std::fs::create_dir_all(&target).unwrap();
-        std::fs::create_dir_all(&run).unwrap();
+        omgs::platform::private_dir(&run).unwrap();
         // Copy finishes quickly; hashing leaves a deterministic preparation window.
         std::fs::File::create(target.join("large"))
             .unwrap()
@@ -1883,6 +1883,7 @@ fn socket_and_fifo_gaps_survive_validation_and_replay() {
     }
     let d = PathBuf::from("/tmp").join(format!("omgs-s-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
+    omgs::platform::create_private_dir(&d).unwrap();
     let target = d.join("t");
     std::fs::create_dir_all(&target).unwrap();
     let socket = std::os::unix::net::UnixListener::bind(target.join("socket")).unwrap();
@@ -1974,6 +1975,7 @@ fn symlink_proofs_replay_when_sockets_appear_or_disappear() {
     }
     let d = PathBuf::from("/tmp").join(format!("omgs-sl-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
+    omgs::platform::create_private_dir(&d).unwrap();
     let target = d.join("target");
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(
