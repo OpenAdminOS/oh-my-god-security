@@ -27,7 +27,7 @@ extern "C" {
     fn acl_init(count: c_int) -> Ptr;
     fn acl_set_fd_np(fd: c_int, acl: Ptr, kind: c_int) -> c_int;
     fn acl_free(object: Ptr) -> c_int;
-    fn mbr_uid_to_uuid(uid: libc::uid_t, uuid: *mut u8) -> c_int;
+    fn mbr_uuid_to_id(uuid: *const u8, id: *mut libc::id_t, kind: *mut c_int) -> c_int;
 }
 
 struct Allocation(NonNull<c_void>);
@@ -86,11 +86,6 @@ fn check(acl: &Allocation, owner: libc::uid_t) -> Result<()> {
         if acl_valid(acl.ptr()) != 0 {
             return Err(Error::last_os_error());
         }
-        let mut owner_uuid = [0u8; 16];
-        let code = mbr_uid_to_uuid(owner, owner_uuid.as_mut_ptr());
-        if code != 0 {
-            return Err(Error::from_raw_os_error(code));
-        }
         for index in 0.. {
             let mut entry = null_mut();
             if acl_get_entry(acl.ptr(), index, &mut entry) != 0 {
@@ -124,7 +119,13 @@ fn check(acl: &Allocation, owner: libc::uid_t) -> Result<()> {
             }
             let qualifier = Allocation::new(acl_get_qualifier(entry))?;
             let principal = std::slice::from_raw_parts(qualifier.ptr().cast::<u8>(), 16);
-            if principal != owner_uuid {
+            // Resolve both directory-service and synthesized UUIDs. Only a
+            // user ID matching the owner is trusted, never a same-numbered
+            // group ID. Unresolvable principals fail this owner exception.
+            let mut id = 0;
+            let mut kind = -1;
+            let code = mbr_uuid_to_id(principal.as_ptr(), &mut id, &mut kind);
+            if code != 0 || kind != 0 || id != owner {
                 return Err(Error::other(format!(
                     "ACL entry {index} allows mutation by another principal (UUID {}, rights 0x{:x}, effective or inheritable)",
                     crate::sha256::hex(principal), mask & MUTATION_RIGHTS,
@@ -310,6 +311,39 @@ mod tests {
                 String::from_utf8(owner.stdout).unwrap().trim()
             ),
         );
+        assert!(runmeta::read(&fixture.0).is_ok());
+        // Darwin also accepts synthesized owner UUIDs, including after a
+        // directory-service UUID has been assigned to the same account.
+        // SAFETY: geteuid has no arguments or memory preconditions.
+        let uid = unsafe { libc::geteuid() };
+        unsafe {
+            extern "C" {
+                fn acl_create_entry(acl: *mut Ptr, entry: *mut Ptr) -> c_int;
+                fn acl_set_tag_type(entry: Ptr, tag: c_int) -> c_int;
+                fn acl_set_qualifier(entry: Ptr, qualifier: *const c_void) -> c_int;
+                fn acl_set_permset_mask_np(entry: Ptr, mask: u64) -> c_int;
+            }
+            // SAFETY: all ACL objects are owned by this fixture and every
+            // pointer outlives its API call. Only this temporary file changes.
+            let mut acl = Allocation::new(acl_init(1)).unwrap();
+            let mut ptr = acl.ptr();
+            let mut entry = null_mut();
+            let code = acl_create_entry(&mut ptr, &mut entry);
+            acl.0 = NonNull::new(ptr).unwrap();
+            assert_eq!(code, 0);
+            let mut principal = [
+                0xff, 0xff, 0xee, 0xee, 0xdd, 0xdd, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0, 0, 0, 0,
+            ];
+            principal[12..].copy_from_slice(&uid.to_be_bytes());
+            assert_eq!(acl_set_tag_type(entry, ACL_EXTENDED_ALLOW), 0);
+            assert_eq!(acl_set_qualifier(entry, principal.as_ptr().cast()), 0);
+            assert_eq!(acl_set_permset_mask_np(entry, 1 << 2), 0);
+            let file = std::fs::File::open(&metadata).unwrap();
+            assert_eq!(
+                acl_set_fd_np(file.as_raw_fd(), acl.ptr(), ACL_TYPE_EXTENDED),
+                0
+            );
+        }
         assert!(runmeta::read(&fixture.0).is_ok());
         add_acl(
             &fixture.0,
