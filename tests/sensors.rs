@@ -707,6 +707,7 @@ fn scratch_inside_artifacts_is_refused_before_creation() {
         f.tool("trufflehog", &truffle("src/main.rs").to_string(), 0);
         let run = f.root.join("artifact-overlap");
         omgs::platform::create_private_dir_new(&run).unwrap();
+        let audit = command[0] == "audit";
         let mut args = command;
         args.extend([
             "--target",
@@ -722,6 +723,14 @@ fn scratch_inside_artifacts_is_refused_before_creation() {
             .env("TMP", &run)
             .output()
             .unwrap();
+        if audit {
+            // Policy provenance must reject this data/run overlap even before sensors.
+            assert!(!out.status.success());
+            assert!(String::from_utf8_lossy(&out.stderr)
+                .contains("trusted policy store must live outside the run directory"));
+            assert_no_scratch(&run);
+            continue;
+        }
         assert!(
             out.status.success(),
             "{}",
@@ -871,7 +880,7 @@ fn scratch_inside_readable_rules_is_refused_before_creation() {
         "{report}"
     );
     assert!(report["tools_run"].as_array().unwrap().is_empty());
-    assert!(std::fs::read_dir(temp).unwrap().next().is_none());
+    assert_no_scratch(&temp);
 }
 
 #[cfg(target_os = "linux")]
