@@ -261,10 +261,15 @@ fn metadata_hit(
     line: Option<u64>,
     target: &Path,
 ) -> Result<SensorHit, ()> {
+    #[cfg(windows)]
     let target_display = crate::platform::mxc_path(target);
+    #[cfg(windows)]
     let target = Path::new(&target_display);
+    #[cfg(windows)]
     let file_display = crate::platform::mxc_path(Path::new(file));
-    let path = Path::new(&file_display);
+    #[cfg(windows)]
+    let file = file_display.as_str();
+    let path = Path::new(file);
     let relative = if path.is_absolute() {
         path.strip_prefix(target).map_err(|_| ())?
     } else {
@@ -709,6 +714,21 @@ mod offline_tests {
         assert!(osv_hits(r#"{"results":[],"results":[]}"#, target).is_err());
         assert!(osv_hits("[]", target).is_err());
     }
+    #[cfg(unix)]
+    #[test]
+    fn unix_metadata_preserves_literal_windows_looking_names() {
+        let hit = metadata_hit(
+            "trufflehog",
+            "fixture",
+            r"\\?\vendor/lib.rs",
+            Some(1),
+            Path::new("/target"),
+        )
+        .unwrap();
+        assert_eq!(hit.class, crate::paths::Class::Code);
+        assert_eq!(hit.file, "%5C%5C?%5Cvendor/lib.rs");
+    }
+
     #[cfg(unix)]
     #[test]
     fn sensor_supervision_enforces_wall_clock_and_output_cap() {
