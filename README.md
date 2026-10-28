@@ -64,8 +64,9 @@ null persona keeps the full form. Both reports include the recorded pipeline
 timeline and links to proof records. Markdown starts with what needs action,
 including an explicit "Nothing to fix" when no finding was confirmed.
 
-Share `HANDOFF.md` and the protected run directory with a fixer. It explains
-verdicts, proof tiers, retained tests, exact proof commands and cumulative fix
+The installed [handoff and progress guide](skill/HANDOFF-AND-PROGRESS.md) describes how to consume
+the generated `OUTPUT_DIR/HANDOFF.md`. Share that artifact and the protected run directory with a
+fixer. It explains verdicts, proof tiers, retained tests, exact proof commands and cumulative fix
 budgets without requiring the reader to know OMGS. Confirmed records come first.
 Pending records say "verify before fixing" and name the missing fact. Rejected
 records are excluded. The machine-readable equivalent follows
@@ -136,7 +137,7 @@ On supported Windows tiers, OMGS omits parent directory enumeration when the pro
 For free-text options (`--cmd`, `--note`, `--answer`, `--detail`, `--log`, `--reason`), the next argument may begin with `--`, for example `omgs prove --cmd "--version"`. A free-text value matching a known option of that command, or starting with its inline assignment form, must use `--opt=value` so it cannot silently swallow another option. `--help`, `-h` and values starting with `--help=` are also refused as the next free-text argument; pass them using `--opt=value`. All value options accept `--opt=value`; use this form for other values beginning with `--`.
 
 Proof is attempted by default for every candidate with a locally reachable
-runtime, within the proof budget. The [per-stack recipes](skill/VALIDATION-AND-REPORTING.md#proof-by-default-per-stack-recipes)
+runtime, within the proof budget. The [per-stack recipes](skill/PROOF-RECIPES.md#proof-by-default-per-stack-recipes)
 cover PowerShell, Node, Python isolated mode, shell and Swift, including exact
 commands, invariant assertions and blockers. `doctor --live` launches each
 runtime's bounded version command (or `sh -c 'exit 0'`) inside MXC before
@@ -346,7 +347,10 @@ Role contracts live under `skill/agents/`: red-hunter, blue-verifier, evaluator 
 
 - `src/`: the deterministic Rust CLI (findings schema, finding identity across runs, stack detection, coverage ledger, redacted sensor execution, sandbox proof execution, report rendering to Markdown, a self contained HTML one pager, and SARIF, and the architecture map renderer).
 - `schemas/`: coverage ledger JSON schema. Findings, candidate and architecture schemas live in `skill/schemas/`.
-- `skill/`: the agent skill pack and attack class packs that your agent follows.
+- `skill/`: start with the short [entry](skill/SKILL.md), then follow the linked
+  [pipeline](skill/PIPELINE.md), [proof contract](skill/PROOF-CONTRACT.md),
+  [policy and gate](skill/POLICY-AND-GATE.md), and role briefs. Detailed guides
+  are loaded by phase; the binary embeds the complete bundle.
 - `.github/workflows/release.yml`: the signed, notarized, checksummed release pipeline.
 - `benchmark/`: the open benchmark design and case manifest format.
 - `DECISIONS.md`: the locked product decisions this implementation follows.
