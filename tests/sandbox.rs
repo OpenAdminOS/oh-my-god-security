@@ -1908,7 +1908,9 @@ fn socket_and_fifo_gaps_survive_validation_and_replay() {
     if !mxc_ready() {
         return;
     }
-    let d = PathBuf::from("/tmp").join(format!("omgs-s-{}", std::process::id()));
+    let d = std::fs::canonicalize("/tmp")
+        .unwrap()
+        .join(format!("omgs-s-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     omgs::platform::create_private_dir(&d).unwrap();
     let target = d.join("t");
@@ -2000,7 +2002,9 @@ fn symlink_proofs_replay_when_sockets_appear_or_disappear() {
     if !mxc_ready() {
         return;
     }
-    let d = PathBuf::from("/tmp").join(format!("omgs-sl-{}", std::process::id()));
+    let d = std::fs::canonicalize("/tmp")
+        .unwrap()
+        .join(format!("omgs-sl-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     omgs::platform::create_private_dir(&d).unwrap();
     let target = d.join("target");

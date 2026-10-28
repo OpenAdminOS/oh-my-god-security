@@ -28,6 +28,22 @@ class Installers(unittest.TestCase):
                                                dir=os.environ['USERPROFILE'] if os.name == 'nt' else None)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name).resolve()
+        if os.name == 'nt':
+            # Python may reserve temp directories with OWNER RIGHTS and an
+            # elevated token's Administrators owner. Give only this newly
+            # created disposable fixture the product's explicit user DACL.
+            escaped = str(self.root).replace("'", "''")
+            command = f"""
+$ErrorActionPreference = 'Stop'
+$user = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = [Security.AccessControl.DirectorySecurity]::new()
+$acl.SetOwner($user)
+$acl.SetAccessRuleProtection($true, $false)
+$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($user, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+Set-Acl -LiteralPath '{escaped}' -AclObject $acl
+"""
+            subprocess.run(['powershell', '-NoProfile', '-Command', command],
+                           text=True, capture_output=True, check=True)
         self.skill = self.root / 'skill'
         shutil.copytree(ROOT / 'skill', self.skill)
         self.bundle = self.root / 'bundle'
