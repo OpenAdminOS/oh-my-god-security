@@ -867,12 +867,12 @@ mod tests {
         assert_eq!(run.executor_exit_code, Some(99));
         assert!(!run.cleanup_complete && !run.success, "{run:?}");
         // A successful wrapper must not suppress target ACL verification.
-        // Add a distinct trustee because CI temp roots can already have only
+        // Grant LOCAL SERVICE because CI temp roots can already have only
         // explicit ACEs, making /inheritance:d a no-op.
         assert!(Command::new("icacls.exe")
             .arg(&target)
             .arg("/grant")
-            .arg("*S-1-5-21-1000000001-1000000002-1000000003-4242:(R)")
+            .arg("*S-1-5-19:(R)")
             .status()
             .unwrap()
             .success());
@@ -899,11 +899,9 @@ mod tests {
             std::fs::create_dir(&root).unwrap();
             let snapshot = WindowsAclSnapshot::capture([&root]).unwrap();
             let mut cmd = Command::new("icacls.exe");
-            // A distinct trustee guarantees an actual ACL mutation even when
+            // A well-known mapped trustee adds an explicit ACE even when
             // this host's temp directory does not inherit any ACEs.
-            cmd.arg(&root)
-                .arg("/grant")
-                .arg("*S-1-5-21-1000000001-1000000002-1000000003-4242:(R)");
+            cmd.arg(&root).arg("/grant").arg("*S-1-5-19:(R)");
             let mut run = inspect_inner(cmd, true);
             assert!(run.success, "{run:?}");
             match outcome {
