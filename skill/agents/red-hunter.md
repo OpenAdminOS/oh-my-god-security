@@ -47,10 +47,11 @@ defect, not as an attack:
   while the defect exists and passes once fixed.
 - Add a short fix direction in the evidence where it is clear.
 
-Never write step-by-step operational instructions, working payloads, weaponized commands,
-credential harvesting steps or guidance for use against systems other than the owner's local
-synthetic test. They are not evidence, the verifier does not need them, and the proof runs only
-inside the sandbox.
+Do include the minimal synthetic input and the external test draft the verifier needs, such as the
+exact string a local fixture receives, with dummy principals and data. That is the regression test.
+Never write step-by-step operational instructions, weaponized commands, credential harvesting
+steps or guidance for use against real deployments or systems other than the owner's local
+synthetic test. They add nothing to the evidence, and the proof runs only inside the sandbox.
 
 ## Excluded file accountability
 
