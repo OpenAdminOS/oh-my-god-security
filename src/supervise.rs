@@ -299,8 +299,51 @@ mod owner_job {
     }
 }
 
+thread_local! {
+    static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// One wall-clock budget shared by preparation and nested executor runs on
+/// this thread. Cleanup deliberately keeps its independent bounded grace.
+/// The guard cannot move to a different thread.
+pub struct Deadline {
+    previous: Option<Instant>,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Deadline {
+    pub fn after(budget: Duration) -> Self {
+        let end = Instant::now() + budget;
+        let previous = DEADLINE.with(|deadline| {
+            let previous = deadline.get();
+            deadline.set(Some(previous.map_or(end, |old| old.min(end))));
+            previous
+        });
+        Self {
+            previous,
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    pub fn expired() -> bool {
+        DEADLINE.with(|deadline| deadline.get().is_some_and(|end| Instant::now() >= end))
+    }
+}
+
+impl Drop for Deadline {
+    fn drop(&mut self) {
+        DEADLINE.with(|deadline| deadline.set(self.previous));
+    }
+}
+
 /// Preparation loops cooperate with the same guard as executor supervision.
 pub fn check_interrupted() -> io::Result<()> {
+    if Deadline::expired() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "overall operation deadline exceeded",
+        ));
+    }
     #[cfg(any(unix, windows))]
     if interruption::pending() {
         return Err(io::Error::new(
@@ -752,6 +795,8 @@ struct Waited {
     timed_out: bool,
     interrupted: bool,
     healthy: bool,
+    #[cfg(unix)]
+    shutdown_signals: Vec<i32>,
 }
 
 fn wait(
@@ -770,6 +815,8 @@ fn wait(
         timed_out: false,
         interrupted: false,
         healthy: true,
+        #[cfg(unix)]
+        shutdown_signals: Vec::new(),
     };
     #[cfg(unix)]
     let mut owns_leader = true;
@@ -779,6 +826,11 @@ fn wait(
         if check_signals && interruption::pending() {
             waited.interrupted = true;
             notes.push("proof interrupted; executor cleanup required".into());
+            break;
+        }
+        if check_signals && Deadline::expired() {
+            waited.timed_out = true;
+            notes.push("overall operation deadline exceeded; executor cleanup required".into());
             break;
         }
         #[cfg(unix)]
@@ -812,11 +864,24 @@ fn wait(
     #[cfg(unix)]
     if owns_leader {
         if let Ok(pid) = i32::try_from(child.id()) {
-            waited.healthy &= signal(-pid, libc::SIGTERM, notes);
+            // Keep the shutdown order. Group cleanup also runs for an already
+            // exited executor, but cannot explain that executor's signal death.
+            let leader_running = exited_without_reaping(child.id()).is_ok_and(|exited| !exited);
+            let term_sent = signal(-pid, libc::SIGTERM, notes);
+            waited.healthy &= term_sent;
+            if leader_running && term_sent {
+                waited.shutdown_signals.push(libc::SIGTERM);
+            }
             pause(rx, capture, notes, TERM_GRACE);
-            waited.healthy &= signal(-pid, libc::SIGKILL, notes);
+            let leader_running = exited_without_reaping(child.id()).is_ok_and(|exited| !exited);
+            let group_kill_sent = signal(-pid, libc::SIGKILL, notes);
+            waited.healthy &= group_kill_sent;
             // Also reach an executor that changed its own process group.
-            waited.healthy &= signal(pid, libc::SIGKILL, notes);
+            let leader_kill_sent = signal(pid, libc::SIGKILL, notes);
+            waited.healthy &= leader_kill_sent;
+            if leader_running && (group_kill_sent || leader_kill_sent) {
+                waited.shutdown_signals.push(libc::SIGKILL);
+            }
         } else {
             notes.push("executor pid does not fit a process group id".into());
             waited.healthy = false;
@@ -1293,6 +1358,7 @@ mod sweep {
         result.enforced.push("survivor_sweep".into());
         let mut healthy = true;
         let mut seen = Vec::new();
+        let mut zombies = Vec::new();
         for _ in 0..MAX_SCANS {
             let pids = match processes.pids() {
                 Ok(pids) => pids,
@@ -1325,8 +1391,32 @@ mod sweep {
                 }
                 let before = match processes.info(pid) {
                     Ok(info) if info.pbi_uid == uid && info.pbi_status != 5 => info,
-                    Ok(_) => continue,
+                    Ok(info) if info.pbi_uid == uid && info.pbi_status == 5 => {
+                        let identity = (
+                            pid,
+                            info.pbi_uid,
+                            info.pbi_start_tvsec,
+                            info.pbi_start_tvusec,
+                        );
+                        // The first zombie lookup is ambiguous. A later scan
+                        // covers any child it forked before that lookup. The
+                        // same retained zombie cannot fork between scans.
+                        if !zombies.contains(&identity) {
+                            zombies.push(identity);
+                            found = true;
+                        }
+                        continue;
+                    }
+                    // An enumerated owned process may have forked after the
+                    // snapshot and then exited before this first lookup. Its
+                    // child is visible only to a later scan. Do not signal or
+                    // record the parent without a verified live identity.
+                    Ok(_) => {
+                        found = true;
+                        continue;
+                    }
                     Err(error) => {
+                        found = true;
                         if !matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
                             result
                                 .notes
@@ -1672,6 +1762,80 @@ mod sweep {
                 "sweep stopped before script ended"
             );
             (result, processes)
+        }
+
+        #[test]
+        fn early_disappearance_or_zombie_rescans_and_kills_forked_child() {
+            let mut zombie = live();
+            zombie.pbi_status = 5;
+            for first_lookup in [Err(libc::ESRCH), Err(libc::ENOENT), Ok(zombie)] {
+                let (result, processes) = exercise(vec![
+                    scan(&[A]),
+                    Step::Info(A, first_lookup),
+                    Step::Pause,
+                    scan(&[B]),
+                    Step::Info(B, Ok(live())),
+                    Step::Matches(B),
+                    Step::Command(B, Some("child")),
+                    Step::Info(B, Ok(live())),
+                    Step::Signal(B),
+                    Step::Pause,
+                    scan(&[]),
+                ]);
+                assert!(result.cleanup_complete, "{result:?}");
+                assert!(result.notes.is_empty(), "{result:?}");
+                assert_eq!(processes.scans, 3);
+                assert_eq!(processes.signalled, [B]);
+                assert_eq!(result.survivors.len(), 1);
+                assert_eq!(result.survivors[0].pid, B);
+                assert_eq!(result.survivors[0].command, "child");
+            }
+        }
+
+        #[test]
+        fn retained_zombie_rescans_finds_child_and_then_reaches_quiescence() {
+            let mut zombie = live();
+            zombie.pbi_status = 5;
+            let (result, processes) = exercise(vec![
+                scan(&[A]),
+                Step::Info(A, Ok(zombie)),
+                Step::Pause,
+                scan(&[A, B]),
+                Step::Info(A, Ok(zombie)),
+                Step::Info(B, Ok(live())),
+                Step::Matches(B),
+                Step::Command(B, Some("child")),
+                Step::Info(B, Ok(live())),
+                Step::Signal(B),
+                Step::Pause,
+                scan(&[A]),
+                Step::Info(A, Ok(zombie)),
+            ]);
+            assert!(result.cleanup_complete, "{result:?}");
+            assert!(result.notes.is_empty(), "{result:?}");
+            assert_eq!(processes.scans, 3);
+            assert_eq!(processes.signalled, [B]);
+            assert_eq!(result.survivors.len(), 1);
+            assert_eq!(result.survivors[0].pid, B);
+        }
+
+        #[test]
+        fn early_ambiguity_at_scan_or_time_bound_fails_cleanup() {
+            for time_bound in [false, true] {
+                let scans = if time_bound { 1 } else { MAX_SCANS };
+                let mut steps = Vec::new();
+                for _ in 0..scans {
+                    steps.extend([scan(&[A]), Step::Info(A, Err(libc::ESRCH)), Step::Pause]);
+                }
+                if time_bound {
+                    steps.push(Step::Pids(vec![], DRAIN));
+                }
+                let (result, processes) = exercise(steps);
+                assert!(!result.cleanup_complete, "{result:?}");
+                assert!(result.notes.iter().any(|note| note.contains("time bound")));
+                assert!(processes.signalled.is_empty());
+                assert!(result.survivors.is_empty());
+            }
         }
 
         #[test]
@@ -2086,6 +2250,14 @@ fn run_inner(
     } else {
         None
     };
+    if check_signals {
+        if let Err(error) = check_interrupted() {
+            result.timed_out = error.kind() == io::ErrorKind::TimedOut;
+            result.output = error.to_string();
+            result.notes.push(result.output.clone());
+            return result;
+        }
+    }
     #[cfg(unix)]
     let unix_controls = match prepare_unix(&mut cmd, limits) {
         Ok(controls) => controls,
@@ -2273,21 +2445,62 @@ fn run_inner(
             result.enforced.extend(pending_cgroups);
         }
     }
-    // A requested shutdown can race with the wrapper's end marker. Signal
-    // termination is expected after our interrupt/timeout cleanup, even if the
-    // wrapper managed to report its inner status first. Unexpected executor
-    // failures still invalidate cleanup, and requested stops never pass proofs.
+    // A completed wrapper can race with requested shutdown. Only signals
+    // actually sent while the executor was still running explain its death.
+    #[cfg(unix)]
+    let terminating_signal = {
+        use std::os::unix::process::ExitStatusExt;
+        waited.status.and_then(|status| status.signal())
+    };
+    #[cfg(unix)]
     let expected_signal_exit = (waited.interrupted || waited.timed_out)
-        && waited.status.is_some_and(|status| status.code().is_none());
-    let executor_failed = nonce.is_some()
-        && result.command_finished
-        && result.executor_exit_code != result.exit_code
-        && !expected_signal_exit;
+        && terminating_signal.is_some_and(|signal| waited.shutdown_signals.contains(&signal));
+    #[cfg(not(unix))]
+    let expected_signal_exit = false;
+    #[cfg(unix)]
+    let unexpected_signal = terminating_signal.is_some()
+        && !expected_signal_exit
+        && (result.command_finished || waited.interrupted || waited.timed_out);
+    #[cfg(not(unix))]
+    let unexpected_signal = false;
+    #[cfg(unix)]
+    if let Some(signal) = terminating_signal.filter(|_| unexpected_signal) {
+        let name = match signal {
+            libc::SIGTERM => "SIGTERM",
+            libc::SIGKILL => "SIGKILL",
+            libc::SIGUSR1 => "SIGUSR1",
+            libc::SIGUSR2 => "SIGUSR2",
+            libc::SIGSEGV => "SIGSEGV",
+            libc::SIGABRT => "SIGABRT",
+            libc::SIGINT => "SIGINT",
+            libc::SIGHUP => "SIGHUP",
+            libc::SIGQUIT => "SIGQUIT",
+            libc::SIGILL => "SIGILL",
+            libc::SIGTRAP => "SIGTRAP",
+            libc::SIGBUS => "SIGBUS",
+            libc::SIGFPE => "SIGFPE",
+            libc::SIGPIPE => "SIGPIPE",
+            libc::SIGALRM => "SIGALRM",
+            libc::SIGXCPU => "SIGXCPU",
+            libc::SIGXFSZ => "SIGXFSZ",
+            libc::SIGSYS => "SIGSYS",
+            _ => "signal",
+        };
+        result.notes.push(format!(
+            "executor terminated by unexpected {name} ({signal}); shutdown did not account for this signal"
+        ));
+    }
+    let executor_failed = unexpected_signal
+        || (nonce.is_some()
+            && result.command_finished
+            && result.executor_exit_code != result.exit_code
+            && !expected_signal_exit);
     if executor_failed {
         result.notes.push(format!(
             "executor termination disagrees with completed workload: executor={:?}, workload={:?}",
             result.executor_exit_code, result.exit_code
         ));
+        result.executor_error = true;
     }
     result.cleanup_complete = cleanup_complete && !executor_failed;
     result.success = result.exit_code == Some(0)
@@ -2335,6 +2548,54 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn deadline_covers_preparation_and_restores_outer_budget() {
+        let _outer = Deadline::after(Duration::from_secs(60));
+        {
+            let _inner = Deadline::after(Duration::ZERO);
+            assert_eq!(
+                check_interrupted().unwrap_err().kind(),
+                io::ErrorKind::TimedOut
+            );
+            let path = std::env::temp_dir().join(format!("omgs-deadline-{}", std::process::id()));
+            std::fs::write(&path, b"preparation input").unwrap();
+            let error = crate::sha256::digest_file(&path).unwrap_err();
+            std::fs::remove_file(path).unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        }
+        assert!(!Deadline::expired());
+        assert!(check_interrupted().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overall_deadline_stops_executor_before_its_per_probe_timeout() {
+        let _deadline = Deadline::after(Duration::from_millis(100));
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "while :; do :; done"]);
+        let run = run(
+            cmd,
+            &Limits {
+                wall_ms: 30_000,
+                cpu_secs: None,
+                file_size_bytes: None,
+                open_files: None,
+                memory_bytes: None,
+                tasks: None,
+                output_cap_bytes: 65536,
+            },
+            None,
+        );
+        assert!(run.timed_out && run.cleanup_complete, "{run:?}");
+        assert!(run.duration_ms < 5000, "{run:?}");
+        assert!(
+            run.notes
+                .iter()
+                .any(|note| note.contains("overall operation deadline")),
+            "{run:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn executor_failure_after_end_marker_keeps_workload_status_but_fails_cleanup() {
@@ -2370,14 +2631,17 @@ mod tests {
             assert!(out.status.success(), "{out:?}");
             return;
         }
-        for interrupted in [true, false] {
+        for (interrupted, ignore_term) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let trap = if ignore_term { "trap '' TERM;" } else { "" };
             let stop = if interrupted {
                 format!("kill -TERM {};", std::process::id())
             } else {
                 String::new()
             };
             let mut cmd = Command::new("/bin/sh");
-            cmd.args(["-c", &format!("printf 'OMGS_START_test\\nOMGS_END_test:137\\n'; {stop} while :; do /bin/sleep 1; done")]);
+            cmd.args(["-c", &format!("{trap} printf 'OMGS_START_test\\nOMGS_END_test:137\\n'; {stop} while :; do /bin/sleep 1; done")]);
             let run = run_marked(
                 cmd,
                 &Limits {
@@ -2398,8 +2662,43 @@ mod tests {
             assert_eq!(run.interrupted, interrupted, "{run:?}");
             assert_eq!(run.timed_out, !interrupted, "{run:?}");
             assert!(run.capture_complete && run.cleanup_complete, "{run:?}");
-            assert!(!run.success, "{run:?}");
+            assert!(!run.executor_error && !run.success, "{run:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrelated_signal_in_term_handler_after_timeout_fails_cleanup() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "trap 'kill -USR1 $$' TERM; printf 'OMGS_START_test\\nOMGS_END_test:0\\n'; while :; do :; done",
+        ]);
+        let run = run_marked(
+            cmd,
+            &Limits {
+                wall_ms: 100,
+                cpu_secs: None,
+                file_size_bytes: None,
+                open_files: None,
+                memory_bytes: None,
+                tasks: None,
+                output_cap_bytes: 65536,
+            },
+            None,
+            "test",
+        );
+        assert!(run.command_started && run.command_finished, "{run:?}");
+        assert_eq!(run.exit_code, Some(0), "{run:?}");
+        assert!(run.timed_out && run.capture_complete, "{run:?}");
+        assert!(
+            !run.cleanup_complete && run.executor_error && !run.success,
+            "{run:?}"
+        );
+        assert!(
+            run.notes.iter().any(|note| note.contains("SIGUSR1")),
+            "{run:?}"
+        );
     }
 
     #[cfg(unix)]

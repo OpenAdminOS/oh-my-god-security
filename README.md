@@ -233,7 +233,13 @@ calling it reachable. The probe uses the same command lookup as proofs,
 including the `/usr/bin/swiftc` and `/usr/bin/clang` shims when selected by
 the sandbox PATH. On macOS, these compiler probes have a thirty-second
 budget for xcrun's first-launch SDK discovery. Other tools retain their
-three-second budget. A working direct toolchain binary cannot make a
+three-second budget. One 180-second wall-clock deadline covers the entire
+`doctor --live` operation, starting before executor discovery and preparation,
+including staging, policy validation, and all probes. When it expires, OMGS
+stops active execution, reports the current and remaining probes as not checked,
+and exits nonzero. Bounded executor cleanup and output draining still finish
+before exit, so cleanup can extend the elapsed time beyond 180 seconds.
+A working direct toolchain binary cannot make a
 failing shim pass this check. `TMPDIR` points to per-proof scratch; OMGS
 does not grant access to the host user cache for compiler discovery.
 Missing tools print `<runtime> not on host PATH`.
