@@ -256,7 +256,8 @@ pub fn load(run: &Path, proof_ref: &str) -> Result<ProofRecord, String> {
         ));
     }
     let path = record_path(run, n);
-    let text = read_text(&path, 2 << 20)?;
+    let text =
+        crate::run_artifact::text(run, Path::new(proof_ref), crate::run_artifact::PROOF_BYTES)?;
     // Strict like every other run input: duplicate keys and unknown fields
     // are errors.
     let record: ProofRecord =
@@ -267,17 +268,13 @@ pub fn load(run: &Path, proof_ref: &str) -> Result<ProofRecord, String> {
     Ok(record)
 }
 
-fn read_text(path: &Path, limit: u64) -> Result<String, String> {
-    crate::platform::read_bounded(path, limit)
-        .map_err(|e| format!("read {}: {e}", path.display()))
-        .and_then(|bytes| String::from_utf8(bytes).map_err(|e| e.to_string()))
-}
-
 /// Exact replay input stays beside the config; the record carries a redacted
 /// display and digests. Config and command artifacts may contain credentials.
 pub fn recorded_command(run: &Path, record: &ProofRecord) -> Result<String, String> {
-    let path = run.join(DIR).join(record.n.to_string()).join("command.txt");
-    let command = read_text(&path, 1 << 20)?;
+    let relative = Path::new(DIR)
+        .join(record.n.to_string())
+        .join("command.txt");
+    let command = crate::run_artifact::text(run, &relative, crate::run_artifact::COMMAND_BYTES)?;
     if crate::sha256::digest(command.as_bytes()) != record.command_sha256
         || redact(&command) != record.command
     {
@@ -317,6 +314,11 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
                 continue;
             }
         };
+        if record.replays.is_some() {
+            errors.push(format!(
+                "{at}: proof_ref must name the original proof, not a replay"
+            ));
+        }
         if record.finding.as_deref() != Some(f.fingerprint.as_str()) {
             errors.push(format!(
                 "{at}: {r} was recorded for finding {}, not {}",
@@ -471,14 +473,13 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
             crate::sandbox::MXC_VERSION
         ));
     }
-    if run.join(crate::runmeta::FILE).exists() {
-        if let Err(error) = crate::runmeta::read(run) {
+    let run_target = match crate::runmeta::read_optional(run) {
+        Ok(meta) => meta.and_then(|m| m.get("target").and_then(|v| v.as_str()).map(String::from)),
+        Err(error) => {
             errors.push(format!("invalid run metadata: {error}"));
+            None
         }
-    }
-    let run_target = crate::runmeta::read(run)
-        .ok()
-        .and_then(|m| m.get("target").and_then(|v| v.as_str()).map(String::from));
+    };
     if let Some(rt) = run_target {
         let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
         match &record.target {
@@ -492,11 +493,17 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
         errors.push("has no valid target snapshot digest".into());
     }
     if record.test_from.is_some() {
-        let draft = run.join(DIR).join(record.n.to_string()).join("test-draft");
-        if crate::sha256::digest_file(&draft).ok().as_ref() != record.test_sha256.as_ref()
-            || record.test_sha256.is_none()
-        {
-            errors.push("test-draft does not match test_sha256".into());
+        let draft = Path::new(DIR).join(record.n.to_string()).join("test-draft");
+        let digest = crate::run_artifact::read(run, &draft, crate::run_artifact::DRAFT_BYTES)
+            .map(|bytes| crate::sha256::digest(&bytes));
+        if digest.as_ref().ok() != record.test_sha256.as_ref() || record.test_sha256.is_none() {
+            errors.push(format!(
+                "test-draft does not match test_sha256: {}",
+                digest
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "digest mismatch".into())
+            ));
         }
     }
     if record.test_from.is_none() {
@@ -508,6 +515,9 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
             {
                 errors.push("test must be relative to the recorded target".into());
             } else if Path::new(target).exists() {
+                // Checkout content deliberately follows the target's symlinks.
+                // digest_file streams regular content with constant memory; run
+                // evidence must instead use run_artifact::read.
                 let digest = crate::sha256::digest_file(&Path::new(target).join(rel));
                 if digest.ok().as_ref() != record.test_sha256.as_ref()
                     || record.test_sha256.is_none()
@@ -522,11 +532,10 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
     if crate::sha256::digest(record.output.as_bytes()) != record.output_sha256 {
         errors.push("redacted output does not match output_sha256".into());
     }
-    let config = run
-        .join(DIR)
+    let config = Path::new(DIR)
         .join(record.n.to_string())
         .join("mxc-config.json");
-    match crate::platform::read_bounded(&config, 2 << 20) {
+    match crate::run_artifact::read(run, &config, crate::run_artifact::CONFIG_BYTES) {
         Ok(bytes) if crate::sha256::digest(&bytes) == record.config_sha256 => {
             match std::str::from_utf8(&bytes)
                 .map_err(|e| e.to_string())
@@ -840,13 +849,21 @@ pub fn tree_digest(root: &Path) -> std::io::Result<String> {
 /// The checkout's commit, read from `.git` as data. Git itself is never run
 /// against the target, since repository config can execute programs.
 pub fn git_head(target: &Path) -> Option<String> {
+    // Repository metadata is source input, not private proof evidence. Git can
+    // create normally shared read ACLs on Windows. Keep bounded no-follow reads
+    // without requiring those source files to have the run store's private ACL.
+    let source_text = |dir: &Path, relative: &Path, limit| {
+        crate::platform::read_bounded_in(dir, relative, limit)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    };
     let mut git = target.join(".git");
     if git.is_file() {
-        let text = read_text(&git, 1 << 20).ok()?;
+        let text = source_text(target, Path::new(".git"), 1 << 20)?;
         let p = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
         git = if p.is_absolute() { p } else { target.join(p) };
     }
-    let head = read_text(&git.join("HEAD"), 1 << 20).ok()?;
+    let head = source_text(&git, Path::new("HEAD"), 1 << 20)?;
     let head = head.trim();
     let Some(reference) = head.strip_prefix("ref:").map(str::trim) else {
         return is_hex40(head).then(|| head.to_string());
@@ -855,18 +872,17 @@ pub fn git_head(target: &Path) -> Option<String> {
         return None;
     }
     // Linked worktrees keep branch refs in the common dir.
-    let common = read_text(&git.join("commondir"), 1 << 20)
-        .ok()
+    let common = source_text(&git, Path::new("commondir"), 1 << 20)
         .map(|c| git.join(c.trim()))
         .unwrap_or_else(|| git.clone());
     for dir in [&git, &common] {
-        if let Ok(v) = read_text(&dir.join(reference), 1 << 20) {
+        if let Some(v) = source_text(dir, Path::new(reference), 1 << 20) {
             let v = v.trim();
             if is_hex40(v) {
                 return Some(v.to_string());
             }
         }
-        if let Ok(packed) = read_text(&dir.join("packed-refs"), 16 << 20) {
+        if let Some(packed) = source_text(dir, Path::new("packed-refs"), 16 << 20) {
             for line in packed.lines() {
                 if let Some((sha, name)) = line.split_once(' ') {
                     if name == reference && is_hex40(sha) {
@@ -1155,6 +1171,39 @@ impl QuoteCursor {
         self.pos = at;
         self.quote
     }
+}
+
+/// Stable CLI contract: success 0, supported assertion 1, harness/execution error 2.
+pub fn outer_exit(record: &ProofRecord) -> u8 {
+    if !record.clean() {
+        2
+    } else if record.assertion_failure() {
+        1
+    } else if record.exit_code == Some(0) {
+        0
+    } else {
+        2
+    }
+}
+/// Replays cannot replace originals or cross finding, command, snapshot or tier.
+pub fn reproduces(original: &ProofRecord, replay: &ProofRecord) -> bool {
+    original.replays.is_none()
+        && replay.replays == Some(original.n)
+        && original.finding == replay.finding
+        && original.finding.is_some()
+        && original.command_sha256 == replay.command_sha256
+        && original.command == replay.command
+        && original.target == replay.target
+        && original.test == replay.test
+        && original.timeout_ms == replay.timeout_ms
+        && original.target_head == replay.target_head
+        && original.target_sha256 == replay.target_sha256
+        && original.test_sha256 == replay.test_sha256
+        && original.tier == replay.tier
+        && original.exit_code == replay.exit_code
+        && original.contract == replay.contract
+        && original.clean()
+        && replay.clean()
 }
 
 #[cfg(test)]

@@ -1,0 +1,115 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "evaluator": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^omgs-[0-9a-f]{16}$"
+          },
+          "decision": {
+            "enum": [
+              "uphold",
+              "adjust",
+              "overturn"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required_changes": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "required": [
+          "fingerprint",
+          "decision",
+          "reason",
+          "evidence",
+          "required_changes"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "decision": {
+                  "enum": [
+                    "adjust",
+                    "overturn"
+                  ]
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "required_changes": {
+                  "minItems": 1
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "leads": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "unit_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "unit_id",
+          "reason"
+        ]
+      }
+    }
+  },
+  "required": [
+    "evaluator",
+    "source_ref",
+    "decisions",
+    "gaps"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Independent evaluation"
+}

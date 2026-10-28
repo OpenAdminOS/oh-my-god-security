@@ -250,3 +250,11 @@ but failed to launch inside MXC`, missing SDKs or local libraries, unavailable L
 (the runner grants `/usr/include` read-only), nested SwiftPM sandbox creation, denied daemon APIs
 and real root helpers. A compile/load failure earns no tier. Network and home denials above apply to
 Swift too; redirect temporary files into the workspace or scratch.
+
+## PowerShell certificate fixtures on macOS
+
+Certificate store and self-signing APIs can fail under the macOS sandbox with Security framework
+diagnostics. Prefer in-memory `CertificateRequest.Create` with a synthetic issuer and dummy keys
+when a store-backed `CreateSelfSigned` operation is unavailable. Check runtime support with doctor
+and handle construction failures as inner exit 2. A diagnostic line is not assertion evidence;
+require the recipe markers, inner exit and clean fields. Do not weaken isolation or install tools.

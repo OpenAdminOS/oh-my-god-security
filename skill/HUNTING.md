@@ -87,3 +87,17 @@ fingerprints, and exhausted budgets. Send candidates to a fresh verifier with so
 counterevidence. A lead found late (by the critic or the evaluator) still enters as a candidate from
 a hunter, never as a record written directly. Do not endorse them by consensus, promote source
 traces to confirmed, or claim completeness because all dispatched hunters returned.
+
+## Validate and ingest handoffs
+
+Run `omgs validate --candidates OUTPUT_DIR/candidates-HUNTER.json` and
+`omgs validate --dispositions OUTPUT_DIR/dispositions-HUNTER.json`. The disposition schema ships
+at `schemas/dispositions.schema.json`. The host ingests a complete handoff atomically with
+`omgs ledger ingest --ledger OUTPUT_DIR/coverage-ledger.json
+--dispositions OUTPUT_DIR/dispositions-HUNTER.json`. Candidate dispositions map to `covered` with
+evidence, meaning examined and handed to verification, never confirmed or safe.
+
+Hunters must not execute any probe, including synthetic non-target probes on the host. Hand all
+execution plans to the verifier for `omgs prove`. Context isolation is a host obligation, not an OS
+access boundary: shared output directories do not prevent cross-reading. Disclose that limitation;
+use host-enforced read scopes where available and never claim technical isolation without them.

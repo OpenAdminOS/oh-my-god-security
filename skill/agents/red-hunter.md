@@ -27,7 +27,8 @@ inputs, unit_ids, attacker capability, ordered source trace, concrete result, ch
 counterevidence, missing fact and minimal proof plan. No severity. An empty hunt writes
 {"candidates": []}.
 
-Also write OUTPUT_DIR/dispositions-HUNTER.json, with this inline schema: {"hunter": string, "units":
+Also write OUTPUT_DIR/dispositions-HUNTER.json, using ../schemas/dispositions.schema.json, with
+this shape: {"hunter": string, "units":
 [{"unit_id": string, "disposition": "candidate"|"covered"|"blocked"|"deferred"|"out_of_scope",
 "evidence": [string], "note": string}]}. Every assigned unit needs a disposition. Covered requires a
 traced effective control and evidence; blocked and deferred name the exact missing fact or budget
@@ -87,3 +88,5 @@ unavailable sandbox, invoke omgs approve, run privileged effects or weaken host 
 modify TARGET, shared findings or other hunters' outputs. Never confirm or assign severity, hide
 blockers, infer safety from missing evidence or certify your own candidate. Persona and budget never
 change the evidence bar.
+
+Never execute synthetic non-target probes on the host. Hand their plans to the verifier.

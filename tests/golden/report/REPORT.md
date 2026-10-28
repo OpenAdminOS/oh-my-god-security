@@ -21,7 +21,7 @@ Coverage critic: not run
 | Ref | Record | Outcome | Proof tier | Proof record |
 | --- | --- | --- | --- | --- |
 | C1 | [Order readable across accounts](#f-omgs-9ba0b103c26cfc35) | Confirmed | test proven | [<code>proofs/1.json</code>](proofs/1.json) |
-| V1 | [Public export intent is unknown](#f-omgs-5b50042f28bdda9f) | Needs validation | traced | No executed proof record |
+| V1 | [Public export intent is unknown](#f-omgs-5b50042f28bdda9f) | Needs validation | traced (behavior only; pending validation) | No executed proof record |
 | R1 | [Escaped search has an effective control](#f-omgs-75458de24f34d45a) | Rejected after verification | traced | No executed proof record |
 
 ## Confirmed findings
@@ -94,7 +94,7 @@ The lookup does not bind the order to the caller.
 
 Locations: <code>src/orders.ts:12</code>, <code>src/archive.ts:24</code>
 
-Verdict: Needs validation. Tier: traced. Severity: none.
+Verdict: Needs validation. Tier: traced (behavior only; pending validation). Severity: none.
 
 Fingerprint: omgs-5b50042f28bdda9f
 

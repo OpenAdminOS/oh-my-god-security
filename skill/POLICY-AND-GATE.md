@@ -52,3 +52,11 @@ changes nothing. `omgs setup --write-policy TARGET --mode gate|advisory` creates
 on explicit request and refuses replacement. `omgs setup --yes` installs detected skills and
 verifies MXC without interaction; it never silently writes repository policy. Never claim live
 verification passed if setup reports a missing executor or a platform refusal.
+
+## Stage policy proposals
+
+`omgs stage` writes both `proposed-tests.patch` and an owner-review `policy.patch`. The latter
+contains mode, persona, budget and eligible confirmed proof tests. It may list a low severity test
+under a high threshold; gate selects tests at or above the committed threshold. This is a proposal,
+not an installed policy, and does not grant permission to apply it. `omgs intent propose` can also
+produce policy.patch; review before replacing an earlier proposal.

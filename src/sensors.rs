@@ -348,7 +348,7 @@ fn run_offline(tool: &str, target: &Path, artifacts: &Path, report: &mut Sensors
         limits: sensor_limits(),
         semgrep: tool == "semgrep",
         config: if tool == "gitleaks" {
-            "[extend]\nuseDefault = true\n"
+            GITLEAKS_CONFIG
         } else {
             ""
         },
@@ -512,31 +512,47 @@ pub fn reconcile(report: &SensorsReport, ledger: &crate::ledger::Ledger) -> Vec<
 /// The summary and the standalone hit list must agree. Neither malformed
 /// artifact can be silently ignored during reporting or reconciliation.
 pub fn read_report(dir: &Path) -> Result<Option<SensorsReport>, String> {
-    let report = match std::fs::read_to_string(dir.join("sensors.json")) {
-        Ok(text) => Some(crate::shape::sensors(&text)?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("read sensors.json: {e}")),
+    let report = match crate::run_artifact::optional_text(
+        dir,
+        Path::new("sensors.json"),
+        crate::run_artifact::SENSORS_BYTES,
+    )? {
+        Some(text) => Some(crate::shape::sensors(&text)?),
+        None => None,
     };
-    match std::fs::read_to_string(dir.join("sensor-hits.json")) {
-        Ok(text) => {
-            let value = crate::shape::strict_json(&text)?;
-            if !value
-                .as_array()
-                .is_some_and(|hits| hits.iter().all(|h| h.is_object()))
-            {
-                return Err("sensor-hits.json must be an array of hit objects".into());
-            }
-            let hits: Vec<SensorHit> =
-                serde_json::from_value(value).map_err(|_| "invalid sensor-hits.json")?;
-            if report.as_ref().map(|r| &r.hits) != Some(&hits) {
-                return Err("sensor-hits.json disagrees with sensors.json".into());
-            }
+    if let Some(text) = crate::run_artifact::optional_text(
+        dir,
+        Path::new("sensor-hits.json"),
+        crate::run_artifact::SENSOR_HITS_BYTES,
+    )? {
+        let value = crate::shape::strict_json(&text)?;
+        if !value
+            .as_array()
+            .is_some_and(|hits| hits.iter().all(|h| h.is_object()))
+        {
+            return Err("sensor-hits.json must be an array of hit objects".into());
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("read sensor-hits.json: {e}")),
+        let hits: Vec<SensorHit> =
+            serde_json::from_value(value).map_err(|_| "invalid sensor-hits.json")?;
+        if report.as_ref().map(|r| &r.hits) != Some(&hits) {
+            return Err("sensor-hits.json disagrees with sensors.json".into());
+        }
     }
     Ok(report)
 }
+
+/// Azure Functions keys need not carry the signatures recognized by default rules.
+/// Keep this URL-specific to avoid treating arbitrary base64 values as credentials.
+pub const GITLEAKS_CONFIG: &str = r#"[extend]
+useDefault = true
+
+[[rules]]
+id = "omgs-azure-functions-url-key"
+description = "Azure Functions URL code parameter"
+regex = '''(?i)https://[a-z0-9.-]+\.azurewebsites\.net/[^\s"'<>]*[?&]code=([a-z0-9_+/%=-]{32,})'''
+secretGroup = 1
+keywords = ["azurewebsites.net"]
+"#;
 
 #[cfg(test)]
 mod offline_tests {

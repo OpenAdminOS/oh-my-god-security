@@ -1,3 +1,11 @@
+// Valid run evidence uses the same ownership and ACL as runtime writers.
+fn write_private_fixture(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    omgs::runmeta::write_atomic_bytes(path.as_ref(), bytes.as_ref())
+}
+
 use omgs::paths::{classify, classify_with_size, Class};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -1057,7 +1065,7 @@ fn build_names_and_txt_configuration_are_code_before_docs_or_data() {
     )
     .unwrap();
     assert_eq!(init(&target, &run, &[])["files_first_party"], 1);
-    std::fs::write(run.join("candidates-red.json"), r#"{"candidates":[]}"#).unwrap();
+    write_private_fixture(run.join("candidates-red.json"), r#"{"candidates":[]}"#).unwrap();
     let ledger = read(&run.join("coverage-ledger.json"));
     assert!(ledger["units"]
         .as_array()
@@ -1153,7 +1161,7 @@ fn every_excluded_class_requires_review_and_reports_the_reason() {
         sorted.sort();
         sorted.truncate(20);
         assert_eq!(unit["excluded_paths"], json!(sorted));
-        std::fs::write(run.join("candidates-red.json"), r#"{"candidates":[]}"#).unwrap();
+        write_private_fixture(run.join("candidates-red.json"), r#"{"candidates":[]}"#).unwrap();
         let out = cli(&["critic", "--run", run.to_str().unwrap()]);
         assert!(!out.status.success());
         assert!(String::from_utf8_lossy(&out.stderr).contains(unit_id));

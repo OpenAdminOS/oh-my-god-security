@@ -73,3 +73,20 @@ pub fn next_model(models: &Models, role: &str, refused: &[String]) -> Result<Str
             )
         })
 }
+
+/// Host-supplied model names are labels, never permission to dispatch or switch.
+pub fn parse_identities(values: &[String]) -> Result<BTreeMap<String, String>, String> {
+    let mut models = BTreeMap::new();
+    for value in values {
+        let (role, model) = value.split_once('=').ok_or("--model expects role=name")?;
+        if !ROLES.contains(&role)
+            || model.trim().is_empty()
+            || models.insert(role.into(), model.into()).is_some()
+        {
+            return Err(
+                "--model requires a known role, nonblank model, and one value per role".into(),
+            );
+        }
+    }
+    Ok(models)
+}
