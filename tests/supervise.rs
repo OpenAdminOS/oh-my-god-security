@@ -525,6 +525,12 @@ fn unsupervised_spawns_do_not_delay_capture() {
             let _ = self.0.wait();
         }
     }
+    // Complete capture-root confstr/libnotify initialization before unmanaged
+    // forks race with capture creation. Darwin's child-side atfork handler can
+    // abort on an in-progress libSystem once gate inherited from another thread.
+    // The measured phase still races all 128 unmanaged forks with fresh captures.
+    let warmup = run(shell("printf warmup"), &limits(), None);
+    assert!(warmup.success && warmup.capture_complete, "{warmup:?}");
     std::thread::scope(|scope| {
         let start = Arc::new(Barrier::new(9));
         // Unmanaged std spawns have their own non-atomic exec-error pipe on
