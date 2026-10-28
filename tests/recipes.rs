@@ -86,7 +86,7 @@ fn record(out: &Output, expected: i32, test: bool) {
         .lines()
         .find_map(|s| s.strip_prefix("proof record: "))
         .unwrap_or_else(|| panic!("missing proof record: {output}"))
-        .split(" (not linked")
+        .split(" (")
         .next()
         .unwrap();
     let record: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -117,6 +117,7 @@ struct Recipe {
     command: &'static str,
     broken: &'static str,
     control_failure: &'static str,
+    dependency_failure: &'static str,
 }
 fn check(recipe: Recipe) -> bool {
     if !ready(recipe.runtime) {
@@ -145,17 +146,84 @@ fn check(recipe: Recipe) -> bool {
     );
     record(&probe, 0, false);
     std::fs::write(target.join(recipe.test), recipe.harness).unwrap();
+    let run = d.join("run");
+    let init = cli(
+        &home,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+            "--budget",
+            "20",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let fp = omgs::fingerprint("authorization", "can_read", "resource", "owner");
+    let findings_path = run.join("findings.json");
+    let mut n = 0;
     for (variant, source, exit) in [
         ("vulnerable", recipe.vulnerable, 1),
         ("fixed", recipe.fixed, 0),
         ("import failure", recipe.broken, 2),
         ("control failure", recipe.control_failure, 2),
+        (
+            "unauthorized dependency failure",
+            recipe.dependency_failure,
+            2,
+        ),
+        ("missing marker", recipe.vulnerable, 1),
+        ("missing control marker", recipe.vulnerable, 1),
+        ("marker beyond cap", recipe.vulnerable, 1),
     ] {
         std::fs::write(target.join(recipe.source), source).unwrap();
+        n += 1;
+        let harness = match variant {
+            "missing marker" => recipe
+                .harness
+                .replace("BOUNDARY_ASSERTION_FAILED", "BOUNDARY_MARKER_OMITTED"),
+            "missing control marker" => recipe
+                .harness
+                .replace("AUTHORIZED_CONTROL_OK", "CONTROL_MARKER_OMITTED"),
+            _ => recipe.harness.into(),
+        };
+        let harness = if variant == "marker beyond cap" {
+            let flood = match recipe.runtime {
+                "sh" => "i=0; while [ $i -lt 3000 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n'; i=$((i+1)); done\n",
+                "python3" => "print('x' * 300000, flush=True)\n",
+                "node" => "require('node:fs').writeSync(1, 'x'.repeat(300000) + '\\n');\n",
+                "pwsh" => "Write-Output ('x' * 300000)\n",
+                "swiftc" => "print(String(repeating: \"x\", count: 300000))\n",
+                _ => unreachable!(),
+            };
+            format!("{flood}{harness}")
+        } else {
+            harness
+        };
+        std::fs::write(target.join(recipe.test), harness).unwrap();
+        let findings = serde_json::json!({"findings": [{
+            "fingerprint": fp, "title": "Unauthorized resource access", "verdict": "confirmed",
+            "severity": "high", "proof_tier": "test_proven", "attack_class": "authorization",
+            "entry_point": "can_read", "sink": "resource", "boundary": "owner",
+            "location": {"path": recipe.source, "line": 1},
+            "evidence": "Real target invocation with synthetic owner and intruder.",
+            "hunted_by": "red-1", "verified_by": "blue-1",
+            "proof_ref": format!("proofs/{n}.json")
+        }]});
+        std::fs::write(&findings_path, findings.to_string()).unwrap();
         let out = cli(
             &home,
             &[
                 "prove",
+                "--run",
+                run.to_str().unwrap(),
+                "--finding",
+                &fp,
+                "--expect-marker",
+                "BOUNDARY_ASSERTION_FAILED",
                 "--target",
                 target.to_str().unwrap(),
                 "--test",
@@ -172,21 +240,70 @@ fn check(recipe: Recipe) -> bool {
             recipe.runtime
         );
         record(&out, exit, true);
-        if exit != 2 {
+        let supports = exit == 1 && !matches!(variant, "missing marker" | "missing control marker");
+        assert!(
+            output.contains(&format!(
+                "proof support for test_proven: {}",
+                if supports { "yes" } else { "no" }
+            )),
+            "{output}"
+        );
+        let proof = omgs::proof::load(&run, &format!("proofs/{n}.json")).unwrap();
+        assert_eq!(
+            proof.expect_marker.as_deref(),
+            Some("BOUNDARY_ASSERTION_FAILED")
+        );
+        assert_eq!(
+            proof.boundary_marker_seen,
+            exit == 1 && variant != "missing marker",
+            "{variant}"
+        );
+        assert_eq!(
+            proof.authorized_control_seen,
+            !matches!(
+                variant,
+                "import failure" | "control failure" | "missing control marker"
+            ),
+            "{variant}"
+        );
+        if variant == "marker beyond cap" {
+            assert!(proof.output_bytes_total > 256 * 1024);
+            assert!(!proof.output.contains("BOUNDARY_ASSERTION_FAILED"));
+            assert!(!proof.output.contains("AUTHORIZED_CONTROL_OK"));
+        }
+        let validated = cli(
+            &home,
+            &["validate", "--findings", findings_path.to_str().unwrap()],
+        );
+        assert_eq!(
+            validated.status.success(),
+            supports,
+            "{} {variant}: {}",
+            recipe.runtime,
+            text(&validated)
+        );
+        if exit != 2 && variant != "marker beyond cap" {
             assert!(
-                output.lines().any(|s| s == "AUTHORIZED_CONTROL_OK"),
+                output.lines().any(|s| s
+                    == if variant == "missing control marker" {
+                        "CONTROL_MARKER_OMITTED"
+                    } else {
+                        "AUTHORIZED_CONTROL_OK"
+                    }),
                 "{output}"
             );
             assert!(
                 output.lines().any(|s| s
-                    == if exit == 1 {
+                    == if variant == "missing marker" {
+                        "BOUNDARY_MARKER_OMITTED"
+                    } else if exit == 1 {
                         "BOUNDARY_ASSERTION_FAILED"
                     } else {
                         "BOUNDARY_ASSERTION_OK"
                     }),
                 "{output}"
             );
-        } else {
+        } else if exit == 2 {
             assert!(
                 !output.lines().any(|s| s == "BOUNDARY_ASSERTION_FAILED"),
                 "{output}"
@@ -197,6 +314,26 @@ fn check(recipe: Recipe) -> bool {
             recipe.runtime
         );
     }
+    let replay = cli(
+        &home,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--replay",
+            &n.to_string(),
+        ],
+    );
+    assert!(replay.status.success(), "{}", text(&replay));
+    let replayed = omgs::proof::load(&run, &format!("proofs/{}.json", n + 1)).unwrap();
+    assert_eq!(
+        replayed.expect_marker.as_deref(),
+        Some("BOUNDARY_ASSERTION_FAILED")
+    );
+    assert!(replayed.clean() && replayed.boundary_marker_seen && replayed.authorized_control_seen);
+    assert_eq!(replayed.exit_code, Some(1));
+    assert!(text(&replay).contains("proof support for test_proven: yes"));
+    assert!(text(&replay).contains(": reproduced"), "{}", text(&replay));
     std::fs::remove_dir_all(d).unwrap();
     true
 }
@@ -207,7 +344,8 @@ fn shell_recipe() -> Recipe {
         vulnerable: "can_read() { return 0; }\n",
         fixed: "can_read() { [ \"$1\" = \"$2\" ]; }\n",
         broken: "exit 2\n", control_failure: "can_read() { return 1; }\n",
-        harness: ". ./target.sh || exit 2\ncan_read owner owner || exit 2\necho AUTHORIZED_CONTROL_OK\nif can_read intruder owner; then echo BOUNDARY_ASSERTION_FAILED; exit 1; fi\necho BOUNDARY_ASSERTION_OK\n",
+        dependency_failure: "can_read() { if [ \"$1\" = intruder ]; then command omgs_missing_dependency; else return 0; fi; }\n",
+        harness: ". ./target.sh || exit 2\ncan_read owner owner || exit 2\necho AUTHORIZED_CONTROL_OK\ncan_read intruder owner\nstatus=$?\ncase $status in\n  0) echo BOUNDARY_ASSERTION_FAILED; exit 1 ;;\n  1) echo BOUNDARY_ASSERTION_OK; exit 0 ;;\n  *) exit 2 ;;\nesac\n",
     }
 }
 #[cfg(unix)]
@@ -217,7 +355,8 @@ fn python_recipe() -> Recipe {
         vulnerable: "def can_read(actor, owner):\n    return True\n",
         fixed: "def can_read(actor, owner):\n    return actor == owner\n",
         broken: "raise ImportError('missing target dependency')\n", control_failure: "def can_read(actor, owner):\n    return False\n",
-        harness: "import sys\ntry:\n    import runpy\n    can_read = runpy.run_path('./target.py')['can_read']\n    if not can_read('owner', 'owner'):\n        raise RuntimeError('AUTHORIZED_CONTROL_FAILED')\n    print('AUTHORIZED_CONTROL_OK', flush=True)\n    forbidden = can_read('intruder', 'owner')\nexcept Exception as error:\n    print(error, file=sys.stderr)\n    sys.exit(2)\nif forbidden:\n    print('BOUNDARY_ASSERTION_FAILED', flush=True)\n    sys.exit(1)\nprint('BOUNDARY_ASSERTION_OK')\n",
+        dependency_failure: "def can_read(actor, owner):\n    if actor != owner:\n        import omgs_missing_dependency\n    return True\n",
+        harness: "import sys\ntry:\n    import runpy\n    can_read = runpy.run_path('./target.py')['can_read']\n    if not can_read('owner', 'owner'):\n        raise RuntimeError('AUTHORIZED_CONTROL_FAILED')\n    print('AUTHORIZED_CONTROL_OK', flush=True)\n    forbidden = can_read('intruder', 'owner')\n    if type(forbidden) is not bool:\n        raise RuntimeError('INVALID_TARGET_RESULT')\nexcept Exception as error:\n    print(error, file=sys.stderr)\n    sys.exit(2)\nif forbidden:\n    print('BOUNDARY_ASSERTION_FAILED', flush=True)\n    sys.exit(1)\nprint('BOUNDARY_ASSERTION_OK')\n",
     }
 }
 fn node_recipe() -> Recipe {
@@ -226,7 +365,8 @@ fn node_recipe() -> Recipe {
         vulnerable: "exports.canRead = (actor, owner) => true;\n",
         fixed: "exports.canRead = (actor, owner) => actor === owner;\n",
         broken: "require('./missing-dependency.cjs');\n", control_failure: "exports.canRead = () => false;\n",
-        harness: "let forbidden;\ntry {\n  const {canRead} = require('./target.cjs');\n  if (canRead('owner', 'owner') !== true) throw new Error('AUTHORIZED_CONTROL_FAILED');\n  console.log('AUTHORIZED_CONTROL_OK');\n  forbidden = canRead('intruder', 'owner');\n} catch (error) { console.error(error); process.exit(2); }\nif (forbidden !== false) { console.log('BOUNDARY_ASSERTION_FAILED'); process.exit(1); }\nconsole.log('BOUNDARY_ASSERTION_OK');\n",
+        dependency_failure: "exports.canRead = (actor, owner) => { if (actor !== owner) require('./missing-dependency.cjs'); return true; };\n",
+        harness: "let forbidden;\ntry {\n  const {canRead} = require('./target.cjs');\n  if (canRead('owner', 'owner') !== true) throw new Error('AUTHORIZED_CONTROL_FAILED');\n  console.log('AUTHORIZED_CONTROL_OK');\n  forbidden = canRead('intruder', 'owner');\n} catch (error) { console.error(error); process.exit(2); }\nif (typeof forbidden !== 'boolean') { process.exit(2); }\nif (forbidden) { console.log('BOUNDARY_ASSERTION_FAILED'); process.exit(1); }\nconsole.log('BOUNDARY_ASSERTION_OK');\n",
     }
 }
 fn powershell_recipe() -> Recipe {
@@ -235,17 +375,19 @@ fn powershell_recipe() -> Recipe {
         vulnerable: "function Test-CanRead($Actor, $Owner) { return $true }\n",
         fixed: "function Test-CanRead($Actor, $Owner) { return $Actor -ceq $Owner }\n",
         broken: "throw 'missing target module'\n", control_failure: "function Test-CanRead($Actor, $Owner) { return $false }\n",
-        harness: "$ErrorActionPreference = 'Stop'\ntry {\n  . ./target.ps1\n  if (-not (Test-CanRead 'owner' 'owner')) { throw 'AUTHORIZED_CONTROL_FAILED' }\n  Write-Output 'AUTHORIZED_CONTROL_OK'\n  $forbidden = Test-CanRead 'intruder' 'owner'\n} catch { Write-Error -ErrorAction Continue $_; exit 2 }\nif ($forbidden) { Write-Output 'BOUNDARY_ASSERTION_FAILED'; exit 1 }\nWrite-Output 'BOUNDARY_ASSERTION_OK'\nexit 0\n",
+        dependency_failure: "function Test-CanRead($Actor, $Owner) { if ($Actor -cne $Owner) { throw 'missing dependency' }; return $true }\n",
+        harness: "$ErrorActionPreference = 'Stop'\ntry {\n  . ./target.ps1\n  if (-not (Test-CanRead 'owner' 'owner')) { throw 'AUTHORIZED_CONTROL_FAILED' }\n  Write-Output 'AUTHORIZED_CONTROL_OK'\n  $forbidden = Test-CanRead 'intruder' 'owner'\n  if ($forbidden -isnot [bool]) { throw 'INVALID_TARGET_RESULT' }\n} catch { Write-Error -ErrorAction Continue $_; exit 2 }\nif ($forbidden) { Write-Output 'BOUNDARY_ASSERTION_FAILED'; exit 1 }\nWrite-Output 'BOUNDARY_ASSERTION_OK'\nexit 0\n",
     }
 }
 #[cfg(unix)]
 fn swift_recipe() -> Recipe {
     Recipe {
         runtime: "swiftc", source: "target.swift", test: "main.swift", command: "swiftc target.swift main.swift -o fixture || exit 2; ./fixture",
-        broken: "import MissingTargetModule\n", control_failure: "func canRead(_ actor: String, _ owner: String) -> Bool { false }\n",
-        vulnerable: "func canRead(_ actor: String, _ owner: String) -> Bool { true }\n",
-        fixed: "func canRead(_ actor: String, _ owner: String) -> Bool { actor == owner }\n",
-        harness: "#if canImport(Darwin)\nimport Darwin\n#else\nimport Glibc\n#endif\nguard canRead(\"owner\", \"owner\") else { exit(2) }\nprint(\"AUTHORIZED_CONTROL_OK\")\nif canRead(\"intruder\", \"owner\") { print(\"BOUNDARY_ASSERTION_FAILED\"); exit(1) }\nprint(\"BOUNDARY_ASSERTION_OK\")\n",
+        broken: "import MissingTargetModule\n", control_failure: "func canRead(_ actor: String, _ owner: String) throws -> Bool { false }\n",
+        vulnerable: "func canRead(_ actor: String, _ owner: String) throws -> Bool { true }\n",
+        fixed: "func canRead(_ actor: String, _ owner: String) throws -> Bool { actor == owner }\n",
+        dependency_failure: "enum DependencyError: Error { case missing }\nfunc canRead(_ actor: String, _ owner: String) throws -> Bool { if actor != owner { throw DependencyError.missing }; return true }\n",
+        harness: "#if canImport(Darwin)\nimport Darwin\n#else\nimport Glibc\n#endif\ndo {\n  guard try canRead(\"owner\", \"owner\") else { exit(2) }\n  print(\"AUTHORIZED_CONTROL_OK\")\n  if try canRead(\"intruder\", \"owner\") { print(\"BOUNDARY_ASSERTION_FAILED\"); exit(1) }\n  print(\"BOUNDARY_ASSERTION_OK\")\n} catch { exit(2) }\n",
     }
 }
 #[cfg(windows)]

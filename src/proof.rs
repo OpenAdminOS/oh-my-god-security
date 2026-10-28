@@ -63,6 +63,14 @@ pub struct ProofRecord {
     pub started_at_ms: u64,
     pub duration_ms: u64,
     pub exit_code: Option<i32>,
+    /// Exact boundary-failure line declared by the verifier before execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_marker: Option<String>,
+    /// Scanned from the full streams before capping or redaction.
+    #[serde(default)]
+    pub boundary_marker_seen: bool,
+    #[serde(default)]
+    pub authorized_control_seen: bool,
     pub timed_out: bool,
     pub capture_complete: bool,
     /// Every signal, reap and survivor scan succeeded.
@@ -113,12 +121,35 @@ impl ProofRecord {
             && self.survivors.is_empty()
     }
 
-    /// A nonzero exit that a failing assertion can produce, as opposed to a
-    /// shell that could not find or execute the command (126, 127) or a
-    /// process killed by a signal (above 128, or no code at all).
+    /// Exit 2 is a usage or harness error, never assertion evidence.
+    /// A declared recipe contract additionally requires both full-stream markers.
     pub fn assertion_failure(&self) -> bool {
-        matches!(self.exit_code, Some(c) if (1..=125).contains(&c))
+        match &self.expect_marker {
+            Some(marker) => {
+                valid_expect_marker(marker)
+                    && self.exit_code == Some(1)
+                    && self.boundary_marker_seen
+                    && self.authorized_control_seen
+            }
+            None => matches!(self.exit_code, Some(1 | 3..=125)),
+        }
     }
+
+    pub fn supports_verdict(&self, rejected: bool) -> bool {
+        self.assertion_failure()
+            || (self.expect_marker.is_none() && rejected && self.exit_code == Some(0))
+    }
+}
+
+/// Contracts use one short ASCII line, distinct from runner and control markers.
+pub fn valid_expect_marker(marker: &str) -> bool {
+    !marker.is_empty()
+        && marker.len() <= 128
+        && marker
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && marker != "AUTHORIZED_CONTROL_OK"
+        && !marker.starts_with("OMGS_")
 }
 
 /// Reserve the next proof number under `<run>/proofs/` by creating its
@@ -298,16 +329,11 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
         }
         // Every non-rejected record needs the test failing on the target; a
         // rejected one may rest on a control test that passes.
-        if (f.verdict != crate::model::Verdict::Rejected && !record.assertion_failure())
-            || !matches!(record.exit_code, Some(0..=125))
-        {
+        if !record.supports_verdict(f.verdict == crate::model::Verdict::Rejected) {
             errors.push(format!(
-                    "{at}: {r} exited {}, a proven record needs the proof test failing on the target (126, 127 and signals mean the test never ran)",
-                    record
-                        .exit_code
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "without a code".into())
-                ));
+                "{at}: {r} exited {:?}; proof support requires assertion exit 1 or 3..=125 (exit 2 is a harness or usage error); a declared contract requires exit 1, its boundary marker and AUTHORIZED_CONTROL_OK from full-stream capture",
+                record.exit_code
+            ));
         }
     }
     errors

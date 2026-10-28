@@ -1,5 +1,11 @@
 # Hunting
 
+Whenever a hunter or verifier uses a proof recipe, the verifier must declare
+`--expect-marker BOUNDARY_ASSERTION_FAILED` on `omgs prove`. Require exit 1
+and the runner's full-stream `boundary_marker_seen` and
+`authorized_control_seen` fields before claiming recipe proof support.
+Exit 2 is a harness or usage error and never supports a proof.
+
 ## Assign bounded, isolated work
 
 Assign one hunter a small set of ledger units sharing a surface or enforcement chain. Supply source identity, architecture map, relevant pack, trusted intent, local evidence paths, exact call/time allowance, and the candidate contract below. The hunter may read related source, but must record new surfaces instead of silently expanding scope.

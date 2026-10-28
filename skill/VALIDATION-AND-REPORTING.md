@@ -45,9 +45,18 @@ paths are relative to the target. The invariant must fail with an explicit
 `BOUNDARY_ASSERTION_FAILED` marker immediately before exit 1 on vulnerable
 source, then print `BOUNDARY_ASSERTION_OK` and exit 0 on fixed source.
 Require `AUTHORIZED_CONTROL_OK` in both. Import, compile, load and authorized
-control failures exit 2 and earn no boundary evidence. Exit 2 is still within
-the runner's general nonzero range, so reviewers must require the exact boundary
-marker and inspect the harness, not infer a boundary failure from status alone. Import or compile
+control failures exit 2 and earn no proof support. Every recipe invocation must
+include `--expect-marker BOUNDARY_ASSERTION_FAILED`. This declares a contract
+recorded as `expect_marker`: support requires exit 1, the exact boundary line,
+and the exact `AUTHORIZED_CONTROL_OK` line. The runner records
+`boundary_marker_seen` and `authorized_control_seen` from the full stdout and
+stderr streams before capping or redaction; validation and CLI support use those
+fields. Markers must occupy complete lines (LF or CRLF). Replay preserves the
+contract and compares the marker results. Inspect the harness as well: markers
+are accident checks, not authentication against hostile target output.
+Exit 2 is universally rejected as a usage or harness error, including without
+a contract. Without a contract, assertion exits 1 and 3 through 125 remain
+available for other frameworks; rejected controls may also exit 0. Import or compile
 the real unmodified target implementation, never a copy of its decision logic.
 Tiny executable examples for all five recipes live in `tests/recipes.rs`; its
 fixtures are staged into disposable targets, and every execution, including
@@ -86,6 +95,7 @@ try {
   if (-not (Test-CanRead 'owner' 'owner')) { throw 'AUTHORIZED_CONTROL_FAILED' }
   Write-Output 'AUTHORIZED_CONTROL_OK'
   $forbidden = Test-CanRead 'intruder' 'owner'
+  if ($forbidden -isnot [bool]) { throw 'INVALID_TARGET_RESULT' }
 } catch { Write-Error -ErrorAction Continue $_; exit 2 }
 if ($forbidden) { Write-Output 'BOUNDARY_ASSERTION_FAILED'; exit 1 }
 Write-Output 'BOUNDARY_ASSERTION_OK'
@@ -93,7 +103,7 @@ exit 0
 ```
 
 ```sh
-omgs prove --run RUN --finding FP --test test.ps1 --test-from DRAFT --cmd "pwsh -NoProfile -NonInteractive -File test.ps1"
+omgs prove --run RUN --finding FP --test test.ps1 --test-from DRAFT --expect-marker BOUNDARY_ASSERTION_FAILED --cmd "pwsh -NoProfile -NonInteractive -File test.ps1"
 ```
 
 Common blockers: `pwsh not on host PATH`,
@@ -124,12 +134,13 @@ try {
   console.log('AUTHORIZED_CONTROL_OK');
   forbidden = canRead('intruder', 'owner');
 } catch (error) { console.error(error); process.exit(2); }
-if (forbidden !== false) { console.log('BOUNDARY_ASSERTION_FAILED'); process.exit(1); }
+if (typeof forbidden !== 'boolean') { process.exit(2); }
+if (forbidden) { console.log('BOUNDARY_ASSERTION_FAILED'); process.exit(1); }
 console.log('BOUNDARY_ASSERTION_OK');
 ```
 
 ```sh
-omgs prove --run RUN --finding FP --test test.cjs --test-from DRAFT --cmd "node test.cjs"
+omgs prove --run RUN --finding FP --test test.cjs --test-from DRAFT --expect-marker BOUNDARY_ASSERTION_FAILED --cmd "node test.cjs"
 ```
 
 Common blockers: `node not on host PATH` or
@@ -160,6 +171,8 @@ try:
         raise RuntimeError('AUTHORIZED_CONTROL_FAILED')
     print('AUTHORIZED_CONTROL_OK', flush=True)
     forbidden = can_read('intruder', 'owner')
+    if type(forbidden) is not bool:
+        raise RuntimeError('INVALID_TARGET_RESULT')
 except Exception as error:
     print(error, file=sys.stderr)
     sys.exit(2)
@@ -170,7 +183,7 @@ print('BOUNDARY_ASSERTION_OK')
 ```
 
 ```sh
-omgs prove --run RUN --finding FP --test test.py --test-from DRAFT --cmd "python3 -I test.py"
+omgs prove --run RUN --finding FP --test test.py --test-from DRAFT --expect-marker BOUNDARY_ASSERTION_FAILED --cmd "python3 -I test.py"
 ```
 
 Common blockers: `python3 not on host PATH` or
@@ -185,6 +198,9 @@ control, exiting 2 if sourcing or the control fails. Print
 `BOUNDARY_ASSERTION_FAILED` and exit 1 when the forbidden effect is observed. Exit 0
 only after checking denied behavior and resulting synthetic state. Prefer POSIX
 `sh` and explicit status checks so a pipeline's final command cannot hide failure.
+For the unauthorized call, status 0 means allowed, 1 means expected denial,
+and every other status is an execution error that makes the harness exit 2.
+A missing dependency or command must never count as denial.
 
 Example harness (replace the local target path and function with the real source):
 
@@ -192,12 +208,17 @@ Example harness (replace the local target path and function with the real source
 . ./target.sh || exit 2
 can_read owner owner || exit 2
 echo AUTHORIZED_CONTROL_OK
-if can_read intruder owner; then echo BOUNDARY_ASSERTION_FAILED; exit 1; fi
-echo BOUNDARY_ASSERTION_OK
+can_read intruder owner
+status=$?
+case $status in
+  0) echo BOUNDARY_ASSERTION_FAILED; exit 1 ;;
+  1) echo BOUNDARY_ASSERTION_OK; exit 0 ;;
+  *) exit 2 ;;
+esac
 ```
 
 ```sh
-omgs prove --run RUN --finding FP --test test.sh --test-from DRAFT --cmd "sh test.sh"
+omgs prove --run RUN --finding FP --test test.sh --test-from DRAFT --expect-marker BOUNDARY_ASSERTION_FAILED --cmd "sh test.sh"
 ```
 
 Common blockers: `sh not on host PATH` or
@@ -211,7 +232,10 @@ Keep the XCTest regression draft, but when SwiftPM's nested sandbox is blocked,
 compile the real module plus a `main.swift` invariant harness directly. Assert an
 authorized success with `exit(2)` on control failure, print
 `BOUNDARY_ASSERTION_FAILED` and `exit(1)` on the
-vulnerable path, then exit 0 on fixed code. Disclose the runner substitution.
+vulnerable path, then exit 0 on fixed code. Use a throwing target API with
+`do`/`catch` so dependency and invocation errors exit 2. For a nonthrowing API,
+remove `try` and the catch after checking its error channel explicitly.
+Disclose the runner substitution.
 
 Example harness (replace the local target path and function with the real source):
 
@@ -221,14 +245,16 @@ import Darwin
 #else
 import Glibc
 #endif
-guard canRead("owner", "owner") else { exit(2) }
-print("AUTHORIZED_CONTROL_OK")
-if canRead("intruder", "owner") { print("BOUNDARY_ASSERTION_FAILED"); exit(1) }
-print("BOUNDARY_ASSERTION_OK")
+do {
+  guard try canRead("owner", "owner") else { exit(2) }
+  print("AUTHORIZED_CONTROL_OK")
+  if try canRead("intruder", "owner") { print("BOUNDARY_ASSERTION_FAILED"); exit(1) }
+  print("BOUNDARY_ASSERTION_OK")
+} catch { exit(2) }
 ```
 
 ```sh
-omgs prove --run RUN --finding FP --test main.swift --test-from DRAFT --cmd "swiftc target.swift main.swift -o fixture || exit 2; ./fixture"
+omgs prove --run RUN --finding FP --test main.swift --test-from DRAFT --expect-marker BOUNDARY_ASSERTION_FAILED --cmd "swiftc target.swift main.swift -o fixture || exit 2; ./fixture"
 ```
 
 For modules needing a library, use `swiftc -emit-library` inside the same proof
@@ -246,7 +272,7 @@ Swift too; redirect temporary files into the workspace or scratch.
 2. Create dummy principals A and B, synthetic resources and local secrets. State the intended invariant as the test assertion, such as B cannot read A's private row. Include an authorized success control so a broken harness cannot look like protection.
 3. Exercise the actual route/action/service and enforcement chain. Mock only unrelated external effects. Do not mock out the authorization check, tenant predicate, signature verification, or RLS whose failure is at issue. A mock database that simply returns a forbidden row cannot establish a real RLS bypass.
 4. Assert the minimum decisive effect: response contents for a read, unchanged synthetic state for a denied write, or no privileged effect for an invalid event. A status code alone is insufficient when a mutation could occur before the response.
-5. Submit the test and exact runner invocation to `omgs prove`. Run test discovery, setup, builds, and prerequisites only there. No installs, downloads, remote credentials, or external endpoints. Record runner exit, assertion output, authorized control, observed effect, backend/policy/limits, and source identity.
+5. Submit the test and exact runner invocation to `omgs prove`. Whenever using a recipe, declare `--expect-marker BOUNDARY_ASSERTION_FAILED`; do not omit the contract. Run test discovery, setup, builds, and prerequisites only there. No installs, downloads, remote credentials, or external endpoints. Record runner exit, assertion output, authorized control, observed effect, backend/policy/limits, and source identity.
 6. Confirm only when the invariant fails for the claimed security reason. Syntax errors, missing modules, unrelated assertions, and all-denied fixtures are blockers or harness failures. Preserve the test as the fix acceptance check. A future approved patch should make the same test pass without weakening the invariant, with all reruns still sandboxed.
 
 Validation requires bubblewrap containment for every `local_app` proof record. Replay requires the recorded `timeout_ms`, rejects overrides, consumes proof budget and checks the target commit, copied-tree digest including all `.git` content, inner exit code and cleanliness. Exact command and config artifacts can contain credentials, so protect the entire run directory. On Unix proof directories are 0700 and command and config files are 0600. Content hashing accepts hardlinks and symlinks resolving to regular files; small trust files retain bounded, single-link, no-follow reads. Snapshot hashing has no size cap. Target FIFOs and sockets are skipped in the workspace copy and snapshot digest, with up to 20 paths recorded as proof gaps and one aggregate count for the remainder. Devices are refused before copying.

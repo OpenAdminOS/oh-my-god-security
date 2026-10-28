@@ -57,7 +57,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--hunter <id>] [--verifier <id>]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--hunter <id>] [--verifier <id>]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -78,7 +78,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "validate" => ("--findings", false),
         "fingerprint" => ("--attack-class --entry-point --sink --boundary", false),
         "prove" => (
-            "--cmd --target --run --finding --test --test-from --replay --tier --timeout-ms",
+            "--cmd --target --run --finding --test --test-from --expect-marker --replay --tier --timeout-ms",
             false,
         ),
         "approve" => ("--target", false),
@@ -336,6 +336,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
                 .as_ref()
                 .ok_or("--replay needs --run <run-dir>, the run that holds the record")?;
             for conflicting in [
+                "--expect-marker",
                 "--cmd",
                 "--finding",
                 "--test",
@@ -360,6 +361,16 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         Some(r) => omgs::proof::recorded_command(run.as_ref().unwrap(), r)?,
         None => flag(args, "--cmd").ok_or("prove requires --cmd <command>")?,
     };
+    let expect_marker = match &replay {
+        Some(r) => r.expect_marker.clone(),
+        None => flag(args, "--expect-marker"),
+    };
+    if expect_marker
+        .as_ref()
+        .is_some_and(|m| !omgs::proof::valid_expect_marker(m))
+    {
+        return Err("--expect-marker must be 1..=128 ASCII letters, digits or underscores, distinct from AUTHORIZED_CONTROL_OK and OMGS_ markers".into());
+    }
     let timeout_ms: u64 = match flag(args, "--timeout-ms") {
         Some(v) => v
             .parse()
@@ -629,6 +640,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         None => None,
     };
     let request = ProveRequest {
+        expect_marker: expect_marker.clone(),
         command: command.clone(),
         test: test.clone(),
         timeout_ms,
@@ -686,6 +698,9 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         started_at_ms,
         duration_ms: s.duration_ms,
         exit_code: s.exit_code,
+        expect_marker,
+        boundary_marker_seen: s.boundary_marker_seen,
+        authorized_control_seen: s.authorized_control_seen,
         timed_out: s.timed_out,
         capture_complete: s.capture_complete,
         cleanup_complete: s.cleanup_complete,
@@ -806,10 +821,8 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         if !record.clean() {
             reasons.push("run did not finish cleanly");
         }
-        if !matches!(record.exit_code, Some(0..=125)) {
-            reasons.push("exit 126, 127, a signal or an invalid exit cannot support a proof");
-        } else if !rejected && !record.assertion_failure() {
-            reasons.push("a non-rejected finding needs assertion failure exit 1..=125");
+        if !record.supports_verdict(rejected) {
+            reasons.push("proof requires assertion exit 1 or 3..=125; exit 2 is a harness or usage error; a declared contract requires exit 1, its boundary marker and AUTHORIZED_CONTROL_OK from full-stream capture");
         }
         let tier_name = if record.tier == "test" {
             "test_proven"
@@ -827,7 +840,11 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     }
     if let Some(orig) = &replay {
         let code = |c: Option<i32>| c.map(|c| c.to_string()).unwrap_or_else(|| "none".into());
-        let same = record.exit_code == orig.exit_code && record.clean() && orig.clean();
+        let same = record.exit_code == orig.exit_code
+            && record.boundary_marker_seen == orig.boundary_marker_seen
+            && record.authorized_control_seen == orig.authorized_control_seen
+            && record.clean()
+            && orig.clean();
         eprintln!(
             "replay of {}: recorded exit {}, replayed exit {}: {}",
             omgs::proof::reference(orig.n),
@@ -1042,6 +1059,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             format!("cat {inside_test}; cat '{}'", secret.display())
         };
         let request = ProveRequest {
+            expect_marker: None,
             command: cmd,
             test: Some(inside_test.into()),
             timeout_ms: 30_000,
@@ -1111,6 +1129,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         for name in &tools {
             // Separate deadlines keep one hanging tool from hiding the rest.
             let reach = ProveRequest {
+                expect_marker: None,
                 command: doctor_probe_command(name),
                 test: None,
                 timeout_ms: 3_000,

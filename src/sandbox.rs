@@ -222,6 +222,7 @@ pub enum Tier {
 }
 
 pub struct ProveRequest {
+    pub expect_marker: Option<String>,
     pub command: String,
     pub test: Option<String>,
     pub timeout_ms: u64,
@@ -1195,6 +1196,15 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         path: req.run_dir.clone(),
         armed: true,
     };
+    if req
+        .expect_marker
+        .as_ref()
+        .is_some_and(|m| !crate::proof::valid_expect_marker(m))
+    {
+        return ProveOutcome::Blocked {
+            reason: "invalid boundary marker contract".into(),
+        };
+    }
     if let Err(reason) = validate_input(&req.command, req.timeout_ms) {
         return ProveOutcome::Blocked { reason };
     }
@@ -1425,7 +1435,13 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             return blocked(reason);
         }
         let cmd = preflight::workload_command(&executor, &config_path, &run_dir);
-        let run = supervise::run_marked(cmd, &limits, markers.as_ref(), &nonce);
+        let run = supervise::run_contracted(
+            cmd,
+            &limits,
+            markers.as_ref(),
+            &nonce,
+            req.expect_marker.as_deref(),
+        );
         #[cfg(windows)]
         let run = {
             let mut run = run;
@@ -1585,6 +1601,7 @@ mod tests {
     fn blocked_proofs_remove_their_staging_directory() {
         let d = std::env::temp_dir().join(format!("omgs-blocked-{}", std::process::id()));
         let req = |command: &str| ProveRequest {
+            expect_marker: None,
             command: command.into(),
             test: None,
             timeout_ms: 1000,
@@ -1850,6 +1867,8 @@ mod tests {
             command_started: false,
             command_finished: false,
             test_reachable: None,
+            boundary_marker_seen: false,
+            authorized_control_seen: false,
             enumerate_rejected: true,
             executor_error: true,
             killed: false,
@@ -1894,6 +1913,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("omgs-refusal-no-config-{}", std::process::id()));
         let before = preflight::config_invocations();
         let request = ProveRequest {
+            expect_marker: None,
             command: "echo must-not-run".into(),
             test: None,
             timeout_ms: 1000,

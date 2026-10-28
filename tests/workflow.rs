@@ -344,6 +344,9 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             started_at_ms: 0,
             duration_ms: 1,
             exit_code: Some(1),
+            expect_marker: None,
+            boundary_marker_seen: false,
+            authorized_control_seen: false,
             timed_out: false,
             capture_complete: true,
             cleanup_complete: true,
@@ -1246,7 +1249,9 @@ fn forged_or_broken_proof_records_are_rejected() {
         ("no enforced controls", &|v| {
             v["enforced"] = serde_json::json!([])
         }),
-        ("never ran", &|v| v["exit_code"] = 127.into()),
+        ("proof support requires assertion exit", &|v| {
+            v["exit_code"] = 127.into()
+        }),
         ("did not finish cleanly", &|v| {
             v["cleanup_complete"] = false.into()
         }),
@@ -1451,6 +1456,8 @@ fn every_proven_verdict_requires_a_valid_inner_exit_and_clean_markers() {
             Some(-1),
             Some(0),
             Some(1),
+            Some(2),
+            Some(3),
             Some(125),
             Some(126),
             Some(127),
@@ -1462,8 +1469,8 @@ fn every_proven_verdict_requires_a_valid_inner_exit_and_clean_markers() {
             record.exit_code = code;
             omgs::proof::write(&dir, &record).unwrap();
             let errors = omgs::proof::validate_proofs(&findings, &dir);
-            let allowed =
-                matches!(code, Some(1..=125)) || (verdict == Verdict::Rejected && code == Some(0));
+            let allowed = matches!(code, Some(1 | 3..=125))
+                || (verdict == Verdict::Rejected && code == Some(0));
             assert_eq!(
                 errors.is_empty(),
                 allowed,
@@ -1481,6 +1488,52 @@ fn every_proven_verdict_requires_a_valid_inner_exit_and_clean_markers() {
         ));
     }
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn linked_proof_contract_requires_boundary_control_and_assertion_exit() {
+    let dir = scratch("proof-contract");
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let original = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    for (label, exit, boundary, control, allowed) in [
+        ("import failure", 2, false, false, false),
+        ("control failure", 2, false, false, false),
+        ("missing boundary", 1, false, true, false),
+        ("missing control", 1, true, false, false),
+        ("dependency failure", 2, false, true, false),
+        ("harness error with markers", 2, true, true, false),
+        ("other assertion exit", 3, true, true, false),
+        ("fixed", 0, false, true, false),
+        ("boundary beyond saved cap", 1, true, true, true),
+    ] {
+        let mut record = original.clone();
+        record.expect_marker = Some("BOUNDARY_ASSERTION_FAILED".into());
+        record.exit_code = Some(exit);
+        record.boundary_marker_seen = boundary;
+        record.authorized_control_seen = control;
+        // Saved output contains neither marker. The runner's full-stream
+        // evidence must be used rather than re-scanning this capped prefix.
+        assert!(record.output.is_empty());
+        omgs::proof::write(&dir, &record).unwrap();
+        let errors = omgs::proof::validate_proofs(&findings, &dir);
+        assert_eq!(errors.is_empty(), allowed, "{label}: {errors:?}");
+    }
+    for marker in [
+        "",
+        "AUTHORIZED_CONTROL_OK",
+        "OMGS_START_fake",
+        "has space",
+        "has\nnewline",
+    ] {
+        let mut record = original.clone();
+        record.expect_marker = Some(marker.into());
+        record.boundary_marker_seen = true;
+        record.authorized_control_seen = true;
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(!omgs::proof::validate_proofs(&findings, &dir).is_empty());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

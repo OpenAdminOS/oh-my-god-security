@@ -100,6 +100,7 @@ fn assert_augmented_tier_refusal(tier: &str, caller: u32) {
     };
     let lib_dir = d.join("library-proof");
     let request = ProveRequest {
+        expect_marker: None,
         command: "echo REFUSAL_WORKLOAD_RAN".into(),
         test: None,
         target: Some(target.clone()),
@@ -669,7 +670,7 @@ fn proof_records_back_confirmed_findings() {
     );
     assert_eq!(never_ran.status.code(), Some(1));
     assert!(
-        text(&never_ran).contains("never ran"),
+        text(&never_ran).contains("proof support requires assertion exit"),
         "{}",
         text(&never_ran)
     );
@@ -1435,6 +1436,7 @@ fn unreachable_tests_never_run_the_command() {
     std::fs::create_dir_all(target.join("directory")).unwrap();
     for (n, test) in ["missing test's file", "directory"].iter().enumerate() {
         let request = ProveRequest {
+            expect_marker: None,
             command: "echo UNREACHABLE_COMMAND_RAN".into(),
             test: Some((*test).into()),
             target: Some(target.clone()),

@@ -460,60 +460,98 @@ fn concurrent_short_marked_runs_complete_capture() {
 #[cfg(target_os = "macos")]
 #[test]
 fn unsupervised_spawns_do_not_delay_capture() {
+    if std::env::var_os("OMGS_CAPTURE_STRESS_CHILD").is_none() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "unsupervised_spawns_do_not_delay_capture",
+                "--nocapture",
+            ])
+            .env("OMGS_CAPTURE_STRESS_CHILD", "1");
+        let mut watchdog = limits();
+        watchdog.wall_ms = 60_000;
+        let result = run(command, &watchdog, None);
+        assert!(result.success && result.capture_complete, "{result:?}");
+        return;
+    }
+    use std::io::{BufRead, BufReader, Write};
     use std::os::unix::process::CommandExt;
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
-    use std::time::{Duration, Instant};
-    let stop = Arc::new(AtomicBool::new(false));
+    use std::process::{Child, Stdio};
+    use std::sync::{mpsc, Arc, Barrier, Mutex};
+    use std::time::Duration;
+
+    // stdin is the explicit release handshake. Drop also releases children
+    // during unwinding, so failed capture assertions cannot leave them behind.
+    struct Held(Child);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            if let Some(mut input) = self.0.stdin.take() {
+                let _ = input.write_all(b"release\n");
+            }
+            let _ = self.0.wait();
+        }
+    }
     std::thread::scope(|scope| {
+        let start = Arc::new(Barrier::new(9));
+        // Unmanaged std spawns have their own non-atomic exec-error pipe on
+        // Darwin. Serialize those spawns with each other, while still racing
+        // them against capture creation. Supervised children seal descriptors.
+        let spawning = Arc::new(Mutex::new(()));
+        let (tx, rx) = mpsc::channel();
         let workers: Vec<_> = (0..8)
             .map(|_| {
-                let stop = stop.clone();
+                let start = start.clone();
+                let spawning = spawning.clone();
+                let tx = tx.clone();
                 scope.spawn(move || {
-                    let mut children = Vec::new();
-                    while !stop.load(Ordering::Relaxed) {
-                        let mut command = Command::new("/bin/sleep");
-                        command.arg("1");
+                    start.wait();
+                    for _ in 0..16 {
+                        let mut command = Command::new("/bin/sh");
+                        command
+                            .args(["-c", "printf 'ready\n'; read release"])
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped());
                         // Select std's fork/exec path, without sealing descriptors.
                         // SAFETY: the callback does nothing and is async-signal-safe.
                         unsafe {
                             command.pre_exec(|| Ok(()));
                         }
-                        children.push(command.spawn().unwrap());
-                        if children.len() == 16 {
-                            for mut child in children.drain(..) {
-                                child.wait().unwrap();
-                            }
+                        let mut child = {
+                            let _lock = spawning.lock().unwrap();
+                            Held(command.spawn().unwrap())
+                        };
+                        let mut line = String::new();
+                        BufReader::new(child.0.stdout.take().unwrap())
+                            .read_line(&mut line)
+                            .unwrap();
+                        assert_eq!(line, "ready\n");
+                        if tx.send(child).is_err() {
+                            return;
                         }
-                    }
-                    for mut child in children {
-                        child.wait().unwrap();
                     }
                 })
             })
             .collect();
-        // Stop workers even if an assertion fails.
-        struct Stop(Arc<AtomicBool>);
-        impl Drop for Stop {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::Relaxed);
-            }
-        }
-        let guard = Stop(stop);
-        for _ in 0..256 {
-            let start = Instant::now();
-            let result = run(shell("printf short"), &limits(), None);
+        drop(tx);
+        start.wait();
+        let mut held = vec![rx.recv_timeout(Duration::from_secs(60)).unwrap()];
+        let mut watchdog = limits();
+        watchdog.wall_ms = 60_000;
+        for _ in 0..128 {
+            let result = run(shell("printf short"), &watchdog, None);
+            held.extend(rx.try_iter());
+            // Capture must reach EOF before releasing any unrelated child.
+            // This checks ownership, independent of how quickly it was scheduled.
+            assert!(held.iter_mut().all(|c| c.0.try_wait().unwrap().is_none()));
             assert!(result.success && result.capture_complete, "{result:?}");
-            assert!(
-                start.elapsed() < Duration::from_millis(750),
-                "capture waited for an unrelated child: {result:?}"
-            );
         }
-        drop(guard);
         for worker in workers {
             worker.join().unwrap();
         }
+        held.extend(rx.try_iter());
+        assert_eq!(held.len(), 128);
+        assert!(held.iter_mut().all(|c| c.0.try_wait().unwrap().is_none()));
+        drop(held);
     });
 }
