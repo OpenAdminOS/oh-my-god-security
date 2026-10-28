@@ -1,0 +1,198 @@
+{
+  "format_version": 1,
+  "examples_only": false,
+  "cases": [
+    {
+      "id": "fixture",
+      "example_only": false,
+      "kind": "generated_app",
+      "description": "Synthetic scorer arithmetic fixture, not a measured security campaign.",
+      "source": {
+        "repository_url": null,
+        "authorization_basis": "Local test data only",
+        "license": {
+          "spdx_id": "Apache-2.0",
+          "redistribution_status": "metadata_only",
+          "note": "Repository test fixture"
+        }
+      },
+      "stack": {
+        "language": "typescript",
+        "nextjs_version": "15.5.4",
+        "database": "supabase"
+      },
+      "provenance": {
+        "advisory_id": null,
+        "advisory_url": null,
+        "first_public_disclosure_at": null,
+        "first_public_fix_at": null,
+        "timeline_evidence_urls": null,
+        "generator": {
+          "agent": "fixture",
+          "model": "fixture",
+          "prompt_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "seed": 17
+        },
+        "human_confirmation": {
+          "reviewer": "fixture-review",
+          "reviewed_at": "2026-10-28T00:00:00Z",
+          "evidence_path": "README.md"
+        }
+      },
+      "cutoff": {
+        "latest_model_knowledge_cutoff": null,
+        "eligibility": "not_applicable",
+        "reason": "Arithmetic fixture only"
+      },
+      "split": {
+        "cohort_id": "arithmetic",
+        "partition": "development",
+        "rotation_id": "1"
+      },
+      "snapshots": [
+        {
+          "id": "positive",
+          "role": "vulnerable",
+          "source_ref": "1111111111111111111111111111111111111111",
+          "fixture_path": "unused/positive",
+          "toolchain_manifest_path": "unused/tools.json"
+        },
+        {
+          "id": "fixed",
+          "role": "fixed",
+          "source_ref": "2222222222222222222222222222222222222222",
+          "fixture_path": "unused/fixed",
+          "toolchain_manifest_path": "unused/tools.json"
+        },
+        {
+          "id": "blocked",
+          "role": "vulnerable",
+          "source_ref": "3333333333333333333333333333333333333333",
+          "fixture_path": "unused/blocked",
+          "toolchain_manifest_path": "unused/tools.json"
+        }
+      ],
+      "fixtures": {
+        "policy_path": "policies/workspace-app.json",
+        "setup_manifest_path": "fixtures/workspace-app-synthetic.json",
+        "dependency_snapshot_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "network": "denied",
+        "data": "synthetic_only",
+        "tier2_first_run_approval_required": true
+      },
+      "expected_findings": [
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/a/route.ts:GET",
+          "sink": "loada",
+          "boundary": "member to private data",
+          "id": "a",
+          "location": {
+            "path": "route.ts",
+            "line": 1
+          },
+          "invariant": "Private rows require membership",
+          "positive_snapshot_ids": [
+            "positive"
+          ],
+          "negative_snapshot_ids": [
+            "fixed"
+          ],
+          "minimum_proof_tier": "test_proven",
+          "proof_test_path": "unused/test.ts"
+        },
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/b/route.ts:GET",
+          "sink": "loadb",
+          "boundary": "member to private data",
+          "id": "b",
+          "location": {
+            "path": "route.ts",
+            "line": 1
+          },
+          "invariant": "Private rows require membership",
+          "positive_snapshot_ids": [
+            "positive"
+          ],
+          "negative_snapshot_ids": [
+            "fixed"
+          ],
+          "minimum_proof_tier": "test_proven",
+          "proof_test_path": "unused/test.ts",
+          "aliases": [
+            {
+              "attack_class": "tenant_isolation",
+              "entry_point": "app/api/b-refactor/route.ts:GET",
+              "sink": "loadb-refactor",
+              "boundary": "member to private data",
+              "review": {
+                "reviewer": "fixture-review",
+                "reviewed_at": "2026-10-28T00:00:00Z",
+                "evidence_path": "README.md"
+              }
+            }
+          ]
+        },
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/c/route.ts:GET",
+          "sink": "loadc",
+          "boundary": "member to private data",
+          "id": "c",
+          "location": {
+            "path": "route.ts",
+            "line": 1
+          },
+          "invariant": "Private rows require membership",
+          "positive_snapshot_ids": [
+            "positive"
+          ],
+          "negative_snapshot_ids": [
+            "fixed"
+          ],
+          "minimum_proof_tier": "test_proven",
+          "proof_test_path": "unused/test.ts"
+        },
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/d/route.ts:GET",
+          "sink": "loadd",
+          "boundary": "member to private data",
+          "id": "d",
+          "location": {
+            "path": "route.ts",
+            "line": 1
+          },
+          "invariant": "Private rows require membership",
+          "positive_snapshot_ids": [
+            "blocked"
+          ],
+          "negative_snapshot_ids": [
+            "fixed"
+          ],
+          "minimum_proof_tier": "test_proven",
+          "proof_test_path": "unused/test.ts"
+        }
+      ],
+      "known_clean_units": [
+        {
+          "snapshot_ids": [
+            "fixed"
+          ],
+          "surface": "GET /a",
+          "boundary": "member to private data",
+          "attack_class": "tenant_isolation",
+          "invariant": "Private rows denied"
+        }
+      ],
+      "budget": {
+        "max_agent_calls": 12,
+        "max_model_tokens": 60000,
+        "max_cost_usd": 5.0,
+        "max_wall_seconds": 900,
+        "max_proof_runs": 4
+      }
+    }
+  ]
+}

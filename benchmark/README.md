@@ -8,9 +8,11 @@ Measure whether agents find real boundary violations, whether fresh verifiers ke
 - **AI generated sample apps:** retain generation prompt hash, agent/model configuration and seed when supported. A human independently confirms each deliberately present defect using local synthetic fixtures and a regression test. A generation prompt or model label is not ground truth. Include repaired versions and realistic distractors.
 - **Clean negatives:** humans inspect and test specific surfaces with effective shared authorization, intentional public data, correct RLS, verified webhooks and UI guards backed by server controls. Record exactly which units are negative. A fixed commit is negative for its repaired defect, not automatically clean for every attack class.
 
-Stay within TypeScript, Next.js App Router, and Postgres or Supabase. No live targets, real user data, or external service validation. An unavailable local dependency, sandbox control, or external policy is a recorded blocker, not evidence of absence or a reason to execute elsewhere.
+Stay within the stacks with OMGS proof recipes: Node and TypeScript (including Next.js), Python, POSIX shell, PowerShell, and Swift. No live targets, real user data, or external service validation. An unavailable local dependency, sandbox control, or external policy is a recorded blocker, not evidence of absence or a reason to execute elsewhere.
 
 For the real post-cutoff cohort, record the latest known training knowledge cutoff for every model used in hunting, criticism, and verification. The vulnerability's earliest known public disclosure and public fix availability must both be later than that cutoff. Include dates and sources, not just the CVE assignment date. Unknown cutoff or earlier disclosure makes the case ineligible for a post-cutoff claim for that configuration; report it in a separate cohort. Post-cutoff selection reduces leakage risk, but does not prove absence of training contamination.
+
+The campaign configuration confirmed on 2026-10-28 has a latest participating cutoff of **2026-06-30**. Only campaign hunting and verification participants set this cutoff; development-only code reviewers do not participate. See the [corpus cutoff configuration](corpus/README.md#cutoff-configuration) for role assignments, cutoff sources and conservative date handling.
 
 ## Split and run protocol
 
@@ -74,3 +76,136 @@ Paths are relative to an authorized local fixture bundle outside evaluated targe
 ## Licensing: open decision
 
 Benchmark corpus licensing is explicitly deferred in [DECISIONS.md](../DECISIONS.md). This design does not choose a corpus license or authorize copying upstream source, advisories, patches, or generated app dependencies. Track rights per case; retain required notices. Until the decision and rights are resolved, keep restricted material in authorized local fixtures and publish only metadata whose redistribution is permitted. Example license identifiers are illustrative, not a licensing decision.
+
+## Score saved runs offline
+
+```sh
+omgs bench score --cases benchmark/fixtures/score/cases.json \
+  --runs benchmark/fixtures/score/run-1 \
+  --runs benchmark/fixtures/score/run-2 > score.json 2> score.md
+```
+
+JSON goes to stdout and a short Markdown table to stderr. Errors return exit 2
+without partial results. The command reads saved artifacts only. It performs no fetches,
+proof replays, builds or target execution. Every exported finding is bound to its
+source run's `findings.json`, including the identity, verdict, tier and
+`proof_ref`. Source findings must pass the evidence rules used by `omgs validate`.
+Each matching finding then passes the same offline proof validator, including
+runner config, command and draft digests, clean execution and `omgs-proof/2`
+recipe contract rules. Its proof record must have a `target_head` exactly equal
+to the observation's frozen manifest snapshot `source_ref`. Missing or mismatched
+revisions cannot support TP, recovery or FP counts. Missing, mismatched or
+invalid evidence is excluded from TP, recovery and FP counts and listed in
+`invalid_evidence` with diagnostics.
+These are offline consistency checks, not fresh execution or attestation.
+
+Each `--runs` directory is **one complete independent repetition** across every
+case snapshot, including blocked and budget-exhausted snapshots. Save a
+`benchmark-run.json` object with these required fields (no defaults):
+
+| Field | Shape |
+| --- | --- |
+| `format_version` | `1` |
+| `run_id`, `campaign_id`, `configuration` | Nonempty strings; run IDs unique, campaign/configuration identical across repetitions. Configuration identifies the frozen settings, versions, tools, sampling and seeds |
+| `manifest_sha256` | SHA-256 of compact, key-sorted parsed manifest JSON, binding the truth set to the frozen repetition |
+| `repetitions` | Predeclared positive integer `k`, equal to the number of supplied run directories |
+| `observations` | Exactly one object per manifest case/snapshot pair |
+| `resource_usage` | Object with required `proof_tool_cost_usd` and `wall_seconds`, each finite nonnegative number or explicit null |
+
+Every observation requires `case_id`, `snapshot_id`, `status` (`complete`,
+`blocked`, `budget_exhausted`), string arrays `blockers`, `examined_units`,
+`unexamined_units`, and arrays `candidates`, `findings`, `adjudications`.
+Each observation also requires `source_run`, a directory relative to its
+`--runs` repetition containing the archived source `findings.json` and adjacent
+`proofs/` records and runner artifacts. Use null when no source run is available;
+any exported findings then appear in `invalid_evidence` and cannot count.
+Absolute paths, parent traversal and directories escaping the repetition are
+rejected as evidence. Incomplete observations must name blockers. They may
+retain partial findings.
+An empty findings array never removes a case from the primary denominator.
+Whenever `source_run` is supplied, its complete source findings file is validated,
+even for an empty export. Every archived `confirmed` and `needs_validation`
+finding must appear in the export. An invalid source archive or an omitted
+finding rejects the entire score command with exit 2 and a diagnostic naming
+the run, case, snapshot and source archive. Omissions also list the missing
+fingerprints. No partial metrics are emitted. This applies to complete, blocked
+and budget-exhausted observations, so clearing findings and adjudications on a
+fixed snapshot cannot silently turn an archived false positive into FP 0 or FDR 0.
+
+- Each candidate has required `attack_class`, `entry_point`, `sink`, `boundary`
+  and `verifier` (`accepted`, `rejected`, `pending`). Export the pre-verifier
+  candidates, including lost or deferred candidates. Identities must be unique
+  within a snapshot; reviewed semantic aliases collapse to a defect within each
+  repetition. Rejection and pending numerators count groups with an explicit
+  rejection or pending candidate respectively; they can overlap for a group
+  with multiple submitted identities. They are not inferred from final verdicts.
+- Each finding has required `fingerprint`, the four identity inputs, `verdict`
+  (`confirmed`, `rejected`, `needs_validation`) and `proof_tier` (`traced`,
+  `test_proven`, `sandbox_exploited`) and `proof_ref` (string or explicit null).
+  Fingerprints must match `omgs fingerprint`. Recovery requires validated source
+  evidence at the expected minimum tier, never below `test_proven`. The source
+  file is checked as a whole for invalid identities and conflicting records;
+  proof errors are reported per exported finding.
+- Each adjudication has required `fingerprint`, `outcome` (`false_positive`,
+  `pending`, `disputed`), `negative_unit` and `review`. A false positive names the zero-based
+  index of an independently adjudicated `known_clean_units` entry covering that
+  snapshot. Pending and disputed use null. `review` has `reviewer`, ISO UTC `reviewed_at`,
+  and evaluator-only `evidence_path`. Only independently refuted proven
+  confirmations count as FP. Unexpected confirmations, including unreviewed
+  fixed-snapshot findings, stay listed for adjudication. Pending and disputed
+  adjudications are listed separately in `pending_adjudications`, even for a
+  positive identity match. They count neither as TP nor recovery until resolved.
+  The frozen denominator is unchanged. This list is separate from
+  `true_candidates_pending`, which measures verifier deferrals.
+
+Required manifest fields from the format above are validated recursively,
+including explicit nullable fields. Unknown keys, duplicates, missing fields,
+invalid enums, malformed dates/hashes, example flags and dangling snapshot
+references fail closed. Snapshot refs are full 40-digit commit IDs. Location
+`line` is a positive integer or explicit null when not known. An expected finding
+may additionally have optional `aliases`: an array of the four identity inputs
+plus required `review` as above. The scorer computes every canonical and alias
+fingerprint itself. Aliases must be unique within a case and may not cross
+expected defects. No advisory-name or line-number matching is used.
+
+Results are separated by cutoff eligibility, partition and rotation, with frozen case
+context (family cohort, stack, budgets, split, provenance and minimum tiers) alongside metrics.
+Every ratio contains numerator, denominator and value. Parent cohort/context
+applies to all its nested metrics. FP and needs-validation counts use denominator
+1 repetition; negative-unit denominators count frozen adjudicated
+unit/snapshot pairs per repetition. TP counts distinct matched defect/snapshot
+pairs, FP counts distinct independently refuted findings per snapshot. Repeated
+FP detections on fixed snapshots remain in each run's result. The union recall
+uses distinct positive defects and the same denominator as every single run.
+
+Mean recall reports the sum of recovered defect counts over all repetitions
+divided by positive defects times `k`, equivalent to the arithmetic mean because
+every repetition has the same frozen denominator. Variance objects contain the
+distribution, known-sample numerator and total-repetition denominator. Standard deviation is the population
+standard deviation (divide by `k`), using `delta * delta` for squared deviations.
+Floating point comparisons use an absolute tolerance of `1e-12` plus a relative
+tolerance of `1e-12 * abs(expected)`; counts and structural fields remain exact.
+The golden wall-time fixture includes decimal samples to exercise this tolerance.
+Zero denominators and unavailable values
+produce null. Any unknown sample makes complete-distribution mean, range and
+standard deviation null, rather than silently selecting a cheaper executable
+subset. Per-defect frequency uses recovered repetitions divided by `k`. Its display
+keys join case and defect IDs with `:` after escaping `%` as `%25` and `:` as
+`%3A` in each component, so identifiers cannot collide.
+
+Optional `run-metadata.json` provides cumulative host accounting. The existing
+`agent_calls_used` field supplies calls. `accounting` maps `red-hunter`,
+`blue-verifier`, `evaluator`, `green-fixer` to optional nullable `tokens`,
+`cost_usd`, `duration_ms`, and optional `input_tokens`/`output_tokens` splits.
+Accounting must include retries across the complete repetition. A total is known
+only if every role supplies that dimension; explicit measured zero is preserved,
+missing billing is never zero. No token pricing is inferred. Raw role accounting
+is retained. Cost, proof/tool cost and wall time are campaign-wide, each labeled
+with cohort and sample count, and are not allocated to individual families.
+The `k`-run currency total is null if any repetition has unknown billing.
+CLI model-call count is always zero.
+
+The [golden fixture](fixtures/score/README.md) demonstrates the export format and
+hand arithmetic. The [corpus inventory](corpus/README.md) records researched real
+pairs, cutoff sources, SHA verification and the remaining admission gap. It is
+metadata awaiting campaign preparation, not a scorable case manifest.

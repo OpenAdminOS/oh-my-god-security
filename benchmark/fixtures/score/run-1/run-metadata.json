@@ -1,0 +1,25 @@
+{
+  "agent_calls_used": 4,
+  "accounting": {
+    "red-hunter": {
+      "tokens": 100,
+      "cost_usd": 0.5,
+      "duration_ms": 1000
+    },
+    "blue-verifier": {
+      "tokens": 100,
+      "cost_usd": 0.5,
+      "duration_ms": 1000
+    },
+    "evaluator": {
+      "tokens": 100,
+      "cost_usd": 0.5,
+      "duration_ms": 1000
+    },
+    "green-fixer": {
+      "tokens": 100,
+      "cost_usd": 0.5,
+      "duration_ms": 1000
+    }
+  }
+}
