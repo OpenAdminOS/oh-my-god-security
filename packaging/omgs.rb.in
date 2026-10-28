@@ -41,8 +41,10 @@ class Omgs < Formula
 
   def install
     bin.install Dir["omgs-*"][0] => "omgs"
+    chmod 0755, bin/"omgs"
     unless OS.mac? && Hardware::CPU.intel?
       resource("mxc").stage { libexec.install Dir["mxc-*"][0] => (OS.mac? ? "mxc-exec-mac" : "lxc-exec") }
+      chmod 0755, libexec/(OS.mac? ? "mxc-exec-mac" : "lxc-exec")
       bin.install_symlink libexec/(OS.mac? ? "mxc-exec-mac" : "lxc-exec")
     end
   end

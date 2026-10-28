@@ -20,10 +20,13 @@ def pins():
     source = (ROOT / 'src/sandbox.rs').read_text()
     rows = [line.split() for line in (ROOT / 'skill/mxc-pins.txt').read_text().splitlines()
             if line and not line.startswith('#')]
-    assert len(rows) == 5 and len({row[2] for row in rows}) == 5
-    assert ZIP_SHA in source and 'pub const MXC_VERSION: &str = "1.0.1"' in source
+    if len(rows) != 5 or any(len(row) != 4 for row in rows) or len({row[2] for row in rows}) != 5:
+        raise ValueError('Expected five distinct MXC platform assets')
+    if ZIP_SHA not in source or 'pub const MXC_VERSION: &str = "1.0.1"' not in source:
+        raise ValueError('MXC version or archive pin diverged')
     for _, _, _, sha in rows:
-        assert re.fullmatch('[0-9a-f]{64}', sha) and sha in source, 'MXC pins diverged'
+        if not re.fullmatch('[0-9a-f]{64}', sha) or sha not in source:
+            raise ValueError('MXC pins diverged')
     return rows
 
 

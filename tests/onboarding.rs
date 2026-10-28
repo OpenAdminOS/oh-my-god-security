@@ -10,7 +10,10 @@ fn readme_has_newcomer_headings() {
         "Handing results to an agent",
         "Known limitations",
     ] {
-        assert!(readme.contains(&format!("## {heading}\n")), "{heading}");
+        assert!(
+            readme.lines().any(|line| line == format!("## {heading}")),
+            "{heading}"
+        );
     }
 }
 

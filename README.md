@@ -59,9 +59,9 @@ provider unless it runs locally.
 Network use is specific: `review` and `batch init` use `git clone` over HTTPS;
 `watch` serves only loopback HTTP. The installer downloads release assets over
 HTTPS after consent. Sensors default to local tools and local data. Setting
-`OMGS_SEMGREP_ALLOW_REGISTRY=1` permits Semgrep rule downloads. This revision only
-detects OSV availability; an opt-in OSV database download belongs to the sensor
-integration and must be disclosed when enabled. Proofs never download target
+`OMGS_SEMGREP_ALLOW_REGISTRY=1` permits Semgrep rule downloads. OSV database preparation is
+opt-in and separate from proof execution. At this revision the binary only detects
+OSV availability and never downloads its database. Proofs never download target
 dependencies or access the external network. The CLI's git subprocess can also
 inherit user git configuration and credentials; use an appropriate review account.
 
