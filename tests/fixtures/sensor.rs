@@ -21,6 +21,8 @@ fn main() {
     } else {
         target
     };
+    let data = target.join(".sensor-fixture");
+    let fixture = |extension: &str| data.join(format!("{tool}.{extension}"));
     let tmp = PathBuf::from(env::var_os(if cfg!(windows) { "TEMP" } else { "TMPDIR" }).unwrap());
     check(
         fs::write(
@@ -35,18 +37,18 @@ fn main() {
         34,
     );
     check(
-        fs::write(exe.parent().unwrap().join("scanner-wrote-runtime"), "bad").is_err(),
+        fs::OpenOptions::new().append(true).open(&exe).is_err(),
         35,
     );
     check(fs::read(target.join("../outside")).is_err(), 36);
-    let outside = fs::read_to_string(exe.with_extension("outside"))
+    let outside = fs::read_to_string(fixture("outside"))
         .unwrap_or_else(|_| std::process::exit(37));
     check(fs::read(outside).is_err(), 38);
     if let Ok(db) = env::var("OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY") {
         assert!(fs::read(PathBuf::from(&db).join("osv-scanner/crates.io/all.zip")).is_ok());
         assert!(fs::write(PathBuf::from(db).join("scanner-wrote-db"), "bad").is_err());
     }
-    let loopback = fs::read_to_string(exe.with_extension("port")).unwrap();
+    let loopback = fs::read_to_string(fixture("port")).unwrap();
     for ip in [loopback.as_str(), "1.1.1.1:443"] {
         assert!(std::net::TcpStream::connect_timeout(
             &ip.parse().unwrap(),
@@ -88,19 +90,20 @@ fn main() {
                 .contains("-r ../outside"));
         }
         "semgrep" => {
+            assert!(has("--max-target-bytes=1000000"));
             assert!(has("--disable-nosem") && has("--no-git-ignore"));
             assert!(!target.join(".semgrepignore").exists());
             assert!(!target.join("src/.semgrepignore").exists());
         }
         _ => {}
     }
-    let mode = fs::read_to_string(exe.with_extension("mode")).unwrap();
+    let mode = fs::read_to_string(fixture("mode")).unwrap();
     if mode == "timeout" {
         std::thread::sleep(Duration::from_secs(30));
     }
     print!(
         "{}",
-        fs::read_to_string(exe.with_extension("json")).unwrap()
+        fs::read_to_string(fixture("json")).unwrap()
     );
     std::process::exit(mode.parse().unwrap_or(0));
 }

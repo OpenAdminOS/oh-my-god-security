@@ -211,7 +211,12 @@ for manual ecosystem archive downloads and cache layout.
 
 Every scanner gets a bounded read-only workspace copy, read-only installed
 binary/runtime roots, read-only rules/database and a private writable scratch
-home/cache outside permanent run artifacts. The original target is not mounted.
+home/cache outside permanent run artifacts. Native scanners receive only an
+executable-file grant. Python entry points also receive narrow installation/runtime
+prefixes. Grants exposing the whole HOME or
+user profile, or overlapping the original target or artifacts, are refused.
+Scratch is checked against the target, artifacts and all grants before creation.
+The original target is not mounted.
 The disposable tree, including raw scanner temp files, is removed after
 supervised cleanup on success, failure, interruption and timeout. Cleanup failure
 is a gap. OMGS does not retain raw stdout, stderr or diagnostics. It preserves
@@ -226,14 +231,16 @@ and database installations are operator-supplied readable inputs, not part of
 this source byte budget. They can affect parser memory usage. No total process
 memory cap is claimed on macOS or Windows. Semgrep additionally uses
 `--max-target-bytes=1000000 --max-memory=512 --jobs=1`; its reported skipped
-inputs and diagnostics become gaps.
+inputs and diagnostics become gaps. OMGS independently counts copied files above
+the 1,000,000 byte target limit, even when quiet output omits skipped paths.
 
 Scanners have a 120 second MXC deadline, supervised teardown (up to 15 seconds
 extra on Unix) and a 4 MiB combined output cap. Unix adds CPU, file size and open
 file limits. Linux requests a 2 GiB cgroup memory limit and 128 tasks through an
-available systemd user scope. If unavailable, OMGS records a gap. Other OSes
-record the absent memory/task limits. Oversized output, malformed JSON, missing
-metadata, unexpected exit codes, reported omissions and incomplete cleanup are
+available systemd user scope. If unavailable, OMGS records the same gap as
+`prove`. Sensors follow the same per-OS enforced set as `prove`: macOS and
+Windows have no memory/task cap by design. Oversized output, malformed JSON,
+missing metadata, unexpected exit codes, reported omissions and incomplete cleanup are
 explicit gaps. No sensor is a successful zero-hit scan merely because it failed.
 
 `sensors.json` records successful tools, unavailable tools, gaps and redacted

@@ -35,7 +35,7 @@ use crate::platform::which;
 /// Run deterministic sensor tools against source text. Sensors never execute
 /// target code. Raw scanner output can contain matched secret values, so only
 /// rule, file and line metadata is retained and the raw report is deleted.
-pub fn run_sensors(target: &Path, _scratch_dir: &Path) -> SensorsReport {
+pub fn run_sensors(target: &Path, artifacts: &Path) -> SensorsReport {
     let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
     let target = target.as_path();
     let mut report = SensorsReport {
@@ -45,7 +45,7 @@ pub fn run_sensors(target: &Path, _scratch_dir: &Path) -> SensorsReport {
         gaps: Vec::new(),
     };
     for tool in ["gitleaks", "semgrep", "trufflehog", "osv-scanner"] {
-        run_offline(tool, target, &mut report);
+        run_offline(tool, target, artifacts, &mut report);
     }
     for hit in &mut report.hits {
         hit.fingerprint = hit_fingerprint(hit);
@@ -68,27 +68,19 @@ pub fn parse_semgrep(text: &str, target: &Path, report: &mut SensorsReport) {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let rel = Path::new(&file)
-            .strip_prefix(target)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or(file);
-        report.hits.push(SensorHit {
-            tool: "semgrep".into(),
-            rule: item
-                .get("check_id")
+        if let Ok(hit) = metadata_hit(
+            "semgrep",
+            item.get("check_id")
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            class: crate::paths::classify_file(target, Path::new(&rel)),
-            fingerprint: String::new(),
-            package: None,
-            vendored: crate::is_vendored_path(&rel),
-            file: rel,
-            line: item
-                .get("start")
+                .unwrap_or("unknown"),
+            &file,
+            item.get("start")
                 .and_then(|s| s.get("line"))
                 .and_then(|v| v.as_u64()),
-        });
+            target,
+        ) {
+            report.hits.push(hit);
+        }
     }
 }
 
@@ -142,7 +134,7 @@ fn metadata_hit(
     let mut hit = SensorHit {
         tool: tool.into(),
         rule: crate::platform::escape_controls(rule),
-        file: crate::paths::display(relative),
+        file: crate::platform::escape_controls(&crate::paths::display(relative)),
         line,
         vendored: class == crate::paths::Class::Vendored,
         class,
@@ -242,7 +234,9 @@ fn sensor_limits() -> crate::supervise::Limits {
     }
 }
 
-fn run_offline(tool: &str, target: &Path, report: &mut SensorsReport) {
+pub(crate) const SEMGREP_MAX_TARGET_BYTES: usize = 1_000_000;
+
+fn run_offline(tool: &str, target: &Path, artifacts: &Path, report: &mut SensorsReport) {
     let Some(executable) = which(tool) else {
         report.tools_unavailable.push(tool.into());
         report.gaps.push(format!("{tool}: not present on PATH"));
@@ -300,13 +294,13 @@ fn run_offline(tool: &str, target: &Path, report: &mut SensorsReport) {
                 "--disable-version-check",
                 "--disable-nosem",
                 "--no-git-ignore",
-                "--max-target-bytes=1000000",
                 "--max-memory=512",
                 "--jobs=1",
                 "--config",
             ]
             .map(str::to_string)
             .to_vec();
+            args.insert(1, format!("--max-target-bytes={SEMGREP_MAX_TARGET_BYTES}"));
             args.push(crate::platform::mxc_path(&config));
             args.push("{target}".into());
             readonly.push(config);
@@ -342,6 +336,7 @@ fn run_offline(tool: &str, target: &Path, report: &mut SensorsReport) {
         executable: &executable,
         args,
         target,
+        artifacts,
         readonly,
         env,
         limits: sensor_limits(),
@@ -675,5 +670,54 @@ mod offline_tests {
         .unwrap();
         assert_eq!(hit.class, crate::paths::Class::Code);
         assert_eq!(hit.file, "%5C%5C?%5Cvendor/lib.rs");
+    }
+    #[test]
+    fn every_parser_escapes_control_paths_and_markdown_metadata_is_literal() {
+        let file = "src/new\nline\r\u{1b}[31m`<img src=x>.rs";
+        let target = Path::new("/target");
+        let expected = crate::platform::escape_controls(&crate::paths::display(Path::new(file)));
+        let mut truffle = truffle();
+        truffle["SourceMetadata"]["Data"]["Filesystem"]["file"] = json!(file);
+        let osv = json!({"results":[{"source":{"path":file},"packages":[{"package":{"name":"<b>p</b>\nsecond","version":"1`","ecosystem":"test"},"vulnerabilities":[{"id":"OSV-1"}]}]}]});
+        let semgrep = json!({"results":[{"check_id":"<script>\r\n# heading","path":file,"start":{"line":1}}]});
+        let gitleaks = json!([{"RuleID":"fixture","File":file,"StartLine":1}]);
+        let mut report = SensorsReport {
+            tools_run: vec![],
+            tools_unavailable: vec![],
+            hits: vec![],
+            gaps: vec![],
+        };
+        report
+            .hits
+            .extend(trufflehog_hits(&truffle.to_string(), target).unwrap());
+        report
+            .hits
+            .extend(osv_hits(&osv.to_string(), target).unwrap());
+        report
+            .hits
+            .extend(simple_hits("semgrep", &semgrep.to_string(), target).unwrap());
+        report
+            .hits
+            .extend(simple_hits("gitleaks", &gitleaks.to_string(), target).unwrap());
+        parse_semgrep(&semgrep.to_string(), target, &mut report);
+        assert!(report.hits.iter().all(|h| h.file == expected));
+        let markdown = crate::report::sensor_section(Some(&report), false);
+        assert!(!markdown.contains(['\r', '\u{1b}']));
+        // Backticks, HTML and Markdown are literal inside the longer span.
+        assert!(markdown.contains("<img"));
+        assert!(markdown.contains("<script>"));
+        assert_eq!(
+            markdown
+                .lines()
+                .filter(|l| l.starts_with("- `` ") && l.ends_with(" ``"))
+                .count(),
+            5
+        );
+        assert!(markdown.contains("<b>p</b>\\nsecond"));
+        // Also protect report rendering of older, unescaped metadata.
+        report.hits[0].file = file.into();
+        let markdown = crate::report::sensor_section(Some(&report), false);
+        assert!(!markdown.contains(['\r', '\u{1b}']));
+        assert!(!markdown.contains("new\nline"));
     }
 }

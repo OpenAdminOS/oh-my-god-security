@@ -1195,7 +1195,14 @@ pub fn sensor_section(report: Option<&crate::sensors::SensorsReport>, html: bool
             "\n## Sensor hits and gaps\n\nScanner leads require review.\n\n{}\n",
             lines
                 .iter()
-                .map(|l| format!("- `{}`\n", l.replace('`', "&#96;")))
+                .map(|l| {
+                    let literal = crate::platform::escape_controls(l);
+                    // A longer delimiter prevents any metadata backtick run
+                    // from closing the code span. Padding preserves edge ticks.
+                    let ticks = "`"
+                        .repeat(literal.split(|c| c != '`').map(str::len).max().unwrap_or(0) + 1);
+                    format!("- {ticks} {literal} {ticks}\n")
+                })
                 .collect::<String>()
         )
     }

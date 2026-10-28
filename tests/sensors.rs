@@ -88,13 +88,15 @@ impl Fixture {
             assert!(status.success());
             exe
         });
+        let data = self.target.join(".sensor-fixture");
+        std::fs::create_dir_all(&data).unwrap();
         std::fs::write(
-            self.bin.join(format!("{tool}.outside")),
+            data.join(format!("{tool}.outside")),
             self.root.join("outside").to_str().unwrap(),
         )
         .unwrap();
         std::fs::write(
-            self.bin.join(format!("{tool}.port")),
+            data.join(format!("{tool}.port")),
             self.listener.local_addr().unwrap().to_string(),
         )
         .unwrap();
@@ -104,11 +106,12 @@ impl Fixture {
             tool.into()
         });
         std::fs::copy(launcher, path).unwrap();
-        std::fs::write(self.bin.join(format!("{tool}.json")), output).unwrap();
-        std::fs::write(self.bin.join(format!("{tool}.mode")), exit.to_string()).unwrap();
+        std::fs::write(data.join(format!("{tool}.json")), output).unwrap();
+        std::fs::write(data.join(format!("{tool}.mode")), exit.to_string()).unwrap();
     }
-    fn cli(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_omgs"))
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omgs"));
+        command
             .args(args)
             .env(
                 "PATH",
@@ -131,9 +134,11 @@ impl Fixture {
                 omgs::sandbox::locate_executor()
                     .map(|l| l.path)
                     .unwrap_or_else(|_| self.root.join("missing-mxc")),
-            )
-            .output()
-            .unwrap()
+            );
+        command
+    }
+    fn cli(&self, args: &[&str]) -> Output {
+        self.command(args).output().unwrap()
     }
     fn init(&self, name: &str) -> PathBuf {
         let run = self.root.join(name);
@@ -228,6 +233,10 @@ fn offline_tools_feed_redacted_artifacts_reports_and_critic() {
             "{summary}"
         );
     }
+    #[cfg(not(target_os = "linux"))]
+    assert!(!read(&run.join("sensors.json"))["gaps"]
+        .to_string()
+        .contains("Linux cgroup"));
     let hits = read(&run.join("sensor-hits.json"));
     assert_eq!(
         hits.as_array().unwrap().len(),
@@ -459,7 +468,7 @@ fn forced_timeout_removes_scratch() {
     }
     let f = Fixture::new();
     f.tool("trufflehog", "", 0);
-    std::fs::write(f.bin.join("trufflehog.mode"), "timeout").unwrap();
+    std::fs::write(f.target.join(".sensor-fixture/trufflehog.mode"), "timeout").unwrap();
     let out = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "sensor_timeout_child", "--nocapture"])
         .env("OMGS_TIMEOUT_FIXTURE", &f.root)
@@ -509,6 +518,7 @@ fn sensor_timeout_child() {
         .map(str::to_string)
         .to_vec(),
         target: &root.join("target"),
+        artifacts: &root.join("artifacts"),
         readonly: vec![],
         env: vec![],
         semgrep: false,
@@ -613,4 +623,258 @@ fn scratch_inside_target_is_refused_before_creation() {
         .file_name()
         .to_string_lossy()
         .starts_with("omgs-sensor-")));
+}
+
+#[test]
+fn scanner_directly_in_home_cannot_read_private_sibling() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    let private = f.bin.join("private-key");
+    std::fs::write(&private, "synthetic private key").unwrap();
+    f.tool("trufflehog", &truffle("src/main.rs").to_string(), 0);
+    // The native fixture attempts this read and exits 38 if it succeeds.
+    std::fs::write(
+        f.target.join(".sensor-fixture/trufflehog.outside"),
+        private.to_string_lossy().as_bytes(),
+    )
+    .unwrap();
+    let run = f.root.join("home-boundary");
+    let out = f
+        .command(&[
+            "audit",
+            "init",
+            "--target",
+            f.target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+        ])
+        .env("HOME", &f.bin)
+        .env("USERPROFILE", &f.bin)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = read(&run.join("sensors.json"));
+    assert_eq!(report["hits"].as_array().unwrap().len(), 1, "{report}");
+    assert!(
+        report["tools_run"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("trufflehog")),
+        "{report}"
+    );
+}
+
+#[test]
+fn scratch_inside_artifacts_is_refused_before_creation() {
+    if !ready() {
+        return;
+    }
+    for command in [vec!["audit", "init"], vec!["check"]] {
+        let f = Fixture::new();
+        f.tool("trufflehog", &truffle("src/main.rs").to_string(), 0);
+        let run = f.root.join("artifact-overlap");
+        omgs::platform::create_private_dir_new(&run).unwrap();
+        let mut args = command;
+        args.extend([
+            "--target",
+            f.target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+        ]);
+        let out = f
+            .command(&args)
+            .env("TMPDIR", &run)
+            .env("TEMP", &run)
+            .env("TMP", &run)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report = read(&run.join("sensors.json"));
+        assert!(
+            report["gaps"]
+                .to_string()
+                .contains("scratch overlaps artifacts"),
+            "{report}"
+        );
+        assert!(report["tools_run"].as_array().unwrap().is_empty());
+        for e in std::fs::read_dir(&run).unwrap() {
+            let p = e.unwrap().path();
+            assert!(!p.is_dir(), "scratch created in artifacts: {}", p.display());
+            assert!(!std::fs::read_to_string(&p)
+                .unwrap()
+                .contains("raw-secret-must-never-be-stored"));
+        }
+    }
+}
+
+#[test]
+fn semgrep_size_omissions_are_gaps_even_without_reported_skips() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    std::fs::File::create(f.target.join("two-mib.rs"))
+        .unwrap()
+        .set_len(2 << 20)
+        .unwrap();
+    f.tool(
+        "semgrep",
+        r#"{"results":[],"errors":[],"paths":{"scanned":[],"skipped":[]}}"#,
+        0,
+    );
+    let run = f.init("semgrep-size");
+    let report = read(&run.join("sensors.json"));
+    assert!(
+        report["tools_run"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("semgrep")),
+        "{report}"
+    );
+    assert!(
+        report["gaps"]
+            .to_string()
+            .contains("2 input files exceed Semgrep's 1000000 byte target limit"),
+        "{report}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hostile_filenames_are_escaped_in_artifacts_ledger_cli_and_reports() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    let name = "src/new\nline\r\x1b[31m`<img src=x onerror=alert(1)>.rs";
+    std::fs::write(f.target.join(name), "fixture").unwrap();
+    f.tool("trufflehog", &truffle(name).to_string(), 0);
+    let run = f.init("hostile-path");
+    let expected = omgs::platform::escape_controls(&omgs::paths::display(Path::new(name)));
+    let report = read(&run.join("sensors.json"));
+    assert_eq!(report["hits"][0]["file"], expected, "{report}");
+    let hits = read(&run.join("sensor-hits.json"));
+    assert_eq!(hits[0]["file"], expected);
+    let ledger = read(&run.join("coverage-ledger.json"));
+    assert!(ledger["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|u| u["surface"] == expected));
+    let cli = f.cli(&[
+        "check",
+        "--target",
+        f.target.to_str().unwrap(),
+        "--out",
+        f.root.join("check-path").to_str().unwrap(),
+    ]);
+    assert!(cli.status.success());
+    let stdout = String::from_utf8(cli.stdout).unwrap();
+    assert!(stdout.contains(&expected), "{stdout}");
+    assert!(!stdout.contains(['\r', '\x1b']));
+    assert!(!stdout.contains(name));
+    let out = f.cli(&[
+        "report",
+        "--findings",
+        run.join("findings.json").to_str().unwrap(),
+        "--out",
+        run.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let markdown = std::fs::read_to_string(run.join("REPORT.md")).unwrap();
+    let section = markdown.split("## Sensor hits and gaps").nth(1).unwrap();
+    assert!(!section.contains(['\r', '\x1b']));
+    assert!(section
+        .lines()
+        .any(|line| line.starts_with("- `` trufflehog:")
+            && line.ends_with(" ``")
+            && line.contains("new\\nline\\r\\u{1b}[31m")
+            && line.contains("<img")));
+    let html = std::fs::read_to_string(run.join("REPORT.html")).unwrap();
+    assert!(!html.contains("<img src=x"));
+}
+
+#[test]
+fn scratch_inside_readable_rules_is_refused_before_creation() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    f.tool("semgrep", r#"{"results":[]}"#, 0);
+    let run = f.root.join("grant-overlap");
+    let temp = f.root.join("temp");
+    let out = f
+        .command(&[
+            "audit",
+            "init",
+            "--target",
+            f.target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+        ])
+        .env("OMGS_SEMGREP_CONFIG", &temp)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report = read(&run.join("sensors.json"));
+    assert!(
+        report["gaps"]
+            .to_string()
+            .contains("scratch overlaps a readable grant"),
+        "{report}"
+    );
+    assert!(report["tools_run"].as_array().unwrap().is_empty());
+    assert!(std::fs::read_dir(temp).unwrap().next().is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_linux_cgroup_scope_records_prove_gap() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    f.tool("trufflehog", &truffle("src/main.rs").to_string(), 0);
+    let run = f.root.join("no-cgroup");
+    // Keep systemd-run off PATH without changing executor discovery.
+    let out = f
+        .command(&[
+            "check",
+            "--target",
+            f.target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+        ])
+        .env("PATH", &f.bin)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report = read(&run.join("sensors.json"));
+    assert!(
+        report["tools_run"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("trufflehog")),
+        "{report}"
+    );
+    assert!(
+        report["gaps"].as_array().unwrap().contains(&json!(
+            "trufflehog: memory and task limits not applied: Linux cgroups required"
+        )),
+        "{report}"
+    );
 }

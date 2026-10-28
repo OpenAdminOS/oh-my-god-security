@@ -5,6 +5,7 @@ pub struct SensorRequest<'a> {
     pub executable: &'a Path,
     pub args: Vec<String>,
     pub target: &'a Path,
+    pub artifacts: &'a Path,
     pub readonly: Vec<PathBuf>,
     pub env: Vec<String>,
     pub limits: supervise::Limits,
@@ -37,7 +38,7 @@ fn quote(arg: &str) -> Result<String, String> {
     }
 }
 
-pub fn run_sensor(req: SensorRequest<'_>) -> Result<(String, i32, Vec<String>), String> {
+pub fn run_sensor(mut req: SensorRequest<'_>) -> Result<(String, i32, Vec<String>), String> {
     let located =
         locate_executor().map_err(|_| "pinned MXC unavailable; sensor not run".to_string())?;
     let os = std::env::consts::OS;
@@ -46,6 +47,16 @@ pub fn run_sensor(req: SensorRequest<'_>) -> Result<(String, i32, Vec<String>), 
     } else {
         (false, false, Vec::new(), Vec::new())
     };
+    let executable = std::fs::canonicalize(req.executable).map_err(|_| "cannot resolve scanner")?;
+    let mut readonly = scanner_runtime_roots(&executable, req.semgrep)?;
+    readonly.extend(req.readonly.iter().cloned());
+    let homes: Vec<_> = ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .collect();
+    validate_sensor_grants(&readonly, &homes, req.target, req.artifacts)?;
     let _signals = supervise::interruption::Guard::install()
         .map_err(|_| "cannot install sensor interruption guard".to_string())?;
     let nonce = platform::random_nonce().map_err(|_| "cannot create sensor nonce")?;
@@ -55,8 +66,15 @@ pub fn run_sensor(req: SensorRequest<'_>) -> Result<(String, i32, Vec<String>), 
     if overlapping_root(req.target, std::slice::from_ref(&root)).is_some() {
         return Err("private sensor scratch overlaps target; sensor not run".into());
     }
+    if overlapping_root(req.artifacts, std::slice::from_ref(&root)).is_some() {
+        return Err("private sensor scratch overlaps artifacts; sensor not run".into());
+    }
+    if overlapping_root(&root, &readonly).is_some() {
+        return Err("private sensor scratch overlaps a readable grant; sensor not run".into());
+    }
     platform::create_private_dir_new(&root).map_err(|_| "cannot create private sensor scratch")?;
     let scratch = Scratch(root);
+    req.readonly = readonly;
     let result = run_in_scratch(req, &located, &scratch.0, list_parents, &nonce, &mut gaps);
     let removed = std::fs::remove_dir_all(&scratch.0).is_ok();
     if !removed {
@@ -85,8 +103,7 @@ fn run_in_scratch(
     let work = root.join("scratch");
     platform::create_private_dir_new(&work).map_err(|_| "cannot create sensor home")?;
     let executable = std::fs::canonicalize(req.executable).map_err(|_| "cannot resolve scanner")?;
-    let mut readonly = scanner_runtime_roots(&executable)?;
-    readonly.extend(req.readonly);
+    let mut readonly = req.readonly;
     let target = root.join("target");
     platform::create_private_dir_new(&target).map_err(|_| "cannot create sensor workspace")?;
     let mut budget = InputBudget::default();
@@ -95,6 +112,12 @@ fn run_in_scratch(
         gaps.push(format!("{} input entries skipped: links, special files, unreadable files or input bounds (16 MiB/file, 64 MiB total, 10000 entries, 64 directory levels)", budget.skipped));
     }
     if req.semgrep {
+        if budget.semgrep_oversized > 0 {
+            gaps.push(format!(
+                "{} input files exceed Semgrep's 1000000 byte target limit; not scanned by Semgrep",
+                budget.semgrep_oversized
+            ));
+        }
         remove_semgrep_ignores(&target)?;
     }
     if overlapping_root(&root, &readonly).is_some() {
@@ -214,12 +237,13 @@ fn run_in_scratch(
                         .saturating_sub(if os == "windows" { 0 } else { 15000 }));
         return Err(format!("scan failed, timed out, or output incomplete (timeout={timed_out}, started={}, finished={}, cleanup={}, capture={})", run.command_started, run.command_finished, run.cleanup_complete, run.capture_complete));
     }
-    if !run
-        .enforced
-        .iter()
-        .any(|s| s.starts_with("cgroup_memory_max="))
+    if os == "linux"
+        && !run
+            .enforced
+            .iter()
+            .any(|s| s.starts_with("cgroup_memory_max="))
     {
-        gaps.push("memory and task limits not applied: no available Linux cgroup scope; wall clock and output limits remain active".into());
+        gaps.push("memory and task limits not applied: Linux cgroups required".into());
     }
     if run.output.lines().any(|line| {
         let lower = line.to_ascii_lowercase();
@@ -311,6 +335,7 @@ struct InputBudget {
     bytes: u64,
     entries: usize,
     skipped: usize,
+    semgrep_oversized: usize,
 }
 fn copy_input(
     root: &Path,
@@ -355,6 +380,9 @@ fn copy_input(
             match platform::read_bounded_in(root, &path, (16 << 20).min((64 << 20) - budget.bytes))
             {
                 Ok(bytes) => {
+                    if bytes.len() > crate::sensors::SEMGREP_MAX_TARGET_BYTES {
+                        budget.semgrep_oversized += 1;
+                    }
                     budget.bytes += bytes.len() as u64;
                     std::fs::write(dest.join(&path), bytes)
                         .map_err(|_| "cannot copy sensor input")?;
@@ -368,46 +396,190 @@ fn copy_input(
     Ok(())
 }
 
-// Grant the installed tool and its runtime, not unrelated build caches or
-// entire optional installation trees such as /opt or the user's home.
-fn scanner_runtime_roots(executable: &Path) -> Result<Vec<PathBuf>, String> {
+// Native tools need only their executable, not the directory containing it.
+// Python entry points additionally need their package prefix and interpreter.
+fn scanner_runtime_roots(executable: &Path, semgrep: bool) -> Result<Vec<PathBuf>, String> {
     use std::io::Read;
-    let runtime = executable.parent().ok_or("scanner has no runtime root")?;
-    let mut roots = vec![runtime.to_path_buf()];
-    if let Some(venv) = runtime.parent().filter(|p| p.join("pyvenv.cfg").is_file()) {
-        roots.push(venv.to_path_buf());
-        let config = platform::read_bounded(&venv.join("pyvenv.cfg"), 16384)
-            .map_err(|_| "cannot read scanner runtime configuration")?;
-        for line in String::from_utf8_lossy(&config).lines() {
-            if let Some(("home", home)) = line.split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
-                let home = Path::new(home);
-                if home.is_absolute() && home.is_dir() {
-                    roots.push(home.to_path_buf());
-                }
-            }
-        }
-    }
+    let mut roots = vec![executable.to_path_buf()];
     let mut header = Vec::new();
     std::fs::File::open(executable)
         .and_then(|f| f.take(1024).read_to_end(&mut header))
         .map_err(|_| "cannot read installed scanner header")?;
     if header.starts_with(b"#!") {
         let header = String::from_utf8_lossy(&header);
-        if let Some(interpreter) = header[2..].split_whitespace().next() {
-            let path = std::fs::canonicalize(interpreter)
-                .map_err(|_| "scanner interpreter unavailable")?;
-            if let Some(bin) = path.parent() {
-                roots.push(bin.to_path_buf());
-                if bin.file_name().is_some_and(|n| n == "bin") {
-                    if let Some(prefix) = bin.parent() {
-                        // System libraries are already provided by MXC.
-                        if prefix != Path::new("/usr") && prefix != Path::new("/") {
-                            roots.push(prefix.to_path_buf());
+        let interpreter = header[2..]
+            .split_whitespace()
+            .next()
+            .ok_or("missing scanner interpreter")?;
+        let path =
+            std::fs::canonicalize(interpreter).map_err(|_| "scanner interpreter unavailable")?;
+        roots.push(path.clone());
+        if semgrep {
+            add_package_prefix(executable, &mut roots);
+            add_package_prefix(&path, &mut roots);
+        }
+    }
+    if semgrep {
+        // Windows Python console launchers have no shebang. Virtual environment
+        // configuration identifies both the package prefix and base runtime.
+        if let Some(prefix) = executable.parent().and_then(Path::parent) {
+            if prefix.join("pyvenv.cfg").is_file() {
+                roots.push(prefix.to_path_buf());
+                let config = platform::read_bounded(&prefix.join("pyvenv.cfg"), 16384)
+                    .map_err(|_| "cannot read scanner runtime configuration")?;
+                for line in String::from_utf8_lossy(&config).lines() {
+                    if let Some(("home", home)) =
+                        line.split_once('=').map(|(k, v)| (k.trim(), v.trim()))
+                    {
+                        let home = Path::new(home);
+                        if !home.is_absolute() || !home.is_dir() {
+                            return Err("scanner base runtime unavailable".into());
+                        }
+                        if home.file_name().is_some_and(|n| n == "bin") {
+                            add_package_prefix(&home.join("python3"), &mut roots);
+                        } else {
+                            roots.push(home.to_path_buf());
                         }
                     }
                 }
             }
         }
     }
-    Ok(roots)
+    roots.sort();
+    roots.dedup();
+    roots
+        .into_iter()
+        .map(|p| {
+            std::fs::canonicalize(p).map_err(|_| "cannot resolve scanner runtime grant".into())
+        })
+        .collect()
+}
+
+fn add_package_prefix(executable: &Path, roots: &mut Vec<PathBuf>) {
+    let Some(bin) = executable.parent() else {
+        return;
+    };
+    if bin
+        .file_name()
+        .is_some_and(|n| n == "bin" || n == "Scripts")
+    {
+        if let Some(prefix) = bin.parent() {
+            // MXC already supplies system binaries and libraries. As with
+            // prove's toolchain roots, never infer all of /usr or /opt.
+            if !["/", "/usr", "/usr/local", "/opt", "/opt/homebrew"]
+                .iter()
+                .any(|p| prefix == Path::new(p))
+            {
+                roots.push(prefix.to_path_buf());
+            } else {
+                for name in ["lib", "lib64"] {
+                    let lib = prefix.join(name);
+                    if lib.is_dir() {
+                        roots.push(lib);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_sensor_grants(
+    grants: &[PathBuf],
+    homes: &[PathBuf],
+    target: &Path,
+    artifacts: &Path,
+) -> Result<(), String> {
+    for grant in grants {
+        // A child of HOME can be a legitimate installation. An ancestor grants
+        // the whole profile. Target and artifact overlap is unsafe either way.
+        let normalize = |p: &Path| {
+            let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+            if cfg!(windows) {
+                PathBuf::from(mxc_path(&p).to_lowercase())
+            } else {
+                p
+            }
+        };
+        if homes
+            .iter()
+            .any(|h| normalize(h).starts_with(normalize(grant)))
+        {
+            return Err("sensor runtime grant exposes HOME or user profile; sensor not run".into());
+        }
+        if overlapping_root(target, std::slice::from_ref(grant)).is_some()
+            || overlapping_root(artifacts, std::slice::from_ref(grant)).is_some()
+        {
+            return Err(
+                "sensor runtime grant overlaps original target or artifacts; sensor not run".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_grants_refuse_profiles_targets_artifacts_and_aliases() {
+        let root = std::env::temp_dir().join(format!(
+            "omgs-runtime-{}",
+            &platform::random_nonce().unwrap()[..16]
+        ));
+        std::fs::create_dir_all(root.join("home/bin")).unwrap();
+        std::fs::create_dir_all(root.join("profile")).unwrap();
+        std::fs::create_dir_all(root.join("target/src")).unwrap();
+        std::fs::create_dir_all(root.join("run")).unwrap();
+        let _cleanup = Scratch(root.clone());
+        let homes = vec![root.join("home"), root.join("profile")];
+        let check = |grant: PathBuf| {
+            validate_sensor_grants(&[grant], &homes, &root.join("target"), &root.join("run"))
+        };
+        for grant in [
+            &root,
+            &homes[0],
+            &homes[1],
+            &root.join("target"),
+            &root.join("target/src"),
+            &root.join("run"),
+        ] {
+            assert!(check(grant.clone()).is_err(), "{}", grant.display());
+        }
+        assert!(check(root.join("home/bin")).is_ok());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&homes[0], root.join("alias")).unwrap();
+            assert!(check(root.join("alias")).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_runtime_uses_install_prefix_and_refuses_home_prefix() {
+        let root = std::env::temp_dir().join(format!(
+            "omgs-python-{}",
+            &platform::random_nonce().unwrap()[..16]
+        ));
+        let _cleanup = Scratch(root.clone());
+        let home = root.join("home");
+        for prefix in [&home, &home.join("venv")] {
+            let bin = prefix.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let interpreter = bin.join("python3");
+            std::fs::write(&interpreter, "native fixture").unwrap();
+            let scanner = bin.join("semgrep");
+            std::fs::write(&scanner, format!("#!{}\n", interpreter.display())).unwrap();
+            let grants = scanner_runtime_roots(&scanner, true).unwrap();
+            assert!(grants.contains(&std::fs::canonicalize(prefix).unwrap()));
+            assert!(!grants.contains(&root));
+            let result = validate_sensor_grants(
+                &grants,
+                std::slice::from_ref(&home),
+                &root.join("target"),
+                &root.join("run"),
+            );
+            assert_eq!(result.is_err(), prefix == &home);
+        }
+    }
 }
