@@ -572,3 +572,45 @@ fn oversized_and_linked_inputs_remain_explicit_gaps() {
     );
     assert_eq!(r["hits"].as_array().unwrap().len(), 1, "{r}");
 }
+
+#[test]
+fn scratch_inside_target_is_refused_before_creation() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    f.tool("trufflehog", &truffle("src/main.rs").to_string(), 0);
+    let out = Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "audit",
+            "init",
+            "--target",
+            f.target.to_str().unwrap(),
+            "--out",
+            f.root.join("overlap").to_str().unwrap(),
+        ])
+        .env("PATH", &f.bin)
+        .env(
+            "OMGS_MXC_EXEC",
+            omgs::sandbox::locate_executor().unwrap().path,
+        )
+        .env("TMPDIR", &f.target)
+        .env("TEMP", &f.target)
+        .env("TMP", &f.target)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report = read(&f.root.join("overlap/sensors.json"));
+    assert!(
+        report["gaps"]
+            .to_string()
+            .contains("scratch overlaps target"),
+        "{report}"
+    );
+    assert!(report["tools_run"].as_array().unwrap().is_empty());
+    assert!(!std::fs::read_dir(&f.target).unwrap().any(|e| e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with("omgs-sensor-")));
+}

@@ -49,7 +49,12 @@ pub fn run_sensor(req: SensorRequest<'_>) -> Result<(String, i32, Vec<String>), 
     let _signals = supervise::interruption::Guard::install()
         .map_err(|_| "cannot install sensor interruption guard".to_string())?;
     let nonce = platform::random_nonce().map_err(|_| "cannot create sensor nonce")?;
-    let root = std::env::temp_dir().join(format!("omgs-sensor-{}", &nonce[..16]));
+    let temp = std::fs::canonicalize(std::env::temp_dir())
+        .map_err(|_| "cannot resolve private sensor temp parent")?;
+    let root = temp.join(format!("omgs-sensor-{}", &nonce[..16]));
+    if overlapping_root(req.target, std::slice::from_ref(&root)).is_some() {
+        return Err("private sensor scratch overlaps target; sensor not run".into());
+    }
     platform::create_private_dir_new(&root).map_err(|_| "cannot create private sensor scratch")?;
     let scratch = Scratch(root);
     let result = run_in_scratch(req, &located, &scratch.0, list_parents, &nonce, &mut gaps);
