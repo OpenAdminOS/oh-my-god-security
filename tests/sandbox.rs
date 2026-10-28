@@ -9,8 +9,12 @@ fn scratch(name: &str) -> PathBuf {
     let base = std::env::temp_dir()
         .canonicalize()
         .unwrap_or_else(|_| std::env::temp_dir());
-    let base = base.join(format!("omgs-private-fixtures-{}", std::process::id()));
-    omgs::platform::create_private_tree(&base).unwrap();
+    static BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(|| {
+        let base = base.join(format!("omgs-private-fixtures-{}", std::process::id()));
+        omgs::platform::create_private_tree(&base).unwrap();
+        base
+    });
     let d = base.join(format!("omgs-sbx-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     omgs::platform::private_dir(&d).unwrap();

@@ -7,8 +7,13 @@ use omgs::report::{render_html, render_markdown, ReportMeta};
 use std::path::Path;
 
 fn scratch(name: &str) -> std::path::PathBuf {
-    let base = std::env::temp_dir().join(format!("omgs-private-fixtures-{}", std::process::id()));
-    omgs::platform::create_private_tree(&base).unwrap();
+    static BASE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(|| {
+        let base =
+            std::env::temp_dir().join(format!("omgs-private-fixtures-{}", std::process::id()));
+        omgs::platform::create_private_tree(&base).unwrap();
+        base
+    });
     let dir = base.join(format!("omgs-orch-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     omgs::platform::private_dir(&dir).unwrap();

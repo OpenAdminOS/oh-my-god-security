@@ -3,8 +3,13 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 fn scratch(name: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("omgs-private-fixtures-{}", std::process::id()));
-    omgs::platform::create_private_tree(&base).unwrap();
+    static BASE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(|| {
+        let base =
+            std::env::temp_dir().join(format!("omgs-private-fixtures-{}", std::process::id()));
+        omgs::platform::create_private_tree(&base).unwrap();
+        base
+    });
     let path = base.join(format!("omgs-roles-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     omgs::platform::private_dir(&path).unwrap();
