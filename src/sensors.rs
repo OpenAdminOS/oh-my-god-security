@@ -44,6 +44,12 @@ pub fn run_sensors(target: &Path, artifacts: &Path) -> SensorsReport {
         hits: Vec::new(),
         gaps: Vec::new(),
     };
+    if let Err(e) = crate::scratch::recover() {
+        report
+            .gaps
+            .push(format!("scratch recovery unavailable: {e}"));
+        return report;
+    }
     for tool in ["gitleaks", "semgrep", "trufflehog", "osv-scanner"] {
         run_offline(tool, target, artifacts, &mut report);
     }

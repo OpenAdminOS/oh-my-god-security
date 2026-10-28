@@ -123,6 +123,42 @@ fn wide(path: &Path) -> Result<Vec<u16>> {
 /// NtCreateFile avoids reopening any ancestor by pathname. Reparse points,
 /// directories and alternate data streams are excluded.
 pub(super) fn open_relative(dir: &std::fs::File, name: &Path) -> Result<std::fs::File> {
+    open_relative_options(dir, name, 0x0012_0089, 1, 0x0020_0060)
+}
+
+/// Scratch handles request DELETE and deny delete sharing, pinning their names
+/// until removal by handle. FILE_OPEN_REPARSE_POINT also applies to directories.
+pub(crate) fn open_scratch_relative(
+    dir: &std::fs::File,
+    name: &Path,
+    directory: bool,
+) -> Result<std::fs::File> {
+    open_relative_options(
+        dir,
+        name,
+        0x0013_0089,
+        3,
+        0x0020_0020 | if directory { 1 } else { 0 },
+    )
+}
+/// Live workload ancestors must allow broker readers that omit delete sharing.
+/// Cleanup upgrades by opening the same object through its retained handle.
+pub(crate) fn open_scratch_view(dir: &std::fs::File, name: &Path) -> Result<std::fs::File> {
+    open_relative_options(dir, name, 0x0012_0089, 7, 0x0020_0021)
+}
+
+pub(crate) fn open_scratch_lock(dir: &std::fs::File, name: &Path) -> Result<std::fs::File> {
+    // Lock readers share read/write access, but no handle permits replacement.
+    open_relative_options(dir, name, 0x0012_0089, 3, 0x0020_0060)
+}
+
+fn open_relative_options(
+    dir: &std::fs::File,
+    name: &Path,
+    access: u32,
+    share: u32,
+    options: u32,
+) -> Result<std::fs::File> {
     #[repr(C)]
     struct UnicodeString {
         length: u16,
@@ -188,14 +224,14 @@ pub(super) fn open_relative(dir: &std::fs::File, name: &Path) -> Result<std::fs:
     unsafe {
         let code = NtCreateFile(
             &mut handle,
-            0x0012_0089,
+            access,
             &mut attributes,
             &mut status,
             null_mut(),
             0,
-            0x1,
+            share,
             1,
-            0x0020_0060,
+            options,
             null_mut(),
             0,
         );

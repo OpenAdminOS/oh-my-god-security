@@ -13,15 +13,6 @@ pub struct SensorRequest<'a> {
     pub config: &'static str,
 }
 
-// Drop is a fallback for setup failures and unwinding. Normal exits explicitly
-// remove the tree after supervision and report any failure without raw content.
-struct Scratch(PathBuf);
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 fn quote(arg: &str) -> Result<String, String> {
     if arg.contains(['\0', '\r', '\n']) {
         return Err("sensor argument contains a control character".into());
@@ -39,6 +30,7 @@ fn quote(arg: &str) -> Result<String, String> {
 }
 
 pub fn run_sensor(mut req: SensorRequest<'_>) -> Result<(String, i32, Vec<String>), String> {
+    crate::scratch::recover()?;
     let located =
         locate_executor().map_err(|_| "pinned MXC unavailable; sensor not run".to_string())?;
     let os = std::env::consts::OS;
@@ -76,24 +68,22 @@ pub fn run_sensor(mut req: SensorRequest<'_>) -> Result<(String, i32, Vec<String
     let _signals = supervise::interruption::Guard::install()
         .map_err(|_| "cannot install sensor interruption guard".to_string())?;
     let nonce = platform::random_nonce().map_err(|_| "cannot create sensor nonce")?;
-    let temp = platform::scratch_root()
-        .map_err(|e| format!("cannot admit private sensor scratch parent: {e}"))?;
-    let root = temp.join(format!("omgs-sensor-{}", &nonce[..16]));
-    if overlapping_root(req.target, std::slice::from_ref(&root)).is_some() {
-        return Err("private sensor scratch overlaps target; sensor not run".into());
-    }
-    if overlapping_root(req.artifacts, std::slice::from_ref(&root)).is_some() {
-        return Err("private sensor scratch overlaps artifacts; sensor not run".into());
-    }
-    if overlapping_root(&root, &readonly).is_some() {
-        return Err("private sensor scratch overlaps a readable grant; sensor not run".into());
-    }
-    platform::create_private_dir_new(&root).map_err(|_| "cannot create private sensor scratch")?;
-    let scratch = Scratch(root);
+    let mut scratch = crate::scratch::Scratch::create_checked("sensor", |root| {
+        if overlapping_root(req.target, &[root.to_path_buf()]).is_some() {
+            return Err("private sensor scratch overlaps target; sensor not run".into());
+        }
+        if overlapping_root(req.artifacts, &[root.to_path_buf()]).is_some() {
+            return Err("private sensor scratch overlaps artifacts; sensor not run".into());
+        }
+        if overlapping_root(root, &readonly).is_some() {
+            return Err("private sensor scratch overlaps a readable grant; sensor not run".into());
+        }
+        Ok(())
+    })?;
+    let root = scratch.path();
     req.readonly = readonly;
-    let result = run_in_scratch(req, &located, &scratch.0, list_parents, &nonce, &mut gaps);
-    let removed = std::fs::remove_dir_all(&scratch.0).is_ok();
-    if !removed {
+    let result = run_in_scratch(req, &located, &root, list_parents, &nonce, &mut gaps);
+    if scratch.cleanup().is_err() {
         return Err("private sensor scratch cleanup failed; raw scanner data may remain in the OMGS data directory".into());
     }
     result.map(|(output, code)| (output, code, gaps))
@@ -217,6 +207,7 @@ fn run_in_scratch(
     #[cfg(windows)]
     let acl =
         preflight::WindowsAclSnapshot::capture([&work].into_iter().chain(input.readonly.iter()))?;
+    let usage = crate::scratch::UsageMonitor::start(work.clone());
     #[allow(unused_mut)]
     let mut validation = preflight::dry_run(&executor, &path, &root);
     #[cfg(windows)]
@@ -229,10 +220,24 @@ fn run_in_scratch(
     let cmd = preflight::workload_command(&executor, &path, &root);
     let mut limits = req.limits;
     limits.wall_ms = supervisor_timeout_ms(os, limits.wall_ms);
+    limits.file_size_bytes = Some(
+        limits
+            .file_size_bytes
+            .unwrap_or(crate::scratch::SENSOR_WRITE_BYTES)
+            .min(crate::scratch::SENSOR_WRITE_BYTES),
+    );
     #[allow(unused_mut)]
-    let mut run = supervise::run_marked(cmd, &limits, markers.as_ref(), nonce);
+    let mut run =
+        supervise::run_monitored(cmd, &limits, markers.as_ref(), nonce, &usage.cancellation);
     #[cfg(windows)]
     acl.verify(&mut run);
+    if let Err(reason) = usage.finish() {
+        if !run.cleanup_complete || !run.survivors.is_empty() {
+            return Err(format!("{reason}; workload cleanup could not be verified"));
+        }
+        gaps.push(reason);
+        return Ok((String::new(), 3));
+    }
     // Never retain executor diagnostics, scanner stderr, or survivor commands.
     if run.timed_out
         || run.interrupted
@@ -721,6 +726,13 @@ fn validate_sensor_grants(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn runtime_grants_refuse_profiles_targets_artifacts_and_aliases() {
