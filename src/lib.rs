@@ -5,6 +5,7 @@ pub mod batch;
 pub mod bench;
 pub mod budget;
 pub mod critic;
+pub mod handoff;
 pub mod intent;
 pub mod ledger;
 pub mod model;
