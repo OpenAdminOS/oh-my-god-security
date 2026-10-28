@@ -70,6 +70,31 @@ fn prove_refuses_an_executor_that_does_not_match_the_pin() {
 
 #[cfg(unix)]
 #[test]
+fn blocked_reason_escapes_terminal_controls() {
+    let d = scratch("blocked-controls");
+    let fake = d.join("fake\x1b[31m\r\nexecutor");
+    std::fs::write(&fake, b"not a pinned executor").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["prove", "--cmd", "echo hi"])
+        .env("OMGS_HOME", d.join("home"))
+        .env("OMGS_MXC_EXEC", &fake)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains('\x1b') && !stderr.contains('\r'),
+        "{stderr:?}"
+    );
+    assert!(
+        stderr.contains("fake\\u{1b}[31m\\r\\nexecutor"),
+        "{stderr:?}"
+    );
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn denials_hold_and_the_target_is_untouched() {
     if !mxc_ready() {
         return;

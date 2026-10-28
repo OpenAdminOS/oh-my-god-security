@@ -642,7 +642,10 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     let result = match prove(&request) {
         ProveOutcome::Blocked { reason } => {
             release();
-            eprintln!("needs_validation: target code was not executed. {reason}");
+            eprintln!(
+                "needs_validation: target code was not executed. {}",
+                omgs::platform::escape_controls(&reason)
+            );
             return Err("__EXIT3__".into());
         }
         ProveOutcome::Ran(r) => r,

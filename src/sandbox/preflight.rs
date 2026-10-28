@@ -3,8 +3,7 @@ use serde::Deserialize;
 use std::path::Path;
 use std::process::Command;
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 pub struct WindowsProbe {
     pub tier: Option<String>,
     pub needs_dacl_augmentation: Option<bool>,
@@ -13,7 +12,7 @@ pub struct WindowsProbe {
     pub probes: WindowsCapabilities,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowsCapabilities {
     pub base_container_api_present: bool,
@@ -25,15 +24,35 @@ pub struct WindowsCapabilities {
 
 impl WindowsProbe {
     pub fn parse(text: &str) -> Result<Self, String> {
-        let p: Self = serde_json::from_str(text)
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct WireProbe {
+            tier: Option<String>,
+            needs_dacl_augmentation: Option<bool>,
+            error: Option<String>,
+            warnings: Option<Vec<String>>,
+            probes: Option<WindowsCapabilities>,
+        }
+        let p: WireProbe = serde_json::from_str(text)
             .map_err(|e| format!("invalid Windows MXC probe JSON: {e}"))?;
-        match (&p.tier, p.needs_dacl_augmentation, &p.error) {
-            (Some(_), Some(_), None) | (None, None, Some(_)) => Ok(p),
-            _ => Err(
+        let detector_error = match (&p.tier, p.needs_dacl_augmentation, &p.error) {
+            (Some(_), Some(_), None) => false,
+            (None, None, Some(_)) => true,
+            _ => return Err(
                 "invalid Windows MXC probe: success and detector error must be mutually exclusive"
                     .into(),
             ),
+        };
+        if !detector_error && (p.warnings.is_none() || p.probes.is_none()) {
+            return Err("invalid Windows MXC probe: success requires warnings and probes".into());
         }
+        Ok(Self {
+            tier: p.tier,
+            needs_dacl_augmentation: p.needs_dacl_augmentation,
+            error: p.error,
+            warnings: p.warnings.unwrap_or_default(),
+            probes: p.probes.unwrap_or_default(),
+        })
     }
 
     pub fn require_supported_tier(&self) -> Result<(), String> {
@@ -145,7 +164,11 @@ fn executor_command(executor: &Path, cwd: Option<&Path>) -> Command {
     cmd
 }
 
-fn inspect(mut cmd: Command) -> supervise::Supervised {
+fn inspect(cmd: Command) -> supervise::Supervised {
+    inspect_inner(cmd, false)
+}
+
+fn inspect_inner(mut cmd: Command, cleanup: bool) -> supervise::Supervised {
     let limits = supervise::Limits {
         wall_ms: 15_000,
         cpu_secs: Some(10),
@@ -156,6 +179,12 @@ fn inspect(mut cmd: Command) -> supervise::Supervised {
         output_cap_bytes: 64 * 1024,
     };
     cmd.stdin(std::process::Stdio::null());
+    #[cfg(windows)]
+    if cleanup {
+        return supervise::run_cleanup(cmd, &limits);
+    }
+    #[cfg(not(windows))]
+    let _ = cleanup;
     supervise::run(cmd, &limits, None)
 }
 
@@ -209,15 +238,15 @@ pub fn dry_run_result(run: &supervise::Supervised) -> Result<(), String> {
     if completed(run) && run.success {
         return Ok(());
     }
-    let detail = crate::platform::escape_controls(&crate::proof::redact(&run.output));
+    let detail = crate::proof::redact(&run.output);
     if completed(run) && run.exit_code.is_some_and(|c| c != 0) {
         Err(format!(
             "MXC configuration rejection (--dry-run); target code was not executed: {detail}"
         ))
     } else {
-        Err(format!("MXC dry run did not complete: timeout={}, interrupted={}, executor_error={}, cleanup_complete={}, capture_complete={}, survivors={}; target code was not executed: {detail}",
+        Err(format!("MXC dry run did not complete: timeout={}, interrupted={}, executor_error={}, cleanup_complete={}, capture_complete={}, survivors={}; target code was not executed: {detail}; cleanup notes: {}",
             run.timed_out, run.interrupted, run.executor_error, run.cleanup_complete,
-            run.capture_complete, run.survivors.len()))
+            run.capture_complete, run.survivors.len(), run.notes.join("; ")))
     }
 }
 
@@ -231,7 +260,59 @@ pub fn workload_command(executor: &Path, config: &Path, cwd: &Path) -> Command {
 // A changed root is evidence of incomplete restoration, not proof that an
 // unchanged root means every descendant or other host object was restored.
 #[cfg(windows)]
-pub struct WindowsAclSnapshot(Vec<(std::path::PathBuf, String)>);
+pub struct WindowsAclSnapshot(Vec<WindowsAclRoot>);
+
+#[cfg(windows)]
+struct WindowsAclRoot {
+    path: std::path::PathBuf,
+    // Retain the original object, including across rename or link replacement.
+    file: std::fs::File,
+    identity: (u32, u64),
+    acl: String,
+}
+
+#[cfg(windows)]
+fn open_acl_root(path: &Path) -> Result<(std::fs::File, (u32, u64)), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileInfo {
+        attributes: u32,
+        times: [u32; 6],
+        volume: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(handle: *mut std::ffi::c_void, info: *mut FileInfo) -> i32;
+    }
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0x0002_0000) // READ_CONTROL
+        .share_mode(7) // FILE_SHARE_READ | WRITE | DELETE
+        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS permits directories
+        .open(path)
+        .map_err(|e| format!("cannot open granted ACL root {}: {e}", path.display()))?;
+    let mut info = FileInfo::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(format!(
+            "cannot identify granted ACL root {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((
+        file,
+        (
+            info.volume,
+            (u64::from(info.index_high) << 32) | u64::from(info.index_low),
+        ),
+    ))
+}
 
 #[cfg(windows)]
 impl WindowsAclSnapshot {
@@ -240,30 +321,53 @@ impl WindowsAclSnapshot {
     ) -> Result<Self, String> {
         paths
             .into_iter()
-            .map(|path| windows_acl(path).map(|acl| (path.clone(), acl)))
-            .collect::<Result<Vec<_>, _>>()
+            .map(|path| {
+                let path = std::fs::canonicalize(path).map_err(|e| {
+                    format!("cannot resolve granted ACL root {}: {e}", path.display())
+                })?;
+                let (file, identity) = open_acl_root(&path)?;
+                let acl = windows_acl(&path)?;
+                if open_acl_root(&path)?.1 != identity {
+                    return Err(format!(
+                        "granted ACL root changed during capture: {}",
+                        path.display()
+                    ));
+                }
+                Ok(WindowsAclRoot {
+                    path,
+                    file,
+                    identity,
+                    acl,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
             .map(Self)
     }
 
-    pub fn verify_abnormal_exit(self, run: &mut supervise::Supervised) {
-        if run.command_finished
-            && !run.timed_out
-            && !run.interrupted
-            && !run.killed
-            && !run.executor_error
-        {
-            return;
-        }
-        for (path, before) in self.0 {
-            let issue = match windows_acl(&path) {
-                Ok(after) if before == after => continue,
+    pub fn verify(&self, run: &mut supervise::Supervised) {
+        for root in &self.0 {
+            let _keep_open = &root.file;
+            let checked: Result<String, String> = (|| {
+                if open_acl_root(&root.path)?.1 != root.identity {
+                    return Err("granted root identity changed".into());
+                }
+                let after = windows_acl(&root.path)?;
+                if open_acl_root(&root.path)?.1 != root.identity {
+                    return Err("granted root identity changed during verification".into());
+                }
+                Ok(after)
+            })();
+            let issue = match checked {
+                Ok(after) if root.acl == after => continue,
                 Ok(_) => "granted root ACL changed; MXC did not restore the original ACEs or inheritance flags".to_string(),
                 Err(reason) => format!("granted root ACL restoration could not be verified: {reason}"),
             };
             run.cleanup_complete = false;
             run.success = false;
-            run.notes
-                .push(format!("Windows ACL cleanup: {issue}: {}", path.display()));
+            run.notes.push(format!(
+                "Windows ACL cleanup: {issue}: {}",
+                root.path.display()
+            ));
         }
     }
 }
@@ -272,9 +376,10 @@ impl WindowsAclSnapshot {
 fn windows_acl(path: &Path) -> Result<String, String> {
     let root = std::env::var_os("SYSTEMROOT").ok_or("SYSTEMROOT unavailable for ACL check")?;
     let mut cmd = Command::new(Path::new(&root).join("System32/icacls.exe"));
-    // /l inspects the link itself instead of following a reparse point.
+    // Capture already resolved and retained this object. /l prevents following
+    // a replacement reparse point; identity checks reject any replacement.
     cmd.arg(path).arg("/l");
-    let run = inspect(cmd);
+    let run = inspect_inner(cmd, true);
     if completed(&run) && run.success {
         Ok(run.stdout)
     } else {
@@ -422,6 +527,14 @@ mod tests {
     }
     #[test]
     fn detector_error_shape_preserves_text_and_rejects_mixed_results() {
+        // Also accept a minimal detector error. The pinned serializer in
+        // process_container/common/probe.rs includes facts and warnings today,
+        // but they carry no success contract when detection failed.
+        let minimal = r#"{"error":"WRITE_DAC unavailable on path C:\\scratch: denied"}"#;
+        let p = WindowsProbe::parse(minimal).unwrap();
+        assert!(p.warnings.is_empty());
+        assert!(!p.probes.base_container_api_present);
+        assert!(windows_policy(Ok(p)).unwrap().1);
         let mut v = probe();
         v.as_object_mut().unwrap().remove("tier");
         v.as_object_mut().unwrap().remove("needsDaclAugmentation");
@@ -474,7 +587,9 @@ mod tests {
         run.output = "rejected\x1b[31m\r\n".into();
         let rejection = dry_run_result(&run).unwrap_err();
         assert!(rejection.contains("configuration rejection"));
-        assert!(!rejection.chars().any(char::is_control));
+        assert!(!crate::platform::escape_controls(&rejection)
+            .chars()
+            .any(char::is_control));
         for kind in 0..7 {
             let mut failed = run.clone();
             match kind {
@@ -574,16 +689,35 @@ mod tests {
                 config["version"] = "invalid".into();
             }
             std::fs::write(&path, config.to_string()).unwrap();
+            #[cfg(windows)]
+            let snapshot = WindowsAclSnapshot::capture([&d]).unwrap();
             let run = dry_run(&located.path, &path, &d);
+            #[cfg(windows)]
+            {
+                let before = &snapshot.0[0].acl;
+                let after = windows_acl(&d).unwrap();
+                let mut checked = run.clone();
+                snapshot.verify(&mut checked);
+                assert_eq!(
+                    checked.cleanup_complete,
+                    run.cleanup_complete && before == &after,
+                    "{checked:?}"
+                );
+                if before != &after {
+                    assert!(!checked.success);
+                    assert!(checked
+                        .notes
+                        .iter()
+                        .any(|n| n.starts_with("Windows ACL cleanup:")));
+                }
+            }
             let result = dry_run_result(&run);
             assert_eq!(result.is_ok(), valid, "{}", run.output);
             if !valid {
                 let message = result.unwrap_err();
                 assert!(message.contains("configuration rejection"));
                 assert!(!run.output.is_empty());
-                assert!(message.contains(
-                    crate::platform::escape_controls(&crate::proof::redact(&run.output)).as_str()
-                ));
+                assert!(message.contains(crate::proof::redact(&run.output).as_str()));
             }
             assert!(!marker.exists());
         }
@@ -660,7 +794,7 @@ mod tests {
                 output_cap_bytes: 65536,
             };
             let mut run = supervise::run_marked(cmd, &limits, None, &nonce);
-            snapshot.verify_abnormal_exit(&mut run);
+            snapshot.verify(&mut run);
             assert!(run.command_started, "DACL workload did not start: {run:?}");
             assert!(!run.command_finished && !run.success, "{run:?}");
             if supervisor_timeout {
@@ -695,6 +829,240 @@ mod tests {
                 );
             }
         }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn linked_readonly_root_checks_the_target_after_a_completed_wrapper() {
+        let _console = supervise::interruption::Guard::install().unwrap();
+        let d = std::env::temp_dir().join(format!("omgs-linked-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let target = d.join("target");
+        let linked = d.join("readonly");
+        std::fs::create_dir_all(&target).unwrap();
+        let status = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&linked)
+            .arg(&target)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let snapshot = WindowsAclSnapshot::capture([&linked]).unwrap();
+        assert_eq!(snapshot.0[0].path, std::fs::canonicalize(&target).unwrap());
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args([
+            "/d",
+            "/c",
+            "echo OMGS_START_acl& echo OMGS_END_acl:0& exit /b 99",
+        ]);
+        let limits = supervise::Limits {
+            wall_ms: 5000,
+            cpu_secs: None,
+            file_size_bytes: None,
+            open_files: None,
+            memory_bytes: None,
+            tasks: None,
+            output_cap_bytes: 65536,
+        };
+        let mut run = supervise::run_marked(cmd, &limits, None, "acl");
+        assert!(run.command_finished, "{run:?}");
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(run.executor_exit_code, Some(99));
+        assert!(!run.cleanup_complete && !run.success, "{run:?}");
+        // A successful wrapper must not suppress target ACL verification.
+        assert!(Command::new("icacls.exe")
+            .arg(&target)
+            .arg("/inheritance:d")
+            .status()
+            .unwrap()
+            .success());
+        assert_ne!(windows_acl(&target).unwrap(), snapshot.0[0].acl);
+        snapshot.verify(&mut run);
+        assert!(
+            run.notes
+                .iter()
+                .any(|n| n.starts_with("Windows ACL cleanup: granted root ACL changed")),
+            "{run:?}"
+        );
+        std::fs::remove_dir(&linked).unwrap();
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn acl_checks_cover_all_dry_run_outcomes_and_ignore_pending_interrupts() {
+        let _console = supervise::interruption::Guard::install().unwrap();
+        let d = std::env::temp_dir().join(format!("omgs-dry-acl-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        for outcome in ["accept", "reject", "interrupt", "timeout"] {
+            let root = d.join(outcome);
+            std::fs::create_dir(&root).unwrap();
+            let snapshot = WindowsAclSnapshot::capture([&root]).unwrap();
+            let mut cmd = Command::new("icacls.exe");
+            cmd.arg(&root).arg("/inheritance:d");
+            let mut run = inspect_inner(cmd, true);
+            assert!(run.success, "{run:?}");
+            match outcome {
+                "reject" => {
+                    run.success = false;
+                    run.exit_code = Some(1);
+                }
+                "interrupt" => {
+                    run.interrupted = true;
+                    supervise::interruption::request_for_test();
+                }
+                "timeout" => run.timed_out = true,
+                _ => {}
+            }
+            let start = std::time::Instant::now();
+            snapshot.verify(&mut run);
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(4),
+                "ACL inspection paid the interrupt grace"
+            );
+            assert!(!run.cleanup_complete && !run.success, "{outcome}: {run:?}");
+            assert!(
+                run.notes
+                    .iter()
+                    .any(|n| n.contains("granted root ACL changed")),
+                "{run:?}"
+            );
+        }
+        // Even with an interrupt pending, resolution failure must fail closed.
+        assert!(WindowsAclSnapshot::capture([&d.join("missing")]).is_err());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replaced_acl_root_is_not_mistaken_for_the_original_object() {
+        let _console = supervise::interruption::Guard::install().unwrap();
+        let d = std::env::temp_dir().join(format!("omgs-acl-identity-{}", std::process::id()));
+        let root = d.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let snapshot = WindowsAclSnapshot::capture([&root]).unwrap();
+        std::fs::rename(&root, d.join("old")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/d", "/c", "exit /b 0"]);
+        let mut run = inspect(cmd);
+        assert!(run.success);
+        snapshot.verify(&mut run);
+        assert!(!run.cleanup_complete && !run.success);
+        assert!(run.notes.iter().any(|n| n.contains("identity changed")));
+        drop(snapshot);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_owner_helper() {
+        let Some(d) = std::env::var_os("OMGS_OWNER_TEST_DIR") else {
+            return;
+        };
+        let d = std::path::PathBuf::from(d);
+        let executor = super::super::locate_executor().unwrap();
+        let cmd = workload_command(&executor.path, &d.join("config.json"), &d);
+        let limits = supervise::Limits {
+            wall_ms: 120000,
+            cpu_secs: None,
+            file_size_bytes: None,
+            open_files: None,
+            memory_bytes: None,
+            tasks: None,
+            output_cap_bytes: 65536,
+        };
+        let run = supervise::run_marked(cmd, &limits, None, "owner");
+        panic!("infinite executor returned before owner termination: {run:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn killing_owner_terminates_real_executor_and_infinite_workload() {
+        use std::ffi::c_void;
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::FromRawHandle;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        }
+        let Ok(_) = super::super::locate_executor() else {
+            return;
+        };
+        let d = std::env::temp_dir().join(format!("omgs-owner-death-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let config = serde_json::json!({"version":"1.0.0", "containment":"process",
+            "process":{"commandLine":"cmd.exe /d /c echo OMGS_START_owner& echo started>started& for /l %i in (1,0,2) do @rem",
+                "cwd":platform_path(&d), "timeout":0},
+            "filesystem":{"readwritePaths":[platform_path(&d)]},
+            "network":{"egress":{"default":"deny"}},
+            "processContainer":{"leastPrivilege":true}});
+        std::fs::write(d.join("config.json"), config.to_string()).unwrap();
+        let mut owner = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sandbox::preflight::tests::windows_owner_helper",
+                "--nocapture",
+            ])
+            .env("OMGS_OWNER_TEST_DIR", &d)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        while !d.join("started").exists() && start.elapsed() < std::time::Duration::from_secs(30) {
+            if owner.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !d.join("started").exists() {
+            let _ = owner.kill();
+            let output = owner.wait_with_output().unwrap();
+            panic!(
+                "workload did not start: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // Inspect before killing and retain process handles to avoid PID reuse.
+        let query = format!("$e=Get-CimInstance Win32_Process -Filter 'ParentProcessId = {}' | Where-Object Name -eq 'wxc-exec.exe'; $e.ProcessId; Get-CimInstance Win32_Process | Where-Object {{ $_.ParentProcessId -in $e.ProcessId -and $_.Name -eq 'cmd.exe' }} | ForEach-Object ProcessId", owner.id());
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+            .output()
+            .unwrap();
+        let pids: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|s| s.trim().parse().unwrap())
+            .collect();
+        let handles: Vec<std::fs::File> = pids
+            .iter()
+            .map(|pid| {
+                let handle = unsafe { OpenProcess(0x0010_0000, 0, *pid) }; // SYNCHRONIZE
+                assert!(!handle.is_null(), "cannot open running pid {pid}");
+                unsafe { std::fs::File::from_raw_handle(handle) }
+            })
+            .collect();
+        owner.kill().unwrap(); // TerminateProcess, no console cleanup or destructors
+        owner.wait().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            handles.len(),
+            2,
+            "expected executor and workload: {output:?}"
+        );
+        for (pid, handle) in pids.iter().zip(handles) {
+            assert_eq!(
+                unsafe { WaitForSingleObject(handle.as_raw_handle(), 5000) },
+                0,
+                "pid {pid} survived owner death"
+            );
+        }
+        // Force termination can leave ACEs, so recovery is explicit after the
+        // lifetime assertion, before deleting the test's granted directory.
+        let executor = super::super::locate_executor().unwrap();
+        let _ = windows_probe(&executor.path);
         std::fs::remove_dir_all(d).unwrap();
     }
 

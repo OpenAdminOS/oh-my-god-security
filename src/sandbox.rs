@@ -632,7 +632,7 @@ pub fn declared_controls(os: &str, tier: Tier) -> (Vec<String>, Vec<String>) {
             .push("MXC PID namespace teardown kills descendants, including new sessions".into());
     }
     if os == "windows" {
-        gaps.push("Windows expiry or interruption requests executor Ctrl+Break, waits up to 5000ms for MXC cleanup, then forces termination if needed; descendant cleanup depends on MXC ProcessContainer teardown".into());
+        gaps.push("Windows expiry or interruption requests executor Ctrl+Break, waits up to 5000ms for MXC cleanup, then forces termination if needed; an owned kill-on-close job terminates descendants if OMGS dies; forced death can skip MXC ACL restoration".into());
         gaps.push("process tree owned by the MXC ProcessContainer; no per-process CPU, file size or open file limits on Windows".into());
     }
     (enforced, gaps)
@@ -735,7 +735,7 @@ fn retry_without_enumeration(os: &str, run: &supervise::Supervised) -> bool {
 /// proof record lists what was actually applied on that run.
 pub fn declared_limits(os: &str) -> Vec<String> {
     let mut v = if os == "windows" {
-        vec!["Windows expiry or interruption requests executor Ctrl+Break, waits up to 5000ms for MXC cleanup, then forces termination if needed; descendant cleanup depends on MXC ProcessContainer teardown".to_string()]
+        vec!["Windows expiry or interruption requests executor Ctrl+Break, waits up to 5000ms for MXC cleanup, then forces termination if needed; an owned kill-on-close job terminates descendants if OMGS dies; forced death can skip MXC ACL restoration".to_string()]
     } else {
         vec!["wall clock limit; the process group is killed on expiry".to_string()]
     };
@@ -1367,7 +1367,22 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         if let Err(e) = crate::runmeta::write_atomic_bytes(&config_path, config_text.as_bytes()) {
             return blocked(format!("failed to write MXC config: {e}"));
         }
+        #[cfg(windows)]
+        let acl = match preflight::WindowsAclSnapshot::capture(
+            [&workspace, &scratch]
+                .into_iter()
+                .chain(input.readonly.iter()),
+        ) {
+            Ok(acl) => acl,
+            Err(reason) => return blocked(reason),
+        };
         let validation = preflight::dry_run(&executor, &config_path, &run_dir);
+        #[cfg(windows)]
+        let validation = {
+            let mut validation = validation;
+            acl.verify(&mut validation);
+            validation
+        };
         if probe_fallback
             && !validation.success
             && input.list_parents
@@ -1384,21 +1399,12 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         if let Err(reason) = preflight::dry_run_result(&validation) {
             return blocked(reason);
         }
-        #[cfg(windows)]
-        let acl = match preflight::WindowsAclSnapshot::capture(
-            [&workspace, &scratch]
-                .into_iter()
-                .chain(input.readonly.iter()),
-        ) {
-            Ok(acl) => acl,
-            Err(reason) => return blocked(reason),
-        };
         let cmd = preflight::workload_command(&executor, &config_path, &run_dir);
         let run = supervise::run_marked(cmd, &limits, markers.as_ref(), &nonce);
         #[cfg(windows)]
         let run = {
             let mut run = run;
-            acl.verify_abnormal_exit(&mut run);
+            acl.verify(&mut run);
             run
         };
         // MXC rejects the policy before starting anything, so nothing ran and
@@ -1784,6 +1790,7 @@ mod tests {
     fn enumeration_retry_requires_a_clean_windows_executor_refusal() {
         let mut run = supervise::Supervised {
             exit_code: None,
+            executor_exit_code: None,
             command_started: false,
             command_finished: false,
             test_reachable: None,

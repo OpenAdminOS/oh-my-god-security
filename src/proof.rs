@@ -912,11 +912,11 @@ fn redact_line(line: &str, lower: &str) -> String {
         let spaced = lower
             .as_bytes()
             .get(separator)
-            .is_some_and(u8::is_ascii_whitespace);
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == 0x0b);
         while lower
             .as_bytes()
             .get(separator)
-            .is_some_and(u8::is_ascii_whitespace)
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == 0x0b)
         {
             separator += 1;
         }
@@ -934,7 +934,7 @@ fn redact_line(line: &str, lower: &str) -> String {
                 && lower
                     .as_bytes()
                     .get(value)
-                    .is_some_and(u8::is_ascii_whitespace)
+                    .is_some_and(|b| b.is_ascii_whitespace() || *b == 0x0b)
             {
                 value += 1;
             }
@@ -962,8 +962,22 @@ fn redact_line(line: &str, lower: &str) -> String {
     }
     let mut quotes = QuoteCursor::default();
     let mut masked_until = 0;
-    for (at, _) in lower.match_indices("bearer ") {
-        let start = at + "bearer ".len();
+    for (at, _) in lower.match_indices("bearer") {
+        let mut start = at + "bearer".len();
+        if !line
+            .as_bytes()
+            .get(start)
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == 0x0b)
+        {
+            continue;
+        }
+        while line
+            .as_bytes()
+            .get(start)
+            .is_some_and(|b| b.is_ascii_whitespace() || *b == 0x0b)
+        {
+            start += 1;
+        }
         if start < masked_until {
             continue;
         }
@@ -1176,6 +1190,25 @@ mod tests {
             assert!(masked.ends_with(" following"), "{masked}");
             assert_eq!(redact(&masked), masked);
         }
+    }
+
+    #[test]
+    fn bearer_accepts_ascii_whitespace_and_skips_it_before_masking() {
+        for separator in ["  ", "\t", " \t ", "\x0b", "\x0c"] {
+            for line in [
+                format!("curl Bearer{separator}secret following"),
+                format!("tool 'bEaReR{separator}secret hidden' following"),
+            ] {
+                let masked = redact(&line);
+                assert!(
+                    !masked.contains("secret") && !masked.contains("hidden"),
+                    "{masked}"
+                );
+                assert!(masked.ends_with(" following"), "{masked}");
+                assert_eq!(redact(&masked), masked);
+            }
+        }
+        assert_eq!(redact("Bearerish visible"), "Bearerish visible");
     }
 
     #[test]
