@@ -890,7 +890,8 @@ pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_pem = false;
     for line in text.split_inclusive('\n') {
-        let lower = line.to_ascii_lowercase();
+        let mut lower = line.to_owned();
+        lower.make_ascii_lowercase();
         if lower.contains("-----begin") && lower.contains("private key") {
             in_pem = true;
             out.push_str("[omgs redacted private key]\n");
@@ -910,52 +911,38 @@ pub fn redact(text: &str) -> String {
 /// One line: credential URLs lose their user info, bearer tokens and the
 /// value after a credential keyword (quoted or bare, `:` or `=`) are masked.
 fn redact_line(line: &str, lower: &str) -> String {
-    const KEYS: [&str; 19] = [
-        "pass",
-        "pwd",
-        "passcode",
-        "auth",
-        "credentials",
-        "credential",
-        "password",
-        "passwd",
-        "secret",
-        "token",
-        "api_key",
-        "apikey",
-        "api-key",
-        "authorization",
-        "private_key",
-        "cookie",
-        "passphrase",
-        "access_key",
-        "session",
-    ];
-    let mut line = line.to_string();
-    let mut lower = lower.to_string();
-    // scheme://user:pass@host
-    let mut from = 0;
-    while let Some(i) = lower[from..].find("://").map(|i| i + from + 3) {
-        let end = lower[i..]
-            .find(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'')
-            .map(|e| e + i)
-            .unwrap_or(lower.len());
-        if let Some(at) = lower[i..end].rfind('@').map(|a| a + i) {
-            if lower[i..at].contains(':') {
-                line.replace_range(i..at, "[omgs redacted]");
-                lower = line.to_ascii_lowercase();
-            }
-        }
-        from = i.min(lower.len());
-    }
+    let line = redact_url_userinfo(line, lower);
+    let mut lower = line.to_owned();
+    lower.make_ascii_lowercase();
+    let line_end = line.trim_end_matches(['\r', '\n']).len();
+    // Split each name once, without allocating per keyword or component.
     let sensitive = |name: &str| {
-        let components: Vec<_> = name.split(['-', '_']).collect();
-        KEYS.iter().any(|key| {
-            let keyword: Vec<_> = key.split(['-', '_']).collect();
-            components
-                .windows(keyword.len())
-                .any(|parts| parts == keyword)
-        })
+        let mut previous: &[u8] = b"";
+        for component in name.as_bytes().split(|b| matches!(b, b'-' | b'_')) {
+            if matches!(
+                component,
+                b"pass"
+                    | b"pwd"
+                    | b"passcode"
+                    | b"auth"
+                    | b"credentials"
+                    | b"credential"
+                    | b"password"
+                    | b"passwd"
+                    | b"secret"
+                    | b"token"
+                    | b"apikey"
+                    | b"authorization"
+                    | b"cookie"
+                    | b"passphrase"
+                    | b"session"
+            ) || component == b"key" && matches!(previous, b"api" | b"private" | b"access")
+            {
+                return true;
+            }
+            previous = component;
+        }
+        false
     };
     let mut masks = Vec::new();
     let mut quotes = QuoteCursor::default();
@@ -1015,21 +1002,19 @@ fn redact_line(line: &str, lower: &str) -> String {
             if !assigned && lower[value..].starts_with("--") {
                 continue;
             }
-            let (end, replacement) = value_mask(&line, value, quotes.at(&line, value));
+            let (end, replacement) = value_mask(&line, value, line_end, quotes.at(&line, value));
             if end > value {
                 masks.push((value, end, replacement));
                 i = end;
             }
         } else {
             // Headers and assignments may contain whitespace within the secret.
-            masks.push((
-                value,
-                line.trim_end_matches(['\r', '\n']).len(),
-                " [omgs redacted]",
-            ));
+            masks.push((value, line_end, " [omgs redacted]"));
             break;
         }
     }
+    let keyword_masks = masks;
+    let mut masks = Vec::new();
     let mut quotes = QuoteCursor::default();
     let mut masked_until = 0;
     for (at, _) in lower.match_indices("bearer") {
@@ -1052,13 +1037,26 @@ fn redact_line(line: &str, lower: &str) -> String {
             continue;
         }
         if !lower[start..].starts_with("[omgs redacted]") {
-            let (end, replacement) = value_mask(&line, start, quotes.at(&line, start));
+            let (end, replacement) = value_mask(&line, start, line_end, quotes.at(&line, start));
             masked_until = end;
             masks.push((start, end, replacement));
         }
     }
-    masks.sort_unstable_by_key(|(start, _, _)| *start);
-    let mut out = String::new();
+    // Both scans produce ordered, nonoverlapping masks. Merge in linear time.
+    let mut keywords = keyword_masks.into_iter().peekable();
+    let mut bearers = masks.into_iter().peekable();
+    let masks = std::iter::from_fn(|| {
+        if bearers.peek().is_none()
+            || keywords
+                .peek()
+                .is_some_and(|k| k.0 <= bearers.peek().unwrap().0)
+        {
+            keywords.next()
+        } else {
+            bearers.next()
+        }
+    });
+    let mut out = String::with_capacity(line.len());
     let mut from = 0;
     for (start, end, replacement) in masks {
         if start < from || end <= start {
@@ -1072,8 +1070,38 @@ fn redact_line(line: &str, lower: &str) -> String {
     out
 }
 
+/// Copy URL spans forward instead of shifting and lowercasing the entire line
+/// for every credential URL. Authority scans stop at the next slash, so nested
+/// scheme markers also consume only a bounded number of passes over each byte.
+fn redact_url_userinfo(line: &str, lower: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut from = 0;
+    let mut copied = 0;
+    while let Some(i) = lower[from..].find("://").map(|i| i + from + 3) {
+        let end = lower[i..]
+            .find(|c: char| c == '/' || c.is_whitespace() || c == '"' || c == '\'')
+            .map(|e| e + i)
+            .unwrap_or(lower.len());
+        if let Some(at) = lower[i..end].rfind('@').map(|a| a + i) {
+            if lower[i..at].contains(':') {
+                out.push_str(&line[copied..i]);
+                out.push_str("[omgs redacted]");
+                copied = at;
+            }
+        }
+        from = i;
+    }
+    out.push_str(&line[copied..]);
+    out
+}
+
 /// One shell token, preserving a quote opened before the value.
-fn value_mask(line: &str, start: usize, mut quote: Option<char>) -> (usize, &'static str) {
+fn value_mask(
+    line: &str,
+    start: usize,
+    line_end: usize,
+    mut quote: Option<char>,
+) -> (usize, &'static str) {
     let replacement = match quote {
         Some('\'') => "[omgs redacted]'",
         Some('"') => "[omgs redacted]\"",
@@ -1081,7 +1109,7 @@ fn value_mask(line: &str, start: usize, mut quote: Option<char>) -> (usize, &'st
     };
     // The line ending is a hard limit even inside an unclosed quote, so a
     // masked value never swallows the next line.
-    let end = line.trim_end_matches(['\r', '\n']).len().max(start);
+    let end = line_end.max(start);
     let mut escaped = false;
     for (offset, c) in line[start..end].char_indices() {
         if escaped {
@@ -1164,9 +1192,99 @@ mod tests {
         let line = "tool \"--password=hidden value\" Bearer secret ".repeat(30_000);
         let started = std::time::Instant::now();
         let masked = redact(&line);
+        let elapsed = started.elapsed();
+        eprintln!("redact {} bytes: {elapsed:?}", line.len());
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
         assert!(!masked.contains("hidden") && !masked.contains("secret"));
         assert_eq!(redact(&masked), masked);
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // Exact output, so over-redaction cannot make this pass quickly.
+        let unit = redact("tool \"--password=hidden value\" Bearer secret ");
+        assert!(
+            unit.starts_with("tool \"--password=") && unit.contains("Bearer"),
+            "{unit}"
+        );
+        assert_eq!(masked, unit.repeat(30_000));
+    }
+
+    #[test]
+    fn generated_credentials_are_masked_idempotently() {
+        for name in [
+            "password",
+            "api_key",
+            "access-key",
+            "client_secret",
+            "token",
+        ] {
+            for separator in ["=", " ", "\t"] {
+                for value in [
+                    "SENSITIVE_VALUE",
+                    "'SENSITIVE_VALUE more'",
+                    "\"SENSITIVE_VALUE é\"",
+                ] {
+                    for prefix in ["", "é ", "visible; "] {
+                        let input = format!("{prefix}--{name}{separator}{value} --verbose");
+                        let masked = redact(&input);
+                        assert!(!masked.contains("SENSITIVE_VALUE"), "{input}: {masked}");
+                        assert!(masked.ends_with(" --verbose"), "{input}: {masked}");
+                        assert_eq!(redact(&masked), masked, "{input}");
+                    }
+                }
+            }
+        }
+        for count in 1..32 {
+            for unit in [
+                "https://user:SENSITIVE_VALUE@host/path ",
+                "scheme://user:SENSITIVE_VALUE@host://next/path ",
+                "Bearer\x0bSENSITIVE_VALUE ",
+                "\"--token=SENSITIVE_VALUE more\" ",
+            ] {
+                let input = unit.repeat(count);
+                let masked = redact(&input);
+                assert!(!masked.contains("SENSITIVE_VALUE"), "{input}: {masked}");
+                assert_eq!(redact(&masked), masked, "{input}");
+            }
+        }
+    }
+
+    #[test]
+    fn long_url_and_line_ending_runs_have_bounded_redaction_time() {
+        let started = std::time::Instant::now();
+        for line in [
+            "https://user:URL_VALUE@host/path ".repeat(10_000),
+            format!(
+                "{}{}",
+                "Bearer BEARER_VALUE ".repeat(10_000),
+                "\r".repeat(100_000)
+            ),
+            format!(
+                "{}{}",
+                "--token=FLAG_VALUE ".repeat(10_000),
+                "\r".repeat(100_000)
+            ),
+        ] {
+            let masked = redact(&line);
+            assert!(!masked.contains("_VALUE"));
+            assert_eq!(redact(&masked), masked);
+        }
+        let elapsed = started.elapsed();
+        // Exact outputs, so over-redaction cannot make the timing pass.
+        let url = redact("https://user:URL_VALUE@host/path ");
+        assert!(url.contains("@host/path "), "{url}");
+        assert_eq!(
+            redact(&"https://user:URL_VALUE@host/path ".repeat(10_000)),
+            url.repeat(10_000)
+        );
+        for unit in ["Bearer BEARER_VALUE ", "--token=FLAG_VALUE "] {
+            let one = redact(unit);
+            assert!(one.starts_with(&unit[..6]), "{one}");
+            let line = format!("{}{}", unit.repeat(10_000), "\r".repeat(100_000));
+            assert_eq!(
+                redact(&line),
+                format!("{}{}", one.repeat(10_000), "\r".repeat(100_000))
+            );
+        }
+        eprintln!("redact hostile URLs and trailing CR runs: {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
     }
 
     #[test]
