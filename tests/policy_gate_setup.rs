@@ -48,6 +48,9 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().into()
 }
 fn check_patch(repo: &Path, patch: &Path) {
+    apply_patch(repo, patch, true);
+}
+fn apply_patch(repo: &Path, patch: &Path, check: bool) {
     use std::io::Write;
     use std::process::Stdio;
     // Git for Windows does not accept Rust's extended canonical paths as
@@ -60,9 +63,12 @@ fn check_patch(repo: &Path, patch: &Path) {
             "-c",
             "core.hooksPath=/dev/null",
             "apply",
-            "--check",
-            "-",
         ])
+        .args(if check {
+            vec!["--check", "-"]
+        } else {
+            vec!["-"]
+        })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -878,12 +884,16 @@ fn stage_and_intent_propose_patch_validated_tests_and_registry_together() {
     let mut proof = read(&run.join("proofs/1.json"));
     proof["cleanup_complete"] = json!(false);
     write(&run.join("proofs/1.json"), &proof);
-    assert!(!cli(
+    let excluded = cli(
         &root.join("home"),
-        &["stage", "--run", run.to_str().unwrap()]
-    )
-    .status
-    .success());
+        &["stage", "--run", run.to_str().unwrap()],
+    );
+    assert!(excluded.status.success(), "{}", output(&excluded));
+    assert!(output(&excluded).contains("excluded omgs-"));
+    assert!(std::fs::read(run.join("proposed-tests.patch"))
+        .unwrap()
+        .is_empty());
+    assert!(std::fs::read(run.join("policy.patch")).unwrap().is_empty());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -1040,4 +1050,176 @@ fn default_setup_ignores_adjacent_and_checkout_sidecars() {
         assert_eq!(std::fs::read(installed.join(path)).unwrap(), *bytes);
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn policy_stage_admits_valid_proof_and_reports_invalid_proof_once() {
+    let root = scratch("partial-policy-stage");
+    let repo = repo(&root);
+    let base = commit_policy(&repo, &Policy::default());
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, Some(&base)).status.success());
+    evidence(&run, &repo);
+    let mut findings = read(&run.join("findings.json"));
+    let mut invalid = findings["findings"][0].clone();
+    invalid["entry_point"] = json!("GET /invalid");
+    invalid["fingerprint"] = json!(omgs::fingerprint(
+        invalid["attack_class"].as_str().unwrap(),
+        invalid["entry_point"].as_str().unwrap(),
+        invalid["sink"].as_str().unwrap(),
+        invalid["boundary"].as_str().unwrap(),
+    ));
+    invalid["proof_ref"] = json!("proofs/2.json");
+    let invalid_id = invalid["fingerprint"].as_str().unwrap().to_owned();
+    let mut invalid_proof = read(&run.join("proofs/1.json"));
+    invalid_proof["n"] = json!(2);
+    invalid_proof["finding"] = invalid["fingerprint"].clone();
+    invalid_proof["test"] = json!("tests/security/invalid.ts");
+    invalid_proof["cleanup_complete"] = json!(false);
+    write(&run.join("proofs/2.json"), &invalid_proof);
+    findings["findings"].as_array_mut().unwrap().push(invalid);
+    write(&run.join("findings.json"), &findings);
+    assert!(
+        omgs::model::validate(&omgs::shape::findings(&findings.to_string()).unwrap()).is_empty()
+    );
+    let staged = cli(
+        &root.join("home"),
+        &["stage", "--run", run.to_str().unwrap()],
+    );
+    assert!(staged.status.success(), "{}", output(&staged));
+    assert_eq!(
+        output(&staged)
+            .matches(&format!("excluded {invalid_id}:"))
+            .count(),
+        1
+    );
+    assert!(output(&staged).contains("did not finish cleanly"));
+    let tests = std::fs::read_to_string(run.join("proposed-tests.patch")).unwrap();
+    let policy = std::fs::read_to_string(run.join("policy.patch")).unwrap();
+    assert!(policy.ends_with(&tests));
+    for patch in [&tests, &policy] {
+        assert_eq!(
+            patch
+                .matches("diff --git \"a/tests/security/x.test.ts\"")
+                .count(),
+            1
+        );
+        assert!(!patch.contains(&invalid_id));
+        assert!(!patch.contains("GET /invalid"));
+        assert!(!patch.contains("tests/security/invalid.ts"));
+    }
+    for name in ["proposed-tests.patch", "policy.patch"] {
+        check_patch(&repo, &run.join(name));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn proposal_preserves_draft(name: &str, crlf_policy: bool, executable: bool) {
+    let root = scratch(name);
+    let repo = repo(&root);
+    git(&repo, &["config", "core.autocrlf", "false"]);
+    let p = Policy::default();
+    let mut base = commit_policy(&repo, &p);
+    if crlf_policy {
+        std::fs::write(
+            repo.join(policy::PATH),
+            policy::text(&p).unwrap().replace("\n", "\r\n"),
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "Retain CRLF policy"]);
+        base = git(&repo, &["rev-parse", "HEAD"]);
+    }
+    let original_policy = std::fs::read(repo.join(policy::PATH)).unwrap();
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, Some(&base)).status.success());
+    evidence(&run, &repo);
+    let draft = run.join("proofs/1/test-draft");
+    let bytes = if executable {
+        b"#!/bin/sh\nprintf 'fixture boundary failure\\n'\nexit 1\n".to_vec()
+    } else {
+        b"throw new Error('fixture boundary failure');\r\n// retained CRLF\r\n".to_vec()
+    };
+    std::fs::write(&draft, &bytes).unwrap();
+    #[cfg(unix)]
+    if executable {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&draft, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut proof = read(&run.join("proofs/1.json"));
+    proof["test_sha256"] = json!(omgs::sha256::digest(&bytes));
+    write(&run.join("proofs/1.json"), &proof);
+    let staged = cli(
+        &root.join("home"),
+        &["stage", "--run", run.to_str().unwrap()],
+    );
+    assert!(staged.status.success(), "{}", output(&staged));
+    assert!(!output(&staged).contains("excluded"), "{}", output(&staged));
+    let test = proof["test"].as_str().unwrap();
+    // Apply each export to a separate copy, keeping the audited target untouched.
+    for name in ["proposed-tests.patch", "policy.patch"] {
+        let copy = root.join(name);
+        std::fs::create_dir_all(copy.join(".omgs")).unwrap();
+        git(&copy, &["init"]);
+        git(&copy, &["config", "core.autocrlf", "false"]);
+        std::fs::write(copy.join(policy::PATH), &original_policy).unwrap();
+        let patch = run.join(name);
+        check_patch(&copy, &patch);
+        apply_patch(&copy, &patch, false);
+        let applied = std::fs::read(copy.join(test)).unwrap();
+        assert_eq!(applied, bytes);
+        assert_eq!(
+            omgs::sha256::digest(&applied),
+            proof["test_sha256"].as_str().unwrap()
+        );
+        if name == "policy.patch" {
+            let mut expected = p.clone();
+            expected.gate_tests =
+                policy::parse(&std::fs::read_to_string(copy.join(policy::PATH)).unwrap())
+                    .unwrap()
+                    .gate_tests;
+            assert_eq!(expected.gate_tests.len(), 1);
+            assert_eq!(
+                std::fs::read(copy.join(policy::PATH)).unwrap(),
+                policy::text(&expected).unwrap().as_bytes()
+            );
+        }
+        #[cfg(unix)]
+        if executable {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(copy.join(test))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0o111
+            );
+            assert!(std::fs::read_to_string(&patch)
+                .unwrap()
+                .contains("new file mode 100755"));
+        }
+    }
+    assert_eq!(
+        std::fs::read(repo.join(policy::PATH)).unwrap(),
+        original_policy
+    );
+    assert!(!repo.join(test).exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn policy_proposal_preserves_crlf_test_bytes_and_digest() {
+    proposal_preserves_draft("crlf-test-proposal", false, false);
+}
+
+#[test]
+fn policy_proposal_applies_over_existing_crlf_policy() {
+    proposal_preserves_draft("crlf-policy-proposal", true, false);
+}
+
+#[cfg(unix)]
+#[test]
+fn policy_proposal_retains_executable_draft_mode() {
+    proposal_preserves_draft("executable-proposal", false, true);
 }

@@ -505,6 +505,7 @@ pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
 }
 
 pub struct StagedTests {
+    pub admitted: FindingsFile,
     pub patch: String,
     pub excluded: Vec<String>,
 }
@@ -537,5 +538,9 @@ pub fn stage_validated(run: &Path, file: &FindingsFile) -> Result<StagedTests, S
             format!("{}\n{e}", excluded.join("\n"))
         }
     })?;
-    Ok(StagedTests { patch, excluded })
+    Ok(StagedTests {
+        admitted,
+        patch,
+        excluded,
+    })
 }

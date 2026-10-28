@@ -721,10 +721,30 @@ fn advisory_findings(run: &Path, p: &Policy) {
 
 /// Whole-file unified diff so no untrusted diff driver is ever invoked.
 pub fn propose(run: &Path, answers: &crate::intent::Answers) -> Result<std::path::PathBuf, String> {
+    let path = run.join("findings.json");
+    let file = if path.exists() {
+        let bytes = crate::platform::read_bounded_in(run, Path::new("findings.json"), 16 << 20)
+            .map_err(|e| e.to_string())?;
+        crate::shape::findings(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)?
+    } else {
+        crate::model::FindingsFile::default()
+    };
+    let staged = crate::handoff::stage_validated(run, &file)?;
+    for reason in &staged.excluded {
+        eprintln!("{reason}");
+    }
+    propose_staged(run, answers, &staged)
+}
+
+/// Use the same admitted records and exact test patch as the staging export.
+pub fn propose_staged(
+    run: &Path,
+    answers: &crate::intent::Answers,
+    staged: &crate::handoff::StagedTests,
+) -> Result<std::path::PathBuf, String> {
     let s = snapshot(run)?;
     let mut p = s.policy;
-    let mut test_patches = String::new();
-    propose_tests(run, &mut p, &mut test_patches)?;
+    propose_tests(run, &mut p, &staged.admitted)?;
     for a in &answers.answers {
         p.accepted_intent
             .retain(|old| old.id != a.id || old.scope != a.scope);
@@ -739,65 +759,23 @@ pub fn propose(run: &Path, answers: &crate::intent::Answers) -> Result<std::path
         .sort_by(|a, b| (&a.id, &a.scope).cmp(&(&b.id, &b.scope)));
     let new = text(&p)?;
     let old = s.original.unwrap_or_default();
-    let mut diff = String::new();
-    if old != new {
-        diff.push_str(&format!("diff --git a/{PATH} b/{PATH}\n"));
-        if old.is_empty() {
-            diff.push_str("new file mode 100644\n");
-        }
-        diff.push_str(&format!(
-            "--- {}\n+++ b/{PATH}\n@@ -{},{} +1,{} @@\n",
-            if old.is_empty() {
-                "/dev/null".into()
-            } else {
-                format!("a/{PATH}")
-            },
-            usize::from(!old.is_empty()),
-            old.lines().count(),
-            new.lines().count()
-        ));
-        for line in old.lines() {
-            diff.push_str(&format!("-{line}\n"));
-        }
-        if !old.is_empty() && !old.ends_with('\n') {
-            diff.push_str("\\ No newline at end of file\n");
-        }
-        for line in new.lines() {
-            diff.push_str(&format!("+{line}\n"));
-        }
-    }
-    diff.push_str(&test_patches);
+    let mut diff = file_patch(PATH, &old, &new);
+    diff.push_str(&staged.patch);
     let path = run.join("policy.patch");
     crate::runmeta::write_atomic(&path, &diff)?;
     Ok(path)
 }
 
-fn propose_tests(run: &Path, p: &mut Policy, patches: &mut String) -> Result<(), String> {
-    let path = run.join("findings.json");
-    if !path.exists() {
-        return Ok(());
-    }
-    let bytes = crate::platform::read_bounded_in(run, Path::new("findings.json"), 16 << 20)
-        .map_err(|e| e.to_string())?;
-    let file = crate::shape::findings(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)?;
-    let errors = crate::model::validate(&file);
-    if !errors.is_empty() {
-        return Err(errors.join("; "));
-    }
+fn propose_tests(
+    run: &Path,
+    p: &mut Policy,
+    file: &crate::model::FindingsFile,
+) -> Result<(), String> {
     for f in file
         .findings
         .iter()
         .filter(|f| f.verdict == Verdict::Confirmed)
     {
-        let errors = crate::proof::validate_proofs(
-            &crate::model::FindingsFile {
-                findings: vec![f.clone()],
-            },
-            run,
-        );
-        if !errors.is_empty() {
-            return Err(errors.join("; "));
-        }
         let record = crate::proof::load(
             run,
             f.proof_ref
@@ -823,27 +801,6 @@ fn propose_tests(run: &Path, p: &mut Policy, patches: &mut String) -> Result<(),
             println!("already registered: {}", old.id);
             continue;
         }
-        let meta = crate::runmeta::read(run)?;
-        let target = Path::new(meta["target"].as_str().ok_or("run needs target")?);
-        let bytes = if record.test_from.is_some() {
-            let draft = Path::new(f.proof_ref.as_deref().unwrap())
-                .with_extension("")
-                .join("test-draft");
-            crate::platform::read_bounded_in(run, &draft, MAX_BYTES)
-        } else {
-            crate::platform::read_bounded_in(target, Path::new(test), MAX_BYTES)
-        }
-        .map_err(|e| e.to_string())?;
-        if record.test_sha256.as_deref() != Some(&crate::sha256::digest(&bytes)) {
-            return Err("gate proposal test digest mismatch".into());
-        }
-        let new = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
-        let old = match crate::platform::read_bounded_in(target, Path::new(test), MAX_BYTES) {
-            Ok(bytes) => String::from_utf8(bytes).map_err(|e| e.to_string())?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e.to_string()),
-        };
-        patches.push_str(&file_patch(test, &old, new));
         p.gate_tests.push(GateTest {
             id: f.fingerprint.clone(),
             test: test.into(),
@@ -873,15 +830,16 @@ fn file_patch(path: &str, old: &str, new: &str) -> String {
             format!("a/{path}")
         },
         usize::from(!old.is_empty()),
-        old.lines().count(),
-        new.lines().count()
+        old.split_inclusive('\n').count(),
+        new.split_inclusive('\n').count()
     ));
     for (prefix, text) in [("-", old), ("+", new)] {
-        for line in text.lines() {
-            diff.push_str(&format!("{prefix}{line}\n"));
-        }
-        if !text.is_empty() && !text.ends_with('\n') {
-            diff.push_str("\\ No newline at end of file\n");
+        for line in text.split_inclusive('\n') {
+            diff.push_str(prefix);
+            diff.push_str(line);
+            if !line.ends_with('\n') {
+                diff.push_str("\n\\ No newline at end of file\n");
+            }
         }
     }
     diff

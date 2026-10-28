@@ -1284,7 +1284,7 @@ fn cmd_stage(args: &[String]) -> Result<(), String> {
     // Legacy runs can still export retained tests. Policy-aware runs also
     // produce the owner-reviewable registry and intent proposal.
     if run.join(omgs::runmeta::FILE).exists() && omgs::runmeta::read(&run)?.contains_key("policy") {
-        intent_propose(&run)?;
+        intent_propose_with_tests(&run, Some(&staged))?;
     }
     Ok(())
 }
@@ -3122,6 +3122,13 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
 }
 
 fn intent_propose(run: &Path) -> Result<(), String> {
+    intent_propose_with_tests(run, None)
+}
+
+fn intent_propose_with_tests(
+    run: &Path,
+    staged: Option<&omgs::handoff::StagedTests>,
+) -> Result<(), String> {
     let answers = run_answers(Some(run))?;
     let meta = omgs::runmeta::read(run)?;
     let target = meta
@@ -3138,7 +3145,11 @@ fn intent_propose(run: &Path) -> Result<(), String> {
     }
     println!(
         "owner review patch: {}",
-        omgs::policy::propose(run, &merged)?.display()
+        match staged {
+            Some(tests) => omgs::policy::propose_staged(run, &merged, tests)?,
+            None => omgs::policy::propose(run, &merged)?,
+        }
+        .display()
     );
     Ok(())
 }
