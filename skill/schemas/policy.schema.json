@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OMGS committed policy",
+  "description": "Required fields never default. Explicit null persona/budget retain legacy unselected/unbounded behavior. The CLI additionally rejects duplicate intent id/scope pairs, duplicate suppression fingerprints, unknown intent IDs and control characters.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "mode",
+    "persona",
+    "budget",
+    "severity_threshold",
+    "excluded_paths",
+    "accepted_intent",
+    "suppressions"
+  ],
+  "properties": {
+    "schema": {
+      "const": "omgs-policy/1"
+    },
+    "mode": {
+      "enum": [
+        "gate",
+        "advisory"
+      ]
+    },
+    "persona": {
+      "enum": [
+        null,
+        "builder",
+        "inheritor",
+        "team"
+      ]
+    },
+    "budget": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "severity_threshold": {
+      "enum": [
+        "informational",
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    "excluded_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^(?!/)(?!.*[\\\\:])(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/]+(?:/[^/]+)*$"
+      }
+    },
+    "accepted_intent": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "answer",
+          "scope",
+          "source"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "description": "Shipped intent library ID."
+          },
+          "answer": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "const": "repo"
+              },
+              {
+                "type": "string",
+                "pattern": "^(?!/)(?!.*[\\\\:])(?!.*(?:^|/)\\.{1,2}(?:/|$))[^/]+(?:/[^/]+)*$"
+              }
+            ]
+          },
+          "source": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          }
+        }
+      }
+    },
+    "suppressions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "fingerprint",
+          "reason"
+        ],
+        "properties": {
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^omgs-[0-9a-f]{16}$"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S"
+          },
+          "expires_unix": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "UTC Unix seconds; inactive at or after this instant."
+          }
+        }
+      }
+    }
+  }
+}

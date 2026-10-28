@@ -70,7 +70,7 @@ Hand each role brief over **verbatim**, plus its explicit scope and resolved inp
 - Evaluator: [agents/evaluator.md](agents/evaluator.md).
 - Green, only for explicitly approved fixes: [agents/green-fixer.md](agents/green-fixer.md).
 
-For initialization, `omgs audit init --target TARGET --persona builder|inheritor|team` selects defaults, report depth and budget profile. Builder uses concise coverage and 24 calls/proofs; inheritor uses full detail and 64; team uses full detail and 96. All default to advisory. Explicit --mode and --budget override defaults. The persona is recorded in run metadata and never changes the evidence bar, sandbox rules or verdict semantics. Without --persona, the existing unbounded budget remains unless --budget is supplied.
+For initialization, `omgs audit init --target TARGET --persona builder|inheritor|team` selects defaults, report depth and budget profile. Builder uses concise coverage and 24 calls/proofs; inheritor uses full detail and 64; team uses full detail and 96. Without committed base policy, all default to advisory and explicit --mode and --budget override defaults. With --base, committed policy takes precedence and conflicting overrides fail. The persona is recorded in run metadata and never changes the evidence bar, sandbox rules or verdict semantics. Without --persona, the existing unbounded budget remains unless --budget is supplied.
 
 Every inventory class stays accountable. Test, docs, data and vendored groups each get a `planned` exclusion unit with their total count and first 20 sorted paths across all files. Assign these units to hunters to skim or sample, then hunt with `covered` plus evidence or record `out_of_scope` with `--note "reviewed, not security relevant: <reason>"`. For out_of_scope, cite at least one displayed sampled path with --evidence. Describe the review and why the group is irrelevant; classification alone cannot justify exclusion. Blocked or deferred exclusions remain critic failures. The first 20 paths are a sample, not the entire scope. Resolution reasons appear in ledger output and reports.
 
@@ -118,3 +118,47 @@ Use focused text reads and shared maps instead of repeatedly loading the whole r
 Do not equate login with object authorization, absent in-repo checks with absent backend controls, or a UI redirect with endpoint protection. Do not confirm a grep hit, invent intent, assign severity to an unresolved candidate, or count a broken test harness as proof. Do not execute repository scripts directly, provision missing dependencies during proof, reuse real secrets, or test external systems. Do not let model output gate a merge: gate mode uses only committed proof tests and scanner rules; advisory mode blocks nothing. Only reviewed policy, intent answers, suppressions, and accepted proof tests belong in the target tree, never run output.
 
 Host accounting is optional and cumulative per role. Supply `--accounting red-hunter=12000,0.32,45000` on `omgs status` or `omgs report`, repeating the option for blue-verifier, evaluator and green-fixer. Values are tokens, USD cost and duration in milliseconds. Use `unknown` or an empty field for unavailable values. Omitted roles and values stay unknown, never zero; resubmission replaces that role's totals. Report reads saved status accounting. Never estimate missing usage from stage clocks.
+
+## Base policy, gate and setup
+
+For a pull request, initialize with `omgs audit init --target TARGET --base BASE_REF`
+using the trusted base branch ref or event base SHA. The ref must be locally
+available. Never select a head policy as the base. Initialization reads only
+`BASE_REF:.omgs/policy.json` through object-only Git commands and records the
+resolved commit, policy source, raw blob, parsed policy and SHA-256 in run metadata.
+A missing base blob uses advisory, high threshold, null persona, unbounded budget
+and empty exclusions, intent and suppressions. Omitting --base deliberately uses
+local defaults. An invalid base ref or policy is an error, never a fallback.
+
+See [schemas/policy.schema.json](schemas/policy.schema.json). All top-level fields
+are required, even nullable persona and budget; unknown keys are refused. Base
+policy fixes mode, persona and budget. Excluded paths are literal relative path
+prefixes and create planned ledger units with counts and sorted path samples.
+Review and resolve them with evidence; do not silently discard them or treat an
+exclusion as suppression. Accepted intent records require id, answer, scope and
+source. Suppressions require fingerprint and reason, with optional expires_unix
+in UTC Unix seconds.
+
+After recording an owner's answers with `omgs intent answer`, run
+`omgs intent propose --run OUTPUT_DIR` to write `OUTPUT_DIR/policy.patch` for owner
+review. It never changes the target and never changes this run's gate. Only
+reviewed, committed base policy can accept those answers or suppress future runs.
+
+Run `omgs gate --run OUTPUT_DIR` after verification and adjudication. Exit 1
+requires an unsuppressed confirmed finding at or above threshold with a valid
+runner-attested omgs-proof/2 record, including declared recipe contracts. Missing
+or invalid proof is printed as ineligible, never promoted to blocking evidence.
+Advisory prints what would block and exits 0 for valid input. Exit 3 means invalid
+run or policy in either mode. Surface the error rather than describing a pass.
+Gate does not replace validate, independent replay or evaluation.
+
+For setup scripts, `omgs setup --install-skills --verify-mxc` installs only into
+detected home directories under the Skills CLI name omgs-security-review and
+runs the same live deny probe as doctor --live. Use --from to select the source,
+or place skill/ beside the binary (also supported at ../skill/ for bin layouts).
+`omgs setup --dry-run` lists only detected destinations and changes nothing.
+`omgs setup --write-policy TARGET --mode gate|advisory` creates default policy
+only on explicit request and refuses replacement. `omgs setup --yes` installs
+detected skills and verifies MXC without interaction; it never silently writes
+repository policy. Never claim live verification passed if setup reports a
+missing executor or a platform refusal.
