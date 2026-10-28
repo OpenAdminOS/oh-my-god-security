@@ -6,13 +6,17 @@
 // function `decide(_:)` provided by the target source in vulnerable/ or fixed/.
 //
 // Run one snapshot through the sandbox, writing the binary to scratch:
-//   omgs prove --target benchmark/fixtures/installer-trust \
-//     --cmd 'swiftc main.swift vulnerable/Verifier.swift -o "$TMPDIR/probe" && "$TMPDIR/probe"'
+//   omgs prove --target benchmark/fixtures/installer-trust --test main.swift \
+//   --expect-marker BOUNDARY_ASSERTION_FAILED \
+//     --cmd 'swiftc main.swift vulnerable/Verifier.swift -o "$TMPDIR/probe" || exit 2; "$TMPDIR/probe"'
 // The vulnerable snapshot violates the invariants and exits non-zero; swap
 // vulnerable for fixed and it upholds them plus the authorized control and exits
 // zero. See README.md. Keep compile and execution inside `omgs prove`.
 
 import Foundation
+
+guard let nonce = ProcessInfo.processInfo.environment["OMGS_PROOF_NONCE"],
+      let marker = ProcessInfo.processInfo.environment["OMGS_PROOF_CONTRACT"] else { exit(2) }
 
 enum InstallDecision: Equatable {
     case authorized
@@ -98,17 +102,16 @@ check(
 
 // Authorized control: a matching signer installing a forward version is
 // accepted, so the fixed logic is not merely refusing everything.
-check(
-    "authorized control: matching signer and forward version is accepted",
-    isAuthorized(InstallRequest(
-        payloadTeam: trusted, payloadNotarized: true, expectedTeam: trusted,
-        payloadVersion: "2.0", installedVersion: "1.0", expectedVersion: "2.0"))
-)
+guard isAuthorized(InstallRequest(
+    payloadTeam: trusted, payloadNotarized: true, expectedTeam: trusted,
+    payloadVersion: "2.0", installedVersion: "1.0", expectedVersion: "2.0")) else { exit(2) }
+print("OMGS_CONTROL_\(nonce)")
 
 if failures.isEmpty {
-    print("INVARIANTS HOLD")
+    print("BOUNDARY_ASSERTION_OK")
     exit(0)
 } else {
     print("INVARIANTS VIOLATED: \(failures.count)")
+    print("OMGS_BOUNDARY_\(nonce)_\(marker)")
     exit(1)
 }

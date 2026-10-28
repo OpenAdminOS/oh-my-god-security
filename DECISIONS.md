@@ -114,3 +114,21 @@ Done means: the one prompt flow works on the benchmark apps, every confirmed fin
 ## Deferred to later decisions
 
 Each of these returns for its own decision before any work starts: final brand treatment of the name, benchmark corpus licensing, additional stacks and languages, additional sandbox backends, and whether an optional hosted runner should ever exist. Accepting this record does not approve any of them.
+
+## 2026-10-28: required proof contracts and nonce-qualified recipe evidence
+
+Proof schema `omgs-proof/2` requires an explicit `contract` discriminator, either
+`none` or `recipe`. Recipe declarations and both marker evidence flags are
+required and non-null. The MXC environment records the declaration and fresh
+per-run nonce, binding them to the saved config digest and reconstructed command.
+Older schemas predate the current policy, including `RUSTUP_AUTO_INSTALL=0`, and
+must be rerun. No compatibility shim weakens the environment allowlist.
+
+Recipes emit `OMGS_CONTROL_<nonce>` and `OMGS_BOUNDARY_<nonce>_<label>` using
+`OMGS_PROOF_NONCE` and `OMGS_PROOF_CONTRACT`. Fixed or wrong-nonce output cannot
+satisfy the contract. Hostile code sharing the harness process can read the nonce
+and forge those lines. The independent evaluator remains required. Real
+provenance would need assertion reporting separated from target execution, for
+example a trusted reporter in a separately isolated process with a private
+channel unavailable to target code. That option needs a defined isolation policy
+and is not implemented in this PR.

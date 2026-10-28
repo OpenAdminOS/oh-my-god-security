@@ -420,6 +420,8 @@ fn link_dir(to: &Path, link: &Path) -> std::io::Result<()> {
 /// Everything that varies per run, kept separate from probing the host so
 /// the config is testable.
 pub struct ConfigInput<'a> {
+    /// Declaration and nonce bound to the saved config and command.
+    pub contract: Option<(&'a str, &'a str)>,
     pub os: &'a str,
     pub containment: &'a str,
     pub command: &'a str,
@@ -464,6 +466,7 @@ pub fn environment_keys(os: &str) -> Vec<&'static str> {
         "CARGO_NET_OFFLINE",
         "RUSTUP_HOME",
         "RUSTUP_AUTO_INSTALL",
+        "OMGS_PROOF_CONTRACT",
     ]);
     keys
 }
@@ -546,7 +549,14 @@ pub fn supervisor_timeout_ms(os: &str, timeout_ms: u64) -> u64 {
 
 pub fn mxc_config_at(input: &ConfigInput, system_root: &str) -> serde_json::Value {
     let scratch = mxc_path(input.scratch);
-    let env = environment(input.os, &scratch, input.rust.as_ref(), system_root);
+    let mut env = environment(input.os, &scratch, input.rust.as_ref(), system_root);
+    env.push(format!(
+        "OMGS_PROOF_CONTRACT={}",
+        input.contract.map(|(m, _)| m).unwrap_or("none")
+    ));
+    if let Some((_, nonce)) = input.contract {
+        env.push(format!("OMGS_PROOF_NONCE={nonce}"));
+    }
     let mut readonly: Vec<String> = input.readonly.iter().map(|p| mxc_path(p)).collect();
     if let Some(m) = input.allowed_marker {
         readonly.push(mxc_path(m));
@@ -1360,6 +1370,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     }
     extra_gaps.extend(windows_gaps);
     let mut input = ConfigInput {
+        contract: req.expect_marker.as_deref().map(|m| (m, nonce.as_str())),
         os,
         containment: located.executor.containment,
         command: &wrapped,
@@ -1570,6 +1581,7 @@ mod tests {
     fn linux_system_headers_are_an_explicit_readonly_grant() {
         assert!(toolchain_roots("linux", None).contains(&PathBuf::from("/usr/include")));
         let input = ConfigInput {
+            contract: None,
             os: "linux",
             containment: "bubblewrap",
             command: "exit 0",
@@ -1642,33 +1654,39 @@ mod tests {
     #[test]
     fn environment_allowlist_matches_every_emitted_key() {
         for os in ["macos", "linux", "windows"] {
-            let config = mxc_config(&ConfigInput {
-                os,
-                containment: "test",
-                command: "echo test",
-                timeout_ms: 1000,
-                workspace: Path::new("/run/workspace"),
-                scratch: Path::new("/run/scratch"),
-                allowed_marker: None,
-                readonly: vec![],
-                denied: vec![],
-                rust: Some(RustHomes {
-                    bin: "/tools/bin".into(),
-                    cargo_home: "/run/scratch/cargo-home".into(),
-                    rustup_home: Some("/tools/rustup".into()),
-                }),
-                list_parents: false,
-            });
-            let mut keys: Vec<_> = config["process"]["env"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap().split_once('=').unwrap().0)
-                .collect();
-            let mut expected = environment_keys(os);
-            keys.sort_unstable();
-            expected.sort_unstable();
-            assert_eq!(keys, expected, "{os}");
+            for contract in [None, Some(("BOUNDARY", "nonce"))] {
+                let config = mxc_config(&ConfigInput {
+                    contract,
+                    os,
+                    containment: "test",
+                    command: "echo test",
+                    timeout_ms: 1000,
+                    workspace: Path::new("/run/workspace"),
+                    scratch: Path::new("/run/scratch"),
+                    allowed_marker: None,
+                    readonly: vec![],
+                    denied: vec![],
+                    rust: Some(RustHomes {
+                        bin: "/tools/bin".into(),
+                        cargo_home: "/run/scratch/cargo-home".into(),
+                        rustup_home: Some("/tools/rustup".into()),
+                    }),
+                    list_parents: false,
+                });
+                let mut keys: Vec<_> = config["process"]["env"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().split_once('=').unwrap().0)
+                    .collect();
+                let mut expected = environment_keys(os);
+                if contract.is_some() {
+                    expected.push("OMGS_PROOF_NONCE");
+                }
+                keys.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(keys, expected, "{os}");
+            }
         }
     }
 

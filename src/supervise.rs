@@ -360,9 +360,9 @@ impl MarkerScan {
         }
         let line = String::from_utf8_lossy(&bytes);
         let line = line.trim_end_matches('\r');
-        if self.expect_marker.is_some() {
-            self.boundary_marker_seen |= self.expect_marker.as_deref() == Some(line);
-            self.authorized_control_seen |= line == "AUTHORIZED_CONTROL_OK";
+        if let (Some(marker), Some(nonce)) = (&self.expect_marker, &self.nonce) {
+            self.boundary_marker_seen |= line == crate::proof::boundary_marker(marker, nonce);
+            self.authorized_control_seen |= line == crate::proof::control_marker(nonce);
         }
         let lower = line.to_ascii_lowercase();
         if stream == 1
@@ -1699,7 +1699,7 @@ mod tests {
         bytes.extend(vec![b'x'; 300_000]);
         bytes.extend(
             format!(
-                "\nAUTHORIZED_CONTROL_OK\r\nBOUNDARY_ASSERTION_FAILED\r\nOMGS_END_{nonce}:17\r\n"
+                "\nOMGS_CONTROL_{nonce}\r\nOMGS_BOUNDARY_{nonce}_BOUNDARY_ASSERTION_FAILED\r\nOMGS_END_{nonce}:17\r\n"
             )
             .as_bytes(),
         );
@@ -1717,6 +1717,7 @@ mod tests {
     #[test]
     fn contract_markers_require_exact_complete_lines_on_either_stream() {
         let mut scan = MarkerScan {
+            nonce: Some("nonce".into()),
             expect_marker: Some("BOUNDARY".into()),
             ..MarkerScan::default()
         };
@@ -1725,9 +1726,14 @@ mod tests {
             b"prefix BOUNDARY\nBOUNDARY suffix\nAUTHORIZED_CONTROL_OK suffix\n",
         );
         assert!(!scan.boundary_marker_seen && !scan.authorized_control_seen);
-        scan.receive(1, b"BOUN");
-        scan.receive(1, b"DARY\r\n");
-        scan.receive(0, b"AUTHORIZED_CONTROL_OK\n");
+        scan.receive(
+            0,
+            b"BOUNDARY\nAUTHORIZED_CONTROL_OK\nOMGS_BOUNDARY_wrong_BOUNDARY\nOMGS_CONTROL_wrong\n",
+        );
+        assert!(!scan.boundary_marker_seen && !scan.authorized_control_seen);
+        scan.receive(1, b"OMGS_BOUNDARY_nonce_BOU");
+        scan.receive(1, b"NDARY\r\n");
+        scan.receive(0, b"OMGS_CONTROL_nonce\n");
         assert!(scan.boundary_marker_seen && scan.authorized_control_seen);
     }
 

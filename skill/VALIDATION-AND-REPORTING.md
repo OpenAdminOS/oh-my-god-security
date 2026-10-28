@@ -41,19 +41,34 @@ and exhausted budgets remain blockers with `needs_validation`, never rejection.
 
 All commands below run from the reviewer's shell. Replace `RUN`, `FP` and `DRAFT`
 with the resolved external run directory, fingerprint and draft file. Staged test
-paths are relative to the target. The invariant must fail with an explicit
-`BOUNDARY_ASSERTION_FAILED` marker immediately before exit 1 on vulnerable
-source, then print `BOUNDARY_ASSERTION_OK` and exit 0 on fixed source.
-Require `AUTHORIZED_CONTROL_OK` in both. Import, compile, load and authorized
-control failures exit 2 and earn no proof support. Every recipe invocation must
-include `--expect-marker BOUNDARY_ASSERTION_FAILED`. This declares a contract
-recorded as `expect_marker`: support requires exit 1, the exact boundary line,
-and the exact `AUTHORIZED_CONTROL_OK` line. The runner records
-`boundary_marker_seen` and `authorized_control_seen` from the full stdout and
-stderr streams before capping or redaction; validation and CLI support use those
-fields. Markers must occupy complete lines (LF or CRLF). Replay preserves the
-contract and compares the marker results. Inspect the harness as well: markers
-are accident checks, not authentication against hostile target output.
+paths are relative to the target. Every recipe invocation must include
+`--expect-marker BOUNDARY_ASSERTION_FAILED`. OMGS supplies a fresh per-run
+`OMGS_PROOF_NONCE` and the declared label as `OMGS_PROOF_CONTRACT` through the
+allowlisted MXC environment. Print `OMGS_CONTROL_<nonce>` only after the
+authorized control succeeds. Print `OMGS_BOUNDARY_<nonce>_<label>` immediately
+before exit 1 when the invariant fails on vulnerable source. Fixed source prints
+`BOUNDARY_ASSERTION_OK` and exits 0. Import, compile, load and authorized control
+failures exit 2 and earn no proof support.
+
+Proof schema `omgs-proof/2` requires a `contract` object with `kind: "recipe"`,
+`expect_marker`, `boundary_marker_seen` and `authorized_control_seen`. All four
+fields are required and non-null. Runs without a declaration store the explicit
+`{"kind":"none"}` variant. The saved config environment binds the declaration
+and nonce to its digest, and validation reconstructs it with the saved command.
+Support requires exit 1 and both exact nonce-qualified lines. The evidence flags
+come from full stdout and stderr before capping or redaction. Markers must occupy
+complete lines (LF or CRLF). Replay retains the declaration, generates a fresh
+nonce and compares the evidence flags. Older records predate the current policy,
+including `RUSTUP_AUTO_INSTALL=0`, and must be rerun, with no compatibility shim
+or relaxed environment allowlist.
+
+Fixed or wrong-nonce output cannot satisfy the contract. This is an accident and
+collision check, not provenance: hostile code sharing the harness process can
+read the nonce and forge both lines. The independent evaluator remains required
+to check that the real target and intended assertion executed. Real provenance
+would need assertion reporting separated from target execution. A separate trusted
+reporter process with a private channel unavailable to target code is an option
+for a future design; it needs a concrete isolation policy and is outside this PR.
 Exit 2 is universally rejected as a usage or harness error, including without
 a contract. Without a contract, assertion exits 1 and 3 through 125 remain
 available for other frameworks; rejected controls may also exit 0. Import or compile
@@ -93,11 +108,11 @@ $ErrorActionPreference = 'Stop'
 try {
   . ./target.ps1
   if (-not (Test-CanRead 'owner' 'owner')) { throw 'AUTHORIZED_CONTROL_FAILED' }
-  Write-Output 'AUTHORIZED_CONTROL_OK'
+  Write-Output "OMGS_CONTROL_$env:OMGS_PROOF_NONCE"
   $forbidden = Test-CanRead 'intruder' 'owner'
   if ($forbidden -isnot [bool]) { throw 'INVALID_TARGET_RESULT' }
 } catch { Write-Error -ErrorAction Continue $_; exit 2 }
-if ($forbidden) { Write-Output 'BOUNDARY_ASSERTION_FAILED'; exit 1 }
+if ($forbidden) { Write-Output "OMGS_BOUNDARY_$($env:OMGS_PROOF_NONCE)_$($env:OMGS_PROOF_CONTRACT)"; exit 1 }
 Write-Output 'BOUNDARY_ASSERTION_OK'
 exit 0
 ```
@@ -120,7 +135,7 @@ tiers remain refused. Network and home denials above apply to PowerShell too.
 Use `test.cjs` to import the real local target module and check the authorized
 result inside `try`/`catch`; imports, control failures and unexpected target
 exceptions call `process.exit(2)`. Evaluate the unauthorized effect in the
-same guarded block. Outside it, print `BOUNDARY_ASSERTION_FAILED` and exit 1
+same guarded block. Outside it, print the nonce-qualified boundary marker and exit 1
 only for the forbidden result; fixed code prints `BOUNDARY_ASSERTION_OK` and
 exits 0. Keep external effects synthetic.
 
@@ -131,11 +146,11 @@ let forbidden;
 try {
   const {canRead} = require('./target.cjs');
   if (canRead('owner', 'owner') !== true) throw new Error('AUTHORIZED_CONTROL_FAILED');
-  console.log('AUTHORIZED_CONTROL_OK');
+  console.log('OMGS_CONTROL_' + process.env.OMGS_PROOF_NONCE);
   forbidden = canRead('intruder', 'owner');
 } catch (error) { console.error(error); process.exit(2); }
 if (typeof forbidden !== 'boolean') { process.exit(2); }
-if (forbidden) { console.log('BOUNDARY_ASSERTION_FAILED'); process.exit(1); }
+if (forbidden) { console.log('OMGS_BOUNDARY_' + process.env.OMGS_PROOF_NONCE + '_' + process.env.OMGS_PROOF_CONTRACT); process.exit(1); }
 console.log('BOUNDARY_ASSERTION_OK');
 ```
 
@@ -157,19 +172,21 @@ load a local file explicitly with `runpy.run_path('./target.py')` or use an
 explicit local module search path in the harness. Do not load host user packages.
 Wrap imports, control checks and target invocation in `try`/`except Exception`
 with `sys.exit(2)` on error. Only the forbidden result prints
-`BOUNDARY_ASSERTION_FAILED` and calls `sys.exit(1)`; fixed code prints
+the nonce-qualified boundary marker and calls `sys.exit(1)`; fixed code prints
 `BOUNDARY_ASSERTION_OK` and exits 0.
 
 Example harness (replace the local target path and function with the real source):
 
 ```python
-import sys
+import os, sys
+nonce = os.environ['OMGS_PROOF_NONCE']
+marker = os.environ['OMGS_PROOF_CONTRACT']
 try:
     import runpy
     can_read = runpy.run_path('./target.py')['can_read']
     if not can_read('owner', 'owner'):
         raise RuntimeError('AUTHORIZED_CONTROL_FAILED')
-    print('AUTHORIZED_CONTROL_OK', flush=True)
+    print(f'OMGS_CONTROL_{nonce}', flush=True)
     forbidden = can_read('intruder', 'owner')
     if type(forbidden) is not bool:
         raise RuntimeError('INVALID_TARGET_RESULT')
@@ -177,7 +194,7 @@ except Exception as error:
     print(error, file=sys.stderr)
     sys.exit(2)
 if forbidden:
-    print('BOUNDARY_ASSERTION_FAILED', flush=True)
+    print(f'OMGS_BOUNDARY_{nonce}_{marker}', flush=True)
     sys.exit(1)
 print('BOUNDARY_ASSERTION_OK')
 ```
@@ -195,7 +212,7 @@ home denials above apply to Python too.
 
 Use `test.sh` to source the real local implementation, verify the authorized
 control, exiting 2 if sourcing or the control fails. Print
-`BOUNDARY_ASSERTION_FAILED` and exit 1 when the forbidden effect is observed. Exit 0
+the nonce-qualified boundary marker and exit 1 when the forbidden effect is observed. Exit 0
 only after checking denied behavior and resulting synthetic state. Prefer POSIX
 `sh` and explicit status checks so a pipeline's final command cannot hide failure.
 For the unauthorized call, status 0 means allowed, 1 means expected denial,
@@ -207,11 +224,11 @@ Example harness (replace the local target path and function with the real source
 ```sh
 . ./target.sh || exit 2
 can_read owner owner || exit 2
-echo AUTHORIZED_CONTROL_OK
+echo "OMGS_CONTROL_${OMGS_PROOF_NONCE:?}"
 can_read intruder owner
 status=$?
 case $status in
-  0) echo BOUNDARY_ASSERTION_FAILED; exit 1 ;;
+  0) echo "OMGS_BOUNDARY_${OMGS_PROOF_NONCE:?}_${OMGS_PROOF_CONTRACT:?}"; exit 1 ;;
   1) echo BOUNDARY_ASSERTION_OK; exit 0 ;;
   *) exit 2 ;;
 esac
@@ -231,7 +248,7 @@ Windows. Network and home denials above apply to shell subprocesses too.
 Keep the XCTest regression draft, but when SwiftPM's nested sandbox is blocked,
 compile the real module plus a `main.swift` invariant harness directly. Assert an
 authorized success with `exit(2)` on control failure, print
-`BOUNDARY_ASSERTION_FAILED` and `exit(1)` on the
+the nonce-qualified boundary marker and `exit(1)` on the
 vulnerable path, then exit 0 on fixed code. Use a throwing target API with
 `do`/`catch` so dependency and invocation errors exit 2. For a nonthrowing API,
 remove `try` and the catch after checking its error channel explicitly.
@@ -240,6 +257,9 @@ Disclose the runner substitution.
 Example harness (replace the local target path and function with the real source):
 
 ```swift
+import Foundation
+let nonce = ProcessInfo.processInfo.environment["OMGS_PROOF_NONCE"]!
+let marker = ProcessInfo.processInfo.environment["OMGS_PROOF_CONTRACT"]!
 #if canImport(Darwin)
 import Darwin
 #else
@@ -247,8 +267,8 @@ import Glibc
 #endif
 do {
   guard try canRead("owner", "owner") else { exit(2) }
-  print("AUTHORIZED_CONTROL_OK")
-  if try canRead("intruder", "owner") { print("BOUNDARY_ASSERTION_FAILED"); exit(1) }
+  print("OMGS_CONTROL_\(nonce)")
+  if try canRead("intruder", "owner") { print("OMGS_BOUNDARY_\(nonce)_\(marker)"); exit(1) }
   print("BOUNDARY_ASSERTION_OK")
 } catch { exit(2) }
 ```

@@ -819,9 +819,13 @@ fn installer_trust_fixture_fails_vulnerable_and_passes_fixed() {
                 "prove",
                 "--target",
                 fixture.to_str().unwrap(),
+                "--test",
+                "main.swift",
+                "--expect-marker",
+                "BOUNDARY_ASSERTION_FAILED",
                 "--cmd",
                 &format!(
-                    "swiftc main.swift {variant}/Verifier.swift -o \"$TMPDIR/probe\" && \"$TMPDIR/probe\""
+                    "swiftc main.swift {variant}/Verifier.swift -o \"$TMPDIR/probe\" || exit 2; \"$TMPDIR/probe\""
                 ),
             ],
         )
@@ -831,7 +835,11 @@ fn installer_trust_fixture_fails_vulnerable_and_passes_fixed() {
     assert!(text(&vulnerable).contains("INVARIANTS VIOLATED"));
     let fixed = run("fixed");
     assert!(fixed.status.success(), "{}", text(&fixed));
-    assert!(text(&fixed).contains("INVARIANTS HOLD"));
+    assert!(text(&fixed).contains("BOUNDARY_ASSERTION_OK"));
+    assert!(text(&vulnerable).contains("OMGS_BOUNDARY_"));
+    for out in [&vulnerable, &fixed] {
+        assert!(text(out).contains("OMGS_CONTROL_"));
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 

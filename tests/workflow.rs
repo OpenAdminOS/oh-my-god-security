@@ -289,6 +289,7 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             omgs::sandbox::wrapped_command(os, command, &nonce, Some("tests/security/x.test.ts"));
         let allowed_marker = proof_dir.join("markers/allowed");
         let config = omgs::sandbox::mxc_config(&omgs::sandbox::ConfigInput {
+            contract: None,
             os,
             containment: executor.containment,
             command: &wrapped,
@@ -344,9 +345,7 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             started_at_ms: 0,
             duration_ms: 1,
             exit_code: Some(1),
-            expect_marker: None,
-            boundary_marker_seen: false,
-            authorized_control_seen: false,
+            contract: omgs::proof::Contract::None,
             timed_out: false,
             capture_complete: true,
             cleanup_complete: true,
@@ -1490,6 +1489,28 @@ fn every_proven_verdict_requires_a_valid_inner_exit_and_clean_markers() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+// Update a synthetic runner config when constructing a contracted fixture.
+fn bind_contract(dir: &std::path::Path, record: &mut omgs::proof::ProofRecord) {
+    let path = dir.join(format!("proofs/{}/mxc-config.json", record.n));
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let env = config["process"]["env"].as_array_mut().unwrap();
+    env.retain(|v| !v.as_str().unwrap().starts_with("OMGS_PROOF_"));
+    env.push(
+        format!(
+            "OMGS_PROOF_CONTRACT={}",
+            record.contract.expect_marker().unwrap_or("none")
+        )
+        .into(),
+    );
+    if record.contract.expect_marker().is_some() {
+        env.push(format!("OMGS_PROOF_NONCE={}", record.marker_nonce).into());
+    }
+    let text = config.to_string();
+    std::fs::write(path, &text).unwrap();
+    record.config_sha256 = omgs::sha256::digest(text.as_bytes());
+}
+
 #[test]
 fn linked_proof_contract_requires_boundary_control_and_assertion_exit() {
     let dir = scratch("proof-contract");
@@ -1508,10 +1529,13 @@ fn linked_proof_contract_requires_boundary_control_and_assertion_exit() {
         ("boundary beyond saved cap", 1, true, true, true),
     ] {
         let mut record = original.clone();
-        record.expect_marker = Some("BOUNDARY_ASSERTION_FAILED".into());
+        record.contract = omgs::proof::Contract::Recipe {
+            expect_marker: "BOUNDARY_ASSERTION_FAILED".into(),
+            boundary_marker_seen: boundary,
+            authorized_control_seen: control,
+        };
+        bind_contract(&dir, &mut record);
         record.exit_code = Some(exit);
-        record.boundary_marker_seen = boundary;
-        record.authorized_control_seen = control;
         // Saved output contains neither marker. The runner's full-stream
         // evidence must be used rather than re-scanning this capped prefix.
         assert!(record.output.is_empty());
@@ -1527,12 +1551,122 @@ fn linked_proof_contract_requires_boundary_control_and_assertion_exit() {
         "has\nnewline",
     ] {
         let mut record = original.clone();
-        record.expect_marker = Some(marker.into());
-        record.boundary_marker_seen = true;
-        record.authorized_control_seen = true;
+        record.contract = omgs::proof::Contract::Recipe {
+            expect_marker: marker.into(),
+            boundary_marker_seen: true,
+            authorized_control_seen: true,
+        };
         omgs::proof::write(&dir, &record).unwrap();
         assert!(!omgs::proof::validate_proofs(&findings, &dir).is_empty());
     }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn contract_deletions_nulls_and_downgrades_fail_validation_and_replay() {
+    let dir = scratch("contract-tampering");
+    std::fs::write(dir.join(omgs::runmeta::FILE), "{}").unwrap();
+    let (_, _, findings) = complete_run();
+    let findings = attest(&dir, findings);
+    let findings_path = dir.join("findings.json");
+    std::fs::write(&findings_path, serde_json::to_vec(&findings).unwrap()).unwrap();
+    let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    record.contract = omgs::proof::Contract::Recipe {
+        expect_marker: "BOUNDARY_ASSERTION_FAILED".into(),
+        boundary_marker_seen: true,
+        authorized_control_seen: true,
+    };
+    bind_contract(&dir, &mut record);
+    omgs::proof::write(&dir, &record).unwrap();
+    assert!(omgs::proof::validate_proofs(&findings, &dir).is_empty());
+    let original = serde_json::to_value(&record).unwrap();
+    let path = dir.join("proofs/1.json");
+    for field in [
+        "contract",
+        "kind",
+        "expect_marker",
+        "boundary_marker_seen",
+        "authorized_control_seen",
+    ] {
+        for null in [false, true] {
+            let mut value = original.clone();
+            let parent = if field == "contract" {
+                &mut value
+            } else {
+                &mut value["contract"]
+            };
+            if null {
+                parent[field] = serde_json::Value::Null;
+            } else {
+                parent.as_object_mut().unwrap().remove(field);
+            }
+            std::fs::write(&path, value.to_string()).unwrap();
+            assert!(
+                !omgs::proof::validate_proofs(&findings, &dir).is_empty(),
+                "{field} null={null}"
+            );
+            for args in [
+                vec!["validate", "--findings", findings_path.to_str().unwrap()],
+                vec!["prove", "--run", dir.to_str().unwrap(), "--replay", "1"],
+            ] {
+                let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(!out.status.success(), "{field} null={null}");
+                assert!(
+                    String::from_utf8_lossy(&out.stderr).contains("proof:"),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+    // A valid explicit none declaration cannot replace a contracted record.
+    // The saved config digest and reconstruction bind the contract to command.txt.
+    for mutation in ["none", "label", "nonce", "command", "legacy"] {
+        let mut value = original.clone();
+        match mutation {
+            "none" => value["contract"] = serde_json::json!({"kind":"none"}),
+            "label" => value["contract"]["expect_marker"] = "OTHER_BOUNDARY".into(),
+            "nonce" => value["marker_nonce"] = "b".repeat(64).into(),
+            "command" => value["command_sha256"] = "0".repeat(64).into(),
+            "legacy" => {
+                value["schema"] = "omgs-proof/1".into();
+                value.as_object_mut().unwrap().remove("contract");
+                value["expect_marker"] = "BOUNDARY_ASSERTION_FAILED".into();
+            }
+            _ => unreachable!(),
+        }
+        std::fs::write(&path, value.to_string()).unwrap();
+        assert!(
+            !omgs::proof::validate_proofs(&findings, &dir).is_empty(),
+            "{mutation}"
+        );
+        for args in [
+            vec!["validate", "--findings", findings_path.to_str().unwrap()],
+            vec!["prove", "--run", dir.to_str().unwrap(), "--replay", "1"],
+        ] {
+            let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(!out.status.success(), "{mutation}");
+            if mutation != "legacy" && mutation != "command" {
+                let error = String::from_utf8_lossy(&out.stderr);
+                assert!(error.contains("invalid"), "{mutation}: {error}");
+            }
+            if mutation == "legacy" {
+                let error = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    error.contains("predates the current policy")
+                        && error.contains("rerun omgs prove"),
+                    "{error}"
+                );
+            }
+        }
+    }
+    assert!(!dir.join("proofs/3").exists());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1762,6 +1896,7 @@ fn saved_configs_use_recorded_roots_full_env_and_a_closed_schema() {
         omgs::sandbox::wrapped_command(os, &command, &record.marker_nonce, record.test.as_deref());
     let allowed = proof_dir.join("markers/allowed");
     let config = omgs::sandbox::mxc_config(&omgs::sandbox::ConfigInput {
+        contract: None,
         os,
         containment: &record.containment,
         command: &wrapped,
@@ -2065,6 +2200,7 @@ fn windows_unc_proof_directories_match_writer_and_validator() {
         let scratch = std::path::PathBuf::from(format!("{prefix}\\scratch"));
         let config = omgs::sandbox::mxc_config_at(
             &omgs::sandbox::ConfigInput {
+                contract: None,
                 os: "windows",
                 containment: &record.containment,
                 command: &wrapped,

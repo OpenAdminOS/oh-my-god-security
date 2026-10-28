@@ -126,6 +126,7 @@ fn mxc_config_matches_verified_contract() {
     use omgs::sandbox::{declared_controls, mxc_config, tier2_unavailable, ConfigInput, Tier};
     use std::path::{Path, PathBuf};
     let input = |os: &'static str| ConfigInput {
+        contract: None,
         os,
         containment: "process",
         command: "cmd.exe /d /s /c echo hi",

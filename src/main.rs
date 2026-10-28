@@ -362,7 +362,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         None => flag(args, "--cmd").ok_or("prove requires --cmd <command>")?,
     };
     let expect_marker = match &replay {
-        Some(r) => r.expect_marker.clone(),
+        Some(r) => r.contract.expect_marker().map(String::from),
         None => flag(args, "--expect-marker"),
     };
     if expect_marker
@@ -698,9 +698,14 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         started_at_ms,
         duration_ms: s.duration_ms,
         exit_code: s.exit_code,
-        expect_marker,
-        boundary_marker_seen: s.boundary_marker_seen,
-        authorized_control_seen: s.authorized_control_seen,
+        contract: match expect_marker {
+            Some(expect_marker) => omgs::proof::Contract::Recipe {
+                expect_marker,
+                boundary_marker_seen: s.boundary_marker_seen,
+                authorized_control_seen: s.authorized_control_seen,
+            },
+            None => omgs::proof::Contract::None,
+        },
         timed_out: s.timed_out,
         capture_complete: s.capture_complete,
         cleanup_complete: s.cleanup_complete,
@@ -822,7 +827,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             reasons.push("run did not finish cleanly");
         }
         if !record.supports_verdict(rejected) {
-            reasons.push("proof requires assertion exit 1 or 3..=125; exit 2 is a harness or usage error; a declared contract requires exit 1, its boundary marker and AUTHORIZED_CONTROL_OK from full-stream capture");
+            reasons.push("proof requires assertion exit 1 or 3..=125; exit 2 is a harness or usage error; a declared contract requires exit 1, its nonce-qualified boundary and control markers from full-stream capture");
         }
         let tier_name = if record.tier == "test" {
             "test_proven"
@@ -841,8 +846,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     if let Some(orig) = &replay {
         let code = |c: Option<i32>| c.map(|c| c.to_string()).unwrap_or_else(|| "none".into());
         let same = record.exit_code == orig.exit_code
-            && record.boundary_marker_seen == orig.boundary_marker_seen
-            && record.authorized_control_seen == orig.authorized_control_seen
+            && record.contract == orig.contract
             && record.clean()
             && orig.clean();
         eprintln!(

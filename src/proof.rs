@@ -6,7 +6,7 @@ use crate::model::{FindingsFile, ProofTier};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA: &str = "omgs-proof/1";
+pub const SCHEMA: &str = "omgs-proof/2";
 pub const DIR: &str = "proofs";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,14 +63,8 @@ pub struct ProofRecord {
     pub started_at_ms: u64,
     pub duration_ms: u64,
     pub exit_code: Option<i32>,
-    /// Exact boundary-failure line declared by the verifier before execution.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expect_marker: Option<String>,
-    /// Scanned from the full streams before capping or redaction.
-    #[serde(default)]
-    pub boundary_marker_seen: bool,
-    #[serde(default)]
-    pub authorized_control_seen: bool,
+    /// Required even when no recipe contract was declared.
+    pub contract: Contract,
     pub timed_out: bool,
     pub capture_complete: bool,
     /// Every signal, reap and survivor scan succeeded.
@@ -124,21 +118,66 @@ impl ProofRecord {
     /// Exit 2 is a usage or harness error, never assertion evidence.
     /// A declared recipe contract additionally requires both full-stream markers.
     pub fn assertion_failure(&self) -> bool {
-        match &self.expect_marker {
-            Some(marker) => {
-                valid_expect_marker(marker)
+        match &self.contract {
+            Contract::Recipe {
+                expect_marker,
+                boundary_marker_seen,
+                authorized_control_seen,
+            } => {
+                valid_expect_marker(expect_marker)
                     && self.exit_code == Some(1)
-                    && self.boundary_marker_seen
-                    && self.authorized_control_seen
+                    && *boundary_marker_seen
+                    && *authorized_control_seen
             }
-            None => matches!(self.exit_code, Some(1 | 3..=125)),
+            Contract::None => matches!(self.exit_code, Some(1 | 3..=125)),
         }
     }
 
     pub fn supports_verdict(&self, rejected: bool) -> bool {
         self.assertion_failure()
-            || (self.expect_marker.is_none() && rejected && self.exit_code == Some(0))
+            || (self.contract.expect_marker().is_none() && rejected && self.exit_code == Some(0))
     }
+}
+
+/// Required discriminator and evidence. Missing and null fields are errors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Contract {
+    None,
+    Recipe {
+        expect_marker: String,
+        boundary_marker_seen: bool,
+        authorized_control_seen: bool,
+    },
+}
+
+impl Contract {
+    pub fn expect_marker(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Recipe { expect_marker, .. } => Some(expect_marker),
+        }
+    }
+
+    pub fn evidence(&self) -> (bool, bool) {
+        match self {
+            Self::None => (false, false),
+            Self::Recipe {
+                boundary_marker_seen,
+                authorized_control_seen,
+                ..
+            } => (*boundary_marker_seen, *authorized_control_seen),
+        }
+    }
+}
+
+/// Exact full-stream lines, scoped to this run and declared boundary label.
+pub fn boundary_marker(marker: &str, nonce: &str) -> String {
+    format!("OMGS_BOUNDARY_{nonce}_{marker}")
+}
+
+pub fn control_marker(nonce: &str) -> String {
+    format!("OMGS_CONTROL_{nonce}")
 }
 
 /// Contracts use one short ASCII line, distinct from runner and control markers.
@@ -331,7 +370,7 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
         // rejected one may rest on a control test that passes.
         if !record.supports_verdict(f.verdict == crate::model::Verdict::Rejected) {
             errors.push(format!(
-                "{at}: {r} exited {:?}; proof support requires assertion exit 1 or 3..=125 (exit 2 is a harness or usage error); a declared contract requires exit 1, its boundary marker and AUTHORIZED_CONTROL_OK from full-stream capture",
+                "{at}: {r} exited {:?}; proof support requires assertion exit 1 or 3..=125 (exit 2 is a harness or usage error); a declared contract requires exit 1, its nonce-qualified boundary and control markers from full-stream capture",
                 record.exit_code
             ));
         }
@@ -377,6 +416,13 @@ pub fn command_names(command: &str, test: &str) -> bool {
 /// defence against a process that runs as the user and forges every file.
 pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
     let mut errors = Vec::new();
+    if record
+        .contract
+        .expect_marker()
+        .is_some_and(|m| !valid_expect_marker(m))
+    {
+        errors.push("invalid boundary marker contract".into());
+    }
     if record.tier == "local_app" && record.containment != "bubblewrap" {
         errors.push("local_app records require bubblewrap containment on Linux".into());
     }
@@ -691,6 +737,10 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
     let expected = crate::sandbox::mxc_config_at(
         &crate::sandbox::ConfigInput {
             os,
+            contract: record
+                .contract
+                .expect_marker()
+                .map(|m| (m, record.marker_nonce.as_str())),
             containment: &record.containment,
             command: &wrapped,
             timeout_ms: record.timeout_ms,
