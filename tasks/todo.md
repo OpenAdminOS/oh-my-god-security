@@ -66,13 +66,13 @@ parent-owned full-diff reviews and PR creation are separate from this implementa
 
 ## PR 2: role briefs, stacks and packs (`feat/role-briefs-packs`)
 
-- [ ] `skill/agents/` briefs: red hunter, blue verifier, evaluator, green fixer
+- [x] `skill/agents/` briefs: red hunter, blue verifier, evaluator, green fixer
 - [x] Proof by default with per-stack recipes
 - [x] Windows toolchains reachable inside MXC: replace the batch-expanded `%t` lookup loop with actual version launches, supply a safe PATHEXT and disable Rust auto-install. The Windows 11 mini PC reports cargo, node and pwsh reachable in its interactive desktop session; real proofs launch all three. SSH session 0 DLL initialization remains an explicit runtime blocker.
 - [x] Supervisor drain flake: Darwin pipe creation had a pipe()/fcntl(CLOEXEC) inheritance window across concurrent spawns. Capture uses atomically close-on-exec FIFO opens and executor children seal non-stdio descriptors. The 2 s drain bound is unchanged; deliberate inheritance and 192 interleaved supervisor calls pass.
-- [ ] Shared path classifier; shell and browser-extension stacks; monorepo detection
-- [ ] Packs: identity binding, fail-closed semantics
-- [ ] Persona modes; host-provided accounting
+- [x] Shared path classifier; shell and browser-extension stacks; monorepo detection
+- [x] Packs: identity binding, fail-closed semantics
+- [x] Persona modes; host-provided accounting
 
 ## PR 3: output people can trust and act on (`feat/report-handoff`)
 

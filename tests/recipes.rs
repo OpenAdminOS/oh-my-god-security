@@ -129,6 +129,7 @@ fn check(recipe: Recipe) -> bool {
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&d);
+    omgs::platform::create_private_dir(&d).unwrap();
     let target = d.join("target");
     std::fs::create_dir_all(&target).unwrap();
     let home = d.join("home");

@@ -4,6 +4,9 @@ use crate::model::{Finding, FindingsFile, Location, Verdict};
 
 #[derive(Default)]
 pub struct ReportMeta {
+    pub accounting: crate::accounting::Accounting,
+    pub persona: String,
+    pub report_depth: String,
     pub repo: String,
     pub source_ref: String,
     pub mode: String,
@@ -101,7 +104,10 @@ fn run_meta_text(meta: &ReportMeta) -> String {
         .agent_calls
         .map(|n| n.to_string())
         .unwrap_or_else(|| "not recorded".into());
-    format!("hunters {hunters}, verifier {verifier}, agent calls {agent_calls}")
+    format!("hunters {hunters}, verifier {verifier}, agent calls {agent_calls}. Persona {}, report depth {}. Accounting: {}",
+        if meta.persona.is_empty() { "unknown" } else { &meta.persona },
+        if meta.report_depth.is_empty() { "full" } else { &meta.report_depth },
+        crate::accounting::lines(&meta.accounting).join("; "))
 }
 
 fn confirmed(file: &FindingsFile) -> Vec<&crate::model::Finding> {
@@ -922,7 +928,7 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
         &render_cards(&rejected, "No candidates were rejected in this run.", meta),
     );
 
-    let coverage_body = if meta.coverage.is_empty() {
+    let mut coverage_body = if meta.coverage.is_empty() {
         "<p class=\"empty\">No coverage ledger was supplied for this report.</p>".to_string()
     } else {
         let mut items = String::from("<ul class=\"coverage\">");
@@ -932,6 +938,10 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
         items.push_str("</ul>");
         items
     };
+    if meta.report_depth == "concise" {
+        coverage_body =
+            format!("<details><summary>Coverage details</summary>{coverage_body}</details>");
+    }
     let critic_body = match &meta.critic {
         None => "<p class=\"note\">Coverage critic: not run for this report.</p>".to_string(),
         Some(c) if c.passed() => format!(

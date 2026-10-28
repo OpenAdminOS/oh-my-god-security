@@ -6,10 +6,26 @@ use omgs::model::{validate, Finding, FindingsFile, Location, ProofTier, Verdict}
 use omgs::report::{render_html, render_markdown, ReportMeta};
 use std::path::Path;
 
+// Valid storage fixtures must have the same owner and ACL as runtime files,
+// including when the Windows test process has an elevated token.
+fn write_private_fixture(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    omgs::runmeta::write_atomic_bytes(path.as_ref(), bytes.as_ref())
+}
+
 fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("omgs-orch-{}-{name}", std::process::id()));
+    static BASE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(|| {
+        let base =
+            std::env::temp_dir().join(format!("omgs-private-fixtures-{}", std::process::id()));
+        omgs::platform::create_private_tree(&base).unwrap();
+        base
+    });
+    let dir = base.join(format!("omgs-orch-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    omgs::platform::private_dir(&dir).unwrap();
     dir
 }
 
@@ -121,12 +137,12 @@ fn batch_summary_reads_a_run_directory() {
     let run = index.join("github.com__a__b");
     std::fs::create_dir_all(&run).unwrap();
     std::fs::write(run.join("findings.json"), r#"{"findings": []}"#).unwrap();
-    std::fs::write(
+    write_private_fixture(
         run.join("run-metadata.json"),
         r#"{"run_status":"complete","agent_calls_used":12,"reroutes":[{"role":"hunter","from":"m1","to":"m2","reason":"declined"}],"blockers":["route exhausted"]}"#,
     )
     .unwrap();
-    std::fs::write(
+    write_private_fixture(
         run.join("coverage-ledger.json"),
         r#"{"units":[{"id":"u1","surface":".","attack_classes":[],"status":"blocked","note":"no db"}]}"#,
     )
@@ -228,7 +244,7 @@ fn status_updates_stages_children_counters_and_log() {
 fn watch_routes_and_host_rules() {
     use omgs::watch::respond;
     let dir = scratch("watch");
-    std::fs::write(
+    write_private_fixture(
         dir.join("pipeline-status.json"),
         r#"{"stages":[],"updated_ms":5}"#,
     )
@@ -286,7 +302,7 @@ fn watch_routes_and_host_rules() {
 fn watch_serves_loopback_and_stops_when_the_run_completes() {
     use std::io::{Read, Write};
     let dir = scratch("watch-live");
-    std::fs::write(
+    write_private_fixture(
         dir.join("run-metadata.json"),
         r#"{"run_status":"in_progress"}"#,
     )
@@ -309,7 +325,7 @@ fn watch_serves_loopback_and_stops_when_the_run_completes() {
     assert!(resp.contains("Cache-Control: no-store"));
     assert!(resp.contains("X-Content-Type-Options: nosniff"));
     assert!(resp.ends_with(r#"{"stages":[],"updated_ms":0}"#));
-    std::fs::write(
+    write_private_fixture(
         dir.join("run-metadata.json"),
         r#"{"run_status":"complete"}"#,
     )
@@ -326,7 +342,7 @@ fn watch_serves_loopback_and_stops_when_the_run_completes() {
 #[test]
 fn route_follows_fallbacks_and_records_reroutes() {
     let dir = scratch("route");
-    std::fs::write(
+    write_private_fixture(
         dir.join("run-metadata.json"),
         r#"{"run_status":"in_progress"}"#,
     )
@@ -503,6 +519,9 @@ fn intent_ids_validate_group_and_show_answers() {
     )
     .is_err());
     let meta = ReportMeta {
+        accounting: Default::default(),
+        persona: String::new(),
+        report_depth: String::new(),
         intent_answers: answers,
         ..ReportMeta::default()
     };
@@ -550,7 +569,7 @@ fn answer_scopes_match_path_prefixes_only_at_boundaries() {
 fn report_marks_the_run_complete_and_records_metadata() {
     let dir = scratch("complete");
     std::fs::write(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
-    std::fs::write(
+    write_private_fixture(
         dir.join("run-metadata.json"),
         r#"{"run_status":"in_progress","models":{"hunter":"model-a"},"reroutes":[{"role":"hunter","from":"model-z","to":"model-a","reason":"declined"}]}"#,
     )
@@ -627,7 +646,7 @@ fn batch_file_requires_runs() {
 #[test]
 fn concurrent_route_and_status_updates_are_not_lost() {
     let dir = scratch("concurrent");
-    std::fs::write(
+    write_private_fixture(
         dir.join("run-metadata.json"),
         r#"{"run_status":"in_progress"}"#,
     )
@@ -698,7 +717,7 @@ fn status_log_timestamps_are_strings_per_schema() {
 fn a_trickling_client_cannot_hold_the_watch_server() {
     use std::io::Write;
     let dir = scratch("slow");
-    std::fs::write(
+    write_private_fixture(
         dir.join("run-metadata.json"),
         r#"{"run_status":"in_progress"}"#,
     )
@@ -806,7 +825,7 @@ fn answers_files_are_strict_and_bound_to_the_run_target() {
         r#"{"target":"/somewhere/else","answers":[{"id":"web.public-resource","answer":"public","scope":"repo","source":"o","recorded_unix":1}]}"#,
     )
     .unwrap();
-    std::fs::write(
+    write_private_fixture(
         dir.join("run-metadata.json"),
         r#"{"target":"/this/target"}"#,
     )
@@ -955,7 +974,7 @@ fn batch_index_follows_symlinks_before_dotdot() {
 #[test]
 fn a_slow_response_reader_cannot_hold_the_watch_server() {
     let dir = scratch("slow-reader");
-    std::fs::write(
+    write_private_fixture(
         dir.join("run-metadata.json"),
         r#"{"run_status":"in_progress"}"#,
     )
@@ -964,7 +983,7 @@ fn a_slow_response_reader_cannot_hold_the_watch_server() {
         r#"{{"stages":[],"updated_ms":1,"pad":"{}"}}"#,
         "x".repeat(900_000)
     );
-    std::fs::write(dir.join("pipeline-status.json"), big).unwrap();
+    write_private_fixture(dir.join("pipeline-status.json"), big).unwrap();
     let (listener, port) = omgs::watch::bind().unwrap();
     let d = dir.clone();
     let start = std::time::Instant::now();
@@ -1017,7 +1036,7 @@ fn concurrent_intent_answers_and_ledger_updates_are_not_lost() {
         );
     }
     let ledger = dir.join("coverage-ledger.json");
-    std::fs::write(&ledger, r#"{"units": []}"#).unwrap();
+    write_private_fixture(&ledger, r#"{"units": []}"#).unwrap();
     for i in 0..20 {
         kids.push(
             std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
@@ -1049,7 +1068,7 @@ fn malformed_routing_history_stops_route() {
         r#"{"reroutes":[{"role":"hunter"}]}"#,
         r#"{"models":[]}"#,
     ] {
-        std::fs::write(dir.join("run-metadata.json"), bad).unwrap();
+        write_private_fixture(dir.join("run-metadata.json"), bad).unwrap();
         let out = omgs(&[
             "route",
             "--run",
@@ -1099,7 +1118,7 @@ fn configs_reject_positional_and_duplicate_forms() {
 #[test]
 fn status_keeps_an_unreadable_file() {
     let dir = scratch("status-unreadable");
-    std::fs::write(dir.join("pipeline-status.json"), [0xff, 0xfe, 0x00]).unwrap();
+    write_private_fixture(dir.join("pipeline-status.json"), [0xff, 0xfe, 0x00]).unwrap();
     let r = omgs::status::apply(
         &dir,
         &omgs::status::Update {
@@ -1297,7 +1316,7 @@ fn duplicate_keys_in_run_metadata_and_batch_files_are_errors() {
     let models = dir.join("models.json");
     std::fs::write(&models, r#"{"roles":{"hunter":["m1","m2"]}}"#).unwrap();
     let bad = r#"{"reroutes":[{"role":"hunter","from":"m1"}],"reroutes":[]}"#;
-    std::fs::write(dir.join("run-metadata.json"), bad).unwrap();
+    write_private_fixture(dir.join("run-metadata.json"), bad).unwrap();
     let out = omgs(&[
         "route",
         "--run",
@@ -1315,7 +1334,7 @@ fn duplicate_keys_in_run_metadata_and_batch_files_are_errors() {
     assert!(
         omgs::batch::parse_batch(r#"{"runs":[{"url":"u","status":"failed"}],"runs":[]}"#).is_err()
     );
-    std::fs::write(
+    write_private_fixture(
         dir.join("pipeline-status.json"),
         r#"{"stages":[],"stages":[]}"#,
     )
@@ -1372,7 +1391,7 @@ fn batch_index_fails_on_malformed_run_metadata() {
     let run = index.join("r");
     std::fs::create_dir_all(&run).unwrap();
     std::fs::write(run.join("findings.json"), r#"{"findings": []}"#).unwrap();
-    std::fs::write(
+    write_private_fixture(
         run.join("run-metadata.json"),
         r#"{"blockers":["x"],"blockers":[]}"#,
     )
@@ -1406,7 +1425,7 @@ fn batch_index_rejects_wrong_metadata_types() {
         r#"{"agent_calls_used":"12"}"#,
         r#"{"run_status":1}"#,
     ] {
-        std::fs::write(run.join("run-metadata.json"), bad).unwrap();
+        write_private_fixture(run.join("run-metadata.json"), bad).unwrap();
         assert!(summarize(&r, &index).is_err(), "{bad}");
     }
     let _ = std::fs::remove_dir_all(&index);
@@ -1456,7 +1475,7 @@ fn report_rejects_malformed_routing_metadata() {
         r#"{"models": {"hunter": 42}}"#,
         r#"{"reroutes": [{"role": "hunter", "from": 3}]}"#,
     ] {
-        std::fs::write(dir.join("run-metadata.json"), bad).unwrap();
+        write_private_fixture(dir.join("run-metadata.json"), bad).unwrap();
         let out = omgs(&[
             "report",
             "--findings",
@@ -1483,7 +1502,7 @@ fn status_refuses_a_malformed_document_without_rewriting_it() {
         r#"{"log":[false]}"#,
         r#"{"updated_ms":"now"}"#,
     ] {
-        std::fs::write(dir.join("pipeline-status.json"), bad).unwrap();
+        write_private_fixture(dir.join("pipeline-status.json"), bad).unwrap();
         let r = omgs::status::apply(
             &dir,
             &omgs::status::Update {
@@ -1561,7 +1580,7 @@ fn route_rejects_wrong_value_types_without_writing() {
         r#"{"reroutes":[{"role":"hunter","from":"m0","to":5}]}"#,
         r#"{"reroutes":[{"role":"hunter","from":"m0","reason":false}]}"#,
     ] {
-        std::fs::write(dir.join("run-metadata.json"), bad).unwrap();
+        write_private_fixture(dir.join("run-metadata.json"), bad).unwrap();
         let out = omgs(&[
             "route",
             "--run",
@@ -1583,7 +1602,7 @@ fn route_rejects_wrong_value_types_without_writing() {
 #[test]
 fn status_accepts_schema_minimal_log_entries() {
     let dir = scratch("status-minimal-log");
-    std::fs::write(
+    write_private_fixture(
         dir.join("pipeline-status.json"),
         r#"{"stages":[],"updated_ms":1,"log":[{"m":"mapping started"}]}"#,
     )
@@ -1834,6 +1853,9 @@ fn markdown_shows_intent_answers_for_every_verdict() {
         findings: vec![confirmed, rejected],
     };
     let meta = ReportMeta {
+        accounting: Default::default(),
+        persona: String::new(),
+        report_depth: String::new(),
         intent_answers: omgs::intent::Answers {
             target: "/x".into(),
             answers: vec![omgs::intent::Answer {
@@ -1900,4 +1922,71 @@ fn audit_init_accepts_hunter_and_verifier_metadata() {
     assert_eq!(meta["hunter"], "hunter-1");
     assert_eq!(meta["verifier"], "verifier-1");
     std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn default_storage_refusal_names_path_permissions_and_migration() {
+    let dir = scratch("default-storage-refusal");
+    let target = dir.join("app");
+    std::fs::create_dir(&target).unwrap();
+    let store = dir.join("store");
+    omgs::platform::create_private_dir(&store).unwrap();
+    let base = store.join("app");
+    omgs::platform::create_private_dir(&base).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let result = std::process::Command::new("icacls")
+            .arg(&base)
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)(W)"])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", &store)
+        .args([
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--no-sensors",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains(base.to_str().unwrap()), "{error}");
+    assert!(error.contains("README.md#storage-migration"), "{error}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        assert!(
+            error.contains(&format!(
+                "owner uid {}",
+                std::fs::metadata(&base).unwrap().uid()
+            )),
+            "{error}"
+        );
+        assert!(error.contains("mode 0755"), "{error}");
+        assert_eq!(
+            std::fs::metadata(&base).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+    }
+    #[cfg(windows)]
+    {
+        assert!(error.contains("owner and DACL:"), "{error}");
+        assert!(omgs::platform::check_private_dir(&base).is_err());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
