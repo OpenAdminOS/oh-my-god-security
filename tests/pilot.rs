@@ -494,3 +494,116 @@ fn guidance_preserves_probe_and_artifact_rules() {
         assert!(guide.contains(phrase), "missing {phrase}");
     }
 }
+
+#[test]
+fn unresolved_evaluator_leads_keep_delivery_partial() {
+    let f = Fixture::new();
+    let source = read(f.run.join("run-metadata.json"))["source_ref"].clone();
+    let mut ledger = read(f.run.join("coverage-ledger.json"));
+    for u in ledger["units"].as_array_mut().unwrap() {
+        u["status"] = "covered".into();
+        u["evidence"] = json!(["sample.ps1"]);
+    }
+    ledger["units"].as_array_mut().unwrap().push(json!({"id":"late-lead","surface":"sample.ps1","attack_classes":[],"status":"blocked","note":"provider block"}));
+    f.put("coverage-ledger.json", ledger.clone());
+    f.put("candidates-empty.json", json!({"candidates":[]}));
+    f.put("evaluation.json",json!({"evaluator":"independent","source_ref":source,"decisions":[],"gaps":[],"leads":[{"unit_id":"late-lead","reason":"new boundary"}]}));
+    for status in ["blocked", "deferred"] {
+        ledger["units"].as_array_mut().unwrap().last_mut().unwrap()["status"] = status.into();
+        f.put("coverage-ledger.json", ledger.clone());
+        let critic = omgs::critic::critique_run(&f.run).unwrap();
+        assert!(critic
+            .gaps
+            .iter()
+            .any(|g| g.contains(&format!("late-lead remains {status}"))));
+        let out = f.cli(&[
+            "report",
+            "--findings",
+            f.run.join("findings.json").to_str().unwrap(),
+            "--out",
+            f.run_str(),
+        ]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            read(f.run.join("run-metadata.json"))["run_status"],
+            "partial"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn report_cannot_restore_allowance_after_concurrent_call_charge() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = Fixture::new();
+    assert!(f
+        .cli(&["budget", "--run", f.run_str(), "--charge-calls", "5"])
+        .status
+        .success());
+    std::fs::remove_file(f.run.join("coverage-ledger.json")).unwrap();
+    let evaluation = f.run.join("evaluation.json");
+    let name = std::ffi::CString::new(evaluation.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", f.root.join("state"))
+        .args([
+            "report",
+            "--findings",
+            f.run.join("findings.json").to_str().unwrap(),
+            "--out",
+            f.run_str(),
+            "--agent-calls",
+            "5",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The report opens evaluation after publishing its initial counters.
+    // A nonblocking writer can connect only once the reader reaches that point.
+    let start = std::time::Instant::now();
+    let mut writer = loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&evaluation)
+        {
+            Ok(writer) => break writer,
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                if start.elapsed().as_secs() > 10 || child.try_wait().unwrap().is_some() {
+                    let _ = child.kill();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "report never reached the coordination point: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    omgs::budget::charge_calls(&f.run, 1).unwrap();
+    let source = read(f.run.join("run-metadata.json"))["source_ref"].clone();
+    let data = json!({"evaluator":"independent","source_ref":source,"decisions":[],"gaps":[]});
+    // Replace the pathname while the report holds its original FIFO reader.
+    // Its later consistency read sees a regular file with identical contents.
+    f.put("evaluation.json", data.clone());
+    writer.write_all(data.to_string().as_bytes()).unwrap();
+    drop(writer);
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read(f.run.join("run-metadata.json"))["agent_calls_used"], 6);
+    assert!(omgs::budget::summary(&f.run)
+        .unwrap()
+        .contains("6 used of 12; 6 remaining"));
+}

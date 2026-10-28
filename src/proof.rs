@@ -845,13 +845,21 @@ pub fn tree_digest(root: &Path) -> std::io::Result<String> {
 /// The checkout's commit, read from `.git` as data. Git itself is never run
 /// against the target, since repository config can execute programs.
 pub fn git_head(target: &Path) -> Option<String> {
+    // Repository metadata is source input, not private proof evidence. Git can
+    // create normally shared read ACLs on Windows. Keep bounded no-follow reads
+    // without requiring those source files to have the run store's private ACL.
+    let source_text = |dir: &Path, relative: &Path, limit| {
+        crate::platform::read_bounded_in(dir, relative, limit)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    };
     let mut git = target.join(".git");
     if git.is_file() {
-        let text = read_text(&git, 1 << 20).ok()?;
+        let text = source_text(target, Path::new(".git"), 1 << 20)?;
         let p = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
         git = if p.is_absolute() { p } else { target.join(p) };
     }
-    let head = read_text(&git.join("HEAD"), 1 << 20).ok()?;
+    let head = source_text(&git, Path::new("HEAD"), 1 << 20)?;
     let head = head.trim();
     let Some(reference) = head.strip_prefix("ref:").map(str::trim) else {
         return is_hex40(head).then(|| head.to_string());
@@ -860,18 +868,17 @@ pub fn git_head(target: &Path) -> Option<String> {
         return None;
     }
     // Linked worktrees keep branch refs in the common dir.
-    let common = read_text(&git.join("commondir"), 1 << 20)
-        .ok()
+    let common = source_text(&git, Path::new("commondir"), 1 << 20)
         .map(|c| git.join(c.trim()))
         .unwrap_or_else(|| git.clone());
     for dir in [&git, &common] {
-        if let Ok(v) = read_text(&dir.join(reference), 1 << 20) {
+        if let Some(v) = source_text(dir, Path::new(reference), 1 << 20) {
             let v = v.trim();
             if is_hex40(v) {
                 return Some(v.to_string());
             }
         }
-        if let Ok(packed) = read_text(&dir.join("packed-refs"), 16 << 20) {
+        if let Some(packed) = source_text(dir, Path::new("packed-refs"), 16 << 20) {
             for line in packed.lines() {
                 if let Some((sha, name)) = line.split_once(' ') {
                     if name == reference && is_hex40(sha) {

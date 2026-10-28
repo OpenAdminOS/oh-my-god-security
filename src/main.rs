@@ -1470,14 +1470,18 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             (!verifier_ids.is_empty())
                 .then(|| verifier_ids.into_iter().collect::<Vec<_>>().join(", "))
         });
-    let agent_calls = flag(args, "--agent-calls")
-        .and_then(|s| s.parse::<u32>().ok())
-        .or_else(|| {
-            saved
-                .get("agent_calls_used")
-                .and_then(|v| v.as_u64())
-                .and_then(|n| u32::try_from(n).ok())
-        });
+    let explicit_agent_calls = flag(args, "--agent-calls")
+        .map(|n| {
+            n.parse::<u32>()
+                .map_err(|_| "--agent-calls needs a non-negative integer")
+        })
+        .transpose()?;
+    let agent_calls = explicit_agent_calls.or_else(|| {
+        saved
+            .get("agent_calls_used")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+    });
     if hunters.is_none() || verifier.is_none() || agent_calls.is_none() {
         eprintln!(
             "warning: run metadata incomplete; pass --hunters <n>, --verifier <id>, and --agent-calls <n>. Unrecorded values render as \"not recorded\"."
@@ -1489,7 +1493,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         .filter(|d| d.join(omgs::runmeta::FILE).is_file())
     {
         omgs::runmeta::update(run, |m| {
-            if let Some(n) = agent_calls {
+            if let Some(n) = explicit_agent_calls {
                 let old = m
                     .get("agent_calls_used")
                     .and_then(|v| v.as_u64())
@@ -1620,9 +1624,6 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             }
             if let Some(v) = &meta.verifier {
                 m.insert("verifier".into(), serde_json::json!(v));
-            }
-            if let Some(n) = meta.agent_calls {
-                m.insert("agent_calls_used".into(), serde_json::json!(n));
             }
             let mut usage = omgs::accounting::read(m)?;
             usage.extend(supplied_usage.clone());

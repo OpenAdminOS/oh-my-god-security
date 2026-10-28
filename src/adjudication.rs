@@ -123,6 +123,9 @@ pub fn dispositions(text: &str) -> Result<Dispositions, String> {
                 "unit ids must be unique and dispositions must use documented values".into(),
             );
         }
+        if u.evidence.iter().any(|e| e.trim().is_empty()) {
+            return Err("disposition evidence entries must not be blank".into());
+        }
         if ["candidate", "covered"].contains(&u.disposition.as_str())
             && u.evidence.iter().all(|s| s.trim().is_empty())
         {
@@ -136,38 +139,15 @@ pub fn dispositions(text: &str) -> Result<Dispositions, String> {
 }
 pub fn candidates(text: &str) -> Result<crate::critic::CandidatesFile, String> {
     let c = crate::shape::candidates(text)?;
-    let units = c
+    let errors: Vec<_> = c
         .candidates
         .iter()
-        .flat_map(|c| c.unit_ids.iter())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|id| {
-            let mut u = crate::ledger::Unit::new(id, ".", &[], "covered");
-            u.evidence.push("synthetic-validation-context".into());
-            u
+        .enumerate()
+        .flat_map(|(i, candidate)| {
+            crate::critic::validate_candidate(candidate)
+                .into_iter()
+                .map(move |e| format!("candidates[{i}]: {e}"))
         })
-        .collect();
-    let report = crate::critic::critique(
-        &crate::ledger::Ledger {
-            units,
-            ..Default::default()
-        },
-        1,
-        &c.candidates
-            .iter()
-            .cloned()
-            .map(|candidate| crate::critic::SourcedCandidate {
-                file: "input".into(),
-                candidate,
-            })
-            .collect::<Vec<_>>(),
-        &FindingsFile::default(),
-    );
-    let errors: Vec<_> = report
-        .gaps
-        .into_iter()
-        .filter(|g| !g.contains("was never verified"))
         .collect();
     if errors.is_empty() {
         Ok(c)
@@ -175,6 +155,7 @@ pub fn candidates(text: &str) -> Result<crate::critic::CandidatesFile, String> {
         Err(errors.join("; "))
     }
 }
+
 pub fn load(run: &Path) -> Result<Option<Evaluation>, String> {
     let path = run.join("evaluation.json");
     match std::fs::read_to_string(&path) {
@@ -271,7 +252,14 @@ pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String>
                 .map_err(|e| e.to_string())?,
         )?;
         for lead in &e.leads {
-            if !ledger.units.iter().any(|u| u.id == lead.unit_id) {
+            if let Some(unit) = ledger.units.iter().find(|u| u.id == lead.unit_id) {
+                if !["covered", "out_of_scope"].contains(&unit.status.as_str()) {
+                    gaps.push(format!(
+                        "evaluator lead {} remains {}; partial handoff only",
+                        lead.unit_id, unit.status
+                    ));
+                }
+            } else {
                 gaps.push(format!(
                     "evaluator lead {} has no ledger disposition",
                     lead.unit_id

@@ -434,9 +434,11 @@ fn adjudicate_fixture(dir: &std::path::Path, findings: &FindingsFile) {
             fn relocate(v: &mut serde_json::Value, old: &str, new: &str) {
                 match v {
                     serde_json::Value::String(s) => {
-                        *s = s
-                            .replace(old, new)
-                            .replace(&old.replace('\\', "/"), &new.replace('\\', "/"));
+                        *s = if s.contains(old) {
+                            s.replace(old, new)
+                        } else {
+                            s.replace(&old.replace('\\', "/"), &new.replace('\\', "/"))
+                        };
                     }
                     serde_json::Value::Array(a) => {
                         for v in a {
@@ -3532,4 +3534,62 @@ fn stage_includes_only_validated_confirmed_proofs_and_reports_exclusions() {
     assert_eq!(omgs::proof::tree_digest(&target).unwrap(), snapshot);
     std::fs::remove_dir_all(dir).unwrap();
     std::fs::remove_dir_all(target).unwrap();
+}
+
+#[test]
+fn candidate_content_cannot_hide_its_validation_errors() {
+    let mut candidate = candidate_json(&filled());
+    candidate["title"] = "was never verified".into();
+    candidate["fingerprint"] = "invalid".into();
+    candidate["trace"] = "".into();
+    candidate["unit_ids"] = serde_json::json!([]);
+    let error =
+        omgs::adjudication::candidates(&serde_json::json!({"candidates":[candidate]}).to_string())
+            .unwrap_err();
+    for expected in ["fingerprint", "trace is empty", "names no ledger unit"] {
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn evaluator_cannot_judge_an_absorbed_hunters_candidate() {
+    let dir = scratch("merged-evaluator");
+    let (ledger, mut candidates, mut findings) = complete_run();
+    let mut absorbed = candidates[0].clone();
+    absorbed.candidate.hunter = "red-merged".into();
+    absorbed.candidate.entry_point = "POST /other".into();
+    absorbed.candidate.fingerprint = omgs::fingerprint(
+        &absorbed.candidate.attack_class,
+        &absorbed.candidate.entry_point,
+        &absorbed.candidate.sink,
+        &absorbed.candidate.boundary,
+    );
+    findings.findings[0]
+        .candidates
+        .push(absorbed.candidate.fingerprint.clone());
+    candidates.push(absorbed);
+    let findings = attest(&dir, findings);
+    write_private_fixture(
+        dir.join("findings.json"),
+        serde_json::to_string(&findings).unwrap(),
+    )
+    .unwrap();
+    write_private_fixture(
+        dir.join("coverage-ledger.json"),
+        serde_json::to_string(&ledger).unwrap(),
+    )
+    .unwrap();
+    write_private_fixture(dir.join("candidates-merged.json"), serde_json::json!({"candidates":candidates.iter().map(|c| candidate_json(&c.candidate)).collect::<Vec<_>>()} ).to_string()).unwrap();
+    adjudicate_fixture(&dir, &findings);
+    let path = dir.join("evaluation.json");
+    let mut e: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    e["evaluator"] = "red-merged".into();
+    write_private_fixture(path, e.to_string()).unwrap();
+    assert!(omgs::critic::critique_run(&dir)
+        .unwrap()
+        .gaps
+        .iter()
+        .any(|g| g.contains("evaluator hunted absorbed candidate")));
+    std::fs::remove_dir_all(dir).unwrap();
 }

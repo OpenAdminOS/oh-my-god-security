@@ -89,6 +89,52 @@ impl CriticReport {
     }
 }
 
+/// Validate candidate fields without filtering target-derived diagnostics.
+pub fn validate_candidate(c: &Candidate) -> Vec<String> {
+    let mut errors = Vec::new();
+    let expected = crate::fingerprint(&c.attack_class, &c.entry_point, &c.sink, &c.boundary);
+    for (name, value) in [
+        ("source_ref", &c.source_ref),
+        ("title", &c.title),
+        ("attack_class", &c.attack_class),
+        ("entry_point", &c.entry_point),
+        ("sink", &c.sink),
+        ("boundary", &c.boundary),
+        ("location.path", &c.location.path),
+        ("attacker_capability", &c.attacker_capability),
+        ("trace", &c.trace),
+        ("concrete_result", &c.concrete_result),
+        ("counterevidence", &c.counterevidence),
+        ("proof_plan", &c.proof_plan),
+    ] {
+        if value.trim().is_empty() {
+            errors.push(format!("{name} is empty"));
+        }
+    }
+    if c.location.line == Some(0) {
+        errors.push("location.line must be one-based".into());
+    }
+    if !is_fingerprint(&c.fingerprint) {
+        errors.push(format!(
+            "fingerprint '{}' is not an omgs fingerprint",
+            c.fingerprint
+        ));
+    }
+    if c.fingerprint != expected {
+        errors.push(format!(
+            "fingerprint {} does not match computed identity {expected}",
+            c.fingerprint
+        ));
+    }
+    if identity(&Some(c.hunter.clone())).is_none() {
+        errors.push("hunter is not recorded".into());
+    }
+    if c.unit_ids.is_empty() {
+        errors.push("names no ledger unit".into());
+    }
+    errors
+}
+
 /// Reconcile one run. `candidate_files` counts the candidates files found,
 /// so a run where no hunter wrote anything is reported as a gap.
 pub fn critique(
@@ -129,49 +175,15 @@ pub fn critique(
     for sc in candidates {
         let c = &sc.candidate;
         let at = format!("{} candidate '{}'", sc.file, c.title);
-        let expected = crate::fingerprint(&c.attack_class, &c.entry_point, &c.sink, &c.boundary);
-        for (name, value) in [
-            ("source_ref", &c.source_ref),
-            ("title", &c.title),
-            ("attack_class", &c.attack_class),
-            ("entry_point", &c.entry_point),
-            ("sink", &c.sink),
-            ("boundary", &c.boundary),
-            ("location.path", &c.location.path),
-            ("attacker_capability", &c.attacker_capability),
-            ("trace", &c.trace),
-            ("concrete_result", &c.concrete_result),
-            ("counterevidence", &c.counterevidence),
-            ("proof_plan", &c.proof_plan),
-        ] {
-            if value.trim().is_empty() {
-                gaps.push(format!("{at}: {name} is empty"));
-            }
-        }
-        if c.location.line == Some(0) {
-            gaps.push(format!("{at}: location.line must be one-based"));
-        }
-        if !is_fingerprint(&c.fingerprint) {
-            gaps.push(format!(
-                "{at}: fingerprint '{}' is not an omgs fingerprint",
-                c.fingerprint
-            ));
-            continue;
-        }
-        if c.fingerprint != expected {
-            gaps.push(format!(
-                "{at}: fingerprint {} does not match computed identity {expected}",
-                c.fingerprint
-            ));
-        }
-        match identity(&Some(c.hunter.clone())) {
-            Some(h) => {
+        gaps.extend(
+            validate_candidate(c)
+                .into_iter()
+                .map(|e| format!("{at}: {e}")),
+        );
+        if is_fingerprint(&c.fingerprint) {
+            if let Some(h) = identity(&Some(c.hunter.clone())) {
                 hunters.entry(c.fingerprint.as_str()).or_default().insert(h);
             }
-            None => gaps.push(format!("{at}: hunter is not recorded")),
-        }
-        if c.unit_ids.is_empty() {
-            gaps.push(format!("{at}: names no ledger unit"));
         }
         for id in &c.unit_ids {
             if !unit_ids.contains(id.as_str()) {
@@ -330,5 +342,28 @@ pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport,
     report
         .gaps
         .extend(crate::adjudication::check(dir, findings)?);
+    if let Some(evaluation) = crate::adjudication::load(dir)? {
+        for decision in &evaluation.decisions {
+            if let Some(f) = findings
+                .findings
+                .iter()
+                .find(|f| f.fingerprint == decision.fingerprint)
+            {
+                for candidate in candidates.iter().filter(|c| {
+                    c.candidate.fingerprint == f.fingerprint
+                        || f.candidates.contains(&c.candidate.fingerprint)
+                }) {
+                    if candidate
+                        .candidate
+                        .hunter
+                        .trim()
+                        .eq_ignore_ascii_case(evaluation.evaluator.trim())
+                    {
+                        report.gaps.push(format!("{}: evaluator hunted absorbed candidate {}; independent adjudication required", f.fingerprint, candidate.candidate.fingerprint));
+                    }
+                }
+            }
+        }
+    }
     Ok(report)
 }
