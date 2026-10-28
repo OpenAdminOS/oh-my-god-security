@@ -1,6 +1,12 @@
 use omgs::supervise::{run, Limits};
 use std::process::Command;
 
+// A successful global survivor scan requires a quiescent process population.
+// Keep the single real sweep fixture apart from deliberate spawn stress in
+// sibling tests. Internal concurrency and all sweep assertions stay intact.
+#[cfg(target_os = "macos")]
+static PROCESS_ACTIVITY: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 fn limits() -> Limits {
     Limits {
         wall_ms: 5000,
@@ -15,6 +21,8 @@ fn limits() -> Limits {
 
 #[test]
 fn spawn_failure_is_reported() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     let result = run(Command::new("/omgs/nonexistent/executor"), &limits(), None);
     assert!(!result.success);
     assert!(!result.capture_complete);
@@ -62,6 +70,8 @@ fn output_pid(result: &omgs::supervise::Supervised) -> i32 {
 #[cfg(unix)]
 #[test]
 fn rlimits_are_inherited() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     let mut limits = limits();
     limits.open_files = Some(64);
     limits.file_size_bytes = Some(1024 * 1024);
@@ -85,6 +95,8 @@ fn rlimits_are_inherited() {
 #[cfg(unix)]
 #[test]
 fn invalid_rlimit_fails_without_panicking() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     let mut limits = limits();
     limits.open_files = Some(u64::MAX);
     let result = run(shell("exit 0"), &limits, None);
@@ -95,6 +107,8 @@ fn invalid_rlimit_fails_without_panicking() {
 #[cfg(unix)]
 #[test]
 fn timeout_kills_background_tree() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     let mut limits = limits();
     limits.wall_ms = 500;
     let result = run(shell("sleep 30 & echo $!; wait"), &limits, None);
@@ -109,6 +123,8 @@ fn timeout_kills_background_tree() {
 #[cfg(unix)]
 #[test]
 fn normal_exit_kills_background_tree_before_reaping_leader() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     let result = run(shell("sleep 30 & echo $!; exit 0"), &limits(), None);
     assert!(result.success, "{result:?}");
     assert_eq!(result.exit_code, Some(0));
@@ -119,6 +135,8 @@ fn normal_exit_kills_background_tree_before_reaping_leader() {
 #[cfg(unix)]
 #[test]
 fn output_is_capped_and_all_bytes_are_counted() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     let mut limits = limits();
     limits.output_cap_bytes = 37;
     let result = run(
@@ -134,6 +152,8 @@ fn output_is_capped_and_all_bytes_are_counted() {
 #[cfg(unix)]
 #[test]
 fn zero_cap_still_drains_and_counts() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     let mut limits = limits();
     limits.output_cap_bytes = 0;
     let result = run(shell("printf output; printf error >&2"), &limits, None);
@@ -145,6 +165,8 @@ fn zero_cap_still_drains_and_counts() {
 #[cfg(unix)]
 #[test]
 fn stdout_precedes_stderr() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     let result = run(shell("printf error >&2; printf output"), &limits(), None);
     assert!(result.success, "{result:?}");
     assert_eq!(result.output, "outputerror");
@@ -153,6 +175,8 @@ fn stdout_precedes_stderr() {
 #[cfg(unix)]
 #[test]
 fn nonzero_exit_is_preserved() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     let result = run(shell("exit 7"), &limits(), None);
     assert_eq!(result.exit_code, Some(7));
     assert!(!result.success);
@@ -162,6 +186,8 @@ fn nonzero_exit_is_preserved() {
 #[cfg(target_os = "macos")]
 #[test]
 fn sweep_kills_detached_sandbox_process_and_spares_unrelated_process() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.write().unwrap();
     use omgs::supervise::SweepMarkers;
     use std::process::Child;
 
@@ -240,6 +266,8 @@ fn sweep_kills_detached_sandbox_process_and_spares_unrelated_process() {
 #[cfg(target_os = "macos")]
 #[test]
 fn inherited_pipe_from_detached_process_has_a_bounded_drain() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     if !std::path::Path::new("/usr/bin/perl").is_file() {
         eprintln!("skipping bounded drain test: perl is unavailable");
         return;
@@ -263,6 +291,8 @@ fn inherited_pipe_from_detached_process_has_a_bounded_drain() {
 #[cfg(target_os = "linux")]
 #[test]
 fn cgroup_limits_are_applied_or_explained_without_environment_leaks() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     let mut limits = limits();
     limits.memory_bytes = Some(128 * 1024 * 1024);
     limits.tasks = Some(32);
@@ -285,6 +315,8 @@ fn cgroup_limits_are_applied_or_explained_without_environment_leaks() {
 
 #[test]
 fn executor_text_errors_and_outer_exit_codes_cannot_substitute_for_markers() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     use omgs::supervise::run_marked;
     let scripts = if cfg!(windows) {
         [
@@ -320,6 +352,8 @@ fn executor_text_errors_and_outer_exit_codes_cannot_substitute_for_markers() {
 #[cfg(unix)]
 #[test]
 fn timeout_words_and_signal_death_are_not_timeouts() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     let nonce = "nonce";
     let cmd = shell("printf 'OMGS_START_nonce\nscript timed out after 1ms\nOMGS_END_nonce:0\n'");
     let result = omgs::supervise::run_marked(cmd, &limits(), None, nonce);
@@ -346,6 +380,8 @@ fn timeout_words_and_signal_death_are_not_timeouts() {
 #[cfg(windows)]
 #[test]
 fn windows_wall_clock_kills_executor_and_discloses_owner_job() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     let mut cmd = Command::new("cmd.exe");
     cmd.args(["/d", "/q", "/c", "for /l %i in (1,0,2) do @rem"]);
     let mut limits = limits();
@@ -381,6 +417,8 @@ fn windows_wall_clock_kills_executor_and_discloses_owner_job() {
 #[cfg(target_os = "macos")]
 #[test]
 fn executor_does_not_inherit_another_spawns_pipe() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     // Other tests deliberately spawn children without the supervisor. Isolate
     // the intentionally inheritable descriptor so it cannot leak into them.
     if std::env::var_os("OMGS_INHERITANCE_CHILD").is_none() {
@@ -459,6 +497,8 @@ fn executor_does_not_inherit_another_spawns_pipe() {
 #[cfg(unix)]
 #[test]
 fn concurrent_short_marked_runs_complete_capture() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     std::thread::scope(|scope| {
         // Unmarked calls can spawn concurrently with marked calls even though
         // the process-wide signal guard serializes marked supervisors.
@@ -493,6 +533,8 @@ fn concurrent_short_marked_runs_complete_capture() {
 #[cfg(target_os = "macos")]
 #[test]
 fn unsupervised_spawns_do_not_delay_capture() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.read().unwrap();
     if std::env::var_os("OMGS_CAPTURE_STRESS_CHILD").is_none() {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -529,8 +571,10 @@ fn unsupervised_spawns_do_not_delay_capture() {
     // forks race with capture creation. Darwin's child-side atfork handler can
     // abort on an in-progress libSystem once gate inherited from another thread.
     // The measured phase still races all 128 unmanaged forks with fresh captures.
+    eprintln!("capture stress: initializing capture");
     let warmup = run(shell("printf warmup"), &limits(), None);
     assert!(warmup.success && warmup.capture_complete, "{warmup:?}");
+    eprintln!("capture stress: warmup complete");
     std::thread::scope(|scope| {
         let start = Arc::new(Barrier::new(9));
         // Unmanaged std spawns have their own non-atomic exec-error pipe on
@@ -580,7 +624,9 @@ fn unsupervised_spawns_do_not_delay_capture() {
             .collect();
         drop(tx);
         start.wait();
+        eprintln!("capture stress: unmanaged spawn workers started");
         let mut held = vec![rx.recv_timeout(Duration::from_secs(60)).unwrap()];
+        eprintln!("capture stress: first unmanaged child ready");
         let mut watchdog = limits();
         watchdog.wall_ms = 60_000;
         for _ in 0..128 {
@@ -591,12 +637,15 @@ fn unsupervised_spawns_do_not_delay_capture() {
             assert!(held.iter_mut().all(|c| c.0.try_wait().unwrap().is_none()));
             assert!(result.success && result.capture_complete, "{result:?}");
         }
+        eprintln!("capture stress: all captures reached EOF");
         for worker in workers {
             worker.join().unwrap();
         }
         held.extend(rx.try_iter());
         assert_eq!(held.len(), 128);
         assert!(held.iter_mut().all(|c| c.0.try_wait().unwrap().is_none()));
+        eprintln!("capture stress: releasing 128 unmanaged children");
         drop(held);
+        eprintln!("capture stress: all unmanaged children reaped");
     });
 }
