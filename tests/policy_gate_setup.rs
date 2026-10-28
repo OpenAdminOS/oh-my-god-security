@@ -976,8 +976,7 @@ fn pre_policy_run_cannot_seed_a_fix_run() {
         ],
     );
     assert_eq!(result.status.code(), Some(2), "{}", output(&result));
-    assert!(output(&result)
-        .contains("legacy run has no base-policy snapshot and cannot seed a fix run"));
+    assert!(output(&result).contains("trusted policy record unavailable"));
     assert!(output(&result).contains("docs/policy-workflow.md#pre-policy-runs"));
     assert!(!child.exists());
     assert_eq!(
@@ -1222,4 +1221,603 @@ fn policy_proposal_applies_over_existing_crlf_policy() {
 #[test]
 fn policy_proposal_retains_executable_draft_mode() {
     proposal_preserves_draft("executable-proposal", false, true);
+}
+
+fn report_intent(root: &Path, run: &Path) -> (Output, String) {
+    let out = cli(
+        &root.join("home"),
+        &[
+            "report",
+            "--findings",
+            run.join("findings.json").to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", output(&out));
+    let text = std::fs::read_to_string(run.join("REPORT.md")).unwrap();
+    (out, text)
+}
+
+#[test]
+fn report_intent_uses_committed_policy_and_rejects_untrusted_provenance() {
+    let root = scratch("report-intent-trust");
+    let repo = repo(&root);
+    let mut p = Policy::default();
+    p.accepted_intent.push(policy::AcceptedIntent {
+        id: omgs::intent::library().questions[0].id.clone(),
+        answer: "GENUINE OWNER ACCEPTANCE".into(),
+        scope: "repo".into(),
+        source: "maintainer".into(),
+    });
+    let base = commit_policy(&repo, &p);
+    let run = root.join("run");
+    let initialized = init(&root, &repo, &run, Some(&base));
+    assert!(initialized.status.success(), "{}", output(&initialized));
+    write(
+        &run.join("findings.json"),
+        &json!({"findings": [{
+            "title": "Intent trust fixture", "verdict": "needs_validation",
+            "fingerprint": omgs::fingerprint("access", "GET /x", "resource", "owner"),
+            "hunted_by": "reviewer", "verified_by": "verifier",
+            "proof_tier": "traced", "attack_class": "access",
+            "entry_point": "GET /x", "sink": "resource", "boundary": "owner",
+            "location": {"path": "main.rs", "line": 1},
+            "intent_id": p.accepted_intent[0].id
+        }]}),
+    );
+    let original = read(&run.join(omgs::runmeta::FILE));
+    let answers = read(&run.join("intent-answers.json"));
+    // There are no independently recorded answers. Trusted base acceptance renders.
+    let (_, text) = report_intent(&root, &run);
+    assert!(text.contains("GENUINE OWNER ACCEPTANCE"));
+
+    // Change every internally checked snapshot field, including its digest.
+    // A self-consistent run-local snapshot still cannot authorize an answer.
+    let mut fabricated = p.accepted_intent[0].clone();
+    fabricated.answer = "FABRICATED OWNER ACCEPTANCE".into();
+    fabricated.scope = "main.rs".into();
+    p.accepted_intent.push(fabricated);
+    let raw = policy::text(&p).unwrap();
+    let mut forged = original.clone();
+    forged["policy"]["policy"] = serde_json::to_value(&p).unwrap();
+    forged["policy"]["original"] = json!(raw);
+    forged["policy"]["sha256"] = json!(omgs::sha256::digest(raw.as_bytes()));
+    write(&run.join(omgs::runmeta::FILE), &forged);
+    let mut forged_answers = answers.clone();
+    let mut fabricated_answer = answers["answers"][0].clone();
+    fabricated_answer["answer"] = json!("FABRICATED OWNER ACCEPTANCE");
+    fabricated_answer["scope"] = json!("main.rs");
+    forged_answers["answers"]
+        .as_array_mut()
+        .unwrap()
+        .push(fabricated_answer);
+    write(&run.join("intent-answers.json"), &forged_answers);
+    let (out, text) = report_intent(&root, &run);
+    assert!(!text.contains("FABRICATED OWNER ACCEPTANCE"));
+    assert!(text.contains("GENUINE OWNER ACCEPTANCE"));
+    assert!(output(&out).contains("ignoring snapshot"));
+
+    // A real, different commit and its matching digest cannot replace the
+    // reviewer-selected base, even if the entire snapshot is self-consistent.
+    let substituted = commit_policy(&repo, &p);
+    forged["policy"] =
+        serde_json::to_value(policy::load_base(&repo, Some(&substituted)).unwrap()).unwrap();
+    write(&run.join(omgs::runmeta::FILE), &forged);
+    let (out, text) = report_intent(&root, &run);
+    assert!(!text.contains("FABRICATED OWNER ACCEPTANCE"));
+    assert!(text.contains("GENUINE OWNER ACCEPTANCE"));
+    assert!(output(&out).contains("ignoring snapshot"));
+
+    // Editing policy contents alone cannot change the base-derived answers.
+    forged["policy"]["sha256"] = original["policy"]["sha256"].clone();
+    write(&run.join(omgs::runmeta::FILE), &forged);
+    let (_, text) = report_intent(&root, &run);
+    assert!(!text.contains("FABRICATED OWNER ACCEPTANCE"));
+
+    write(&run.join("intent-answers.json"), &answers);
+    let mut broken = original.clone();
+    broken["policy"]["base_commit"] = json!("0000000000000000000000000000000000000000");
+    write(&run.join(omgs::runmeta::FILE), &broken);
+    let (out, text) = report_intent(&root, &run);
+    assert!(text.contains("GENUINE OWNER ACCEPTANCE"));
+    assert!(output(&out).contains("ignoring snapshot"));
+
+    // A later init against another base cannot retarget this run's record.
+    let later = root.join("later-run");
+    assert!(init(&root, &repo, &later, Some(&substituted))
+        .status
+        .success());
+    let (_, text) = report_intent(&root, &run);
+    assert!(!text.contains("FABRICATED OWNER ACCEPTANCE"));
+
+    write(&run.join(omgs::runmeta::FILE), &original);
+    let store = omgs::intent::answers_file(&root.join("home/omgs-data"), &repo);
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    for target in ["", root.to_str().unwrap()] {
+        let mut invalid = answers.clone();
+        invalid["target"] = json!(target);
+        write(&store, &invalid);
+        let (out, text) = report_intent(&root, &run);
+        assert!(!text.contains("GENUINE OWNER ACCEPTANCE"));
+        assert!(output(&out).contains("store for this path belongs to another target"));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn fix_init(root: &Path, repo: &Path, parent: &Path, child: &Path) -> Output {
+    cli(
+        &root.join("home"),
+        &[
+            "audit",
+            "init",
+            "--target",
+            repo.to_str().unwrap(),
+            "--out",
+            child.to_str().unwrap(),
+            "--fix-of",
+            parent.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    )
+}
+
+#[test]
+fn fix_runs_ignore_edited_parent_policy_and_rederive_all_settings() {
+    let root = scratch("fix-policy-trust");
+    let repo = repo(&root);
+    let mut p = Policy {
+        mode: Mode::Gate,
+        persona: Some("inheritor".into()),
+        excluded_paths: vec!["excluded".into()],
+        ..Policy::default()
+    };
+    p.suppressions.push(policy::Suppression {
+        fingerprint: omgs::fingerprint("access", "GET /x", "resource", "owner"),
+        reason: "Owner reviewed".into(),
+        expires_unix: omgs::runmeta::now_unix() + 3600,
+    });
+    p.gate_tests.push(registered());
+    let base = commit_policy(&repo, &p);
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, Some(&base)).status.success());
+    let original = read(&run.join(omgs::runmeta::FILE));
+    for (i, (key, value)) in [
+        ("excluded_paths", json!(["main.rs"])),
+        ("mode", json!("advisory")),
+        ("persona", json!("builder")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Preserve family registration between children, editing only policy.
+        let mut edited = read(&run.join(omgs::runmeta::FILE));
+        edited["policy"]["policy"][key] = value;
+        let forged = edited["policy"]["policy"].to_string();
+        edited["policy"]["original"] = json!(forged);
+        edited["policy"]["sha256"] = json!(omgs::sha256::digest(forged.as_bytes()));
+        write(&run.join(omgs::runmeta::FILE), &edited);
+        let child = root.join(format!("fix-{i}"));
+        let out = fix_init(&root, &repo, &run, &child);
+        assert!(out.status.success(), "{}", output(&out));
+        assert!(output(&out).contains("ignoring snapshot"));
+        let inherited = read(&child.join(omgs::runmeta::FILE));
+        assert_eq!(inherited["policy"], original["policy"]);
+        assert_eq!(inherited["mode"], "gate");
+        assert_eq!(inherited["persona"], "inheritor");
+        assert_eq!(
+            inherited["files_first_party"],
+            original["files_first_party"]
+        );
+        let ledger = read(&child.join("coverage-ledger.json"));
+        assert!(!ledger.to_string().contains("policy:excluded:main.rs"));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn no_base_cli_settings_survive_authenticated_fix_inheritance() {
+    let root = scratch("fix-no-base-settings");
+    let repo = repo(&root);
+    // Cover no --base as well as a base commit without a policy blob.
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    for (i, base) in [None, Some(base.as_str())].into_iter().enumerate() {
+        let run = root.join(format!("run-{i}"));
+        let mut args = vec![
+            "audit",
+            "init",
+            "--target",
+            repo.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+            "--mode",
+            "gate",
+            "--persona",
+            "team",
+            "--budget",
+            "37",
+        ];
+        if let Some(base) = base {
+            args.extend(["--base", base]);
+        }
+        let out = cli(&root.join("home"), &args);
+        assert!(out.status.success(), "{}", output(&out));
+        let original = read(&run.join(omgs::runmeta::FILE));
+        let mut edited = original.clone();
+        edited["policy"] = json!({"base_commit": "HEAD", "policy": {"persona": "builder"}});
+        write(&run.join(omgs::runmeta::FILE), &edited);
+        let child = root.join(format!("fix-{i}"));
+        let out = fix_init(&root, &repo, &run, &child);
+        assert!(out.status.success(), "{}", output(&out));
+        let inherited = read(&child.join(omgs::runmeta::FILE));
+        assert_eq!(inherited["policy"], original["policy"]);
+        assert_eq!(inherited["mode"], "gate");
+        assert_eq!(inherited["persona"], "team");
+        assert_eq!(inherited["budget_agent_calls"], 37);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn policy_patch_ignores_fabricated_snapshot_and_applies_to_real_base() {
+    let root = scratch("proposal-trusted-base");
+    let repo = repo(&root);
+    let p = Policy::default();
+    let base = commit_policy(&repo, &p);
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, Some(&base)).status.success());
+    let answer = cli(
+        &root.join("home"),
+        &[
+            "intent",
+            "answer",
+            "--target",
+            repo.to_str().unwrap(),
+            "--id",
+            &omgs::intent::library().questions[0].id,
+            "--answer",
+            "Owner confirmed",
+            "--source",
+            "owner",
+        ],
+    );
+    assert!(answer.status.success(), "{}", output(&answer));
+    let propose = || {
+        cli(
+            &root.join("home"),
+            &["intent", "propose", "--run", run.to_str().unwrap()],
+        )
+    };
+    let out = propose();
+    assert!(out.status.success(), "{}", output(&out));
+    let expected = std::fs::read(run.join("policy.patch")).unwrap();
+    let mut forged = p.clone();
+    forged.mode = Mode::Gate;
+    forged.excluded_paths.push("main.rs".into());
+    let other = commit_policy(&repo, &forged);
+    let mut edited = read(&run.join(omgs::runmeta::FILE));
+    edited["policy"] =
+        serde_json::to_value(policy::load_base(&repo, Some(&other)).unwrap()).unwrap();
+    write(&run.join(omgs::runmeta::FILE), &edited);
+    let out = propose();
+    assert!(out.status.success(), "{}", output(&out));
+    assert!(output(&out).contains("ignoring snapshot"));
+    assert_eq!(std::fs::read(run.join("policy.patch")).unwrap(), expected);
+    git(&repo, &["checkout", &base]);
+    check_patch(&repo, &run.join("policy.patch"));
+    apply_patch(&repo, &run.join("policy.patch"), false);
+    let applied = read(&repo.join(policy::PATH));
+    assert_eq!(applied["mode"], "advisory");
+    assert_eq!(applied["excluded_paths"], json!([]));
+    assert_eq!(applied["accepted_intent"][0]["answer"], "Owner confirmed");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn trusted_policy_requires_immutable_base_and_matching_run_target_and_digest() {
+    let root = scratch("policy-provenance-validation");
+    let repo = repo(&root);
+    let base = commit_policy(&repo, &Policy::default());
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, Some(&base)).status.success());
+    let store = root.join("home/omgs-data/intent");
+    let entries: Vec<_> = std::fs::read_dir(&store)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    let record_path = &entries[0];
+    assert!(!record_path.starts_with(&run));
+    assert!(!record_path.starts_with(&repo));
+    let original = read(record_path);
+    assert_eq!(original["base_commit"], base);
+    assert_eq!(
+        original["sha256"],
+        omgs::sha256::digest(&std::fs::read(repo.join(policy::PATH)).unwrap())
+    );
+    for (i, (key, value, reason)) in [
+        ("base_commit", json!("HEAD"), "full immutable commit SHA"),
+        (
+            "base_commit",
+            json!(&base[..12]),
+            "full immutable commit SHA",
+        ),
+        (
+            "sha256",
+            json!("0".repeat(64)),
+            "differs from trusted record",
+        ),
+        ("target", json!(root), "another target or run"),
+        ("run", json!(root), "another target or run"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut edited = original.clone();
+        edited[key] = value;
+        write(record_path, &edited);
+        let child = root.join(format!("refused-{i}"));
+        let out = fix_init(&root, &repo, &run, &child);
+        assert!(!out.status.success(), "{}", output(&out));
+        assert!(output(&out).contains(reason), "{}", output(&out));
+        assert!(!child.exists());
+    }
+    std::fs::remove_file(record_path).unwrap();
+    // A fully intact run snapshot cannot substitute for absent trusted provenance.
+    let child = root.join("missing-provenance");
+    let out = fix_init(&root, &repo, &run, &child);
+    assert!(!out.status.success());
+    assert!(output(&out).contains("trusted policy record unavailable"));
+    assert!(!child.exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn provenance_record(root: &Path) -> PathBuf {
+    let entries: Vec<_> = std::fs::read_dir(root.join("home/omgs-data/intent"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    entries[0].clone()
+}
+
+#[test]
+fn provenance_is_exclusive_and_new_output_paths_have_fresh_generations() {
+    let root = scratch("exclusive-provenance");
+    let repo = repo(&root);
+    let base = commit_policy(&repo, &Policy::default());
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, Some(&base)).status.success());
+    let path = provenance_record(&root);
+    let record = std::fs::read(&path).unwrap();
+    let mut changed = Policy::default();
+    changed.excluded_paths.push("main.rs".into());
+    let other = commit_policy(&repo, &changed);
+    // Empty the run without retiring its trusted record, keeping its inode.
+    for entry in std::fs::read_dir(&run).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(path).unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let out = init(&root, &repo, &run, Some(&other));
+    assert!(!out.status.success(), "{}", output(&out));
+    assert!(
+        output(&out).contains("re-initialize into a new output path"),
+        "{}",
+        output(&out)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), record);
+    let fresh = root.join("fresh");
+    let out = init(&root, &repo, &fresh, Some(&other));
+    assert!(out.status.success(), "{}", output(&out));
+    assert_ne!(
+        std::fs::read(run.join(".omgs-claim")).unwrap(),
+        std::fs::read(fresh.join(".omgs-claim")).unwrap()
+    );
+    assert_eq!(
+        read(&fresh.join(omgs::runmeta::FILE))["policy"]["base_commit"],
+        other
+    );
+    let out = fix_init(&root, &repo, &fresh, &root.join("fresh-child"));
+    assert!(out.status.success(), "{}", output(&out));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provenance_refuses_replaced_directory_even_with_copied_run_identity() {
+    let root = scratch("replacement-provenance");
+    let repo = repo(&root);
+    let base = commit_policy(&repo, &Policy::default());
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, Some(&base)).status.success());
+    let metadata = read(&run.join(omgs::runmeta::FILE));
+    let generation = std::fs::read(run.join(".omgs-claim")).unwrap();
+    let moved = root.join("moved");
+    std::fs::rename(&run, &moved).unwrap();
+    omgs::platform::create_private_dir(&run).unwrap();
+    write(&run.join(omgs::runmeta::FILE), &metadata);
+    for claim in ["0".repeat(64).into_bytes(), generation] {
+        omgs::runmeta::write_atomic_bytes(&run.join(".omgs-claim"), &claim).unwrap();
+        let out = fix_init(&root, &repo, &run, &root.join("child"));
+        assert!(!out.status.success(), "{}", output(&out));
+        assert!(
+            output(&out).contains("generation or directory identity mismatch"),
+            "{}",
+            output(&out)
+        );
+        assert!(!root.join("child").exists());
+    }
+    std::fs::remove_dir_all(&run).unwrap();
+    std::fs::rename(&moved, &run).unwrap();
+    let out = fix_init(&root, &repo, &run, &root.join("child"));
+    assert!(out.status.success(), "{}", output(&out));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fix_budget_uses_trusted_family_cap_despite_edited_parent_metadata() {
+    let root = scratch("trusted-family-cap");
+    let repo = repo(&root);
+    let base = commit_policy(
+        &repo,
+        &Policy {
+            budget: Some(10),
+            ..Policy::default()
+        },
+    );
+    for (i, base) in [Some(base.as_str()), None].into_iter().enumerate() {
+        let run = root.join(format!("run-{i}"));
+        let out = cli(
+            &root.join("home"),
+            &[
+                "audit",
+                "init",
+                "--target",
+                repo.to_str().unwrap(),
+                "--out",
+                run.to_str().unwrap(),
+                "--no-sensors",
+                "--budget",
+                "10",
+            ]
+            .into_iter()
+            .chain(base.into_iter().flat_map(|b| ["--base", b]))
+            .collect::<Vec<_>>(),
+        );
+        assert!(out.status.success(), "{}", output(&out));
+        for (j, cap) in [json!(1000), json!(1), Value::Null].into_iter().enumerate() {
+            let mut edited = read(&run.join(omgs::runmeta::FILE));
+            if cap.is_null() {
+                edited.as_object_mut().unwrap().remove("budget_agent_calls");
+            } else {
+                edited["budget_agent_calls"] = cap;
+            }
+            edited["agent_calls_used"] = json!(3);
+            write(&run.join(omgs::runmeta::FILE), &edited);
+            let child = root.join(format!("fix-{i}-{j}"));
+            let out = fix_init(&root, &repo, &run, &child);
+            assert!(out.status.success(), "{}", output(&out));
+            let meta = read(&child.join(omgs::runmeta::FILE));
+            assert_eq!(meta["budget_agent_calls"], 7);
+            if base.is_none() {
+                assert_eq!(meta["policy"]["policy"]["budget"], 7);
+            }
+            // Descendants still use the original family's authenticated cap.
+            let out = fix_init(&root, &repo, &child, &root.join(format!("next-{i}-{j}")));
+            assert!(out.status.success(), "{}", output(&out));
+        }
+    }
+    let run = root.join("uncapped");
+    assert!(init(&root, &repo, &run, None).status.success());
+    let mut edited = read(&run.join(omgs::runmeta::FILE));
+    edited["budget_agent_calls"] = json!(1000);
+    write(&run.join(omgs::runmeta::FILE), &edited);
+    let child = root.join("uncapped-child");
+    let out = fix_init(&root, &repo, &run, &child);
+    assert!(out.status.success(), "{}", output(&out));
+    let meta = read(&child.join(omgs::runmeta::FILE));
+    assert!(meta.get("budget_agent_calls").is_none());
+    assert!(meta["policy"]["policy"]["budget"].is_null());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+fn icacls(path: &Path, args: &[&str]) {
+    let out = Command::new("icacls.exe")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", output(&out));
+}
+
+#[cfg(windows)]
+#[test]
+fn provenance_refuses_writable_store_on_creation_and_use() {
+    let root = scratch("provenance-store-dacl");
+    let repo = repo(&root);
+    let run = root.join("run");
+    let store = root.join("home/omgs-data/intent");
+    omgs::platform::create_private_tree(&store).unwrap();
+    icacls(&store, &["/grant", "*S-1-1-0:(OI)(CI)(W)"]);
+    let out = init(&root, &repo, &run, None);
+    assert!(!out.status.success(), "{}", output(&out));
+    assert!(
+        output(&out).contains("writable by another principal"),
+        "{}",
+        output(&out)
+    );
+    assert!(!run.exists());
+    icacls(&store, &["/remove:g", "*S-1-1-0"]);
+    assert!(init(&root, &repo, &run, None).status.success());
+    icacls(&store, &["/grant", "*S-1-1-0:(W)"]);
+    let out = fix_init(&root, &repo, &run, &root.join("child"));
+    assert!(!out.status.success(), "{}", output(&out));
+    assert!(
+        output(&out).contains("owner-private intent store"),
+        "{}",
+        output(&out)
+    );
+    assert!(!root.join("child").exists());
+    assert!(omgs::platform::check_private_dir(&store).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn provenance_refuses_record_with_unsafe_dacl_on_every_read() {
+    let root = scratch("provenance-record-dacl");
+    let repo = repo(&root);
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, None).status.success());
+    let record = provenance_record(&root);
+    for sid in ["*S-1-1-0:(W)", "*S-1-5-32-545:(W)"] {
+        icacls(&record, &["/grant", sid]);
+        let out = fix_init(&root, &repo, &run, &root.join("child"));
+        assert!(!out.status.success(), "{}", output(&out));
+        assert!(
+            output(&out).contains("writable by another principal"),
+            "{}",
+            output(&out)
+        );
+        assert!(!root.join("child").exists());
+        icacls(&record, &["/remove:g", sid.split(':').next().unwrap()]);
+    }
+    assert!(fix_init(&root, &repo, &run, &root.join("child"))
+        .status
+        .success());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn provenance_refuses_foreign_owned_record_on_every_read() {
+    let root = scratch("provenance-record-owner");
+    let repo = repo(&root);
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, None).status.success());
+    let record = provenance_record(&root);
+    let user = Command::new("whoami.exe").output().unwrap();
+    assert!(user.status.success());
+    let user = String::from_utf8(user.stdout).unwrap();
+    // Administrators is an assignable owner for these elevated Windows test hosts,
+    // but it is not the current user's SID. Keep the private DACL intact.
+    icacls(&record, &["/setowner", "*S-1-5-32-544"]);
+    let out = fix_init(&root, &repo, &run, &root.join("child"));
+    icacls(&record, &["/setowner", user.trim()]);
+    assert!(!out.status.success(), "{}", output(&out));
+    assert!(
+        output(&out).contains("owned by the current user"),
+        "{}",
+        output(&out)
+    );
+    assert!(!root.join("child").exists());
+    assert!(fix_init(&root, &repo, &run, &root.join("child"))
+        .status
+        .success());
+    std::fs::remove_dir_all(root).unwrap();
 }
