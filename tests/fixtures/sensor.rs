@@ -11,6 +11,27 @@ fn main() {
     let exe = env::current_exe().unwrap();
     let tool = exe.file_stem().unwrap().to_str().unwrap();
     let args: Vec<String> = env::args().skip(1).collect();
+    if tool == "python3" {
+        // Fake interpreter for the user-install grant regression. Discovery
+        // reports only fixture paths, and execution checks the package/data
+        // boundary without requiring Python or a real scanner installation.
+        let bin = exe.parent().unwrap();
+        let local = bin.parent().unwrap();
+        let home = local.parent().unwrap();
+        let base = home.parent().unwrap().join("python-runtime");
+        let site = local.join("lib/python3.13/site-packages");
+        check(env::var_os("HOME").map(PathBuf::from).as_deref() != Some(home), 91);
+        if args.first().map(String::as_str) == Some("-I") {
+            check(env::var_os("PYTHONPATH").is_none(), 94);
+            println!("{{\"base\":{base:?},\"prefix\":{base:?},\"sites\":[{site:?}]}}");
+        } else {
+            check(env::var_os("PYTHONPATH").map(PathBuf::from) == fs::canonicalize(&site).ok(), 93);
+            check(fs::read(local.join("share/private")).is_err(), 90);
+            check(fs::read(site.join("semgrep/__init__.py")).is_ok(), 92);
+            println!("{{\"results\":[]}}");
+        }
+        return;
+    }
     let has = |s: &str| args.iter().any(|a| a == s);
     check(env::var_os("OMGS_TEST_SECRET").is_none(), 31);
     check(env::var("RUSTUP_AUTO_INSTALL").unwrap() == "0", 32);
@@ -98,6 +119,18 @@ fn main() {
         _ => {}
     }
     let mode = fs::read_to_string(fixture("mode")).unwrap();
+    if mode == "private-library" {
+        let library = exe.with_file_name(if cfg!(windows) {
+            "private.dll"
+        } else if cfg!(target_os = "macos") {
+            "libprivate.dylib"
+        } else {
+            "libprivate.so"
+        });
+        // Simulate a native dependency required to finish the scan. Missing
+        // access must produce a scan gap instead of a successful empty report.
+        std::process::exit(if fs::read(library).is_err() { 42 } else { 43 });
+    }
     if mode == "timeout" {
         std::thread::sleep(Duration::from_secs(30));
     }

@@ -878,3 +878,162 @@ fn missing_linux_cgroup_scope_records_prove_gap() {
         "{report}"
     );
 }
+
+#[test]
+fn native_private_adjacent_library_failure_is_a_gap() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    f.tool("trufflehog", "", 0);
+    std::fs::write(
+        f.bin.join(if cfg!(windows) {
+            "private.dll"
+        } else if cfg!(target_os = "macos") {
+            "libprivate.dylib"
+        } else {
+            "libprivate.so"
+        }),
+        "fake private library",
+    )
+    .unwrap();
+    std::fs::write(
+        f.target.join(".sensor-fixture/trufflehog.mode"),
+        "private-library",
+    )
+    .unwrap();
+    let run = f.init("native-library");
+    let report = read(&run.join("sensors.json"));
+    assert!(
+        report["tools_run"].as_array().unwrap().is_empty(),
+        "{report}"
+    );
+    assert!(report["hits"].as_array().unwrap().is_empty(), "{report}");
+    assert!(
+        report["gaps"]
+            .to_string()
+            .contains("trufflehog: scan failed, timed out, or output incomplete (exit=42)"),
+        "{report}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn python_user_install_cannot_expose_shared_private_data() {
+    use std::os::unix::fs::PermissionsExt;
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    let home = f.root.join("profile");
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(home.join(".local/lib/python3.13/site-packages/semgrep")).unwrap();
+    std::fs::create_dir_all(home.join(".local/share")).unwrap();
+    let private = home.join(".local/share/private");
+    std::fs::write(&private, "private application data").unwrap();
+    // A deliberately unsupported fake Python cannot prove its real prefix.
+    // Its bootstrap executes only in MXC and the entry script must be refused.
+    let python = bin.join("python3");
+    std::fs::write(&python, "#!/bin/sh\nexit 77\n").unwrap();
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let scanner = bin.join("semgrep");
+    std::fs::write(
+        &scanner,
+        format!("#!{}\n{}\n", python.display(), private.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&scanner, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let run = f.root.join("python-user");
+    let out = f
+        .command(&[
+            "audit",
+            "init",
+            "--target",
+            f.target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = read(&run.join("sensors.json"));
+    assert!(
+        report["tools_run"].as_array().unwrap().is_empty(),
+        "{report}"
+    );
+    assert!(report["gaps"].to_string().contains("semgrep: Python runtime not proven: file-only MXC introspection failed; sensor not run"), "{report}");
+    assert!(!report.to_string().contains("private application data"));
+
+    // A supported fake interpreter proves its prefix inside MXC. The installed
+    // package is readable, while the sibling application data remains denied.
+    let base = f.root.join("python-runtime");
+    std::fs::create_dir(&base).unwrap();
+    let site = home.join(".local/lib/python3.13/site-packages");
+    std::fs::write(site.join("semgrep/__init__.py"), "fake package").unwrap();
+    f.tool("python3", "", 0);
+    std::fs::copy(f.bin.join("python3"), &python).unwrap();
+    let run = f.root.join("python-proven");
+    let out = f
+        .command(&[
+            "audit",
+            "init",
+            "--target",
+            f.target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("PATH", &bin)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report = read(&run.join("sensors.json"));
+    assert!(
+        report["tools_run"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("semgrep")),
+        "{report}"
+    );
+    assert!(!report.to_string().contains("private application data"));
+
+    // Independently exercise the same file-only grants through MXC: the native
+    // fake succeeds only when its attempt to read the private file is denied.
+    f.tool("trufflehog", &truffle("src/main.rs").to_string(), 0);
+    std::fs::write(
+        f.target.join(".sensor-fixture/trufflehog.outside"),
+        private.to_str().unwrap(),
+    )
+    .unwrap();
+    let out = f
+        .command(&[
+            "audit",
+            "init",
+            "--target",
+            f.target.to_str().unwrap(),
+            "--out",
+            f.root.join("python-boundary").to_str().unwrap(),
+        ])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let report = read(&f.root.join("python-boundary/sensors.json"));
+    assert!(
+        report["tools_run"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("trufflehog")),
+        "{report}"
+    );
+}

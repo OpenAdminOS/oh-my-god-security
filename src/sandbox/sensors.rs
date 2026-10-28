@@ -48,7 +48,23 @@ pub fn run_sensor(mut req: SensorRequest<'_>) -> Result<(String, i32, Vec<String
         (false, false, Vec::new(), Vec::new())
     };
     let executable = std::fs::canonicalize(req.executable).map_err(|_| "cannot resolve scanner")?;
-    let mut readonly = scanner_runtime_roots(&executable, req.semgrep)?;
+    let runtime = scanner_runtime_roots(&executable, req.semgrep)?;
+    let mut readonly = runtime.roots;
+    if let Some(python) = runtime.python {
+        let python_grants = python_runtime_grants(&req, &python)?;
+        let sites: Vec<_> = python_grants
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n == "site-packages"))
+            .map(|p| mxc_path(p))
+            .collect();
+        let path = std::env::join_paths(&sites)
+            .map_err(|_| "cannot represent Python package search path; sensor not run")?
+            .into_string()
+            .map_err(|_| "invalid Python package search path; sensor not run")?;
+        req.env.push(format!("PYTHONPATH={path}"));
+        req.env.push("PYTHONNOUSERSITE=1".into());
+        readonly.extend(python_grants);
+    }
     readonly.extend(req.readonly.iter().cloned());
     let homes: Vec<_> = ["HOME", "USERPROFILE"]
         .into_iter()
@@ -396,91 +412,191 @@ fn copy_input(
     Ok(())
 }
 
-// Native tools need only their executable, not the directory containing it.
-// Python entry points additionally need their package prefix and interpreter.
-fn scanner_runtime_roots(executable: &Path, semgrep: bool) -> Result<Vec<PathBuf>, String> {
+// Never derive directory grants from a bin/Scripts name. Even the Python
+// discovery process starts with file grants only and runs inside pinned MXC.
+struct ScannerRuntime {
+    roots: Vec<PathBuf>,
+    python: Option<PythonRuntime>,
+}
+struct PythonRuntime {
+    interpreter: PathBuf,
+    venv: Option<PathBuf>,
+}
+fn scanner_runtime_roots(executable: &Path, semgrep: bool) -> Result<ScannerRuntime, String> {
     use std::io::Read;
     let mut roots = vec![executable.to_path_buf()];
     let mut header = Vec::new();
     std::fs::File::open(executable)
         .and_then(|f| f.take(1024).read_to_end(&mut header))
         .map_err(|_| "cannot read installed scanner header")?;
+    let mut interpreter = None;
     if header.starts_with(b"#!") {
         let header = String::from_utf8_lossy(&header);
-        let interpreter = header[2..]
+        let name = header[2..]
             .split_whitespace()
             .next()
             .ok_or("missing scanner interpreter")?;
-        let path =
-            std::fs::canonicalize(interpreter).map_err(|_| "scanner interpreter unavailable")?;
-        roots.push(path.clone());
+        let path = std::fs::canonicalize(name).map_err(|_| "scanner interpreter unavailable")?;
+        roots.push(path);
         if semgrep {
-            add_package_prefix(executable, &mut roots);
-            add_package_prefix(&path, &mut roots);
+            let name_path = Path::new(name);
+            let file = name_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            if file.starts_with("python") {
+                interpreter = Some(PathBuf::from(name));
+            } else if file == "env" {
+                return Err(
+                    "Python runtime not proven: env interpreter is ambiguous; sensor not run"
+                        .into(),
+                );
+            }
+            // Other script runtimes use file-only grants, like native tools.
         }
     }
-    if semgrep {
-        // Windows Python console launchers have no shebang. Virtual environment
-        // configuration identifies both the package prefix and base runtime.
-        if let Some(prefix) = executable.parent().and_then(Path::parent) {
-            if prefix.join("pyvenv.cfg").is_file() {
-                roots.push(prefix.to_path_buf());
-                let config = platform::read_bounded(&prefix.join("pyvenv.cfg"), 16384)
-                    .map_err(|_| "cannot read scanner runtime configuration")?;
-                for line in String::from_utf8_lossy(&config).lines() {
-                    if let Some(("home", home)) =
-                        line.split_once('=').map(|(k, v)| (k.trim(), v.trim()))
-                    {
-                        let home = Path::new(home);
-                        if !home.is_absolute() || !home.is_dir() {
-                            return Err("scanner base runtime unavailable".into());
-                        }
-                        if home.file_name().is_some_and(|n| n == "bin") {
-                            add_package_prefix(&home.join("python3"), &mut roots);
-                        } else {
-                            roots.push(home.to_path_buf());
-                        }
-                    }
-                }
+    let venv = executable.parent().and_then(Path::parent).filter(|p| {
+        // The configuration is evidence of a venv; a directory name is not.
+        p.join("pyvenv.cfg").is_file()
+    });
+    if cfg!(windows) && semgrep && interpreter.is_none() {
+        if let Some(prefix) = venv {
+            let python = prefix.join("Scripts/python.exe");
+            if !python.is_file() {
+                return Err(
+                    "Python runtime not proven: venv interpreter unavailable; sensor not run"
+                        .into(),
+                );
             }
+            interpreter = Some(python);
         }
+    }
+    Ok(ScannerRuntime {
+        roots,
+        python: interpreter.map(|interpreter| PythonRuntime {
+            interpreter,
+            venv: venv.map(Path::to_path_buf),
+        }),
+    })
+}
+
+fn python_runtime_grants(
+    req: &SensorRequest<'_>,
+    python: &PythonRuntime,
+) -> Result<Vec<PathBuf>, String> {
+    // -I excludes inherited Python configuration and -S prevents site/.pth
+    // execution during discovery. All reported paths still pass grant policy.
+    // Some non-system interpreters cannot bootstrap with file-only grants. They
+    // are deliberately refused rather than guessing a wider bootstrap prefix.
+    const DISCOVER: &str = "import sys,os; os.environ['HOME']=sys.argv[1]; os.environ['USERPROFILE']=sys.argv[1]; os.environ['APPDATA']=sys.argv[2]; import sysconfig,site,json; print(json.dumps({'base':sys.base_prefix,'prefix':sys.prefix,'sites':[sysconfig.get_path(k) for k in ('purelib','platlib')]+[site.getusersitepackages()]}))";
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .ok_or("Python runtime not proven: user profile unavailable; sensor not run")?;
+    let appdata = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData/Roaming"));
+    let readonly = python.venv.iter().map(|p| p.join("pyvenv.cfg")).collect();
+    let discovered = run_sensor(SensorRequest {
+        executable: &python.interpreter,
+        args: vec![
+            "-I".into(),
+            "-S".into(),
+            "-c".into(),
+            DISCOVER.into(),
+            mxc_path(&home),
+            mxc_path(&appdata),
+        ],
+        target: req.target,
+        artifacts: req.artifacts,
+        readonly,
+        env: Vec::new(),
+        limits: req.limits.clone(),
+        semgrep: false,
+        config: "",
+    });
+    let (output, code, _) = discovered.map_err(|_| {
+        "Python runtime not proven: file-only MXC introspection failed; sensor not run"
+    })?;
+    if code != 0 {
+        return Err(
+            "Python runtime not proven: file-only MXC introspection failed; sensor not run".into(),
+        );
+    }
+    let data = crate::shape::strict_json(&output)
+        .map_err(|_| "Python runtime not proven: invalid MXC introspection; sensor not run")?;
+    python_grants_from_discovery(&data, python.venv.as_deref())
+}
+
+fn python_grants_from_discovery(
+    data: &serde_json::Value,
+    venv: Option<&Path>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut roots = Vec::new();
+    for key in ["base", "prefix"] {
+        let path = data[key]
+            .as_str()
+            .map(Path::new)
+            .filter(|p| p.is_absolute() && p.is_dir())
+            .ok_or("Python runtime not proven: invalid interpreter prefix; sensor not run")?;
+        roots.push(std::fs::canonicalize(path).map_err(|_| "cannot resolve Python prefix")?);
+    }
+    let sites = data["sites"]
+        .as_array()
+        .ok_or("Python runtime not proven: missing package paths; sensor not run")?;
+    let mut candidates: Vec<PathBuf> = sites
+        .iter()
+        .filter_map(|p| p.as_str().map(PathBuf::from))
+        .collect();
+    if let Some(venv) = venv {
+        // Resolve the venv's sys.prefix from its configuration, not bin's name.
+        // Only the base interpreter runs during discovery, so read the version
+        // from pyvenv.cfg to identify the venv's package directory.
+        let config = platform::read_bounded(&venv.join("pyvenv.cfg"), 16384)
+            .map_err(|_| "cannot read scanner runtime configuration")?;
+        let config = String::from_utf8_lossy(&config);
+        let version = config
+            .lines()
+            .find_map(|l| {
+                let (key, value) = l.split_once('=')?;
+                (key.trim() == "version").then_some(value.trim())
+            })
+            .ok_or("Python runtime not proven: missing venv version; sensor not run")?;
+        let parts: Vec<_> = version.split('.').collect();
+        if parts.len() < 2
+            || !parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err("Python runtime not proven: invalid venv version; sensor not run".into());
+        }
+        roots.push(std::fs::canonicalize(venv).map_err(|_| "cannot resolve Python venv")?);
+        candidates.push(venv.join(format!("lib/python{}.{}/site-packages", parts[0], parts[1])));
+        candidates.push(venv.join("Lib/site-packages"));
+    }
+    // Do not grant a whole user installation or every package search path.
+    // Only the specific site-packages containing the tool is needed.
+    let mut found = false;
+    for site in candidates {
+        if site.is_absolute()
+            && site.file_name().is_some_and(|n| n == "site-packages")
+            && site.join("semgrep").is_dir()
+        {
+            roots.push(
+                std::fs::canonicalize(site)
+                    .map_err(|_| "cannot resolve Python package directory")?,
+            );
+            found = true;
+        }
+    }
+    if !found {
+        return Err(
+            "Python runtime not proven: Semgrep site-packages unavailable; sensor not run".into(),
+        );
     }
     roots.sort();
     roots.dedup();
-    roots
-        .into_iter()
-        .map(|p| {
-            std::fs::canonicalize(p).map_err(|_| "cannot resolve scanner runtime grant".into())
-        })
-        .collect()
-}
-
-fn add_package_prefix(executable: &Path, roots: &mut Vec<PathBuf>) {
-    let Some(bin) = executable.parent() else {
-        return;
-    };
-    if bin
-        .file_name()
-        .is_some_and(|n| n == "bin" || n == "Scripts")
-    {
-        if let Some(prefix) = bin.parent() {
-            // MXC already supplies system binaries and libraries. As with
-            // prove's toolchain roots, never infer all of /usr or /opt.
-            if !["/", "/usr", "/usr/local", "/opt", "/opt/homebrew"]
-                .iter()
-                .any(|p| prefix == Path::new(p))
-            {
-                roots.push(prefix.to_path_buf());
-            } else {
-                for name in ["lib", "lib64"] {
-                    let lib = prefix.join(name);
-                    if lib.is_dir() {
-                        roots.push(lib);
-                    }
-                }
-            }
-        }
-    }
+    Ok(roots)
 }
 
 fn validate_sensor_grants(
@@ -489,22 +605,82 @@ fn validate_sensor_grants(
     target: &Path,
     artifacts: &Path,
 ) -> Result<(), String> {
+    let normalize = |p: &Path| {
+        let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        if cfg!(windows) {
+            PathBuf::from(mxc_path(&p).to_lowercase())
+        } else {
+            p
+        }
+    };
+    let mut shared: Vec<PathBuf> = ["APPDATA", "LOCALAPPDATA", "XDG_DATA_HOME"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .collect();
+    let mut secrets: Vec<PathBuf> = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .into_iter()
+        .collect();
+    if cfg!(target_os = "macos") {
+        secrets.extend([
+            PathBuf::from("/Library/Keychains"),
+            PathBuf::from("/System/Library/Keychains"),
+        ]);
+    }
+    for home in homes {
+        for sub in [
+            ".ssh",
+            ".aws",
+            ".config",
+            ".gnupg",
+            ".azure",
+            ".kube",
+            ".docker",
+            "Library/Keychains",
+            "AppData/Roaming/Microsoft/Credentials",
+            "AppData/Roaming/Microsoft/Protect",
+            "AppData/Local/Microsoft/Credentials",
+            "AppData/Local/Microsoft/Vault",
+        ] {
+            secrets.push(home.join(sub));
+        }
+        shared.push(home.join(".local"));
+        shared.extend(
+            [
+                ".local/share",
+                ".local/state",
+                ".cache",
+                "Library",
+                "AppData",
+                "Application Data",
+                "Documents",
+                "Desktop",
+                "Downloads",
+            ]
+            .map(|sub| home.join(sub)),
+        );
+    }
     for grant in grants {
-        // A child of HOME can be a legitimate installation. An ancestor grants
-        // the whole profile. Target and artifact overlap is unsafe either way.
-        let normalize = |p: &Path| {
-            let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-            if cfg!(windows) {
-                PathBuf::from(mxc_path(&p).to_lowercase())
-            } else {
-                p
-            }
-        };
-        if homes
-            .iter()
-            .any(|h| normalize(h).starts_with(normalize(grant)))
-        {
+        let normalized = normalize(grant);
+        if homes.iter().any(|h| normalize(h).starts_with(&normalized)) {
             return Err("sensor runtime grant exposes HOME or user profile; sensor not run".into());
+        }
+        if secrets.iter().any(|p| {
+            let secret = normalize(p);
+            normalized.starts_with(&secret) || secret.starts_with(&normalized)
+        }) {
+            return Err("sensor runtime grant exposes a secret location; sensor not run".into());
+        }
+        // Refuse each shared root and its ancestors. Descendants are permitted
+        // only when selected explicitly by the caller (rules/database) or
+        // established by Python discovery, never inferred from bin/Scripts.
+        if shared.iter().any(|p| normalize(p).starts_with(&normalized)) {
+            return Err(
+                "sensor runtime grant exposes a shared user-data prefix; sensor not run".into(),
+            );
         }
         if overlapping_root(target, std::slice::from_ref(grant)).is_some()
             || overlapping_root(artifacts, std::slice::from_ref(grant)).is_some()
@@ -554,32 +730,104 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
-    fn python_runtime_uses_install_prefix_and_refuses_home_prefix() {
+    fn python_discovery_grants_only_reported_prefixes_and_tool_site() {
         let root = std::env::temp_dir().join(format!(
             "omgs-python-{}",
             &platform::random_nonce().unwrap()[..16]
         ));
         let _cleanup = Scratch(root.clone());
         let home = root.join("home");
-        for prefix in [&home, &home.join("venv")] {
-            let bin = prefix.join("bin");
+        let base = root.join("python");
+        let venv = home.join("venv");
+        let site = home.join(".local/lib/python3.13/site-packages");
+        let unrelated = home.join("other/site-packages");
+        for path in [&base, &venv, &site.join("semgrep"), &unrelated] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(venv.join("pyvenv.cfg"), "version = 3.13.2\n").unwrap();
+        let grants = python_grants_from_discovery(
+            &serde_json::json!({
+                "base": base, "prefix": base, "sites": [site, unrelated]
+            }),
+            Some(&venv),
+        )
+        .unwrap();
+        assert_eq!(grants.len(), 3);
+        for path in [&base, &venv, &site] {
+            assert!(grants.contains(&std::fs::canonicalize(path).unwrap()));
+        }
+        validate_sensor_grants(
+            &grants,
+            std::slice::from_ref(&home),
+            &root.join("target"),
+            &root.join("run"),
+        )
+        .unwrap();
+        for path in [
+            home.join(".local"),
+            home.join(".local/share"),
+            home.join("Library"),
+            home.join("AppData"),
+        ] {
+            std::fs::create_dir_all(&path).unwrap();
+            assert!(validate_sensor_grants(
+                &[path],
+                std::slice::from_ref(&home),
+                &root.join("target"),
+                &root.join("run")
+            )
+            .unwrap_err()
+            .contains("shared user-data"));
+        }
+        for sub in [".ssh", ".aws", ".config", "Library/Keychains"] {
+            let secret = home.join(sub);
+            std::fs::create_dir_all(secret.join("site-packages/semgrep")).unwrap();
+            for path in [&secret, &secret.join("site-packages")] {
+                assert!(validate_sensor_grants(
+                    std::slice::from_ref(path),
+                    std::slice::from_ref(&home),
+                    &root.join("target"),
+                    &root.join("run")
+                )
+                .unwrap_err()
+                .contains("secret location"));
+            }
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(home.join(".ssh"), root.join("alias")).unwrap();
+            assert!(validate_sensor_grants(
+                &[root.join("alias")],
+                &[home],
+                &root.join("target"),
+                &root.join("run")
+            )
+            .is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bin_and_scripts_names_never_prove_a_python_prefix() {
+        let root = std::env::temp_dir().join(format!(
+            "omgs-python-prefix-{}",
+            &platform::random_nonce().unwrap()[..16]
+        ));
+        let _cleanup = Scratch(root.clone());
+        for dir in ["home/.local/bin", "home/Scripts"] {
+            let bin = root.join(dir);
             std::fs::create_dir_all(&bin).unwrap();
             let interpreter = bin.join("python3");
             std::fs::write(&interpreter, "native fixture").unwrap();
             let scanner = bin.join("semgrep");
             std::fs::write(&scanner, format!("#!{}\n", interpreter.display())).unwrap();
-            let grants = scanner_runtime_roots(&scanner, true).unwrap();
-            assert!(grants.contains(&std::fs::canonicalize(prefix).unwrap()));
-            assert!(!grants.contains(&root));
-            let result = validate_sensor_grants(
-                &grants,
-                std::slice::from_ref(&home),
-                &root.join("target"),
-                &root.join("run"),
+            let runtime = scanner_runtime_roots(&scanner, true).unwrap();
+            assert_eq!(
+                runtime.roots,
+                vec![scanner, std::fs::canonicalize(interpreter).unwrap()]
             );
-            assert_eq!(result.is_err(), prefix == &home);
+            assert!(runtime.python.unwrap().venv.is_none());
         }
     }
 }
