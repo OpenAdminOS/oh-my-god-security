@@ -1152,3 +1152,44 @@ pub fn render_sarif(file: &FindingsFile, meta: &ReportMeta) -> String {
     }))
     .unwrap_or_default()
 }
+
+/// A small independent section so sensor leads stay visible at every path
+/// priority, without treating a scanner match as a verified finding.
+pub fn sensor_section(report: Option<&crate::sensors::SensorsReport>, html: bool) -> String {
+    let Some(report) = report else {
+        return String::new();
+    };
+    let mut lines = Vec::new();
+    for hit in &report.hits {
+        lines.push(format!(
+            "{}: {} at {}{} (class {:?}, fingerprint {})",
+            hit.tool,
+            hit.rule,
+            hit.file,
+            hit.line.map(|n| format!(":{n}")).unwrap_or_default(),
+            hit.class,
+            hit.fingerprint
+        ));
+    }
+    for tool in &report.tools_unavailable {
+        lines.push(format!("{tool}: not present or unavailable"));
+    }
+    for gap in &report.gaps {
+        lines.push(format!("Gap: {gap}"));
+    }
+    if lines.is_empty() {
+        lines.push("No sensor hits or gaps recorded.".into());
+    }
+    if html {
+        format!("<section class=\"wrap\" id=\"sensor-hits\"><h2>Sensor hits and gaps</h2><p>Scanner leads require review.</p><ul>{}</ul></section>",
+            lines.iter().map(|l| format!("<li>{}</li>", html_escape(l))).collect::<String>())
+    } else {
+        format!(
+            "\n## Sensor hits and gaps\n\nScanner leads require review.\n\n{}\n",
+            lines
+                .iter()
+                .map(|l| format!("- `{}`\n", l.replace('`', "&#96;")))
+                .collect::<String>()
+        )
+    }
+}

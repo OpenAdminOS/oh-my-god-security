@@ -160,6 +160,64 @@ cargo build --release
 ./target/release/omgs check --target /path/to/your/repo
 ```
 
+## Optional local sensors
+
+`audit init` and `check` look for installed sensors on PATH (PATH plus native
+PATHEXT extensions on Windows). They read source and dependency files as data,
+never run target builds, tests or package scripts, and install nothing.
+`audit init --no-sensors` skips them.
+
+- Gitleaks detects credentials in local files without reading git history.
+- Semgrep uses `OMGS_SEMGREP_CONFIG` when it names an existing local rules file
+  or directory. Without local rules it is skipped. Only
+  `OMGS_SEMGREP_ALLOW_REGISTRY=1` explicitly permits fetching registry rules,
+  including the default `auto` ruleset.
+- TruffleHog scans the filesystem with `--no-verification --no-update --json`.
+  It never verifies a secret online or checks for updates.
+- OSV-Scanner scans dependency files with `--offline-vulnerabilities --offline`,
+  `--no-call-analysis` and `--no-resolve`. It neither executes target code nor
+  resolves dependencies or downloads databases. Set `OMGS_OSV_DB` to a cache
+  root containing `osv-scanner/<ecosystem>/all.zip`. The default root is
+  `<OMGS data dir>/osv-db`. Without an existing nonempty archive it records
+  `osv database not present` and does not launch the scanner. Missing ecosystem
+  databases and corrupt archives remain scan gaps.
+
+OSV database downloads are a separate, explicit network opt-in, like Semgrep's
+registry opt-in. After approving that network access, run the following command
+with your already installed OSV-Scanner outside an OMGS audit. Replace CACHE
+with an absolute cache directory and TARGET with the local repository:
+
+```sh
+OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY=CACHE osv-scanner scan source --offline-vulnerabilities --download-offline-databases --no-call-analysis --no-resolve TARGET
+```
+
+PowerShell: set `$env:OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY = 'CACHE'`, then run
+the same `osv-scanner` command. Set `OMGS_OSV_DB` to CACHE for the subsequent
+audit. OMGS never runs this download command automatically. See the upstream
+[OSV offline database documentation](https://github.com/google/osv-scanner/blob/main/docs/offline-mode.md)
+for manual ecosystem archive downloads and cache layout.
+
+TruffleHog and OSV-Scanner run with a cleared environment and separate scratch
+home/cache directories, a 120 second wall clock, 4 MiB combined output cap and
+supervised process cleanup. Unix also applies CPU, file size and descriptor
+limits. macOS denies network operations through sandbox-exec when available;
+Linux denies socket creation with seccomp. Windows relies on the offline flags
+and reports that OS network containment is unavailable. These restrictions are
+for trusted installed scanners, not a sandbox for executing target code.
+Malformed JSON, missing required metadata, unexpected exit codes and incomplete
+or oversized output are explicit gaps, never successful zero-hit scans.
+
+`sensors.json` records successful tools, unavailable tools, gaps and redacted
+hits; `sensor-hits.json` lists the same hits separately. Each hit keeps the tool,
+detector or advisory ID, relative file, line when supplied, shared path class and
+a SHA-256 fingerprint of that metadata. Raw secrets and scanner output are never
+saved by these two sensors. Both reports list hits from every class and all gaps.
+Each code hit seeds a `sensor:<tool>:<fingerprint>` candidate ledger unit. Hunt it
+with `covered` and evidence, or resolve it with a reason using `deferred`,
+`blocked` or `out_of_scope`. The critic rejects unresolved or missing hit units.
+Non-code hits remain visible and require the existing exclusion group review.
+Old sensor artifacts without class and fingerprint metadata must be regenerated.
+
 ## Persona defaults and accounting
 
 `omgs audit init --target <repo> --persona builder|inheritor|team` records the persona and selects presentation and spending defaults. Builder uses concise coverage detail and a budget of 24 calls/proofs, inheritor uses full detail and 64, and team uses full detail and 96. Every persona defaults to advisory; explicit `--mode` and `--budget` override the defaults. Without `--persona`, the existing budget behavior is unchanged. Proof rules, verdict semantics and the evidence required to confirm a finding are identical.

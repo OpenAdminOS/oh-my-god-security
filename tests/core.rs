@@ -595,6 +595,7 @@ fn semgrep_parser_keeps_only_metadata() {
         tools_run: vec![],
         tools_unavailable: vec![],
         hits: vec![],
+        gaps: vec![],
     };
     // A semgrep "extra.lines" field can echo matched source; it must not survive.
     let json = r#"{"results":[
