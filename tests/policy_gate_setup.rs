@@ -576,6 +576,23 @@ fn setup_detects_only_existing_agents_and_writes_policy_only_on_request() {
             std::fs::read(source.join("SKILL.md")).unwrap()
         );
         assert!(installed.join("schemas/policy.schema.json").is_file());
+        for name in [
+            "PIPELINE.md",
+            "PROOF-CONTRACT.md",
+            "PROOF-RECIPES.md",
+            "POLICY-AND-GATE.md",
+            "BUDGETS-AND-ROUTING.md",
+            "EXECUTION-SAFETY.md",
+            "SETUP.md",
+            "HANDOFF.md",
+            "DECISION-RULES.md",
+        ] {
+            assert_eq!(
+                std::fs::read(installed.join(name)).unwrap(),
+                std::fs::read(source.join(name)).unwrap(),
+                "{name}"
+            );
+        }
     }
     assert!(!home.join(".agents").exists());
     assert!(!home.join(".cursor").exists());
