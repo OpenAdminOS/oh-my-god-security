@@ -235,7 +235,10 @@ supported OS. Offline flags do not substitute for this enforcement.
   enable fetching. Download rules separately before scanning. The disposable
   copy removes every `.semgrepignore`, and `--no-git-ignore --disable-nosem`
   disables repository ignores and inline `nosemgrep` comments. Scanner defaults
-  may still skip unsupported inputs; reported skips remain gaps.
+  may still skip unsupported inputs; reported skips remain gaps. Inside MXC,
+  Semgrep can read its whole site-packages directory, including unrelated
+  packages and anything stored there; install it in a dedicated virtual
+  environment.
 - TruffleHog uses `--no-verification --no-update --json --no-ignore-tag`.
   It cannot verify a secret online, update itself or honor inline ignore tags.
 - OSV-Scanner uses `--offline-vulnerabilities --offline --no-call-analysis

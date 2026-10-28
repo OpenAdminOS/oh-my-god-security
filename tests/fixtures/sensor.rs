@@ -22,6 +22,13 @@ fn main() {
         let site = local.join("lib/python3.13/site-packages");
         check(env::var_os("HOME").map(PathBuf::from).as_deref() != Some(home), 91);
         if args.first().map(String::as_str) == Some("-I") {
+            // Discovery must stay isolated (-I), skip site processing (-S)
+            // and run only the fixed introspection program.
+            check(args.len() == 6 && args[1] == "-S" && args[2] == "-c", 95);
+            check(
+                args[3].starts_with("import sys,os;") && args[3].contains("sysconfig.get_path"),
+                96,
+            );
             check(env::var_os("PYTHONPATH").is_none(), 94);
             println!("{{\"base\":{base:?},\"prefix\":{base:?},\"sites\":[{site:?}]}}");
         } else {
