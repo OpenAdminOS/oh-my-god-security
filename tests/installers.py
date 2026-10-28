@@ -256,6 +256,20 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
         out = self.run_install()
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         home = self.env['OMGS_HOME'].replace("'", "''")
+        # A safe existing SYSTEM grant is admitted, but must not survive the
+        # replacement. File.Replace would retain it from the old executable.
+        seed = f"""
+$ErrorActionPreference = 'Stop'
+$p = Join-Path '{home}' 'bin/omgs.exe'
+$a = Get-Acl -LiteralPath $p
+$s = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+$a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($s, 'FullControl', 'Allow'))
+Set-Acl -LiteralPath $p -AclObject $a
+"""
+        subprocess.run(['powershell', '-NoProfile', '-Command', seed],
+                       text=True, capture_output=True, check=True)
+        replacement = self.run_install()
+        self.assertEqual(replacement.returncode, 0, replacement.stdout + replacement.stderr)
         command = f"""
 $ErrorActionPreference = 'Stop'
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
