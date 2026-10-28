@@ -437,7 +437,7 @@ fn runtime_routes_and_docs_application_keep_coverage() {
         ("tests:excluded", "test or fixture"),
     ] {
         let unit = units.iter().find(|u| u["id"] == id).unwrap();
-        assert_eq!(unit["status"], "out_of_scope");
+        assert_eq!(unit["status"], "planned");
         assert_eq!(unit["surface"], format!("1 {label} file(s)"));
         assert!(unit["note"].as_str().unwrap().contains("1 "));
     }
@@ -980,5 +980,397 @@ fn concurrent_fix_proofs_cannot_exceed_the_original_cap() {
     assert_eq!(successes, 1);
     assert_eq!(allowance(&root)["calls_and_proofs_used"], 1);
     assert_eq!(allowance(&root)["remaining"], 0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn build_names_and_txt_configuration_are_code_before_docs_or_data() {
+    for file in [
+        "CMakeLists.txt",
+        "Makefile",
+        "GNUmakefile",
+        "Dockerfile",
+        "Dockerfile.dev",
+        "Containerfile",
+        "Justfile",
+        "Rakefile",
+        "Gemfile",
+        "build.gradle",
+        "build.gradle.kts",
+        "tool.cmake",
+        "Jenkinsfile",
+        "Vagrantfile",
+        "BUILD",
+        "BUILD.bazel",
+        "WORKSPACE",
+        "WORKSPACE.bazel",
+        "meson.build",
+        "meson_options.txt",
+        "SConstruct",
+        "SConscript",
+        "Procfile",
+        "Brewfile",
+        "Taskfile.yml",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "script.txt",
+        "policy.txt",
+    ] {
+        assert_eq!(classify_with_size(file, 2 << 20), Class::Code, "{file}");
+    }
+    for file in [
+        "README.txt",
+        "LICENSE.txt",
+        "NOTICE.txt",
+        "CHANGES.txt",
+        "AUTHORS.txt",
+        "CONTRIBUTING.txt",
+        "COPYING.txt",
+        "LICENCE.txt",
+        "COPYRIGHT",
+    ] {
+        assert_eq!(classify(file), Class::Docs, "{file}");
+    }
+    let dir = scratch("cmake-only-coverage");
+    let target = dir.join("repo");
+    let run = dir.join("run");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        target.join("CMakeLists.txt"),
+        "execute_process(COMMAND tool)",
+    )
+    .unwrap();
+    assert_eq!(init(&target, &run, &[])["files_first_party"], 1);
+    std::fs::write(run.join("candidates-red.json"), r#"{"candidates":[]}"#).unwrap();
+    let ledger = read(&run.join("coverage-ledger.json"));
+    assert!(ledger["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|u| u["status"] == "planned" && u["id"] == "project:.:generic"));
+    let out = cli(&["critic", "--run", run.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("project:.:generic"));
+    assert!(cli(&[
+        "ledger",
+        "set",
+        "--ledger",
+        run.join("coverage-ledger.json").to_str().unwrap(),
+        "--unit",
+        "project:.:generic",
+        "--status",
+        "covered",
+        "--evidence",
+        "CMakeLists.txt"
+    ])
+    .status
+    .success());
+    assert!(cli(&["critic", "--run", run.to_str().unwrap()])
+        .status
+        .success());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn every_excluded_class_requires_review_and_reports_the_reason() {
+    let dir = scratch("exclusion-accountability");
+    for (class, unit_id, paths) in [
+        (
+            "docs",
+            "docs:excluded",
+            (0..26)
+                .rev()
+                .map(|i| format!("guide{i:02}.md"))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "test",
+            "tests:excluded",
+            (0..26)
+                .rev()
+                .map(|i| format!("tests/fixture{i:02}.unknown"))
+                .collect(),
+        ),
+        (
+            "vendored",
+            "vendored:excluded",
+            (0..26)
+                .rev()
+                .map(|i| format!("vendor/item{i:02}.unknown"))
+                .collect(),
+        ),
+        (
+            "data",
+            "data:excluded",
+            vec!["policy.json".into(), "renamed.json".into()],
+        ),
+    ] {
+        let target = dir.join(class).join("repo");
+        let run = dir.join(class).join("run");
+        std::fs::create_dir_all(&target).unwrap();
+        for path in &paths {
+            let file = target.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let text = if class == "data" {
+                let logic = if path == "policy.json" {
+                    r#"{"policy":{"condition":"eval(input)","effect":"allow"}}"#
+                } else {
+                    "module.exports = input => eval(input);"
+                };
+                format!("{logic}{}", " ".repeat((1 << 20) + 1))
+            } else {
+                "fixture text".into()
+            };
+            std::fs::write(file, text).unwrap();
+        }
+        init(&target, &run, &[]);
+        let ledger_path = run.join("coverage-ledger.json");
+        let ledger = read(&ledger_path);
+        let units = ledger["units"].as_array().unwrap();
+        assert_eq!(units.len(), 1, "{class}");
+        let unit = &units[0];
+        assert_eq!(unit["id"], unit_id);
+        assert_eq!(unit["status"], "planned");
+        assert_eq!(unit["excluded_count"], paths.len());
+        let mut sorted = paths.clone();
+        sorted.sort();
+        sorted.truncate(20);
+        assert_eq!(unit["excluded_paths"], json!(sorted));
+        std::fs::write(run.join("candidates-red.json"), r#"{"candidates":[]}"#).unwrap();
+        let out = cli(&["critic", "--run", run.to_str().unwrap()]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains(unit_id));
+        let set = |status: &str, note: &str| {
+            cli(&[
+                "ledger",
+                "set",
+                "--ledger",
+                ledger_path.to_str().unwrap(),
+                "--unit",
+                unit_id,
+                "--status",
+                status,
+                "--note",
+                note,
+            ])
+        };
+        for note in [
+            "",
+            "classified as inert",
+            "reviewed, not security relevant:   ",
+        ] {
+            assert!(!set("out_of_scope", note).status.success());
+        }
+        for status in ["blocked", "deferred"] {
+            assert!(set(status, "review incomplete").status.success());
+            assert!(!cli(&["critic", "--run", run.to_str().unwrap()])
+                .status
+                .success());
+        }
+        // A recorded review decision, rather than the heuristic label, closes
+        // the unit. This tests the mechanism, not the truth of the decision.
+        let reason =
+            "reviewed, not security relevant: sampled local fixtures; no production consumer";
+        assert!(set("out_of_scope", reason).status.success());
+        assert!(cli(&["critic", "--run", run.to_str().unwrap()])
+            .status
+            .success());
+        assert_eq!(read(&ledger_path)["units"][0]["note"], reason);
+        let listed = cli(&["ledger", "list", "--ledger", ledger_path.to_str().unwrap()]);
+        assert!(listed.status.success());
+        let text = String::from_utf8_lossy(&listed.stdout);
+        assert!(text.contains(reason));
+        assert!(text.contains(&sorted[0]));
+        assert!(cli(&[
+            "report",
+            "--findings",
+            run.join("findings.json").to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap()
+        ])
+        .status
+        .success());
+        for report in ["REPORT.md", "REPORT.html"] {
+            let text = std::fs::read_to_string(run.join(report)).unwrap();
+            assert!(text.contains(reason));
+            assert!(text.contains(&sorted[0]));
+        }
+        assert!(cli(&[
+            "ledger",
+            "set",
+            "--ledger",
+            ledger_path.to_str().unwrap(),
+            "--unit",
+            unit_id,
+            "--status",
+            "covered",
+            "--evidence",
+            &paths[0]
+        ])
+        .status
+        .success());
+        assert!(cli(&["critic", "--run", run.to_str().unwrap()])
+            .status
+            .success());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn linked_budget_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let dir = scratch(name);
+    let target = dir.join("repo");
+    std::fs::create_dir_all(&target).unwrap();
+    let root = dir.join("runs").join("original");
+    init(&target, &root, &["--budget", "10"]);
+    let fix = dir.join("runs").join("fix");
+    init(&target, &fix, &["--fix-of", root.to_str().unwrap()]);
+    set_spending(&fix, 6, 0);
+    assert_eq!(allowance(&root)["remaining"], 4);
+    (dir, root, fix)
+}
+
+fn assert_linked_budget_refused(root: &Path, fix: &Path, error: &str) {
+    let before = std::fs::read(root.join("run-metadata.json")).unwrap();
+    for run in [root, fix] {
+        let out = cli(&["budget", "--run", run.to_str().unwrap()]);
+        assert!(!out.status.success());
+        let message = String::from_utf8_lossy(&out.stderr);
+        assert!(message.contains(error), "{message}");
+        assert!(omgs::budget::charge_proof(run).is_err());
+    }
+    assert_eq!(
+        std::fs::read(root.join("run-metadata.json")).unwrap(),
+        before
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn linked_run_directory_links_cannot_restore_allowance() {
+    let (dir, root, fix) = linked_budget_fixture("linked-directory-refusal");
+    let external = dir.join("external");
+    std::fs::rename(&fix, &external).unwrap();
+    set_spending(&external, 0, 0);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&external, &fix).unwrap();
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&fix)
+            .arg(&external)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert_linked_budget_refused(&root, &fix, "without symlinks or reparse points");
+    assert_eq!(
+        read(&external.join("run-metadata.json"))["proof_runs_used"],
+        0
+    );
+    #[cfg(unix)]
+    std::fs::remove_file(&fix).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(&fix).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_metadata_symlinks_cannot_restore_allowance() {
+    let (dir, root, fix) = linked_budget_fixture("linked-metadata-refusal");
+    let external = dir.join("external.json");
+    let mut meta = read(&fix.join("run-metadata.json"));
+    meta["agent_calls_used"] = json!(0);
+    std::fs::write(&external, serde_json::to_vec(&meta).unwrap()).unwrap();
+    let before = std::fs::read(&external).unwrap();
+    std::fs::remove_file(fix.join("run-metadata.json")).unwrap();
+    std::os::unix::fs::symlink(&external, fix.join("run-metadata.json")).unwrap();
+    assert_linked_budget_refused(&root, &fix, "no-follow metadata read failed");
+    assert_eq!(std::fs::read(&external).unwrap(), before);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn linked_run_identity_and_boundary_must_match_registration() {
+    let (dir, root, fix) = linked_budget_fixture("linked-identity-refusal");
+    let original_fix = read(&fix.join("run-metadata.json"));
+    omgs::runmeta::update(&fix, |m| {
+        m.insert("run_id".into(), json!("replacement-run"));
+        m.insert("agent_calls_used".into(), json!(0));
+        Ok(())
+    })
+    .unwrap();
+    assert_linked_budget_refused(&root, &fix, "identity");
+    std::fs::write(
+        fix.join("run-metadata.json"),
+        serde_json::to_vec(&original_fix).unwrap(),
+    )
+    .unwrap();
+    omgs::runmeta::update(&fix, |m| {
+        m.insert("budget_parent_id".into(), json!("wrong-parent"));
+        Ok(())
+    })
+    .unwrap();
+    assert!(omgs::budget::charge_proof(&fix).is_err());
+    assert!(!cli(&["budget", "--run", root.to_str().unwrap()])
+        .status
+        .success());
+    std::fs::write(
+        fix.join("run-metadata.json"),
+        serde_json::to_vec(&original_fix).unwrap(),
+    )
+    .unwrap();
+    omgs::runmeta::update(&root, |m| {
+        m["fix_runs"][0]["path"] = json!(dir.join("outside").join("run"));
+        Ok(())
+    })
+    .unwrap();
+    assert_linked_budget_refused(&root, &fix, "outside the trusted runs directory");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn outside_fix_output_is_refused_before_creating_a_run() {
+    let (dir, root, _) = linked_budget_fixture("outside-fix-output");
+    let out = dir.join("elsewhere").join("fix");
+    let result = cli(&[
+        "audit",
+        "init",
+        "--target",
+        dir.join("repo").to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--no-sensors",
+        "--fix-of",
+        root.to_str().unwrap(),
+    ]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("trusted runs directory"));
+    assert!(!out.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn legacy_standalone_budget_works_but_unidentified_links_fail_closed() {
+    let (dir, root, fix) = linked_budget_fixture("legacy-linked-refusal");
+    omgs::runmeta::update(&root, |m| {
+        m.insert("fix_runs".into(), json!([fix]));
+        Ok(())
+    })
+    .unwrap();
+    assert_linked_budget_refused(&root, &fix, "register paths and run identities");
+    omgs::runmeta::update(&root, |m| {
+        m.remove("fix_runs");
+        m.remove("run_id");
+        Ok(())
+    })
+    .unwrap();
+    omgs::budget::charge_proof(&root).unwrap();
+    assert_eq!(allowance(&root)["remaining"], 9);
     std::fs::remove_dir_all(dir).unwrap();
 }

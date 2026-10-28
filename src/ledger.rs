@@ -46,6 +46,18 @@ pub struct Unit {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Priority exclusions can close only through hunting or explicit review.
+pub fn is_exclusion(u: &Unit) -> bool {
+    [
+        "tests:excluded",
+        "docs:excluded",
+        "data:excluded",
+        "vendored:excluded",
+    ]
+    .contains(&u.id.as_str())
+        || u.extra.contains_key("excluded_count")
+}
+
 impl Unit {
     pub fn new(id: &str, surface: &str, attack_classes: &[&str], status: &str) -> Unit {
         Unit {
@@ -77,6 +89,18 @@ fn unit_errors(u: &Unit) -> Vec<String> {
     }
     if u.status == "covered" && u.evidence.iter().all(|e| e.trim().is_empty()) {
         errors.push("covered requires at least one evidence reference".into());
+    }
+    if is_exclusion(u) && u.status == "out_of_scope" {
+        let reason = u
+            .note
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .strip_prefix("reviewed, not security relevant:");
+        if !reason.is_some_and(|r| !r.trim().is_empty()) {
+            errors
+                .push("excluded files require 'reviewed, not security relevant: <reason>'".into());
+        }
     }
     if NEEDS_NOTE.contains(&u.status.as_str()) && !u.has_note() {
         errors.push(format!("{} requires a note giving the reason", u.status));
@@ -159,6 +183,17 @@ pub fn coverage_lines(ledger: &Ledger) -> Vec<String> {
         .iter()
         .map(|u| {
             let mut line = format!("{}: {}", u.status, u.id);
+            if let Some(count) = u.extra.get("excluded_count") {
+                line.push_str(&format!(" ({count} excluded files)"));
+                if let Some(paths) = u.extra.get("excluded_paths").and_then(|v| v.as_array()) {
+                    let paths: Vec<_> = paths.iter().filter_map(|v| v.as_str()).collect();
+                    line.push_str(&format!(
+                        ", first {} sorted paths: {}",
+                        paths.len(),
+                        paths.join(", ")
+                    ));
+                }
+            }
             if !u.evidence.is_empty() {
                 line.push_str(&format!(" ({} evidence)", u.evidence.len()));
             }

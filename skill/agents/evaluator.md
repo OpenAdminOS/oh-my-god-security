@@ -12,6 +12,10 @@ Read finalized records, structured candidate claims, relevant source, trusted in
 
 Write OUTPUT_DIR/evaluation.json with this inline schema: {"evaluator": string, "source_ref": string, "decisions": [{"fingerprint": string, "decision": "uphold"|"adjust"|"overturn", "reason": string, "evidence": [string], "required_changes": [string]}], "gaps": [string]}. Include every finalized record, even rejected and pending ones. Cite replay record paths for every upheld proof. Adjustments must describe the exact corrected verdict, tier or severity and why; they return to the verifier for a schema-valid findings.json under SKILL_DIR/schemas/findings.schema.json, followed by a new evaluation. New leads return to a fresh hunter as candidates under SKILL_DIR/schemas/candidates.schema.json. Never directly invent a finding.
 
+## Excluded file accountability
+
+Check every `tests:excluded`, `docs:excluded`, `data:excluded` and `vendored:excluded` unit. Classification is a heuristic for priority, stack detection and size statistics, never proof that files are inert. Confirm that hunters skimmed or sampled the group and recorded either hunting evidence (`covered`) or `out_of_scope` with `reviewed, not security relevant: <reason>`. Challenge reasons that rely only on suffixes, size, directory names or the first 20 displayed paths. Interpreted policy and renamed scripts can appear in any class. Unresolved, blocked and deferred exclusions fail the critic and must remain explicit gaps.
+
 ## Exact commands
 
 ```text

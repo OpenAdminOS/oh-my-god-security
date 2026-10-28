@@ -12,7 +12,11 @@ Read the assigned source as text, related enforcement helpers needed to trace th
 
 Write OUTPUT_DIR/candidates-HUNTER.json as {"candidates": [...]} using every required field in SKILL_DIR/schemas/candidates.schema.json. Use the exact SOURCE_REF and HUNTER, stable identity inputs, unit_ids, attacker capability, ordered source trace, concrete result, checked counterevidence, missing fact and minimal proof plan. No severity. An empty hunt writes {"candidates": []}.
 
-Also write OUTPUT_DIR/dispositions-HUNTER.json, with this inline schema: {"hunter": string, "units": [{"unit_id": string, "disposition": "candidate"|"covered"|"blocked"|"deferred", "evidence": [string], "note": string}]}. Every assigned unit needs a disposition. Covered requires a traced effective control and evidence; blocked and deferred name the exact missing fact or budget limit. Stop on a complete candidate, decisive control, precise blocker or exhausted budget.
+Also write OUTPUT_DIR/dispositions-HUNTER.json, with this inline schema: {"hunter": string, "units": [{"unit_id": string, "disposition": "candidate"|"covered"|"blocked"|"deferred"|"out_of_scope", "evidence": [string], "note": string}]}. Every assigned unit needs a disposition. Covered requires a traced effective control and evidence; blocked and deferred name the exact missing fact or budget limit. Stop on a complete candidate, decisive control, precise blocker or exhausted budget.
+
+## Excluded file accountability
+
+Classification sets hunting priority only. Every assigned `tests:excluded`, `docs:excluded`, `data:excluded` or `vendored:excluded` unit starts unresolved and includes the total count and first 20 sorted paths across all files, regardless of extension. Skim or sample the group and trace any interpreted policy, executable content or build logic you encounter. Hunt relevant logic and record `covered` with evidence, or record `out_of_scope` with the exact note `reviewed, not security relevant: <reason>`. Explain what you sampled and why the group is not relevant; a filename, size or classifier label alone is not a reason. Blocked and deferred units remain gaps. Never treat the displayed first 20 paths as the entire population.
 
 ## Exact commands
 

@@ -1590,11 +1590,28 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     if flag(rest, "--budget").is_some() {
         return Err("--fix-of computes the budget; omit --budget".into());
     }
-    omgs::budget::init_fix(Path::new(&parent), |_, original, remaining| {
+    omgs::budget::init_fix(Path::new(&parent), |root, original, remaining| {
         let target = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
         let target = std::fs::canonicalize(target).map_err(|e| e.to_string())?;
         if original.get("target").and_then(|v| v.as_str()) != target.to_str() {
             return Err("fix run target must match its original run".into());
+        }
+        let runs_dir = root.parent().ok_or("original run needs a runs directory")?;
+        let output_parent = if let Some(out) = flag(rest, "--out") {
+            let out = PathBuf::from(out);
+            let absolute = if out.is_absolute() {
+                out
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| e.to_string())?
+                    .join(out)
+            };
+            resolve_existing_prefix(absolute.parent().ok_or("fix output needs a parent")?)?
+        } else {
+            data_dir().join(target.file_name().ok_or("target needs a name")?)
+        };
+        if resolve_existing_prefix(&output_parent)? != runs_dir {
+            return Err("fix run must be in the trusted runs directory; supply --out with a sibling of the original run".into());
         }
         let mut args = rest.to_vec();
         if let Some(cap) = remaining {
@@ -1820,9 +1837,9 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
     ] {
         let count = counts.get(&class).copied().unwrap_or(0);
         if count > 0 {
-            let mut unit = Unit::new(id, &format!("{count} {label} file(s)"), &[], "out_of_scope");
+            let mut unit = Unit::new(id, &format!("{count} {label} file(s)"), &[], "planned");
             unit.note = Some(format!(
-                "{count} {label} file(s) excluded from hunting by default"
+                "{count} {label} file(s) require review before exclusion"
             ));
             let mut paths: Vec<_> = classified
                 .iter()
@@ -1892,6 +1909,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
         .unwrap_or(0);
     let mut meta = serde_json::json!({
         "repo": repo, "target": target.to_string_lossy(), "source_ref": source_ref,
+        "run_id": omgs::platform::random_nonce().map_err(|e| e.to_string())?,
         "mode": mode, "budget_agent_calls": budget, "profile": "standard",
         "persona": persona.map(|p| p.name), "report_depth": persona.map_or("full", |p| p.report_depth),
         "budget_profile": persona.map_or("standard", |p| p.budget_profile),

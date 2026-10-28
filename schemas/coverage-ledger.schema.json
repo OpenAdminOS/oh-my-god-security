@@ -19,13 +19,26 @@
             "items": { "type": "string" },
             "description": "What shows the unit was examined: finding fingerprints, candidate files, or repo paths."
           },
-          "note": { "type": "string", "description": "Why the unit was deferred, blocked, or put out of scope." },
+          "note": { "type": "string", "description": "Why the unit was deferred, blocked, or put out of scope. Exclusion units require reviewed, not security relevant: followed by a nonempty reason when out_of_scope." },
           "excluded_count": {"type": "integer", "minimum": 0, "description": "Total excluded inventory files in this group."},
           "excluded_paths": {"type": "array", "maxItems": 20, "items": {"type": "string"}, "description": "First 20 excluded inventory paths in sorted order."},
           "excluded_source_count": {"type": "integer", "minimum": 0, "description": "Total excluded files with source or executable extensions in this group."},
           "excluded_source_paths": {"type": "array", "maxItems": 20, "items": {"type": "string"}, "description": "First 20 excluded source paths in sorted order."}
         },
         "allOf": [
+          {
+            "if": {
+              "properties": {"status": {"const": "out_of_scope"}},
+              "anyOf": [
+                {"required": ["excluded_count"]},
+                {"properties": {"id": {"enum": ["tests:excluded", "docs:excluded", "data:excluded", "vendored:excluded"]}}}
+              ]
+            },
+            "then": {
+              "required": ["note"],
+              "properties": {"note": {"pattern": "^\\s*reviewed, not security relevant:\\s*\\S"}}
+            }
+          },
           {
             "if": { "properties": { "status": { "const": "covered" } } },
             "then": { "required": ["evidence"], "properties": { "evidence": { "minItems": 1 } } }

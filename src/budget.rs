@@ -1,7 +1,7 @@
 //! One cumulative allowance from disjoint per-run counters. Child usage is
 //! never copied into its parent's counters.
 use crate::runmeta;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -14,38 +14,121 @@ pub struct Allowance {
     pub run_count: usize,
 }
 
-fn canonical(path: &Path) -> Result<PathBuf, String> {
-    std::fs::canonicalize(path).map_err(|e| format!("run {}: {e}", path.display()))
+/// Resolve only the parent as the trusted runs directory. The run entry
+/// itself is never canonicalized through a symlink or reparse point.
+fn run_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    let name = absolute
+        .file_name()
+        .ok_or("run path needs a directory name")?;
+    if absolute
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("run path must not contain parent traversal".into());
+    }
+    let parent = std::fs::canonicalize(absolute.parent().ok_or("run path needs a parent")?)
+        .map_err(|e| format!("runs directory {}: {e}", path.display()))?;
+    let run = parent.join(name);
+    let meta =
+        std::fs::symlink_metadata(&run).map_err(|e| format!("run {}: {e}", run.display()))?;
+    if crate::platform::is_link(&meta) || !meta.is_dir() {
+        return Err(format!(
+            "run {} must be a directory without symlinks or reparse points",
+            run.display()
+        ));
+    }
+    Ok(run)
 }
 
-fn fix_runs(meta: &Map<String, Value>) -> Result<Vec<PathBuf>, String> {
+/// Open every component below the trusted directory without following links.
+/// Unix uses openat(O_NOFOLLOW); Windows pins ancestors and rejects reparse
+/// points on the opened handles, including run-metadata.json itself.
+fn read_run(run: &Path) -> Result<Map<String, Value>, String> {
+    let boundary = run.parent().ok_or("run path needs a parent")?;
+    let relative = Path::new(run.file_name().ok_or("run path needs a name")?).join(runmeta::FILE);
+    let bytes = crate::platform::read_bounded_in(boundary, &relative, 16 << 20).map_err(|e| {
+        format!(
+            "linked run {}: no-follow metadata read failed: {e}",
+            run.display()
+        )
+    })?;
+    let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+    let Value::Object(meta) = crate::shape::strict_json(text)? else {
+        return Err("run metadata must be an object".into());
+    };
+    runmeta::check_numeric_fields(&meta)?;
+    Ok(meta)
+}
+
+fn run_id(meta: &Map<String, Value>) -> Result<&str, String> {
+    meta.get("run_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "linked run identity missing: run_id is required".into())
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RegisteredRun {
+    path: PathBuf,
+    run_id: String,
+}
+
+fn fix_runs(meta: &Map<String, Value>, boundary: &Path) -> Result<Vec<RegisteredRun>, String> {
     let Some(value) = meta.get("fix_runs") else {
         return Ok(Vec::new());
     };
-    value
-        .as_array()
-        .ok_or("fix_runs must be an array")?
-        .iter()
-        .map(|v| {
-            let path = v.as_str().ok_or("fix_runs entries must be paths")?;
-            canonical(Path::new(path))
-        })
-        .collect()
+    let runs: Vec<RegisteredRun> = serde_json::from_value(value.clone())
+        .map_err(|e| format!("fix_runs must register paths and run identities: {e}"))?;
+    for run in &runs {
+        // Registration stores physical sibling paths. Reject alternate roots,
+        // nested ancestors and traversal before any filesystem resolution.
+        if run.path.parent() != Some(boundary)
+            || !run.path.is_absolute()
+            || run
+                .path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("linked run is outside the trusted runs directory".into());
+        }
+        run_path(&run.path)?;
+        if run.run_id.trim().is_empty() {
+            return Err("registered run identity is empty".into());
+        }
+    }
+    Ok(runs)
 }
 
 /// Resolve either the original run or a registered fix run to the same root.
 pub fn original(run: &Path) -> Result<PathBuf, String> {
-    let run = canonical(run)?;
-    let meta = runmeta::read(&run)?;
+    let run = run_path(run)?;
+    let meta = read_run(&run)?;
     let Some(parent) = meta.get("budget_parent") else {
         return Ok(run);
     };
-    let parent = canonical(Path::new(
-        parent.as_str().ok_or("budget_parent must be a path")?,
-    ))?;
-    let root = runmeta::read(&parent)?;
-    if root.contains_key("budget_parent") || !fix_runs(&root)?.contains(&run) {
-        return Err("budget_parent must name the original run with this fix registered".into());
+    let parent = Path::new(parent.as_str().ok_or("budget_parent must be a path")?);
+    if parent.parent() != run.parent() {
+        return Err("budget_parent is outside the trusted runs directory".into());
+    }
+    let parent = run_path(parent)?;
+    let root = read_run(&parent)?;
+    if root.contains_key("budget_parent")
+        || meta.get("budget_parent_id").and_then(Value::as_str) != Some(run_id(&root)?)
+        || !fix_runs(&root, parent.parent().unwrap())?.iter().any(|r| {
+            r.path == run && Some(r.run_id.as_str()) == meta.get("run_id").and_then(Value::as_str)
+        })
+    {
+        return Err(
+            "budget_parent must name the original run with this fix identity registered".into(),
+        );
     }
     Ok(parent)
 }
@@ -53,27 +136,45 @@ pub fn original(run: &Path) -> Result<PathBuf, String> {
 /// Caller holds the original run's lock. Missing or inconsistent links fail
 /// closed instead of silently understating spent allowance.
 pub fn allowance(root: &Path) -> Result<Allowance, String> {
-    let root = canonical(root)?;
-    let meta = runmeta::read(&root)?;
+    let root = run_path(root)?;
+    let meta = read_run(&root)?;
     if meta.contains_key("budget_parent") {
         return Err("use the original run for cumulative accounting".into());
     }
     let cap = meta.get("budget_agent_calls").and_then(Value::as_u64);
-    let mut runs = vec![root.clone()];
-    runs.extend(fix_runs(&meta)?);
+    let linked = fix_runs(&meta, root.parent().unwrap())?;
+    // Legacy standalone runs remain chargeable. Linked families require ids;
+    // never infer an identity for an old registration that lacks one.
+    let root_id = if linked.is_empty() {
+        meta.get("run_id").and_then(Value::as_str).unwrap_or("")
+    } else {
+        run_id(&meta)?
+    };
+    let mut runs = vec![RegisteredRun {
+        path: root.clone(),
+        run_id: root_id.into(),
+    }];
+    runs.extend(linked);
     let mut seen = BTreeSet::new();
     let mut used = 0u64;
-    for run in &runs {
+    for registered in &runs {
+        let run = &registered.path;
         if !seen.insert(run) {
             return Err("duplicate run in cumulative budget".into());
         }
-        let m = runmeta::read(run)?;
+        let m = read_run(run)?;
+        if m.get("run_id").and_then(Value::as_str).unwrap_or("") != registered.run_id {
+            return Err(format!("linked run identity mismatch: {}", run.display()));
+        }
         if run != &root {
             let parent = m
                 .get("budget_parent")
                 .and_then(Value::as_str)
                 .ok_or("linked fix run has no budget_parent")?;
-            if canonical(Path::new(parent))? != root || !fix_runs(&m)?.is_empty() {
+            if Path::new(parent) != root
+                || m.get("budget_parent_id").and_then(Value::as_str) != Some(run_id(&meta)?)
+                || !fix_runs(&m, root.parent().unwrap())?.is_empty()
+            {
                 return Err("fix run must link directly to its original run".into());
             }
         }
@@ -93,7 +194,7 @@ pub fn allowance(root: &Path) -> Result<Allowance, String> {
 
 /// Serialize proof charging with fix registration and all other family proofs.
 pub fn charge_proof(run: &Path) -> Result<(), String> {
-    let run = canonical(run)?;
+    let run = run_path(run)?;
     let root = original(&run)?;
     runmeta::with_lock(&root, || {
         let total = allowance(&root)?;
@@ -102,7 +203,7 @@ pub fn charge_proof(run: &Path) -> Result<(), String> {
                 "run budget exhausted: cumulative original and fix allowance consumed".into(),
             );
         }
-        let charge = |m: &mut Map<String, Value>| {
+        let charge = |m: &mut Map<String, Value>| -> Result<(), String> {
             let calls = m
                 .get("agent_calls_used")
                 .and_then(Value::as_u64)
@@ -121,15 +222,24 @@ pub fn charge_proof(run: &Path) -> Result<(), String> {
             m.insert("proof_runs_used".into(), Value::from(next));
             Ok(())
         };
-        if run == root {
-            let mut meta = runmeta::read(&run)?;
+        let expected_id = read_run(&run)?.get("run_id").cloned();
+        let update = || {
+            let mut meta = read_run(&run)?;
+            if meta.get("run_id") != expected_id.as_ref() || original(&run)? != root {
+                return Err("linked run identity changed before charging".into());
+            }
+            // Revalidate the whole family immediately before charging.
+            allowance(&root)?;
             charge(&mut meta)?;
             runmeta::write_atomic(
                 &run.join(runmeta::FILE),
                 &serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
             )
+        };
+        if run == root {
+            update()
         } else {
-            runmeta::update(&run, charge)
+            runmeta::with_lock(&run, update)
         }
     })
 }
@@ -142,18 +252,30 @@ pub fn init_fix(
 ) -> Result<PathBuf, String> {
     let root = original(parent)?;
     runmeta::with_lock(&root, || {
-        let mut meta = runmeta::read(&root)?;
+        let mut meta = read_run(&root)?;
         let remaining = allowance(&root)?.remaining;
-        let child = canonical(&init(&root, &meta, remaining)?)?;
+        run_id(&meta)?;
+        let child = run_path(&init(&root, &meta, remaining)?)?;
+        if child.parent() != root.parent() || child == root {
+            return Err("fix run must be a distinct sibling in the trusted runs directory".into());
+        }
+        let child_id = run_id(&read_run(&child)?)?.to_string();
         runmeta::update(&child, |m| {
             m.insert(
                 "budget_parent".into(),
                 Value::from(root.to_string_lossy().as_ref()),
             );
+            m.insert("budget_parent_id".into(), Value::from(run_id(&meta)?));
+            if run_id(m)? != child_id {
+                return Err("linked run identity changed during registration".into());
+            }
             Ok(())
         })?;
-        let mut runs = fix_runs(&meta)?;
-        runs.push(child.clone());
+        let mut runs = fix_runs(&meta, root.parent().unwrap())?;
+        runs.push(RegisteredRun {
+            path: child.clone(),
+            run_id: child_id,
+        });
         meta.insert(
             "fix_runs".into(),
             serde_json::to_value(runs).map_err(|e| e.to_string())?,

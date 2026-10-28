@@ -1,4 +1,4 @@
-//! Fail-safe inventory policy. Unknown files stay in hunting scope.
+//! Heuristic inventory priority. Every class remains accountable in the ledger.
 //! Classification uses path conventions and file size, never execution.
 use serde::Serialize;
 use std::path::{Component, Path};
@@ -31,8 +31,8 @@ pub enum Class {
     Vendored,
 }
 
-/// Source recognition is used for exclusion disclosure, never as an allowlist
-/// for hunting. Unknown formats remain Code too.
+/// Source recognition supplements exclusion disclosure, never accountability.
+/// Unknown formats remain Code too.
 pub fn is_source(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let file = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
@@ -45,7 +45,43 @@ pub fn is_source(path: &str) -> bool {
         "jinja", "jinja2", "j2", "twig", "erb", "tmpl", "tpl", "liquid", "mustache",
     ]
     .contains(&ext)
-        || ["dockerfile", "makefile"].contains(&file)
+        || executable_filename(file)
+}
+
+/// Conventional build and executable configuration names take priority over
+/// docs and data suffixes. Container variants and Gradle Kotlin scripts count.
+fn executable_filename(file: &str) -> bool {
+    [
+        "cmakelists.txt", "makefile", "gnumakefile", "dockerfile", "containerfile",
+        "justfile", "rakefile", "gemfile", "jenkinsfile", "vagrantfile", "build",
+        "build.bazel", "workspace", "workspace.bazel", "meson.build", "meson_options.txt",
+        "sconstruct", "sconscript", "procfile", "brewfile", "taskfile.yml", "taskfile.yaml",
+    ].contains(&file)
+        || [".gradle", ".gradle.kts", ".cmake"].iter().any(|ext| file.ends_with(ext))
+        || file.starts_with("dockerfile.")
+        || file.starts_with("containerfile.")
+        // Pip requirements are dependency configuration, not documentation.
+        || (file.starts_with("requirements") && file.ends_with(".txt"))
+}
+
+fn notice_name(file: &str) -> bool {
+    let stem = file.strip_suffix(".txt").unwrap_or(file);
+    [
+        "readme",
+        "license",
+        "licence",
+        "notice",
+        "changes",
+        "changelog",
+        "authors",
+        "contributors",
+        "contributing",
+        "copying",
+        "copyright",
+        "thanks",
+        "news",
+    ]
+    .contains(&stem)
 }
 
 /// Without file evidence a data-looking name still defaults to Code.
@@ -90,14 +126,15 @@ pub fn classify_with_size(path: &str, size: u64) -> Class {
     {
         return Class::Test;
     }
-    if ["md", "rst", "txt", "adoc"].contains(&ext)
-        || ["license", "notice", "readme"].contains(&file)
-    {
+    if executable_filename(file) {
+        return Class::Code;
+    }
+    if ["md", "rst", "adoc"].contains(&ext) || notice_name(file) {
         return Class::Docs;
     }
     // SQL, HTML, MDX and templates can execute and are never data dumps.
-    // A large structured-data suffix is positive evidence; small configuration
-    // and unknown formats remain in scope. No content is executed or loaded.
+    // Size and suffix prioritize likely data, never establish inertness. Its
+    // exclusion unit still requires review. No content is executed or loaded.
     if size >= 1 << 20 && ["json", "jsonl", "ndjson", "csv", "tsv"].contains(&ext) {
         return Class::Data;
     }
