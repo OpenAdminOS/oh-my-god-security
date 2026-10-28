@@ -481,6 +481,23 @@ fn scanner_runtime_roots(executable: &Path, semgrep: bool) -> Result<ScannerRunt
     })
 }
 
+// Installation metadata may be world-readable. It is not private run data,
+// but links, special files and unbounded reads still cannot establish grants.
+fn read_venv_config(prefix: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = platform::open_single_link(&prefix.join("pyvenv.cfg"))
+        .map_err(|_| "cannot read scanner runtime configuration")?
+        .ok_or("cannot read scanner runtime configuration")?;
+    let mut config = Vec::new();
+    file.take(16385)
+        .read_to_end(&mut config)
+        .map_err(|_| "cannot read scanner runtime configuration")?;
+    if config.len() > 16384 {
+        return Err("scanner runtime configuration exceeds byte limit".into());
+    }
+    Ok(config)
+}
+
 fn python_runtime_grants(
     req: &SensorRequest<'_>,
     python: &PythonRuntime,
@@ -496,6 +513,9 @@ fn python_runtime_grants(
     let appdata = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join("AppData/Roaming"));
+    if let Some(prefix) = &python.venv {
+        read_venv_config(prefix)?;
+    }
     let readonly = python.venv.iter().map(|p| p.join("pyvenv.cfg")).collect();
     let discovered = run_sensor(SensorRequest {
         executable: &python.interpreter,
@@ -552,8 +572,7 @@ fn python_grants_from_discovery(
         // Resolve the venv's sys.prefix from its configuration, not bin's name.
         // Only the base interpreter runs during discovery, so read the version
         // from pyvenv.cfg to identify the venv's package directory.
-        let config = platform::read_bounded(&venv.join("pyvenv.cfg"), 16384)
-            .map_err(|_| "cannot read scanner runtime configuration")?;
+        let config = read_venv_config(venv)?;
         let config = String::from_utf8_lossy(&config);
         let version = config
             .lines()
@@ -746,13 +765,10 @@ mod tests {
             std::fs::create_dir_all(path).unwrap();
         }
         std::fs::write(venv.join("pyvenv.cfg"), "version = 3.13.2\n").unwrap();
-        let grants = python_grants_from_discovery(
-            &serde_json::json!({
-                "base": base, "prefix": base, "sites": [site, unrelated]
-            }),
-            Some(&venv),
-        )
-        .unwrap();
+        let discovery = serde_json::json!({
+            "base": base, "prefix": base, "sites": [site, unrelated]
+        });
+        let grants = python_grants_from_discovery(&discovery, Some(&venv)).unwrap();
         assert_eq!(grants.len(), 3);
         for path in [&base, &venv, &site] {
             assert!(grants.contains(&std::fs::canonicalize(path).unwrap()));
@@ -764,6 +780,13 @@ mod tests {
             &root.join("run"),
         )
         .unwrap();
+        // Public installation metadata is accepted, but aliases cannot turn
+        // a private file into a readable bootstrap grant.
+        let config = venv.join("pyvenv.cfg");
+        let alias = root.join("config-alias");
+        std::fs::rename(&config, &alias).unwrap();
+        std::fs::hard_link(&alias, &config).unwrap();
+        assert!(python_grants_from_discovery(&discovery, Some(&venv)).is_err());
         for path in [
             home.join(".local"),
             home.join(".local/share"),
@@ -771,14 +794,18 @@ mod tests {
             home.join("AppData"),
         ] {
             std::fs::create_dir_all(&path).unwrap();
-            assert!(validate_sensor_grants(
+            let reason = validate_sensor_grants(
                 &[path],
                 std::slice::from_ref(&home),
                 &root.join("target"),
-                &root.join("run")
+                &root.join("run"),
             )
-            .unwrap_err()
-            .contains("shared user-data"));
+            .unwrap_err();
+            // Library and AppData also contain denylisted secret locations.
+            assert!(
+                reason.contains("shared user-data") || reason.contains("secret location"),
+                "{reason}"
+            );
         }
         for sub in [".ssh", ".aws", ".config", "Library/Keychains"] {
             let secret = home.join(sub);
