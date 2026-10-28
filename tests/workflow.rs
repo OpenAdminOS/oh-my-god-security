@@ -1217,7 +1217,7 @@ fn sensors_documents_must_be_objects() {
         omgs::shape::sensors(r#"{"tools_run":[],"tools_unavailable":[],"hits":[],"hits":[]}"#)
             .is_err()
     );
-    assert!(omgs::shape::sensors(r#"{"tools_run":["gitleaks"],"tools_unavailable":[],"hits":[{"tool":"gitleaks","rule":"r","file":"f","line":1,"vendored":false}]}"#).is_ok());
+    assert!(omgs::shape::sensors(r#"{"tools_run":["gitleaks"],"tools_unavailable":[],"hits":[{"tool":"gitleaks","rule":"r","file":"f","line":1,"vendored":false,"class":"code","fingerprint":"f"}]}"#).is_ok());
     let dir = scratch("sensors-array");
     std::fs::write(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
     std::fs::write(dir.join("sensors.json"), "[[],[],[]]").unwrap();

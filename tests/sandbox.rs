@@ -1121,6 +1121,9 @@ fn markers_survive_a_real_mxc_output_flood() {
 #[test]
 fn sensors_execute_resolved_paths_even_with_a_poisoned_current_directory() {
     use std::os::unix::fs::PermissionsExt;
+    if !mxc_ready() {
+        return;
+    }
     let d = scratch("sensor-paths");
     let safe = d.join("safe");
     let poisoned = d.join("poisoned");
@@ -1128,9 +1131,17 @@ fn sensors_execute_resolved_paths_even_with_a_poisoned_current_directory() {
     for dir in [&safe, &poisoned, &target] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    let calls = d.join("calls");
     for tool in ["gitleaks", "semgrep"] {
-        let script = format!("#!/bin/sh\necho \"$0\" >> '{}'\nwhile [ $# -gt 0 ]; do case \"$1\" in --output|--report-path) shift; out=$1;; esac; shift; done\nprintf '%s' '{{\"results\":[],\"errors\":[]}}' > \"$out\"\n", calls.display());
+        let output = if tool == "gitleaks" {
+            "[]"
+        } else {
+            r#"{"results":[],"errors":[]}"#
+        };
+        let script = format!(
+            "#!/bin/sh\n[ \"$0\" = '{}' ] || exit 77\nprintf '%s' '{}'\n",
+            safe.join(tool).display(),
+            output
+        );
         std::fs::write(safe.join(tool), script).unwrap();
         std::fs::set_permissions(safe.join(tool), std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(
@@ -1156,14 +1167,25 @@ fn sensors_execute_resolved_paths_even_with_a_poisoned_current_directory() {
         ])
         .env("PATH", format!(".:{}:/usr/bin:/bin", safe.display()))
         .env("OMGS_SEMGREP_CONFIG", rules)
+        .env(
+            "OMGS_MXC_EXEC",
+            omgs::sandbox::locate_executor().unwrap().path,
+        )
         .current_dir(poisoned)
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", text(&out));
     assert!(!d.join("poisoned-ran").exists());
-    let calls = std::fs::read_to_string(calls).unwrap();
+    let report = std::fs::read_to_string(d.join("reports/sensors.json")).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
     for tool in ["gitleaks", "semgrep"] {
-        assert!(calls.contains(safe.join(tool).to_str().unwrap()), "{calls}");
+        assert!(
+            report["tools_run"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(tool)),
+            "{report}"
+        );
     }
     let _ = std::fs::remove_dir_all(d);
 }

@@ -331,6 +331,104 @@ cargo build --release
 
 Offline benchmark scoring: `omgs bench score --cases <manifest> --runs <run-dir>` reads saved artifacts and emits JSON plus Markdown. See the [benchmark guide](benchmark/README.md#score-saved-runs-offline) and [corpus research inventory](benchmark/corpus/README.md).
 
+## Optional local sensors
+
+`audit init` and `check` look for installed sensors on PATH (PATH plus native
+PATHEXT extensions on Windows). They read source and dependency files as data,
+never run target builds, tests or package scripts, and install nothing.
+`audit init --no-sensors` skips them.
+
+All sensor scanners run inside the same SHA-256 pinned Microsoft MXC executors
+as `omgs prove`. Missing MXC, rejected preflight and Windows tiers requiring
+DACL augmentation are explicit gaps. There is no unsandboxed fallback. MXC
+denies external network egress, inbound connections and host loopback on every
+supported OS. Offline flags do not substitute for this enforcement.
+
+- Gitleaks detects credentials without git history. OMGS supplies its own
+  default-rule config and disables inline allow comments.
+- Semgrep requires an existing local `OMGS_SEMGREP_CONFIG` rules file or
+  directory. Registry shorthand and `OMGS_SEMGREP_ALLOW_REGISTRY` no longer
+  enable fetching. Download rules separately before scanning. The disposable
+  copy removes every `.semgrepignore`, and `--no-git-ignore --disable-nosem`
+  disables repository ignores and inline `nosemgrep` comments. Scanner defaults
+  may still skip unsupported inputs; reported skips remain gaps. Inside MXC,
+  Semgrep can read its whole site-packages directory, including unrelated
+  packages and anything stored there; install it in a dedicated virtual
+  environment.
+- TruffleHog uses `--no-verification --no-update --json --no-ignore-tag`.
+  It cannot verify a secret online, update itself or honor inline ignore tags.
+- OSV-Scanner uses `--offline-vulnerabilities --offline --no-call-analysis
+  --no-resolve --no-ignore` and an OMGS-owned empty `--config`. Repository
+  `osv-scanner.toml` overrides and `.gitignore` cannot suppress results. Set
+  `OMGS_OSV_DB` to an existing cache root with
+  `osv-scanner/<ecosystem>/all.zip`; the default is `<OMGS data dir>/osv-db`.
+  Missing or corrupt databases remain gaps. No dependency resolution, target
+  builds, tests or package scripts are requested.
+
+OSV database downloads remain a separate explicit network opt-in. The download
+runs outside MXC only because it is a network fetch the user has opted into.
+After approving that network access, run the following command
+with your already installed OSV-Scanner outside an OMGS audit. Replace CACHE
+with an absolute cache directory and TARGET with the local repository:
+
+```sh
+OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY=CACHE osv-scanner scan source --offline-vulnerabilities --download-offline-databases --no-call-analysis --no-resolve TARGET
+```
+
+PowerShell: set `$env:OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY = 'CACHE'`, then run
+the same `osv-scanner` command. Set `OMGS_OSV_DB` to CACHE for the subsequent
+audit. OMGS never runs this download command automatically. See the upstream
+[OSV offline database documentation](https://github.com/google/osv-scanner/blob/main/docs/offline-mode.md)
+for manual ecosystem archive downloads and cache layout.
+
+Every scanner gets a bounded read-only workspace copy, read-only installed
+binary/runtime roots, read-only rules/database and a private writable scratch
+home/cache outside permanent run artifacts. Native scanners receive only an
+executable-file grant. Python entry points also receive narrow installation/runtime
+prefixes. Grants exposing the whole HOME or
+user profile, or overlapping the original target or artifacts, are refused.
+Scratch is checked against the target, artifacts and all grants before creation.
+The original target is not mounted.
+The disposable tree, including raw scanner temp files, is removed after
+supervised cleanup on success, failure, interruption and timeout. Cleanup failure
+is a gap. OMGS does not retain raw stdout, stderr or diagnostics. It preserves
+only metadata and generic gap reasons. Custom seccomp and sandbox-exec sensor
+paths have been removed in favor of MXC.
+
+Input is bounded to 16 MiB per file, 64 MiB total, 10,000 entries and 64 directory
+levels per scanner; links, special files, unreadable files and entries exceeding
+these bounds are skipped with an explicit gap. A skipped directory accounts for
+its entire subtree. Copied files are read with no-follow bounded reads. Runtime
+and database installations are operator-supplied readable inputs, not part of
+this source byte budget. They can affect parser memory usage. No total process
+memory cap is claimed on macOS or Windows. Semgrep additionally uses
+`--max-target-bytes=1000000 --max-memory=512 --jobs=1`; its reported skipped
+inputs and diagnostics become gaps. OMGS independently counts copied files above
+the 1,000,000 byte target limit, even when quiet output omits skipped paths.
+
+Scanners have a 120 second MXC deadline, supervised teardown (up to 15 seconds
+extra on Unix) and a 4 MiB combined output cap. Unix adds CPU, file size and open
+file limits. Linux requests a 2 GiB cgroup memory limit and 128 tasks through an
+available systemd user scope. If unavailable, OMGS records the same gap as
+`prove`. Sensors follow the same per-OS enforced set as `prove`: macOS and
+Windows have no memory/task cap by design. Oversized output, malformed JSON,
+missing metadata, unexpected exit codes, reported omissions and incomplete cleanup are
+explicit gaps. No sensor is a successful zero-hit scan merely because it failed.
+
+`sensors.json` records successful tools, unavailable tools, gaps and redacted
+hits; `sensor-hits.json` lists the same hits separately. Each hit keeps the tool,
+detector or advisory ID, relative file, line when supplied, shared path class and
+a SHA-256 fingerprint of that metadata. OSV hits also retain package name, version
+and ecosystem in JSON, fingerprints and reports, so distinct affected versions
+require separate ledger resolutions. Raw secrets and scanner output are never
+saved by the sensors. Both reports list hits from every class and all gaps.
+Each code hit seeds a `sensor:<tool>:<fingerprint>` candidate ledger unit. Hunt it
+with `covered` and evidence, or resolve it with a reason using `deferred`,
+`blocked` or `out_of_scope`. The critic rejects unresolved or missing hit units.
+Non-code hits remain visible and require the existing exclusion group review.
+Old sensor artifacts without class/fingerprint metadata or OSV package identity
+must be regenerated.
+
 ## Persona defaults and accounting
 
 `omgs audit init --target <repo> --persona builder|inheritor|team` records the persona and selects presentation and spending defaults. Builder uses concise coverage detail and a budget of 24 calls/proofs, inheritor uses full detail and 64, and team uses full detail and 96. Without a committed base policy, every persona defaults to advisory and explicit `--mode` and `--budget` override the defaults. Without `--persona`, the existing budget behavior is unchanged. A committed base policy takes precedence and conflicting overrides fail before run creation. Proof rules, verdict semantics and the evidence required to confirm a finding are identical.

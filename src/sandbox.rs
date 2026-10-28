@@ -5,7 +5,9 @@
 //! refuses and the finding stays at the tier it already earned.
 
 mod preflight;
+mod sensors;
 pub use preflight::{windows_build_report, windows_policy, windows_probe};
+pub use sensors::{run_sensor, SensorRequest};
 
 use crate::platform::mxc_path;
 use crate::{platform, sha256, supervise};

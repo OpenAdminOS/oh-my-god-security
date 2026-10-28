@@ -311,6 +311,11 @@ pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport,
         );
     }
     let mut report = critique(&ledger, names.len(), &candidates, findings);
+    if let Some(sensors) = crate::sensors::read_report(dir)? {
+        report
+            .gaps
+            .extend(crate::sensors::reconcile(&sensors, &ledger));
+    }
     for e in crate::proof::validate_proofs(findings, dir) {
         report.gaps.push(format!("findings {e}"));
     }
