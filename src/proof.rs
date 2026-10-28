@@ -523,12 +523,20 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
         errors.push("MXC config commandLine is not the wrapped record.command".into());
     }
     if !(1..=u64::from(u32::MAX)).contains(&record.timeout_ms)
-        || config.pointer("/process/timeout").and_then(|v| v.as_u64()) != Some(record.timeout_ms)
+        || config.pointer("/process/timeout").and_then(|v| v.as_u64())
+            != Some(crate::sandbox::executor_timeout_ms(os, record.timeout_ms))
     {
         errors.push(
-            "MXC config timeout must match record.timeout_ms, a finite MXC millisecond count"
+            "MXC config timeout must match the platform timeout policy for finite record.timeout_ms"
                 .into(),
         );
+    }
+    if os == "windows"
+        && !record
+            .enforced
+            .contains(&format!("wall_clock={}ms", record.timeout_ms))
+    {
+        errors.push("Windows proof requires the recorded finite supervisor wall clock".into());
     }
     let norm = |p: &str| {
         let p = if os == "windows" {

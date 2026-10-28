@@ -356,7 +356,11 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             executor: executor.file.into(),
             executor_sha256: executor.sha256.into(),
             config_sha256: omgs::sha256::digest(config.as_bytes()),
-            enforced: omgs::sandbox::declared_controls(os, tier).0,
+            enforced: {
+                let mut controls = omgs::sandbox::declared_controls(os, tier).0;
+                controls.push("wall_clock=1000ms".into());
+                controls
+            },
             gaps: omgs::sandbox::declared_controls(os, tier).1,
             notes: vec![],
             output_sha256: omgs::sha256::digest(b""),
@@ -1979,6 +1983,9 @@ fn windows_unc_proof_directories_match_writer_and_validator() {
     record.containment = executor.containment.into();
     record.executor_sha256 = executor.sha256.into();
     record.enforced = omgs::sandbox::declared_controls("windows", omgs::sandbox::Tier::Test).0;
+    record
+        .enforced
+        .push(format!("wall_clock={}ms", record.timeout_ms));
     record.gaps = omgs::sandbox::declared_controls("windows", omgs::sandbox::Tier::Test).1;
     record.system_root = Some(r"C:\Windows".into());
     let command = omgs::proof::recorded_command(&dir, &record).unwrap();
@@ -2024,6 +2031,30 @@ fn windows_unc_proof_directories_match_writer_and_validator() {
         omgs::proof::write(&dir, &record).unwrap();
         let errors = omgs::proof::validate_proofs(&findings, &dir);
         assert!(errors.is_empty(), "{prefix}: {errors:?}");
+
+        let mut internal_timer = config.clone();
+        internal_timer["process"]["timeout"] = record.timeout_ms.into();
+        let bytes = serde_json::to_vec(&internal_timer).unwrap();
+        record.config_sha256 = omgs::sha256::digest(&bytes);
+        std::fs::write(dir.join("proofs/1/mxc-config.json"), bytes).unwrap();
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "platform timeout policy"
+        ));
+
+        let bytes = serde_json::to_vec(&config).unwrap();
+        record.config_sha256 = omgs::sha256::digest(&bytes);
+        std::fs::write(dir.join("proofs/1/mxc-config.json"), bytes).unwrap();
+        record.enforced.retain(|c| !c.starts_with("wall_clock="));
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "finite supervisor wall clock"
+        ));
+        record
+            .enforced
+            .push(format!("wall_clock={}ms", record.timeout_ms));
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

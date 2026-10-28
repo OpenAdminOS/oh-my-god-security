@@ -624,6 +624,7 @@ fn wait(
                     .into(),
             );
         } else {
+            waited.healthy = false;
             notes.push("Windows executor shutdown: forced termination after cleanup grace; MXC DACL restoration not assured until next startup".into());
         }
     }

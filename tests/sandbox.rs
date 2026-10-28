@@ -413,7 +413,10 @@ fn proof_records_back_confirmed_findings() {
         &std::fs::read_to_string(run.join("proofs/3/mxc-config.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(config["process"]["timeout"], 17000);
+    assert_eq!(
+        config["process"]["timeout"],
+        omgs::sandbox::executor_timeout_ms(std::env::consts::OS, 17000)
+    );
 
     // A replay never takes a host path from an edited record.
     let original = std::fs::read_to_string(run.join("proofs/1.json")).unwrap();
@@ -743,6 +746,28 @@ fn an_mxc_timeout_is_never_a_proof() {
     let record: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(run.join("proofs/1.json")).unwrap()).unwrap();
     assert_eq!(record["timed_out"], true, "{record}");
+    if cfg!(windows) {
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run.join("proofs/1/mxc-config.json")).unwrap())
+                .unwrap();
+        assert_eq!(config["process"]["timeout"], 0);
+        assert!(record["enforced"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("wall_clock=2000ms")));
+        assert!(!record["output"]
+            .as_str()
+            .unwrap()
+            .contains("script timed out"));
+        if record["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap.as_str().unwrap().starts_with("Windows ACL cleanup:"))
+        {
+            assert_eq!(record["cleanup_complete"], false);
+        }
+    }
     let findings = run.join("findings.json");
     std::fs::write(
         &findings,

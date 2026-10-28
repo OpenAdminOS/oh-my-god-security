@@ -515,6 +515,24 @@ pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
     mxc_config_at(input, &system_root)
 }
 
+// Windows timeout cleanup must pass through the supervisor's Ctrl+Break path.
+// MXC 1.0.1 treats zero as infinite; the finite budget is enforced by OMGS.
+pub fn executor_timeout_ms(os: &str, timeout_ms: u64) -> u64 {
+    if os == "windows" {
+        0
+    } else {
+        timeout_ms
+    }
+}
+
+pub fn supervisor_timeout_ms(os: &str, timeout_ms: u64) -> u64 {
+    if os == "windows" {
+        timeout_ms
+    } else {
+        timeout_ms.saturating_add(15_000)
+    }
+}
+
 pub fn mxc_config_at(input: &ConfigInput, system_root: &str) -> serde_json::Value {
     let scratch = mxc_path(input.scratch);
     let env = environment(input.os, &scratch, input.rust.as_ref(), system_root);
@@ -528,7 +546,7 @@ pub fn mxc_config_at(input: &ConfigInput, system_root: &str) -> serde_json::Valu
         "process": {
             "commandLine": input.command,
             "cwd": mxc_path(input.workspace),
-            "timeout": input.timeout_ms,
+            "timeout": executor_timeout_ms(input.os, input.timeout_ms),
             "env": env
         },
         "network": {
@@ -1323,9 +1341,9 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         return blocked(e.to_string());
     }
     let limits = supervise::Limits {
-        // The executor enforces the config timeout itself; the supervisor
-        // allows a short margin for teardown before killing it.
-        wall_ms: req.timeout_ms.saturating_add(15_000),
+        // Windows uses only our timer so MXC's internal timeout cannot race
+        // its console-control cleanup. Unix allows MXC a teardown margin.
+        wall_ms: supervisor_timeout_ms(os, req.timeout_ms),
         cpu_secs: Some(req.timeout_ms.div_ceil(1000).saturating_mul(2).max(10)),
         file_size_bytes: Some(1 << 30),
         open_files: Some(1024),
@@ -1366,8 +1384,23 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         if let Err(reason) = preflight::dry_run_result(&validation) {
             return blocked(reason);
         }
+        #[cfg(windows)]
+        let acl = match preflight::WindowsAclSnapshot::capture(
+            [&workspace, &scratch]
+                .into_iter()
+                .chain(input.readonly.iter()),
+        ) {
+            Ok(acl) => acl,
+            Err(reason) => return blocked(reason),
+        };
         let cmd = preflight::workload_command(&executor, &config_path, &run_dir);
         let run = supervise::run_marked(cmd, &limits, markers.as_ref(), &nonce);
+        #[cfg(windows)]
+        let run = {
+            let mut run = run;
+            acl.verify_abnormal_exit(&mut run);
+            run
+        };
         // MXC rejects the policy before starting anything, so nothing ran and
         // retrying without the setting is safe.
         if probe_fallback && input.list_parents && retry_without_enumeration(os, &run) {
@@ -1512,6 +1545,18 @@ mod tests {
             request.expected_tree_sha256 = Some("a".repeat(64));
             assert!(matches!(prove(&request), ProveOutcome::Blocked { .. }));
             assert!(!d.exists());
+        }
+    }
+
+    #[test]
+    fn windows_timeout_is_owned_by_supervisor_without_an_internal_timer() {
+        for timeout in [1, 2000, u64::from(u32::MAX)] {
+            assert_eq!(executor_timeout_ms("windows", timeout), 0);
+            assert_eq!(supervisor_timeout_ms("windows", timeout), timeout);
+            for os in ["linux", "macos"] {
+                assert_eq!(executor_timeout_ms(os, timeout), timeout);
+                assert_eq!(supervisor_timeout_ms(os, timeout), timeout + 15_000);
+            }
         }
     }
 

@@ -88,7 +88,7 @@ impl std::fmt::Display for ProbeFailure {
     }
 }
 
-pub const DACL_GAP: &str = "MXC temporarily adds host ACEs to granted paths, including toolchain roots, and restores them best effort during cleanup; an interrupted run or forced termination can leave entries until MXC next starts; this is distinct from optional administrator wxc-host-prep.exe preparation, which OMGS never runs";
+pub const DACL_GAP: &str = "MXC temporarily adds host ACEs to granted paths, including toolchain roots, and restores them best effort during cleanup; cleanup can change inherited ACE flags, and an internal script timeout, interrupted run or forced termination can leave host ACL changes until MXC next starts and attempts best-effort recovery, which does not promise to restore inheritance flags; this is distinct from optional administrator wxc-host-prep.exe preparation, which OMGS never runs";
 
 pub fn windows_policy(
     probe: Result<WindowsProbe, ProbeFailure>,
@@ -225,6 +225,64 @@ pub fn workload_command(executor: &Path, config: &Path, cwd: &Path) -> Command {
     let mut cmd = executor_command(executor, Some(cwd));
     cmd.arg("--config").arg(config);
     cmd
+}
+
+// Check only granted roots, without walking target-controlled descendants.
+// A changed root is evidence of incomplete restoration, not proof that an
+// unchanged root means every descendant or other host object was restored.
+#[cfg(windows)]
+pub struct WindowsAclSnapshot(Vec<(std::path::PathBuf, String)>);
+
+#[cfg(windows)]
+impl WindowsAclSnapshot {
+    pub fn capture<'a>(
+        paths: impl IntoIterator<Item = &'a std::path::PathBuf>,
+    ) -> Result<Self, String> {
+        paths
+            .into_iter()
+            .map(|path| windows_acl(path).map(|acl| (path.clone(), acl)))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self)
+    }
+
+    pub fn verify_abnormal_exit(self, run: &mut supervise::Supervised) {
+        if run.command_finished
+            && !run.timed_out
+            && !run.interrupted
+            && !run.killed
+            && !run.executor_error
+        {
+            return;
+        }
+        for (path, before) in self.0 {
+            let issue = match windows_acl(&path) {
+                Ok(after) if before == after => continue,
+                Ok(_) => "granted root ACL changed; MXC did not restore the original ACEs or inheritance flags".to_string(),
+                Err(reason) => format!("granted root ACL restoration could not be verified: {reason}"),
+            };
+            run.cleanup_complete = false;
+            run.success = false;
+            run.notes
+                .push(format!("Windows ACL cleanup: {issue}: {}", path.display()));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_acl(path: &Path) -> Result<String, String> {
+    let root = std::env::var_os("SYSTEMROOT").ok_or("SYSTEMROOT unavailable for ACL check")?;
+    let mut cmd = Command::new(Path::new(&root).join("System32/icacls.exe"));
+    // /l inspects the link itself instead of following a reparse point.
+    cmd.arg(path).arg("/l");
+    let run = inspect(cmd);
+    if completed(&run) && run.success {
+        Ok(run.stdout)
+    } else {
+        Err(format!(
+            "icacls check failed: {}",
+            crate::proof::redact(&run.output)
+        ))
+    }
 }
 
 // https://github.com/microsoft/mxc/blob/main/docs/backends/process-container/os-version-support.md
@@ -534,7 +592,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_timed_out_proof_restores_granted_scratch_aces() {
+    fn windows_timeouts_restore_scratch_aces_or_report_incomplete_cleanup() {
         let Ok(located) = super::super::locate_executor() else {
             return;
         };
@@ -553,20 +611,47 @@ mod tests {
             assert!(output.status.success(), "{output:?}");
             output.stdout
         };
-        let before = acl();
         let nonce = "d".repeat(64);
         for supervisor_timeout in [false, true] {
-            let config = serde_json::json!({"version":"1.0.0", "containment":"process",
+            // Recreate a fresh inherited DACL for each path under test.
+            std::fs::remove_dir_all(&granted).unwrap();
+            std::fs::create_dir_all(&granted).unwrap();
+            let file = granted.join("file.txt");
+            std::fs::write(&file, "scratch evidence").unwrap();
+            let before = acl();
+            let snapshot = WindowsAclSnapshot::capture([&granted, &file]).unwrap();
+            let mut config = serde_json::json!({"version":"1.0.0", "containment":"process",
                 "process":{"commandLine":format!("cmd.exe /d /c echo OMGS_START_{nonce}& for /l %i in (1,0,2) do @rem"),
-                    "cwd":platform_path(&granted), "timeout":if supervisor_timeout {60000} else {2000}},
+                    "cwd":platform_path(&granted), "timeout":2000},
                 "network":{"egress":{"default":"deny"}},
                 "filesystem":{"readwritePaths":[platform_path(&granted)]},
                 "processContainer":{"leastPrivilege":true}});
+            if supervisor_timeout {
+                // Use the actual production config, including its timer policy.
+                config = super::super::mxc_config(&super::super::ConfigInput {
+                    os: "windows",
+                    containment: "process",
+                    command: config["process"]["commandLine"].as_str().unwrap(),
+                    timeout_ms: 5000,
+                    workspace: &granted,
+                    scratch: &granted,
+                    allowed_marker: None,
+                    readonly: vec![],
+                    denied: vec![],
+                    rust: None,
+                    list_parents: false,
+                });
+                assert_eq!(config["process"]["timeout"], 0);
+            }
             let path = d.join("config.json");
             std::fs::write(&path, config.to_string()).unwrap();
             let cmd = workload_command(&located.path, &path, &d);
             let limits = supervise::Limits {
-                wall_ms: if supervisor_timeout { 5000 } else { 15000 },
+                wall_ms: if supervisor_timeout {
+                    super::super::supervisor_timeout_ms("windows", 5000)
+                } else {
+                    15000
+                },
                 cpu_secs: None,
                 file_size_bytes: None,
                 open_files: None,
@@ -574,11 +659,13 @@ mod tests {
                 tasks: None,
                 output_cap_bytes: 65536,
             };
-            let run = supervise::run_marked(cmd, &limits, None, &nonce);
+            let mut run = supervise::run_marked(cmd, &limits, None, &nonce);
+            snapshot.verify_abnormal_exit(&mut run);
             assert!(run.command_started, "DACL workload did not start: {run:?}");
             assert!(!run.command_finished && !run.success, "{run:?}");
             if supervisor_timeout {
                 assert!(run.timed_out, "{run:?}");
+                assert!(!run.output.contains("script timed out"), "{run:?}");
                 assert!(
                     run.notes
                         .iter()
@@ -587,7 +674,26 @@ mod tests {
                 );
             }
             // Compare before another executor startup can recover leaked ACEs.
-            assert_eq!(acl(), before, "granted path ACEs changed: {run:?}");
+            let after = acl();
+            if after != before {
+                assert!(
+                    !run.cleanup_complete && !run.success,
+                    "ACL drift was reported clean: {run:?}"
+                );
+                assert!(
+                    run.notes
+                        .iter()
+                        .any(|n| n.starts_with("Windows ACL cleanup: granted root ACL changed")),
+                    "ACL drift was not disclosed: {run:?}"
+                );
+            } else {
+                assert!(
+                    !run.notes
+                        .iter()
+                        .any(|n| n.starts_with("Windows ACL cleanup:")),
+                    "unexpected ACL check failure: {run:?}"
+                );
+            }
         }
         std::fs::remove_dir_all(d).unwrap();
     }
