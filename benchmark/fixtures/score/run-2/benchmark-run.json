@@ -1,0 +1,94 @@
+{
+  "format_version": 1,
+  "run_id": "r2",
+  "campaign_id": "fixture-v1",
+  "repetitions": 2,
+  "configuration": "fixture-config",
+  "observations": [
+    {
+      "case_id": "fixture",
+      "snapshot_id": "positive",
+      "status": "complete",
+      "blockers": [],
+      "examined_units": [
+        "route.ts"
+      ],
+      "unexamined_units": [],
+      "candidates": [
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/b-refactor/route.ts:GET",
+          "sink": "loadb-refactor",
+          "boundary": "member to private data",
+          "verifier": "accepted"
+        },
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/c/route.ts:GET",
+          "sink": "loadc",
+          "boundary": "member to private data",
+          "verifier": "accepted"
+        }
+      ],
+      "findings": [
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/b-refactor/route.ts:GET",
+          "sink": "loadb-refactor",
+          "boundary": "member to private data",
+          "fingerprint": "omgs-e00e625fa57d963e",
+          "verdict": "confirmed",
+          "proof_tier": "test_proven",
+          "proof_ref": "proofs/1.json"
+        },
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/c/route.ts:GET",
+          "sink": "loadc",
+          "boundary": "member to private data",
+          "fingerprint": "omgs-1dbc0388d873fabe",
+          "verdict": "confirmed",
+          "proof_tier": "test_proven",
+          "proof_ref": "proofs/2.json"
+        }
+      ],
+      "adjudications": [],
+      "source_run": "positive"
+    },
+    {
+      "case_id": "fixture",
+      "snapshot_id": "fixed",
+      "status": "complete",
+      "blockers": [],
+      "examined_units": [
+        "route.ts"
+      ],
+      "unexamined_units": [],
+      "candidates": [],
+      "findings": [],
+      "adjudications": [],
+      "source_run": null
+    },
+    {
+      "case_id": "fixture",
+      "snapshot_id": "blocked",
+      "status": "blocked",
+      "blockers": [
+        "offline dependency unavailable"
+      ],
+      "examined_units": [],
+      "unexamined_units": [
+        "route.ts"
+      ],
+      "candidates": [],
+      "findings": [],
+      "adjudications": [],
+      "source_run": null
+    }
+  ],
+  "resource_usage": {
+    "proof_tool_cost_usd": null,
+    "wall_seconds": 14.4
+  },
+  "manifest_sha256": "3bb49c77f2a98cea379036f4e8ff1399a6072ce2866af64b0eb062f370da0035"
+}

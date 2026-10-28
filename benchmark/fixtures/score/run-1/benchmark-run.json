@@ -1,0 +1,143 @@
+{
+  "format_version": 1,
+  "run_id": "r1",
+  "campaign_id": "fixture-v1",
+  "repetitions": 2,
+  "configuration": "fixture-config",
+  "observations": [
+    {
+      "case_id": "fixture",
+      "snapshot_id": "positive",
+      "status": "complete",
+      "blockers": [],
+      "examined_units": [
+        "route.ts"
+      ],
+      "unexamined_units": [],
+      "candidates": [
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/a/route.ts:GET",
+          "sink": "loada",
+          "boundary": "member to private data",
+          "verifier": "accepted"
+        },
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/b/route.ts:GET",
+          "sink": "loadb",
+          "boundary": "member to private data",
+          "verifier": "rejected"
+        },
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/c/route.ts:GET",
+          "sink": "loadc",
+          "boundary": "member to private data",
+          "verifier": "pending"
+        }
+      ],
+      "findings": [
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/a/route.ts:GET",
+          "sink": "loada",
+          "boundary": "member to private data",
+          "fingerprint": "omgs-d7c7756a1f68ec92",
+          "verdict": "confirmed",
+          "proof_tier": "test_proven",
+          "proof_ref": "proofs/1.json"
+        },
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/b/route.ts:GET",
+          "sink": "loadb",
+          "boundary": "member to private data",
+          "fingerprint": "omgs-ff2d11f545a90e74",
+          "verdict": "rejected",
+          "proof_tier": "traced",
+          "proof_ref": null
+        },
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/c/route.ts:GET",
+          "sink": "loadc",
+          "boundary": "member to private data",
+          "fingerprint": "omgs-1dbc0388d873fabe",
+          "verdict": "needs_validation",
+          "proof_tier": "traced",
+          "proof_ref": null
+        },
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/unexpected/route.ts:GET",
+          "sink": "loadunexpected",
+          "boundary": "member to private data",
+          "fingerprint": "omgs-02f3376c7e8b992e",
+          "verdict": "confirmed",
+          "proof_tier": "test_proven",
+          "proof_ref": "proofs/2.json"
+        }
+      ],
+      "adjudications": [],
+      "source_run": "positive"
+    },
+    {
+      "case_id": "fixture",
+      "snapshot_id": "fixed",
+      "status": "complete",
+      "blockers": [],
+      "examined_units": [
+        "route.ts"
+      ],
+      "unexamined_units": [],
+      "candidates": [],
+      "findings": [
+        {
+          "attack_class": "tenant_isolation",
+          "entry_point": "app/api/a/route.ts:GET",
+          "sink": "loada",
+          "boundary": "member to private data",
+          "fingerprint": "omgs-d7c7756a1f68ec92",
+          "verdict": "confirmed",
+          "proof_tier": "test_proven",
+          "proof_ref": "proofs/1.json"
+        }
+      ],
+      "adjudications": [
+        {
+          "fingerprint": "omgs-d7c7756a1f68ec92",
+          "outcome": "false_positive",
+          "negative_unit": 0,
+          "review": {
+            "reviewer": "fixture-review",
+            "reviewed_at": "2026-10-28T00:00:00Z",
+            "evidence_path": "README.md"
+          }
+        }
+      ],
+      "source_run": "fixed"
+    },
+    {
+      "case_id": "fixture",
+      "snapshot_id": "blocked",
+      "status": "blocked",
+      "blockers": [
+        "offline dependency unavailable"
+      ],
+      "examined_units": [],
+      "unexamined_units": [
+        "route.ts"
+      ],
+      "candidates": [],
+      "findings": [],
+      "adjudications": [],
+      "source_run": null
+    }
+  ],
+  "resource_usage": {
+    "proof_tool_cost_usd": null,
+    "wall_seconds": 10.1
+  },
+  "manifest_sha256": "3bb49c77f2a98cea379036f4e8ff1399a6072ce2866af64b0eb062f370da0035"
+}

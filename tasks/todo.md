@@ -94,7 +94,9 @@ parent-owned full-diff reviews and PR creation are separate from this implementa
 
 ## PR 6: benchmark runner, corpus, screenshots, self-audit (`feat/benchmark`)
 
-- [ ] `omgs bench score`; at least 5 post-cutoff CVE pairs
+- [x] `omgs bench score`; at least 5 post-cutoff CVE pairs
+  - Offline scorer and arithmetic fixtures implemented. The metadata-only inventory now contains five eligible pairs with verified SHAs, disclosure and public-fix dates, sources, and the complete 2026-06-30 cutoff. Both existing pairs are retained, including the May pair excluded from the post-cutoff count. See `benchmark/corpus/README.md`.
+  - Phase 7 converts each pair into a scored manifest entry only after human confirmation, offline fixture preparation, dependency snapshot hashing and paired sandbox assertions. Inventory eligibility alone cannot be scored.
 - [ ] Opt-in screenshots; self-audit; fix round trip on the fixture
 
 ## Phase 7: Awesome Intune campaign
