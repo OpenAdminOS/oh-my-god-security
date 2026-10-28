@@ -427,8 +427,7 @@ pub struct ConfigInput<'a> {
     pub denied: Vec<PathBuf>,
     pub rust: Option<RustHomes>,
     /// Windows only: let the container list the parent directories of the
-    /// granted paths. Older ProcessContainer builds (Windows Server 2025)
-    /// reject the setting, so it can be turned off.
+    /// granted paths when the MXC probe reports support for it.
     pub list_parents: bool,
 }
 

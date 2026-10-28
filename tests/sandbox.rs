@@ -142,6 +142,9 @@ fn assert_augmented_tier_refusal(tier: &str, caller: u32) {
             }
         }
     }
+    // Blocked cleanup removes run directories, so the absence of configs is
+    // only a sanity check. The evidence that no config reached MXC is the
+    // unchanged ACLs on toolchain roots MXC would have augmented.
     no_config(&d);
     assert_eq!(acls(), before, "refusal changed granted folder ACLs");
     assert_eq!(
@@ -2088,11 +2091,7 @@ fn windows_records_bind_probe_selection_to_the_saved_config() {
     assert!(notes
         .iter()
         .any(|n| n.contains(&format!("tier={}", probe.tier.as_deref().unwrap()))));
-    if probe.needs_dacl_augmentation == Some(true) {
-        assert!(gaps.iter().any(|g| g.contains("temporarily adds host ACEs")
-            && g.contains("toolchain roots")
-            && g.contains("until MXC next starts")));
-    }
+    assert_eq!(probe.needs_dacl_augmentation, Some(false));
     let config: serde_json::Value = serde_json::from_slice(
         &std::fs::read(Path::new(record["proof_dir"].as_str().unwrap()).join("mxc-config.json"))
             .unwrap(),

@@ -53,9 +53,14 @@ PR 1b local verification: macOS passed fmt, Clippy with warnings denied and all
 configs without starting a workload, and passed the live doctor check. The Lima
 host has no rustfmt; no toolchain components were installed. Windows 11 reported
 build 10.0.26200.9711 and base-container probe capabilities, including enumeration.
-The initial windows-2025 CI probe reported appcontainer-dacl, DACL preparation
-advice, and false BaseContainer capabilities. That observed tier is supported
-without administrator preparation, with warnings recorded and enumeration omitted.
+The windows-2025 CI probe reports appcontainer-dacl with DACL augmentation. CI
+showed MXC 1.0.1 leaving changed ACEs on granted folders even after a successful
+dry run, so on 2026-10-28 the owner decided that OMGS never writes host ACLs and
+refuses augmentation tiers with exit 3 before any config-bearing MXC call;
+windows-2025 CI now asserts that refusal. At head ff15a4e the Windows 11 x64
+mini PC (build 26200.9807, base-container, no augmentation) passed the full
+test suite and `doctor --live` with real MXC workloads inside the OMGS
+kill-on-close job.
 The five push CI jobs, including windows-2025 through Test, remain the head check;
 parent-owned full-diff reviews and PR creation are separate from this implementation.
 
@@ -63,6 +68,7 @@ parent-owned full-diff reviews and PR creation are separate from this implementa
 
 - [ ] `skill/agents/` briefs: red hunter, blue verifier, evaluator, green fixer
 - [ ] Proof by default with per-stack recipes
+- [ ] Windows toolchains reachable inside MXC: on the Windows 11 mini PC, `doctor --live` lists cargo, node and pwsh as on PATH but not reachable in the sandbox, although their roots are granted readable; the per-stack recipes need them
 - [ ] Shared path classifier; shell and browser-extension stacks; monorepo detection
 - [ ] Packs: identity binding, fail-closed semantics
 - [ ] Persona modes; host-provided accounting

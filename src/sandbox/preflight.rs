@@ -202,7 +202,9 @@ fn completed(run: &supervise::Supervised) -> bool {
 }
 
 pub fn windows_probe(executor: &Path) -> Result<WindowsProbe, ProbeFailure> {
-    let mut cmd = executor_command(executor, None);
+    // Run from the pinned executor's directory, not the caller's cwd, which is
+    // often the repository under review.
+    let mut cmd = executor_command(executor, executor.parent());
     cmd.arg("--probe");
     let run = inspect(cmd);
     probe_result(&run)

@@ -32,7 +32,7 @@ Acceptance test for this directive: a new user goes from zero to a first proven 
 
 ## Sandbox requirements for proof execution
 
-Target controlled code, including builds, tests and the running app at level 2, executes only inside an OS enforced sandbox. Amended on 2026-10-27: Microsoft MXC is the only backend on every OS (Seatbelt through `mxc-exec-mac` on Apple Silicon macOS 15 or later, bubblewrap through `lxc-exec` on Linux, ProcessContainer through `wxc-exec.exe` on Windows 11 and Windows Server 2025); OMGS's own Seatbelt and bubblewrap profiles are removed. The executor is pinned by SHA-256 to one MXC release and refused on any mismatch. Every proof run aims for all of the following, and its proof record names exactly what was enforced and what was not:
+Target controlled code, including builds, tests and the running app at level 2, executes only inside an OS enforced sandbox. Amended on 2026-10-27: Microsoft MXC is the only backend on every OS (Seatbelt through `mxc-exec-mac` on Apple Silicon macOS 15 or later, bubblewrap through `lxc-exec` on Linux, ProcessContainer through `wxc-exec.exe` on Windows 11 builds where the MXC probe reports no DACL augmentation; tiers that need augmentation, such as the one observed on Windows Server 2025, are refused); OMGS's own Seatbelt and bubblewrap profiles are removed. The executor is pinned by SHA-256 to one MXC release and refused on any mismatch. Every proof run aims for all of the following, and its proof record names exactly what was enforced and what was not:
 
 - No external network. Local client and server traffic stays on an isolated loopback.
 - An empty environment built from an explicit allowlist, with scratch local home, temp and cache directories. Dummy principals and dummy secrets only.
