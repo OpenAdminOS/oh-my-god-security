@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 
 pub const GATE_EXPORT_BYTES: u64 = 4 << 30;
 pub const GATE_EXPORT_ENTRIES: usize = 200_000;
+// Bound gate materialization and downstream path consumers. Cleanup itself has
+// no depth cap, including for trees written by an untrusted scanner.
+pub const GATE_EXPORT_DEPTH: usize = 256;
 pub const SENSOR_WRITE_BYTES: u64 = 1 << 30;
 pub const SENSOR_WRITE_ENTRIES: usize = 100_000;
 const LOCK: &str = ".omgs-scratch.lock";
@@ -25,6 +28,7 @@ struct Owner {
 pub struct Scratch {
     root: PathBuf,
     lock: Option<File>,
+    removed: bool,
     parent_handle: File,
     root_handle: File,
 }
@@ -89,6 +93,7 @@ impl Scratch {
                     Ok(Self {
                         root,
                         lock: Some(lock),
+                        removed: false,
                         parent_handle,
                         root_handle,
                     })
@@ -107,15 +112,34 @@ impl Scratch {
     }
 
     pub fn cleanup(&mut self) -> Result<(), String> {
-        if self.lock.is_none() {
+        self.cleanup_with(|root| fs::remove(root, std::ffi::OsStr::new(PAYLOAD)))
+    }
+
+    fn cleanup_with(
+        &mut self,
+        remove_payload: impl FnOnce(&File) -> std::io::Result<()>,
+    ) -> Result<(), String> {
+        if self.removed {
             return Ok(());
+        }
+        // Losing the lock is not evidence of removal. Fail closed after a
+        // partial metadata teardown, including when Drop retries cleanup.
+        if self.lock.is_none() {
+            return Err("scratch cleanup incomplete; removal was not verified".into());
         }
         with_parent_lock(&self.parent_handle, || {
             let root = fs::pin_removal(&self.root_handle).map_err(|e| e.to_string())?;
             validate_held(&root, &name_for(&self.root)?)?;
-            let lock = self.lock.take().ok_or("scratch lock missing")?;
-            remove_layout(&self.parent_handle, &root, &self.root, lock)
-                .map_err(|e| format!("scratch cleanup failed: {e}"))
+            remove_layout(
+                &self.parent_handle,
+                &root,
+                &self.root,
+                &mut self.lock,
+                remove_payload,
+            )
+            .map_err(|e| format!("scratch cleanup failed: {e}"))?;
+            self.removed = true;
+            Ok(())
         })
     }
 }
@@ -211,16 +235,23 @@ fn report(warnings: Vec<String>) {
         eprintln!("{}", platform::escape_controls(&warning));
     }
 }
-fn remove_layout(parent: &File, root: &File, path: &Path, lock: File) -> std::io::Result<()> {
-    match fs::remove(root, std::ffi::OsStr::new(PAYLOAD), 0) {
+fn remove_layout(
+    parent: &File,
+    root: &File,
+    path: &Path,
+    lock: &mut Option<File>,
+    remove_payload: impl FnOnce(&File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match remove_payload(root) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    fs::remove(root, std::ffi::OsStr::new(OWNER), 0)?;
-    // Retain the run lock until payload and owner deletion have completed.
-    drop(lock);
-    fs::remove(root, std::ffi::OsStr::new(LOCK), 0)?;
+    fs::remove(root, std::ffi::OsStr::new(OWNER))?;
+    // Retain the run lock on payload/owner failure so cleanup can safely retry.
+    // A failure after taking it stays failed rather than claiming success.
+    drop(lock.take());
+    fs::remove(root, std::ffi::OsStr::new(LOCK))?;
     fs::remove_root(parent, path.file_name().unwrap(), root)
 }
 fn recover_in(parent: &Path) -> Result<Vec<String>, String> {
@@ -257,7 +288,10 @@ fn recover_held(
             let root = fs::pin_removal(&root).map_err(|e| e.to_string())?;
             validate_held(&root, &name_text)?;
             after_validate();
-            remove_layout(held, &root, &path, lock).map_err(|e| e.to_string())
+            remove_layout(held, &root, &path, &mut Some(lock), |root| {
+                fs::remove(root, std::ffi::OsStr::new(PAYLOAD))
+            })
+            .map_err(|e| e.to_string())
         };
         if let Err(e) = {
             let mut reap = reap;
@@ -607,7 +641,76 @@ mod tests {
     }
     fn abandon(mut scratch: Scratch) -> PathBuf {
         scratch.lock.take().unwrap().unlock().unwrap();
+        // Simulate termination without running the owner's Drop cleanup.
+        scratch.removed = true;
         scratch.root.clone()
+    }
+    fn deep_payload(scratch: &Scratch) {
+        let mut path = scratch.path();
+        for _ in 0..160 {
+            path.push("d");
+            std::fs::create_dir(&path).unwrap();
+        }
+        std::fs::write(path.join("raw"), b"discard").unwrap();
+    }
+    #[test]
+    fn cleanup_retries_failed_payload_removal_and_drop_retries_too() {
+        let parent = parent();
+        let mut scratch = Scratch::create_in(&parent, "sensor", |_| Ok(())).unwrap();
+        std::fs::write(scratch.path().join("raw"), b"discard").unwrap();
+        for _ in 0..2 {
+            let error = scratch
+                .cleanup_with(|_| Err(std::io::Error::other("injected removal failure")))
+                .unwrap_err();
+            assert!(error.contains("injected removal failure"), "{error}");
+            assert!(scratch.path().join("raw").exists());
+            assert!(scratch.lock.is_some());
+            assert!(!scratch.removed);
+        }
+        scratch.cleanup().unwrap();
+        assert!(!scratch.path().exists());
+        assert!(scratch.removed);
+        scratch.cleanup().unwrap();
+        drop(scratch);
+
+        let mut scratch = Scratch::create_in(&parent, "gate", |_| Ok(())).unwrap();
+        let root = scratch.root.clone();
+        std::fs::write(scratch.path().join("raw"), b"discard").unwrap();
+        assert!(scratch
+            .cleanup_with(|_| Err(std::io::Error::other("injected removal failure")))
+            .is_err());
+        drop(scratch);
+        assert!(!root.exists());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+    #[test]
+    fn cleanup_without_lock_never_claims_verified_removal() {
+        let parent = parent();
+        let mut scratch = Scratch::create_in(&parent, "sensor", |_| Ok(())).unwrap();
+        let lock = scratch.lock.take();
+        assert!(scratch.cleanup().unwrap_err().contains("not verified"));
+        assert!(scratch.path().exists());
+        scratch.lock = lock;
+        scratch.cleanup().unwrap();
+        drop(scratch);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+    #[test]
+    fn deep_gate_and_sensor_payloads_are_removed_and_recovered() {
+        let parent = parent();
+        for kind in ["gate", "sensor"] {
+            let mut scratch = Scratch::create_in(&parent, kind, |_| Ok(())).unwrap();
+            deep_payload(&scratch);
+            scratch.cleanup().unwrap();
+            assert!(!scratch.path().exists());
+            drop(scratch);
+            let scratch = Scratch::create_in(&parent, kind, |_| Ok(())).unwrap();
+            deep_payload(&scratch);
+            let root = abandon(scratch);
+            assert!(recover_in(&parent).unwrap().is_empty());
+            assert!(!root.exists());
+        }
+        std::fs::remove_dir_all(parent).unwrap();
     }
     #[test]
     fn recovery_reaps_abandoned_but_preserves_active_and_invalid() {
@@ -779,11 +882,56 @@ mod process_tests {
     fn scratch_owner_process() {
         let parent = PathBuf::from(std::env::var_os("OMGS_TEST_SCRATCH_PARENT").unwrap());
         let scratch = Scratch::create_in(&parent, "sensor", |_| Ok(())).unwrap();
-        std::fs::write(scratch.path().join("raw"), "discard").unwrap();
+        let mut path = scratch.path();
+        for _ in 0..160 {
+            path.push("d");
+            std::fs::create_dir(&path).unwrap();
+        }
+        std::fs::write(path.join("raw"), "discard").unwrap();
         std::fs::write(parent.join("ready"), b"ready").unwrap();
         loop {
             std::thread::park();
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn deep_cleanup_with_low_descriptor_limit() {
+        const CHILD: &str = "OMGS_TEST_LOW_FD_CLEANUP";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "scratch::process_tests::deep_cleanup_with_low_descriptor_limit",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
+            0
+        );
+        let mut limit = unsafe { limit.assume_init() };
+        limit.rlim_cur = limit.rlim_cur.min(64);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let parent = platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-low-fd-{}", platform::random_nonce().unwrap()));
+        platform::create_private_dir_new(&parent).unwrap();
+        let mut scratch = Scratch::create_in(&parent, "sensor", |_| Ok(())).unwrap();
+        let mut path = scratch.path();
+        for _ in 0..300 {
+            path.push("d");
+            std::fs::create_dir(&path).unwrap();
+        }
+        std::fs::write(path.join("raw"), b"discard").unwrap();
+        scratch.cleanup().unwrap();
+        assert!(!scratch.path().exists());
+        drop(scratch);
+        std::fs::remove_dir_all(parent).unwrap();
     }
     #[test]
     fn crash_recovery_after_owner_kill() {

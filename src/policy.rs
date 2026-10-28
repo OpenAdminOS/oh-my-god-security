@@ -637,6 +637,12 @@ fn export_head_bounded(
                 "blocked head tree entry: {path}; gate requires regular files"
             ));
         }
+        if path.split('/').count() - 1 > crate::scratch::GATE_EXPORT_DEPTH {
+            return Err(format!(
+                "gate export depth cap exceeded (limit {} directories); reduce the committed tree depth",
+                crate::scratch::GATE_EXPORT_DEPTH
+            ));
+        }
         if !folded.insert(path.to_lowercase()) {
             return Err("case-colliding head paths are blocked".into());
         }
@@ -1048,6 +1054,31 @@ mod scratch_tests {
         std::fs::create_dir(&default_out).unwrap();
         assert_eq!(export_head(&repo, &head, &default_out).unwrap().len(), 2);
         assert_eq!(std::fs::read(default_out.join("nested/two")).unwrap(), blob);
+        // Manifest validation rejects the entire export before even shallow
+        // blobs are materialized when a later entry exceeds supported depth.
+        let deep = format!("{}raw", "z/".repeat(crate::scratch::GATE_EXPORT_DEPTH + 1));
+        let blob = git_fixture(&repo, &["rev-parse", "HEAD:one"]);
+        git_fixture(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                &blob,
+                &deep,
+            ],
+        );
+        let tree = git_fixture(&repo, &["write-tree"]);
+        let head = git_fixture(&repo, &["commit-tree", &tree, "-m", "Deep fixture"]);
+        let out = root.join("too-deep");
+        std::fs::create_dir(&out).unwrap();
+        let error = export_head(&repo, &head, &out).unwrap_err();
+        assert!(
+            error.contains("depth cap exceeded (limit 256 directories)"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

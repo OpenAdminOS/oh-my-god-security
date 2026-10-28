@@ -1,4 +1,4 @@
-//! Handle-relative scratch admission and removal. No deletion reopens an ancestor.
+//! Handle-relative scratch admission and removal. Never follow ancestor pathnames.
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
@@ -233,23 +233,41 @@ fn delete_handle(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-pub fn remove(dir: &File, name: &OsStr, depth: usize) -> io::Result<()> {
-    if depth > 128 {
-        return Err(io::Error::other("scratch removal depth exceeded"));
+// Each frame owns a directory while it is inspected. Windows keeps all handles
+// to pin ancestor names against replacement. Unix keeps a bounded window and
+// reopens an evicted parent only through its held child's "..", checking the
+// saved identity before using it. A moved child fails closed, never redirecting
+// deletion through a substituted ancestor pathname.
+struct RemovalFrame {
+    dir: Option<File>,
+    #[cfg(unix)]
+    name: OsString,
+    entries: std::vec::IntoIter<OsString>,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+impl RemovalFrame {
+    fn new(dir: File, _name: &OsStr) -> io::Result<Self> {
+        Ok(Self {
+            entries: names(&dir)?.into_iter(),
+            #[cfg(unix)]
+            identity: crate::platform::held_directory_identity(&dir)?,
+            dir: Some(dir),
+            #[cfg(unix)]
+            name: _name.to_owned(),
+        })
     }
+}
+
+// Return None after deleting a non-directory leaf without following it.
+fn removal_directory(dir: &File, name: &OsStr) -> io::Result<Option<File>> {
     #[cfg(unix)]
     {
-        // An opened directory can move, but recursion remains tied to that
-        // directory. unlinkat only removes an empty replacement, never its data.
         match open(dir, name, true) {
-            Ok(child) => {
-                for entry in names(&child)? {
-                    remove(&child, &entry, depth + 1)?;
-                }
-                unlink(dir, name, true)
-            }
+            Ok(child) => Ok(Some(child)),
             Err(e) if [Some(libc::ENOTDIR), Some(libc::ELOOP)].contains(&e.raw_os_error()) => {
-                unlink(dir, name, false)
+                unlink(dir, name, false)?;
+                Ok(None)
             }
             Err(e) => Err(e),
         }
@@ -259,12 +277,58 @@ pub fn remove(dir: &File, name: &OsStr, depth: usize) -> io::Result<()> {
         let child = open(dir, name, false)?;
         let meta = child.metadata()?;
         if meta.is_dir() && !crate::platform::is_link(&meta) {
-            for entry in names(&child)? {
-                remove(&child, &entry, depth + 1)?;
-            }
+            Ok(Some(child))
+        } else {
+            delete_handle(&child)?;
+            Ok(None)
         }
-        delete_handle(&child)
     }
+}
+
+pub fn remove(dir: &File, name: &OsStr) -> io::Result<()> {
+    let Some(child) = removal_directory(dir, name)? else {
+        return Ok(());
+    };
+    let mut stack = vec![RemovalFrame::new(child, name)?];
+    while let Some(frame) = stack.last_mut() {
+        if let Some(entry) = frame.entries.next() {
+            if let Some(child) = removal_directory(frame.dir.as_ref().unwrap(), &entry)? {
+                let next = RemovalFrame::new(child, &entry)?;
+                #[cfg(unix)]
+                if stack.len() >= 16 {
+                    // Leave room for enumeration, locks and unrelated runtime
+                    // descriptors even under a low process descriptor limit.
+                    let evicted = stack.len() - 16;
+                    stack[evicted].dir.take();
+                }
+                stack.push(next);
+            }
+            continue;
+        }
+        let child = stack.pop().unwrap();
+        let child_dir = child.dir.unwrap();
+        #[cfg(unix)]
+        {
+            let parent = if let Some(frame) = stack.last_mut() {
+                if frame.dir.is_none() {
+                    let reopened = open(&child_dir, OsStr::new(".."), true)?;
+                    if crate::platform::held_directory_identity(&reopened)? != frame.identity {
+                        return Err(io::Error::other("scratch parent moved during cleanup"));
+                    }
+                    frame.dir = Some(reopened);
+                }
+                frame.dir.as_ref().unwrap()
+            } else {
+                dir
+            };
+            // Only unlink an empty replacement if the entry was renamed.
+            // Descendant deletion always used the admitted directory handle.
+            unlink(parent, &child.name, true)?;
+        }
+        #[cfg(windows)]
+        delete_handle(&child_dir)?;
+    }
+    Ok(())
 }
 
 pub fn remove_root(parent: &File, name: &OsStr, root: &File) -> io::Result<()> {

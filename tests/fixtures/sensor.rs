@@ -149,6 +149,17 @@ fn main() {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+    if mode == "scratch-deep" {
+        let mut path = tmp.clone();
+        for _ in 0..160 {
+            path.push("d");
+            fs::create_dir(&path).unwrap();
+        }
+        fs::write(path.join("raw"), b"raw-secret-must-be-discarded").unwrap();
+        // The monitor's depth refusal must cancel this scanner, then cleanup
+        // must remove the entire tree rather than leave an unreapable payload.
+        std::thread::sleep(Duration::from_secs(120));
+    }
     if mode == "timeout" {
         std::thread::sleep(Duration::from_secs(30));
     }

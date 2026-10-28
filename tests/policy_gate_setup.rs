@@ -2096,3 +2096,60 @@ fn gate_export_caps_are_bounded_and_only_base_policy_can_raise_them() {
     }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn deep_gate_exports_are_cleaned_and_unsupported_depth_exits_three() {
+    let root = scratch("deep-gate-export");
+    let repo = repo(&root);
+    let base = commit_policy(
+        &repo,
+        &Policy {
+            mode: Mode::Gate,
+            gate_tests: vec![registered()],
+            ..Policy::default()
+        },
+    );
+    let blob = git(&repo, &["rev-parse", "HEAD:main.rs"]);
+    for depth in [
+        130,
+        omgs::scratch::GATE_EXPORT_DEPTH,
+        omgs::scratch::GATE_EXPORT_DEPTH + 1,
+    ] {
+        git(&repo, &["read-tree", &base]);
+        let path = format!("{}raw", "d/".repeat(depth));
+        git(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                &blob,
+                &path,
+            ],
+        );
+        let tree = git(&repo, &["write-tree"]);
+        let head = git(
+            &repo,
+            &["commit-tree", &tree, "-p", &base, "-m", "Deep fixture"],
+        );
+        git(&repo, &["update-ref", "HEAD", &head]);
+        let out = gate(&root, &repo, &base, &head, None, 3);
+        if depth <= omgs::scratch::GATE_EXPORT_DEPTH {
+            // This check runs only after all blobs have been exported. The
+            // deliberately missing registration avoids needing a sandbox here.
+            assert!(
+                output(&out).contains("registered test missing from head"),
+                "{}",
+                output(&out)
+            );
+        } else {
+            assert!(
+                output(&out).contains("gate export depth cap exceeded (limit 256 directories)"),
+                "{}",
+                output(&out)
+            );
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
