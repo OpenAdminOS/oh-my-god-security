@@ -590,7 +590,6 @@ fn report_shows_run_metadata_or_not_recorded() {
 #[test]
 fn semgrep_parser_keeps_only_metadata() {
     use omgs::sensors::{parse_semgrep, SensorsReport};
-    use std::path::Path;
     let mut report = SensorsReport {
         tools_run: vec![],
         tools_unavailable: vec![],
@@ -598,11 +597,18 @@ fn semgrep_parser_keeps_only_metadata() {
         gaps: vec![],
     };
     // A semgrep "extra.lines" field can echo matched source; it must not survive.
-    let json = r#"{"results":[
-      {"check_id":"rules.nil-team","path":"/t/src/Helper.swift","start":{"line":42},"extra":{"lines":"let token = \"supersecret\""}},
-      {"check_id":"rules.vendored","path":"/t/lib/foo.min.js","start":{"line":1}}
-    ],"errors":[]}"#;
-    parse_semgrep(json, Path::new("/t"), &mut report);
+    // An absolute root on every platform; "/t" is relative on Windows.
+    let root = std::env::temp_dir().join("t");
+    let at = |rel: &str| serde_json::to_string(&root.join(rel).to_string_lossy()).unwrap();
+    let json = format!(
+        r#"{{"results":[
+      {{"check_id":"rules.nil-team","path":{},"start":{{"line":42}},"extra":{{"lines":"let token = \"supersecret\""}}}},
+      {{"check_id":"rules.vendored","path":{},"start":{{"line":1}}}}
+    ],"errors":[]}}"#,
+        at("src/Helper.swift"),
+        at("lib/foo.min.js")
+    );
+    parse_semgrep(&json, &root, &mut report);
     assert_eq!(report.hits.len(), 2);
     let h = &report.hits[0];
     assert_eq!(h.tool, "semgrep");
