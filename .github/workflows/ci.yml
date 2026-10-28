@@ -107,6 +107,10 @@ jobs:
             test "$status" -eq 0
           fi
 
+  # Temporary PR regression gate for survivor and fixture races. Keep both
+  # thread counts and ten repetitions until four consecutive weeks of clean
+  # runner results, then move repetitions to a scheduled workflow while keeping
+  # the normal macOS PR suite. Do not reduce limits without clean runner evidence.
   macos-isolation:
     name: macos isolation (${{ matrix.threads }})
     runs-on: macos-15

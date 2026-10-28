@@ -912,20 +912,24 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn doctor_probe_command(os: &str, name: &str) -> String {
+fn doctor_probe_command(_os: &str, name: &str) -> String {
+    // Use the same PATH lookup as proof commands, including Apple's compiler
+    // shims. A working direct compiler does not establish shim readiness.
     match name {
-        "swiftc" | "clang" if os == "macos" => format!(
-            "tool=$(command -v {name}) || exit; \
-             if [ \"$tool\" = /usr/bin/{name} ]; then \
-             developer=$(/usr/bin/xcode-select -p) || exit; \
-             tool=\"$developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/{name}\"; \
-             if [ ! -x \"$tool\" ]; then tool=\"$developer/usr/bin/{name}\"; fi; \
-             fi; \"$tool\" --version"
-        ),
         "sh" => "sh -c 'exit 0'".into(),
         "java" => "java -version".into(),
         "go" => "go version".into(),
         _ => format!("{name} --version"),
+    }
+}
+
+fn doctor_probe_timeout_ms(os: &str, name: &str) -> u64 {
+    if os == "macos" && matches!(name, "swiftc" | "clang") {
+        // xcrun may perform SDK discovery on its first launch. This changes
+        // only doctor's fixed probe budget, not proof containment limits.
+        30_000
+    } else {
+        3_000
     }
 }
 
@@ -1189,7 +1193,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
                 expect_marker: None,
                 command: doctor_probe_command(os, name),
                 test: None,
-                timeout_ms: 3_000,
+                timeout_ms: doctor_probe_timeout_ms(os, name),
                 target: None,
                 run_dir: probe.join(format!("reach-{name}")),
                 tier: Tier::Test,
@@ -3355,14 +3359,11 @@ mod cli_tests {
         for os in ["macos", "linux", "windows"] {
             for name in ["swiftc", "clang"] {
                 let command = super::doctor_probe_command(os, name);
-                if os == "macos" {
-                    assert!(command.contains(&format!("tool=$(command -v {name}) || exit")));
-                    assert!(command.contains("developer=$(/usr/bin/xcode-select -p) || exit"));
-                    assert!(command.contains(&format!("XcodeDefault.xctoolchain/usr/bin/{name}")));
-                    assert!(command.ends_with("\"$tool\" --version"));
-                } else {
-                    assert_eq!(command, format!("{name} --version"));
-                }
+                assert_eq!(command, format!("{name} --version"));
+                assert_eq!(
+                    super::doctor_probe_timeout_ms(os, name),
+                    if os == "macos" { 30_000 } else { 3_000 }
+                );
             }
         }
         assert_eq!(
@@ -3399,6 +3400,68 @@ mod cli_tests {
         run.capture_complete = true;
         run.executor_error = true;
         assert!(super::doctor_probe_result(&run).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_rejects_failing_compiler_shims_even_when_direct_binaries_work() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "omgs-doctor-shims-{}",
+            omgs::platform::random_nonce().unwrap()
+        ));
+        let shims = dir.join("shims");
+        let direct = dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin");
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::create_dir_all(&direct).unwrap();
+        for name in ["swiftc", "clang"] {
+            for (path, body) in [
+                (
+                    shims.join(name),
+                    "#!/bin/sh\necho shim-unavailable >&2\nexit 1\n",
+                ),
+                (direct.join(name), "#!/bin/sh\necho direct-compiler-ready\n"),
+            ] {
+                std::fs::write(&path, body).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            // Exercise the same acceptance check used by doctor with runner
+            // markers. The direct binary is a positive control only; readiness
+            // must be decided by the shim that proof commands resolve.
+            let command = super::doctor_probe_command("macos", name);
+            assert_eq!(command, format!("{name} --version"));
+            for (path, ready) in [(&direct, true), (&shims, false)] {
+                let script = format!(
+                    "printf 'OMGS_START_doctor\\n'; {command}; status=$?; printf '\\nOMGS_END_doctor:%s\\n' \"$status\"; exit \"$status\""
+                );
+                let mut probe = std::process::Command::new("/bin/sh");
+                probe.args(["-c", &script]).env_clear().env("PATH", path);
+                let run = omgs::supervise::run_marked(
+                    probe,
+                    &omgs::supervise::Limits {
+                        wall_ms: super::doctor_probe_timeout_ms("macos", name),
+                        cpu_secs: None,
+                        file_size_bytes: None,
+                        open_files: None,
+                        memory_bytes: None,
+                        tasks: None,
+                        output_cap_bytes: 1024,
+                    },
+                    None,
+                    "doctor",
+                );
+                assert_eq!(super::doctor_probe_result(&run).is_ok(), ready, "{run:?}");
+                assert!(
+                    run.output.contains(if ready {
+                        "direct-compiler-ready"
+                    } else {
+                        "shim-unavailable"
+                    }),
+                    "{run:?}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     use super::*;

@@ -1642,7 +1642,7 @@ fn linux_new_session_descendants_die_with_the_pid_namespace() {
         } else {
             format!("if os.fork()==0:\n os.setsid()\n if os.fork()==0:\n  os.execv(\"{}\", {args})\n os._exit(0)", py.display())
         };
-        let command = format!("'{}' -I -c 'import os,time\n{launch}\nwhile not os.path.exists(\"release\"):\n time.sleep(0.01)\nprint(\"escape positive control observed\")'", py.display());
+        let command = format!("'{}' -I -c 'import os,time\nopen(\"ready\",\"w\").close()\n{launch}\nwhile not os.path.exists(\"release\"):\n time.sleep(0.01)\nprint(\"escape positive control observed\")'", py.display());
         let executor = omgs::sandbox::locate_executor().unwrap();
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
             .args([
@@ -1668,24 +1668,49 @@ fn linux_new_session_descendants_die_with_the_pid_namespace() {
                     })
             })
         };
-        let start = std::time::Instant::now();
-        while !visible() && start.elapsed().as_secs() < 8 && child.try_wait().unwrap().is_none() {
+        // Staging and executor startup are separate from observing a launched
+        // descendant. Heavy parallelism must not spend the observation budget
+        // before Python has even started running the fixture.
+        let ready_path = run.join("proofs/1/workspace/ready");
+        let readiness_start = std::time::Instant::now();
+        while !ready_path.exists()
+            && readiness_start.elapsed().as_secs() < 30
+            && child.try_wait().unwrap().is_none()
+        {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let observed = visible();
+        let ready = ready_path.exists();
+        let observation_start = std::time::Instant::now();
+        while ready
+            && !visible()
+            && observation_start.elapsed().as_secs() < 8
+            && child.try_wait().unwrap().is_none()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let observed = ready && visible();
         if observed {
             std::fs::write(run.join("proofs/1/workspace/release"), b"go").unwrap();
         }
         let out = child.wait_with_output().unwrap();
         assert!(
-            observed,
-            "host must see the detached descendant before teardown: {}",
+            ready,
+            "readiness phase: Python fixture did not signal startup for {method}: {}",
             text(&out)
         );
-        assert!(out.status.success(), "{}", text(&out));
+        assert!(
+            observed,
+            "observation phase: host did not see the detached descendant within eight seconds after readiness for {method}: {}",
+            text(&out)
+        );
+        assert!(
+            out.status.success(),
+            "release phase: proof failed for {method}: {}",
+            text(&out)
+        );
         assert!(
             !visible(),
-            "detached descendant survived namespace teardown"
+            "teardown phase: detached descendant survived namespace teardown for {method}"
         );
         let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
         assert!(record.clean(), "{record:?}");

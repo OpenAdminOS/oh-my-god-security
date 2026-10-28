@@ -1168,8 +1168,10 @@ mod sweep {
         Ok(check(Some(allowed))? == 0)
     }
 
-    fn matches(pid: i32, allowed: &CString, denied: &CString) -> io::Result<bool> {
-        policy_matches(allowed, denied, |path| policy_check(pid, path))
+    fn same_identity(before: &libc::proc_bsdinfo, after: &libc::proc_bsdinfo) -> bool {
+        before.pbi_uid == after.pbi_uid
+            && before.pbi_start_tvsec == after.pbi_start_tvsec
+            && before.pbi_start_tvusec == after.pbi_start_tvusec
     }
 
     fn command(pid: i32) -> Option<String> {
@@ -1199,7 +1201,10 @@ mod sweep {
         fn pids(&mut self) -> io::Result<Vec<i32>>;
         fn owned_pids(&mut self, uid: libc::uid_t, capacity: usize) -> io::Result<Vec<i32>>;
         fn info(&mut self, pid: i32) -> io::Result<libc::proc_bsdinfo>;
-        fn matches(&mut self, pid: i32, allowed: &CString, denied: &CString) -> io::Result<bool>;
+        fn policy_check(&mut self, pid: i32, path: Option<&CString>) -> io::Result<i32>;
+        fn matches(&mut self, pid: i32, allowed: &CString, denied: &CString) -> io::Result<bool> {
+            policy_matches(allowed, denied, |path| self.policy_check(pid, path))
+        }
         fn command(&mut self, pid: i32) -> Option<String>;
         fn signal(&mut self, pid: i32, number: i32, notes: &mut Vec<String>) -> bool;
         fn elapsed(&self) -> Duration;
@@ -1223,8 +1228,8 @@ mod sweep {
             info(pid)
         }
 
-        fn matches(&mut self, pid: i32, allowed: &CString, denied: &CString) -> io::Result<bool> {
-            matches(pid, allowed, denied)
+        fn policy_check(&mut self, pid: i32, path: Option<&CString>) -> io::Result<i32> {
+            policy_check(pid, path)
         }
 
         fn command(&mut self, pid: i32) -> Option<String> {
@@ -1334,7 +1339,8 @@ mod sweep {
                 let matched = match processes.matches(pid, &allowed, &denied) {
                     Ok(matched) => matched,
                     Err(error) => {
-                        if error.raw_os_error() != Some(libc::ESRCH) {
+                        found = true;
+                        if !matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
                             result
                                 .notes
                                 .push(format!("sandbox check for {pid} failed: {error}"));
@@ -1344,6 +1350,23 @@ mod sweep {
                     }
                 };
                 if !matched {
+                    // A vanished pid can return a denial, not just ESRCH. A
+                    // negative fingerprint is stable only while its original
+                    // identity is still alive. Otherwise it may have forked
+                    // after enumeration, so require another complete scan.
+                    match processes.info(pid) {
+                        Ok(after) if same_identity(&before, &after) && after.pbi_status != 5 => {}
+                        Ok(_) => found = true,
+                        Err(error) => {
+                            found = true;
+                            if !matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
+                                result.notes.push(format!(
+                                    "non-match identity recheck for {pid} failed: {error}"
+                                ));
+                                healthy = false;
+                            }
+                        }
+                    }
                     continue;
                 }
                 // Every match requires another scan, even if it exits or its pid
@@ -1360,11 +1383,7 @@ mod sweep {
                 // Check identity after the policy and command calls, before
                 // recording a survivor or signalling a potentially reused pid.
                 let (may_signal, exited) = match processes.info(pid) {
-                    Ok(after)
-                        if after.pbi_uid != before.pbi_uid
-                            || after.pbi_start_tvsec != before.pbi_start_tvsec
-                            || after.pbi_start_tvusec != before.pbi_start_tvusec =>
-                    {
+                    Ok(after) if !same_identity(&before, &after) => {
                         continue;
                     }
                     // A zombie cannot execute or fork, and awaits its own parent.
@@ -1408,7 +1427,7 @@ mod sweep {
         }
         result
             .notes
-            .push("survivor sweep reached its scan or time bound with matches present".into());
+            .push("survivor sweep reached its scan or time bound with matches or ambiguous inspections present".into());
         false
     }
 
@@ -1504,6 +1523,7 @@ mod sweep {
             Pids(Vec<i32>, Duration),
             Info(i32, Result<libc::proc_bsdinfo, i32>),
             Matches(i32),
+            Policy(i32, Option<&'static str>, Result<i32, i32>),
             Command(i32, Option<&'static str>),
             Signal(i32),
             Pause,
@@ -1549,19 +1569,13 @@ mod sweep {
                 result.map_err(io::Error::from_raw_os_error)
             }
 
-            fn matches(
-                &mut self,
-                pid: i32,
-                allowed: &CString,
-                denied: &CString,
-            ) -> io::Result<bool> {
-                let Step::Matches(expected) = self.next() else {
+            fn policy_check(&mut self, pid: i32, path: Option<&CString>) -> io::Result<i32> {
+                let Step::Policy(expected, expected_path, result) = self.next() else {
                     panic!("expected sandbox query for {pid}");
                 };
                 assert_eq!(pid, expected);
-                assert_eq!(allowed.to_bytes(), b"/allowed");
-                assert_eq!(denied.to_bytes(), b"/denied");
-                Ok(true)
+                assert_eq!(path.map(|p| p.to_str().unwrap()), expected_path);
+                result.map_err(io::Error::from_raw_os_error)
             }
 
             fn command(&mut self, pid: i32) -> Option<String> {
@@ -1607,7 +1621,17 @@ mod sweep {
 
         fn exercise(steps: Vec<Step>) -> (Supervised, Scripted) {
             let mut processes = Scripted {
-                steps: steps.into(),
+                steps: steps
+                    .into_iter()
+                    .flat_map(|step| match step {
+                        Step::Matches(pid) => vec![
+                            Step::Policy(pid, None, Ok(1)),
+                            Step::Policy(pid, Some("/denied"), Ok(1)),
+                            Step::Policy(pid, Some("/allowed"), Ok(0)),
+                        ],
+                        step => vec![step],
+                    })
+                    .collect(),
                 owned: Vec::new(),
                 elapsed: Duration::ZERO,
                 scans: 0,
@@ -1680,6 +1704,126 @@ mod sweep {
             );
             assert_eq!(result.survivors[1].pid, B);
             assert_eq!(result.survivors[1].command, "child");
+        }
+
+        fn negative_inspections() -> Vec<Vec<Step>> {
+            let mut reused = live();
+            reused.pbi_start_tvusec += 1;
+            let mut other_uid = live();
+            other_uid.pbi_uid += 1;
+            let mut zombie = live();
+            zombie.pbi_status = 5;
+            let mut cases = Vec::new();
+            for after in [None, Some(reused), Some(other_uid), Some(zombie)] {
+                cases.push(vec![
+                    Step::Policy(A, None, Ok(1)),
+                    Step::Policy(A, Some("/denied"), Ok(1)),
+                    // P vanished or changed identity before the allowed query.
+                    Step::Policy(A, Some("/allowed"), Ok(1)),
+                    Step::Info(A, after.ok_or(libc::ESRCH)),
+                ]);
+            }
+            for query in 0..3 {
+                let mut steps = Vec::new();
+                for (index, path) in [None, Some("/denied"), Some("/allowed")]
+                    .into_iter()
+                    .enumerate()
+                {
+                    steps.push(Step::Policy(
+                        A,
+                        path,
+                        if index == query {
+                            Err(libc::ESRCH)
+                        } else {
+                            Ok(1)
+                        },
+                    ));
+                    if index == query {
+                        break;
+                    }
+                }
+                cases.push(steps);
+            }
+            cases
+        }
+
+        #[test]
+        fn vanished_or_reused_non_match_rescans_and_kills_forked_child() {
+            for inspection in negative_inspections() {
+                let mut steps = vec![scan(&[A]), Step::Info(A, Ok(live()))];
+                steps.extend(inspection);
+                steps.extend([
+                    Step::Pause,
+                    scan(&[B]),
+                    Step::Info(B, Ok(live())),
+                    Step::Matches(B),
+                    Step::Command(B, Some("child")),
+                    Step::Info(B, Ok(live())),
+                    Step::Signal(B),
+                    Step::Pause,
+                    scan(&[]),
+                ]);
+                let (result, processes) = exercise(steps);
+                assert!(result.cleanup_complete, "{result:?}");
+                assert!(result.notes.is_empty(), "{result:?}");
+                assert_eq!(processes.scans, 3);
+                assert_eq!(processes.signalled, [B]);
+                assert_eq!(result.survivors.len(), 1);
+                assert_eq!(result.survivors[0].pid, B);
+                assert_eq!(result.survivors[0].command, "child");
+            }
+        }
+
+        #[test]
+        fn stable_non_matches_do_not_require_a_rescan_or_signal() {
+            for paths in [
+                vec![None],
+                vec![None, Some("/denied")],
+                vec![None, Some("/denied"), Some("/allowed")],
+            ] {
+                let mut steps = vec![scan(&[A]), Step::Info(A, Ok(live()))];
+                for (index, path) in paths.iter().enumerate() {
+                    let answer = if paths.len() == 3 || index + 1 < paths.len() {
+                        1
+                    } else {
+                        0
+                    };
+                    steps.push(Step::Policy(A, *path, Ok(answer)));
+                }
+                steps.push(Step::Info(A, Ok(live())));
+                let (result, processes) = exercise(steps);
+                assert!(result.cleanup_complete, "{result:?}");
+                assert_eq!(processes.scans, 1);
+                assert!(processes.signalled.is_empty());
+                assert!(result.survivors.is_empty());
+            }
+        }
+
+        #[test]
+        fn ambiguous_non_matches_at_scan_or_time_bound_fail_cleanup() {
+            for time_bound in [false, true] {
+                let scans = if time_bound { 1 } else { MAX_SCANS };
+                let mut steps = Vec::new();
+                for _ in 0..scans {
+                    steps.extend([
+                        scan(&[A]),
+                        Step::Info(A, Ok(live())),
+                        Step::Policy(A, None, Ok(1)),
+                        Step::Policy(A, Some("/denied"), Ok(1)),
+                        Step::Policy(A, Some("/allowed"), Ok(1)),
+                        Step::Info(A, Err(libc::ESRCH)),
+                        Step::Pause,
+                    ]);
+                }
+                if time_bound {
+                    steps.push(Step::Pids(vec![], DRAIN));
+                }
+                let (result, processes) = exercise(steps);
+                assert!(!result.cleanup_complete, "{result:?}");
+                assert!(result.notes.iter().any(|note| note.contains("time bound")));
+                assert!(processes.signalled.is_empty());
+                assert!(result.survivors.is_empty());
+            }
         }
 
         #[test]

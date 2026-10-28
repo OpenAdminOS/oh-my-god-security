@@ -140,15 +140,13 @@ runtime, within the proof budget. The [per-stack recipes](skill/VALIDATION-AND-R
 cover PowerShell, Node, Python isolated mode, shell and Swift, including exact
 commands, invariant assertions and blockers. `doctor --live` launches each
 runtime's bounded version command (or `sh -c 'exit 0'`) inside MXC before
-calling it reachable. On macOS, when `swiftc` or `clang` resolves to an Apple
-shim in `/usr/bin`, the probe reads the selected developer directory with
-`xcode-select -p` inside MXC and launches its toolchain binary directly. This
-avoids xcrun's SDK discovery and Xcode first-launch work within the unchanged
-three-second reach deadline. Other tools on the sandbox PATH keep their own
-version command. A missing developer directory or failing tool still fails
-the probe. `TMPDIR` already points to per-proof scratch; setting
-`DARWIN_USER_CACHE_DIR` does not repair Xcode's sandboxed `confstr(3)` lookup,
-so OMGS does not grant access to the host user cache for it.
+calling it reachable. The probe uses the same command lookup as proofs,
+including the `/usr/bin/swiftc` and `/usr/bin/clang` shims when selected by
+the sandbox PATH. On macOS, these compiler probes have a thirty-second
+budget for xcrun's first-launch SDK discovery. Other tools retain their
+three-second budget. A working direct toolchain binary cannot make a
+failing shim pass this check. `TMPDIR` points to per-proof scratch; OMGS
+does not grant access to the host user cache for compiler discovery.
 Missing tools print `<runtime> not on host PATH`.
 Installed tools whose probes fail print
 `<runtime> on host PATH but failed to launch inside MXC` and a reason.
