@@ -11,10 +11,12 @@
 //! embeds a timestamp. The same input renders byte-identical output.
 
 /// Inventory counts use the same classifier as stack detection and sensors.
-pub fn path_counts(paths: &[String]) -> std::collections::BTreeMap<crate::paths::Class, usize> {
+pub fn path_counts(
+    paths: &[(String, crate::paths::Class)],
+) -> std::collections::BTreeMap<crate::paths::Class, usize> {
     let mut counts = std::collections::BTreeMap::new();
-    for path in paths {
-        *counts.entry(crate::paths::classify(path)).or_insert(0) += 1;
+    for (_, class) in paths {
+        *counts.entry(*class).or_insert(0) += 1;
     }
     counts
 }

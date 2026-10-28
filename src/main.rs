@@ -57,7 +57,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>]\n  omgs budget --run <run-dir>\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -68,7 +68,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "setup" => ("--yes --from", false),
         "review" => ("--repo-url --mode --budget --no-sensors", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
-            "--target --out --mode --budget --no-sensors --hunter --verifier --persona",
+            "--target --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of",
             true,
         ),
         "batch" if args.first().is_some_and(|a| a == "init") => {
@@ -94,7 +94,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "ledger" if args.first().is_some_and(|a| a == "set") => {
             ("--ledger --unit --status --evidence --note", true)
         }
-        "critic" => ("--run", false),
+        "critic" | "budget" => ("--run", false),
         "status" => (
             "--run --stage --state --label --parent --detail --counter --log --accounting",
             false,
@@ -204,6 +204,7 @@ fn main() -> ExitCode {
         "architecture" => cmd_architecture(rest),
         "ledger" => cmd_ledger(rest),
         "critic" => cmd_critic(rest),
+        "budget" => cmd_budget(rest),
         "batch" => cmd_batch(rest),
         "status" => cmd_status(rest),
         "watch" => cmd_watch(rest),
@@ -226,6 +227,17 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+fn cmd_budget(args: &[String]) -> Result<(), String> {
+    let run = flag(args, "--run").ok_or("budget requires --run <run-dir>")?;
+    let root = omgs::budget::original(Path::new(&run))?;
+    let allowance = omgs::runmeta::with_lock(&root, || omgs::budget::allowance(&root))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&allowance).map_err(|e| e.to_string())?
+    );
+    Ok(())
 }
 
 fn read_findings(path: &str) -> Result<FindingsFile, String> {
@@ -564,21 +576,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             // Check and charge the budget in one locked step, before anything
             // runs, so concurrent proofs cannot overspend it. A run that is
             // interrupted keeps its charge; a blocked one gets it back below.
-            let charged = omgs::runmeta::update(r, |m| {
-                omgs::runmeta::check_numeric_fields(m)?;
-                let used = |k: &str| m.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-                let (calls, proofs) = (used("agent_calls_used"), used("proof_runs_used"));
-                if let Some(b) = m.get("budget_agent_calls").and_then(|v| v.as_u64()) {
-                    if u128::from(calls) + u128::from(proofs) >= u128::from(b) {
-                        return Err(format!(
-                            "run budget exhausted: {calls} agent call(s) and {proofs} proof run(s) against a budget of {b}"
-                        ));
-                    }
-                }
-                let next = proofs.checked_add(1).ok_or("proof_runs_used exhausted")?;
-                m.insert("proof_runs_used".into(), serde_json::json!(next));
-                Ok(())
-            });
+            let charged = omgs::budget::charge_proof(r);
             if let Err(e) = charged {
                 if e.starts_with("run budget exhausted") {
                     eprintln!("needs_validation: target code was not executed. {e}");
@@ -1533,7 +1531,7 @@ fn walk_limited(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, limit: usize) 
         let path = entry.path();
         if ftype.is_dir() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if ["node_modules", ".git", ".next", "target", "dist"].contains(&name.as_str()) {
+            if name == ".git" {
                 continue;
             }
             if walk_limited(&path, depth + 1, out, limit) {
@@ -1586,7 +1584,32 @@ fn resolve_existing_prefix(p: &Path) -> Result<PathBuf, String> {
 
 /// Initialize a run and return its directory.
 fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
-    audit_init_limited(rest, omgs::stacks::INVENTORY_LIMIT)
+    let Some(parent) = flag(rest, "--fix-of") else {
+        return audit_init_limited(rest, omgs::stacks::INVENTORY_LIMIT);
+    };
+    if flag(rest, "--budget").is_some() {
+        return Err("--fix-of computes the budget; omit --budget".into());
+    }
+    omgs::budget::init_fix(Path::new(&parent), |_, original, remaining| {
+        let target = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
+        let target = std::fs::canonicalize(target).map_err(|e| e.to_string())?;
+        if original.get("target").and_then(|v| v.as_str()) != target.to_str() {
+            return Err("fix run target must match its original run".into());
+        }
+        let mut args = rest.to_vec();
+        if let Some(cap) = remaining {
+            args.extend(["--budget".into(), cap.to_string()]);
+        }
+        let run = audit_init_limited(&args, omgs::stacks::INVENTORY_LIMIT)?;
+        if remaining.is_none() {
+            // Persona defaults must not invent a cap for an uncapped original.
+            omgs::runmeta::update(&run, |m| {
+                m.remove("budget_agent_calls");
+                Ok(())
+            })?;
+        }
+        Ok(run)
+    })
 }
 
 fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf, String> {
@@ -1717,15 +1740,20 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
         .iter()
         .map(|p| omgs::paths::display(p))
         .collect();
-    let counts = omgs::architecture::path_counts(&rel_paths);
+    let classified: Vec<_> = native_paths
+        .iter()
+        .zip(&rel_paths)
+        .map(|(native, rel)| (rel.clone(), omgs::paths::classify_file(&target, native)))
+        .collect();
+    let counts = omgs::architecture::path_counts(&classified);
     let vendored_count = counts
         .get(&omgs::paths::Class::Vendored)
         .copied()
         .unwrap_or(0);
-    let first_party: Vec<String> = rel_paths
+    let first_party: Vec<String> = classified
         .iter()
-        .filter(|p| omgs::paths::classify(p) == omgs::paths::Class::Code)
-        .cloned()
+        .filter(|(_, class)| *class == omgs::paths::Class::Code)
+        .map(|(path, _)| path.clone())
         .collect();
     let projects = omgs::stacks::detect(&target, &native_paths);
     let stacks: Vec<_> = projects
@@ -1738,6 +1766,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
     for rel in &first_party {
         let is_route = rel.ends_with("/route.ts")
             || rel.ends_with("/route.tsx")
+            || rel.starts_with("pages/api/")
             || rel.contains("/pages/api/");
         if is_route {
             units.push(Unit::new(
@@ -1779,6 +1808,11 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
         ),
         (omgs::paths::Class::Docs, "docs:excluded", "documentation"),
         (
+            omgs::paths::Class::Data,
+            "data:excluded",
+            "large structured data",
+        ),
+        (
             omgs::paths::Class::Test,
             "tests:excluded",
             "test or fixture",
@@ -1790,6 +1824,40 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             unit.note = Some(format!(
                 "{count} {label} file(s) excluded from hunting by default"
             ));
+            let mut paths: Vec<_> = classified
+                .iter()
+                .filter(|(_, c)| *c == class)
+                .map(|(p, _)| p.clone())
+                .collect();
+            paths.sort();
+            // Include all exclusions, including unknown executable formats, so
+            // extending source recognition cannot conceal a coverage change.
+            unit.extra
+                .insert("excluded_count".into(), serde_json::json!(paths.len()));
+            unit.extra.insert(
+                "excluded_paths".into(),
+                serde_json::json!(&paths[..paths.len().min(20)]),
+            );
+            let mut source_paths: Vec<_> = paths
+                .into_iter()
+                .filter(|p| omgs::paths::is_source(p))
+                .collect();
+            unit.extra.insert(
+                "excluded_source_count".into(),
+                serde_json::json!(source_paths.len()),
+            );
+            source_paths.truncate(20);
+            if !source_paths.is_empty() {
+                unit.note.as_mut().unwrap().push_str(&format!(
+                    "; first {} excluded source path(s), sorted: {}",
+                    source_paths.len(),
+                    source_paths.join(", ")
+                ));
+            }
+            unit.extra.insert(
+                "excluded_source_paths".into(),
+                serde_json::json!(source_paths),
+            );
             units.push(unit);
         }
     }
@@ -2847,6 +2915,7 @@ mod cli_tests {
         ("ledger", "add"),
         ("ledger", "set"),
         ("critic", ""),
+        ("budget", ""),
         ("status", ""),
         ("watch", ""),
         ("route", ""),

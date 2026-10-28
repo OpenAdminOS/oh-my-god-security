@@ -19,7 +19,11 @@
             "items": { "type": "string" },
             "description": "What shows the unit was examined: finding fingerprints, candidate files, or repo paths."
           },
-          "note": { "type": "string", "description": "Why the unit was deferred, blocked, or put out of scope." }
+          "note": { "type": "string", "description": "Why the unit was deferred, blocked, or put out of scope." },
+          "excluded_count": {"type": "integer", "minimum": 0, "description": "Total excluded inventory files in this group."},
+          "excluded_paths": {"type": "array", "maxItems": 20, "items": {"type": "string"}, "description": "First 20 excluded inventory paths in sorted order."},
+          "excluded_source_count": {"type": "integer", "minimum": 0, "description": "Total excluded files with source or executable extensions in this group."},
+          "excluded_source_paths": {"type": "array", "maxItems": 20, "items": {"type": "string"}, "description": "First 20 excluded source paths in sorted order."}
         },
         "allOf": [
           {

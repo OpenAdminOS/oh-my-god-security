@@ -1,4 +1,4 @@
-use omgs::paths::{classify, Class};
+use omgs::paths::{classify, classify_with_size, Class};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -46,12 +46,12 @@ fn classifier_table_covers_every_class_and_stack_conventions() {
         ("scripts/run.sh", Class::Code),
         ("vendor/tests/x.py", Class::Vendored),
         ("node_modules/package/main.js", Class::Vendored),
-        ("lib/third_party/x.c", Class::Vendored),
-        (r"APP\NODE_MODULES\x.js", Class::Vendored),
-        ("build/output.swift", Class::Vendored),
-        ("lib/foo.min.js", Class::Vendored),
+        ("lib/third_party/x.c", Class::Code),
+        (r"APP\NODE_MODULES\x.js", Class::Code),
+        ("build/output.swift", Class::Code),
+        ("lib/foo.min.js", Class::Code),
         ("tests/security.rs", Class::Test),
-        ("src/__tests__/auth.ts", Class::Test),
+        ("src/__tests__/auth.ts", Class::Code),
         ("src/auth.spec.tsx", Class::Test),
         ("src/auth.test.js", Class::Test),
         ("test_auth.py", Class::Test),
@@ -62,15 +62,15 @@ fn classifier_table_covers_every_class_and_stack_conventions() {
         ("auth_test.go", Class::Test),
         ("auth.bats", Class::Test),
         ("tests/check.sh", Class::Test),
-        ("fixtures/handler.js", Class::Test),
-        ("docs/example.py", Class::Docs),
+        ("fixtures/handler.js", Class::Code),
+        ("docs/example.py", Class::Code),
         ("README.md", Class::Docs),
-        ("docs/guide.mdx", Class::Docs),
+        ("docs/guide.mdx", Class::Code),
         ("LICENSE", Class::Docs),
-        ("data/export.json", Class::Data),
-        ("export.csv", Class::Data),
-        ("package.json", Class::Data),
-        ("assets/icon.png", Class::Data),
+        ("data/export.json", Class::Code),
+        ("export.csv", Class::Code),
+        ("package.json", Class::Code),
+        ("assets/icon.png", Class::Code),
         ("contest/main.rs", Class::Code),
     ] {
         assert_eq!(classify(path), class, "{path}");
@@ -78,7 +78,8 @@ fn classifier_table_covers_every_class_and_stack_conventions() {
     let root = scratch("large-data");
     let file = std::fs::File::create(root.join("dump.json")).unwrap();
     file.set_len(20 << 20).unwrap();
-    assert_eq!(classify("dump.json"), Class::Data);
+    assert_eq!(classify("dump.json"), Class::Code);
+    assert_eq!(classify_with_size("dump.json", 20 << 20), Class::Data);
     let meta = init(&root, &root.with_extension("run"), &[]);
     assert_eq!(meta["files_first_party"], 0);
     assert_eq!(meta["path_classes"]["data"], 1);
@@ -114,7 +115,7 @@ fn monorepo_stacks_are_scoped_and_exclude_docs_tests_and_vendor() {
     }
     let meta = init(&target, &dir.join("run"), &[]);
     let projects = meta["subprojects"].as_array().unwrap();
-    assert_eq!(projects.len(), 3, "{projects:?}");
+    assert_eq!(projects.len(), 4, "{projects:?}");
     for (root, stack) in [
         ("apps/web", "nextjs-app-router"),
         ("apps/addon", "browser-extension"),
@@ -123,7 +124,7 @@ fn monorepo_stacks_are_scoped_and_exclude_docs_tests_and_vendor() {
         let p = projects.iter().find(|p| p["root"] == root).unwrap();
         assert!(p["stacks"].as_array().unwrap().contains(&json!(stack)));
     }
-    assert!(!meta["detected_stacks"]
+    assert!(meta["detected_stacks"]
         .as_array()
         .unwrap()
         .contains(&json!("python")));
@@ -364,9 +365,12 @@ fn native_manifest_paths_do_not_reinterpret_literal_backslashes() {
         .any(|p| p.stacks.contains(&"browser-extension")));
     let meta = init(&target, &dir.join("run"), &[]);
     let projects = meta["subprojects"].as_array().unwrap();
-    assert_eq!(projects.len(), 1);
-    assert_eq!(projects[0]["root"], "apps%5Caddon");
-    assert_eq!(projects[0]["stacks"], json!(["browser-extension"]));
+    assert_eq!(projects.len(), 2);
+    let addon = projects
+        .iter()
+        .find(|p| p["root"] == "apps%5Caddon")
+        .unwrap();
+    assert_eq!(addon["stacks"], json!(["browser-extension"]));
     for path in [
         PathBuf::from("../outside/manifest.json"),
         dir.join("outside/manifest.json"),
@@ -524,7 +528,7 @@ fn mixed_monorepo_keeps_unknown_stacks_and_generic_coverage() {
 }
 
 #[test]
-fn dumps_are_data_templates_are_code_and_test_suffixes_need_boundaries() {
+fn sql_and_html_always_stay_code_and_test_suffixes_need_boundaries() {
     for file in [
         "dump.sql",
         "dump.html",
@@ -532,7 +536,7 @@ fn dumps_are_data_templates_are_code_and_test_suffixes_need_boundaries() {
         "dumps/site.html",
         "exports/database.sql",
     ] {
-        assert_eq!(classify(file), Class::Data, "{file}");
+        assert_eq!(classify(file), Class::Code, "{file}");
     }
     for file in [
         "templates/index.html",
@@ -563,8 +567,8 @@ fn dumps_are_data_templates_are_code_and_test_suffixes_need_boundaries() {
     }
     let run = dir.with_extension("run");
     let meta = init(&dir, &run, &[]);
-    assert_eq!(meta["path_classes"]["data"], 2);
-    assert_eq!(meta["files_first_party"], 1);
+    assert!(meta["path_classes"].get("data").is_none());
+    assert_eq!(meta["files_first_party"], 3);
     std::fs::remove_dir_all(run).unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -702,61 +706,6 @@ fn installed_brief_references_resolve_to_packaged_schemas() {
 }
 
 #[test]
-fn fixer_budget_and_persona_contract_preserves_remaining_allowance() {
-    let dir = scratch("fixer-allowance");
-    let target = dir.join("repo");
-    std::fs::create_dir_all(&target).unwrap();
-    let skill = Path::new(env!("CARGO_MANIFEST_DIR")).join("skill");
-    let brief = std::fs::read_to_string(skill.join("agents/green-fixer.md")).unwrap();
-    let command = brief
-        .lines()
-        .find(|l| l.starts_with("omgs audit init"))
-        .unwrap();
-    for persona in [None, Some("builder")] {
-        let run = dir.join(if persona.is_some() {
-            "builder"
-        } else {
-            "default"
-        });
-        let mut args: Vec<_> = command
-            .split_whitespace()
-            .take_while(|s| !s.starts_with('['))
-            .skip(1)
-            .map(str::to_string)
-            .collect();
-        for arg in &mut args {
-            *arg = match arg.as_str() {
-                "TARGET" => target.to_string_lossy().into_owned(),
-                "FIX_OUTPUT_DIR" => run.to_string_lossy().into_owned(),
-                "REMAINING_BUDGET" => "0".into(),
-                _ => arg.clone(),
-            };
-        }
-        if let Some(persona) = persona {
-            args.extend(["--persona".into(), persona.into()]);
-        }
-        let out = cli(&args.iter().map(String::as_str).collect::<Vec<_>>());
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let meta = read(&run.join("run-metadata.json"));
-        assert_eq!(meta["budget_agent_calls"], 0);
-        assert_eq!(meta["persona"].as_str(), persona);
-    }
-    for contract in [
-        "minus agent_calls_used and proof_runs_used",
-        "pause spending",
-        "omit --budget too",
-        "shared allowance is exhausted",
-    ] {
-        assert!(brief.contains(contract), "{contract}");
-    }
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
 fn initial_proof_belongs_to_verifier_and_replay_to_evaluator() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let hunter = std::fs::read_to_string(root.join("skill/agents/red-hunter.md")).unwrap();
@@ -782,4 +731,254 @@ fn initial_proof_belongs_to_verifier_and_replay_to_evaluator() {
     assert!(skill.contains("The independent verifier submits"));
     let decisions = std::fs::read_to_string(root.join("DECISIONS.md")).unwrap();
     assert!(!decisions.contains("red agents hunt and prove"));
+}
+
+#[test]
+fn adversarial_classifier_requires_exclusion_evidence() {
+    for (path, size, expected) in [
+        ("app/api/tests/route.ts", 0, Class::Code),
+        ("app/api/fixtures/route.ts", 0, Class::Code),
+        ("pages/api/test.ts", 0, Class::Code),
+        ("src/views/export.html", 0, Class::Code),
+        ("migrations/exports/001.sql", 0, Class::Code),
+        ("src/test_utils.py", 0, Class::Code),
+        ("tests/fixtures/app/route.ts", 0, Class::Test),
+        ("data/dump.ndjson", 20 << 20, Class::Data),
+        ("docs/guide.md", 0, Class::Docs),
+        ("data/dump.json", (1 << 20) - 1, Class::Code),
+        ("data/dump.json", 1 << 20, Class::Data),
+        ("templates/exports/dump.html", 20 << 20, Class::Code),
+        ("migrations/dump.sql", 20 << 20, Class::Code),
+        ("src/server/tests/tool.ps1", 0, Class::Code),
+        ("server/fixtures/run.sh", 0, Class::Code),
+        ("src/vendor/handler.ts", 0, Class::Code),
+        ("backend/tests/route.ts", 0, Class::Code),
+        ("templates/__tests__/export.html", 0, Class::Code),
+        ("app/api/node_modules/route.ts", 0, Class::Code),
+        ("src/auth.test.helper.ts", 0, Class::Code),
+        ("docs/guide.py", 0, Class::Code),
+        ("dist/server.js", 0, Class::Code),
+        ("production/unknown.format", 0, Class::Code),
+        ("tests_auth.py", 0, Class::Code),
+        ("tests/auth.py", 0, Class::Test),
+        ("checks/__tests__/auth.ts", 0, Class::Code),
+        ("src/auth.test.ts", 0, Class::Test),
+        ("auth_test.go", 0, Class::Test),
+        ("test_auth.py", 0, Class::Test),
+        ("AuthTests.cs", 0, Class::Test),
+    ] {
+        assert_eq!(classify_with_size(path, size), expected, "{path}");
+    }
+}
+
+#[test]
+fn adversarial_routes_seed_hunting_and_disclose_sorted_exclusions() {
+    let dir = scratch("adversarial-coverage");
+    let target = dir.join("repo");
+    let run = dir.join("run");
+    let runtime = [
+        "app/api/tests/route.ts",
+        "app/api/fixtures/route.ts",
+        "pages/api/test.ts",
+        "src/views/export.html",
+        "migrations/exports/001.sql",
+        "src/test_utils.py",
+    ];
+    for path in runtime.into_iter().chain([
+        "tests/fixtures/app/route.ts",
+        "vendor/package/tool.sh",
+        "node_modules/pkg/index.js",
+        "docs/guide.md",
+        "data/dump.ndjson",
+    ]) {
+        let path = target.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        if path.extension().unwrap() == "ndjson" {
+            // A real 20 MiB NDJSON dump, rather than a sparse placeholder.
+            let rows = b"{\"row\":0}\n".repeat((20 << 20) / 10);
+            assert_eq!(rows.len(), 20 << 20);
+            std::fs::write(&path, rows).unwrap();
+        }
+    }
+    for i in (0..25).rev() {
+        std::fs::write(target.join(format!("tests/test_{i:02}.py")), "").unwrap();
+    }
+    let meta = init(&target, &run, &[]);
+    assert_eq!(meta["files_first_party"], runtime.len());
+    let ledger = read(&run.join("coverage-ledger.json"));
+    let units = ledger["units"].as_array().unwrap();
+    for route in &runtime[..3] {
+        assert!(
+            units
+                .iter()
+                .any(|u| u["id"] == format!("route:{route}") && u["status"] == "planned"),
+            "{route}"
+        );
+    }
+    let tests = units.iter().find(|u| u["id"] == "tests:excluded").unwrap();
+    assert_eq!(tests["excluded_count"], 26);
+    assert_eq!(tests["excluded_source_count"], 26);
+    let sample = tests["excluded_source_paths"].as_array().unwrap();
+    assert_eq!(sample.len(), 20);
+    assert_eq!(sample[0], "tests/fixtures/app/route.ts");
+    assert_eq!(sample[19], "tests/test_18.py");
+    assert!(sample.windows(2).all(|w| w[0].as_str() < w[1].as_str()));
+    let vendor = units
+        .iter()
+        .find(|u| u["id"] == "vendored:excluded")
+        .unwrap();
+    assert_eq!(vendor["excluded_source_count"], 2);
+    assert_eq!(
+        vendor["excluded_source_paths"],
+        json!(["node_modules/pkg/index.js", "vendor/package/tool.sh"])
+    );
+    let data = units.iter().find(|u| u["id"] == "data:excluded").unwrap();
+    assert_eq!(data["excluded_paths"], json!(["data/dump.ndjson"]));
+    let listed = cli(&[
+        "ledger",
+        "list",
+        "--ledger",
+        run.join("coverage-ledger.json").to_str().unwrap(),
+    ]);
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("tests/fixtures/app/route.ts"));
+    let out = cli(&["critic", "--run", run.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "unhunted production routes must not pass"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("app/api/tests/route.ts"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn set_spending(run: &Path, calls: u64, proofs: u64) {
+    omgs::runmeta::update(run, |m| {
+        m.insert("agent_calls_used".into(), json!(calls));
+        m.insert("proof_runs_used".into(), json!(proofs));
+        Ok(())
+    })
+    .unwrap();
+}
+fn allowance(run: &Path) -> Value {
+    let out = cli(&["budget", "--run", run.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[test]
+fn fixer_allowance_counts_multiple_rounds_once_and_never_goes_negative() {
+    let dir = scratch("cumulative-fix-budget");
+    let target = dir.join("repo");
+    std::fs::create_dir_all(&target).unwrap();
+    let root = dir.join("original");
+    init(&target, &root, &["--persona", "builder"]);
+    set_spending(&root, 10, 4);
+    let fix1 = dir.join("fix1");
+    let meta = init(
+        &target,
+        &fix1,
+        &["--fix-of", root.to_str().unwrap(), "--persona", "builder"],
+    );
+    assert_eq!(meta["budget_agent_calls"], 10);
+    set_spending(&fix1, 4, 2);
+    assert_eq!(allowance(&root)["remaining"], 4);
+    assert_eq!(allowance(&fix1)["calls_and_proofs_used"], 20);
+    assert_eq!(
+        read(&root.join("run-metadata.json"))["agent_calls_used"],
+        10
+    );
+    let fix2 = dir.join("fix2");
+    let meta = init(
+        &target,
+        &fix2,
+        &["--fix-of", root.to_str().unwrap(), "--persona", "builder"],
+    );
+    assert_eq!(meta["budget_agent_calls"], 4);
+    set_spending(&fix2, 1, 1);
+    assert_eq!(allowance(&root)["remaining"], 2);
+    omgs::budget::charge_proof(&root).unwrap();
+    omgs::budget::charge_proof(&fix2).unwrap();
+    assert_eq!(allowance(&root)["remaining"], 0);
+    assert!(omgs::budget::charge_proof(&root)
+        .unwrap_err()
+        .starts_with("run budget exhausted"));
+    assert!(omgs::budget::charge_proof(&fix1)
+        .unwrap_err()
+        .starts_with("run budget exhausted"));
+    let fix3 = dir.join("fix3");
+    assert_eq!(
+        init(&target, &fix3, &["--fix-of", root.to_str().unwrap()])["budget_agent_calls"],
+        0
+    );
+    set_spending(&fix2, 9, 9);
+    assert_eq!(allowance(&root)["remaining"], 0);
+    set_spending(&root, u64::MAX, 1);
+    let out = cli(&["budget", "--run", root.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("overflow"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn uncapped_fix_runs_stay_uncapped_and_broken_links_fail_closed() {
+    let dir = scratch("uncapped-fix-budget");
+    let target = dir.join("repo");
+    std::fs::create_dir_all(&target).unwrap();
+    let root = dir.join("original");
+    init(&target, &root, &[]);
+    let fix = dir.join("fix");
+    let meta = init(
+        &target,
+        &fix,
+        &["--fix-of", root.to_str().unwrap(), "--persona", "builder"],
+    );
+    assert!(meta.get("budget_agent_calls").is_none());
+    set_spending(&fix, 30, 40);
+    assert!(allowance(&fix)["remaining"].is_null());
+    omgs::runmeta::update(&root, |m| {
+        let duplicate = m["fix_runs"][0].clone();
+        m["fix_runs"].as_array_mut().unwrap().push(duplicate);
+        Ok(())
+    })
+    .unwrap();
+    assert!(!cli(&["budget", "--run", root.to_str().unwrap()])
+        .status
+        .success());
+    std::fs::remove_dir_all(&fix).unwrap();
+    assert!(!cli(&["budget", "--run", root.to_str().unwrap()])
+        .status
+        .success());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn concurrent_fix_proofs_cannot_exceed_the_original_cap() {
+    let dir = scratch("concurrent-fix-budget");
+    let target = dir.join("repo");
+    std::fs::create_dir_all(&target).unwrap();
+    let root = dir.join("original");
+    init(&target, &root, &["--budget", "1"]);
+    let fix1 = dir.join("fix1");
+    let fix2 = dir.join("fix2");
+    for fix in [&fix1, &fix2] {
+        init(&target, fix, &["--fix-of", root.to_str().unwrap()]);
+    }
+    let threads: Vec<_> = [root.clone(), fix1, fix2]
+        .into_iter()
+        .map(|run| std::thread::spawn(move || omgs::budget::charge_proof(&run)))
+        .collect();
+    let successes = threads
+        .into_iter()
+        .map(|t| t.join().unwrap())
+        .filter(Result::is_ok)
+        .count();
+    assert_eq!(successes, 1);
+    assert_eq!(allowance(&root)["calls_and_proofs_used"], 1);
+    assert_eq!(allowance(&root)["remaining"], 0);
+    std::fs::remove_dir_all(dir).unwrap();
 }

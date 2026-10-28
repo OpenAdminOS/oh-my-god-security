@@ -206,12 +206,14 @@ fn stack_detection_matches_field_ecosystems() {
 }
 
 #[test]
-fn vendored_paths_are_excluded() {
-    assert!(omgs::is_vendored_path(
+fn vendored_roots_require_specific_evidence() {
+    assert!(omgs::is_vendored_path("vendor/package/main.js"));
+    assert!(omgs::is_vendored_path("node_modules/package/main.js"));
+    assert!(!omgs::is_vendored_path(
         "Web/MonacoEditor/min/vs/editor/editor.main.js"
     ));
-    assert!(omgs::is_vendored_path("lib/foo.min.js"));
-    assert!(omgs::is_vendored_path("bin/tool.dll"));
+    assert!(!omgs::is_vendored_path("lib/foo.min.js"));
+    assert!(!omgs::is_vendored_path("bin/tool.dll"));
     assert!(!omgs::is_vendored_path("Scripts/Update-Thing.ps1"));
     assert!(!omgs::is_vendored_path("app/api/orders/route.ts"));
 }
@@ -606,7 +608,10 @@ fn semgrep_parser_keeps_only_metadata() {
     assert_eq!(h.file, "src/Helper.swift");
     assert_eq!(h.line, Some(42));
     assert!(!h.vendored);
-    assert!(report.hits[1].vendored, "a .min.js path is vendored");
+    assert!(
+        !report.hits[1].vendored,
+        "minification alone is not vendor evidence"
+    );
     let dump = format!("{report:?}");
     assert!(!dump.contains("supersecret"), "matched source text leaked");
 }

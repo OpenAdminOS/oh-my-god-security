@@ -149,7 +149,7 @@ cargo build --release
 
 `omgs audit init --target <repo> --persona builder|inheritor|team` records the persona and selects presentation and spending defaults. Builder uses concise coverage detail and a budget of 24 calls/proofs, inheritor uses full detail and 64, and team uses full detail and 96. Every persona defaults to advisory; explicit `--mode` and `--budget` override the defaults. Without `--persona`, the existing budget behavior is unchanged. Proof rules, verdict semantics and the evidence required to confirm a finding are identical.
 
-Inventory uses one path classifier for code, tests, docs, data and vendored/generated content. JSON and CSV dumps do not count as first-party code. Shell scripts and browser extensions with a valid manifest version are detected alongside existing stacks. Nested project markers produce separate subproject roots in run metadata, coverage units and the architecture seed.
+Inventory uses one path classifier for code, tests, docs, data and vendored/generated content. Code is the default, including unknown formats, SQL, HTML and templates. Only JSON, JSONL, NDJSON, CSV and TSV files of at least 1 MiB are excluded as data. Documentation requires a doc extension (md, rst, txt, adoc) or a conventional extensionless notice name. Only inventory-root test/spec and dependency containers are excluded by directory name. Nested directory hints, minified names and binary extensions alone cannot exclude a file; `src/test_utils.py` is a runtime helper and counts as code. Conventional test suffixes still identify tests. Every exclusion group in the ledger records its total and first 20 sorted paths, plus a separate source count and first 20 source paths. Shell scripts and browser extensions with a valid manifest version are detected alongside existing stacks. Nested project markers produce separate subproject roots in run metadata, coverage units and the architecture seed.
 
 Supply host usage cumulatively per role with `--accounting ROLE=TOKENS,COST_USD,DURATION_MS` on status or report. The roles are `red-hunter`, `blue-verifier`, `evaluator` and `green-fixer`. Repeat the option for multiple roles. For example:
 
@@ -160,12 +160,14 @@ omgs report --findings <run-dir>/findings.json --out <run-dir> --accounting blue
 
 Each supplied entry replaces that role's cumulative totals. Empty fields or `unknown` mean unavailable. Missing usage round-trips as JSON null and renders as `unknown`, including roles that have not run. Explicit zero means a measured zero. Reports reuse saved status accounting.
 
+`omgs budget --run <run-dir>` reports the shared cumulative calls/proofs and remaining allowance. Start each fix run with `omgs audit init --target <repo> --out <fix-run-dir> --no-sensors --fix-of <original-run-dir>` to register it and compute its cap. Each run records only its own spending; never fold fix usage into the original counters. Multiple fix rounds share the original cap. Exhaustion returns zero, an uncapped original returns null, and invalid links or counter overflow are errors.
+
 Role contracts live under `skill/agents/`: red-hunter, blue-verifier, evaluator and green-fixer. The host passes each brief verbatim with its scope. The identity-binding and fail-closed-semantics packs add reusable intent questions and minimal proof shapes.
 
 ## Repository layout
 
 - `src/`: the deterministic Rust CLI (findings schema, finding identity across runs, stack detection, coverage ledger, redacted sensor execution, sandbox proof execution, report rendering to Markdown, a self contained HTML one pager, and SARIF, and the architecture map renderer).
-- `schemas/`: findings and coverage ledger JSON schemas (the agent-facing candidate and architecture schemas live in `skill/schemas/`).
+- `schemas/`: coverage ledger JSON schema. Findings, candidate and architecture schemas live in `skill/schemas/`.
 - `skill/`: the agent skill pack and attack class packs that your agent follows.
 - `.github/workflows/release.yml`: the signed, notarized, checksummed release pipeline.
 - `benchmark/`: the open benchmark design and case manifest format.

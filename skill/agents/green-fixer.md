@@ -24,11 +24,14 @@ omgs prove --run OUTPUT_DIR --replay N
 After an authorized edit, the old replay snapshot intentionally no longer matches. Initialize a new external run for the changed revision and rerun the same retained test and exact invariant assertion:
 
 ```text
-omgs audit init --target TARGET --out FIX_OUTPUT_DIR --no-sensors --budget REMAINING_BUDGET [--persona ORIGINAL_PERSONA]
+omgs budget --run OUTPUT_DIR
+omgs audit init --target TARGET --out FIX_OUTPUT_DIR --no-sensors --fix-of OUTPUT_DIR [--persona ORIGINAL_PERSONA]
 omgs prove --run FIX_OUTPUT_DIR --test RELATIVE_TEST --test-from OUTPUT_DIR/DRAFT --cmd COMMAND
 ```
 
-The host computes REMAINING_BUDGET from the original budget_agent_calls minus agent_calls_used and proof_runs_used across the original run and all earlier fix runs, including the baseline replay above. Reserve that allowance for this fix run and pause spending in the original run while it is active. Carry the exact original persona with --persona, omitting that option when persona is null. Explicit --budget overrides the persona default, including a remaining budget of zero. If the original run has no budget cap, omit --budget too; never invent a new cap or reset a consumed allowance. The host accounts for fix calls and proofs in the original total before any later dispatch. Stop when the shared allowance is exhausted.
+`omgs budget --run OUTPUT_DIR` is the authoritative cumulative total and remaining allowance. The CLI sums each run's own agent_calls_used and proof_runs_used exactly once across the original run and its registered fix runs, including baseline replays. Never fold fix usage into the original counters or subtract it a second time. With a cap of 24, original usage of 14 and fix usage of 6, remaining is 4. Checked arithmetic clamps an exhausted allowance to zero and rejects counter overflow.
+
+`--fix-of OUTPUT_DIR` registers the new fix run with the original and sets its budget to the current remaining allowance, including zero. It cannot be combined with --budget. Carry the exact original persona with --persona, omitting that option when persona is null. An uncapped original stays uncapped even with a persona. Report each run's own cumulative call count only. Before each dispatch, refresh `omgs budget --run OUTPUT_DIR`; pause spending in the original and earlier fix runs while a fix is active. Proof charging also checks the shared allowance under the original run lock. Stop when the shared allowance is exhausted.
 
 Omit --test-from only when the identical retained test is already accepted into TARGET. A fixed test passes while the authorized success control still succeeds. Record the new runner proof path; ask for independent verification and evaluation before closing the item. If prove exits 3, record that nothing ran and keep the fix blocked rather than claiming verification.
 

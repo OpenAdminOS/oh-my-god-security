@@ -1,6 +1,6 @@
 //! Stack inventory grouped by nearest project marker. Native paths are used
 //! for reads; display paths are never converted back into filesystem paths.
-use crate::paths::{classify, display, safe_relative, Class};
+use crate::paths::{classify_file, display, safe_relative, Class};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ pub fn detect(target: &Path, paths: &[PathBuf]) -> Vec<Project> {
         .filter(|p| {
             safe_relative(p)
                 && !matches!(
-                    classify(&display(p)),
+                    classify_file(target, p),
                     Class::Vendored | Class::Docs | Class::Test
                 )
         })
@@ -61,7 +61,7 @@ pub fn detect(target: &Path, paths: &[PathBuf]) -> Vec<Project> {
     }
     // Seed marker roots even if no supported stack can be inferred. Lookup
     // walks ancestors rather than scanning every root for every inventory path.
-    let mut groups: BTreeMap<PathBuf, Vec<String>> =
+    let mut groups: BTreeMap<PathBuf, Vec<(String, Class)>> =
         roots.iter().map(|r| (r.clone(), Vec::new())).collect();
     for path in eligible {
         let root = path
@@ -73,19 +73,20 @@ pub fn detect(target: &Path, paths: &[PathBuf]) -> Vec<Project> {
         groups
             .entry(root.to_path_buf())
             .or_default()
-            .push(display(path));
+            .push((display(path), classify_file(target, path)));
     }
     groups
         .into_iter()
         .filter_map(|(root, paths)| {
             // Keep full paths for classification, including fixture ancestry.
-            let mut stacks = crate::detect_stacks(&paths);
+            let mut stacks =
+                crate::detect_stacks(&paths.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
             if extensions.contains(&root) {
                 stacks.push("browser-extension");
             }
             (!stacks.is_empty()
                 || roots.contains(&root)
-                || paths.iter().any(|p| classify(p) == Class::Code))
+                || paths.iter().any(|(_, class)| *class == Class::Code))
             .then(|| Project {
                 root: if root.as_os_str().is_empty() {
                     ".".into()

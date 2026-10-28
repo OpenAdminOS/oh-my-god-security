@@ -1,5 +1,5 @@
-//! Shared, path-only inventory policy. Classification never executes or reads
-//! target content; data stays data regardless of its size.
+//! Fail-safe inventory policy. Unknown files stay in hunting scope.
+//! Classification uses path conventions and file size, never execution.
 use serde::Serialize;
 use std::path::{Component, Path};
 
@@ -31,100 +31,85 @@ pub enum Class {
     Vendored,
 }
 
+/// Source recognition is used for exclusion disclosure, never as an allowlist
+/// for hunting. Unknown formats remain Code too.
+pub fn is_source(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let file = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    [
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "cs", "cshtml", "razor", "csproj", "sln",
+        "fs", "fsx", "vb", "swift", "ps1", "psm1", "psd1", "py", "pyi", "sh", "bash", "zsh", "ksh",
+        "fish", "cmd", "bat", "bats", "html", "htm", "css", "scss", "sql", "go", "java", "kt",
+        "rb", "php", "c", "h", "cpp", "hpp", "vue", "svelte", "astro", "ejs", "hbs", "pug",
+        "jinja", "jinja2", "j2", "twig", "erb", "tmpl", "tpl", "liquid", "mustache",
+    ]
+    .contains(&ext)
+        || ["dockerfile", "makefile"].contains(&file)
+}
+
+/// Without file evidence a data-looking name still defaults to Code.
 pub fn classify(path: &str) -> Class {
+    classify_with_size(path, 0)
+}
+
+/// Exclusion requires a specific convention. Nested directory names cannot
+/// turn production source into tests, docs, data or vendor.
+pub fn classify_with_size(path: &str, size: u64) -> Class {
     let native_name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-    let path = path.replace('\\', "/").to_lowercase();
+    let path = path.replace('\\', "/").to_ascii_lowercase();
     let parts: Vec<_> = path.split('/').collect();
     let file = parts.last().copied().unwrap_or("");
+    let dirs = &parts[..parts.len().saturating_sub(1)];
     let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-    if parts.iter().any(|p| {
-        [
-            "vendor",
-            "node_modules",
-            "third_party",
-            "thirdparty",
-            "external",
-            "monacoeditor",
-            "dist",
-            "build",
-            "target",
-            ".next",
-            ".git",
-        ]
-        .contains(p)
-    }) || [".min.js", ".min.css", ".dll", ".exe", ".pdb", ".map"]
-        .iter()
-        .any(|e| file.ends_with(e))
+    // Only inventory-root containers are conclusive. A nested tests/vendor
+    // name may be part of runtime code, even in an unfamiliar framework.
+    // Prefer extra hunting to guessing that a nested directory is excluded.
+    if dirs
+        .first()
+        .is_some_and(|dir| ["node_modules", "vendor", "third_party", "thirdparty"].contains(dir))
     {
         return Class::Vendored;
     }
-    let source = [
-        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "cs", "cshtml", "csproj", "sln", "fs", "fsx",
-        "vb", "swift", "ps1", "psm1", "psd1", "py", "pyi", "sh", "bash", "zsh", "ksh", "fish",
-        "cmd", "bat", "html", "css", "scss", "sql", "go", "java", "kt", "rb", "php", "c", "h",
-        "cpp", "hpp",
-    ]
-    .contains(&ext)
-        || ["dockerfile", "makefile"].contains(&file);
-    // Explicit fixture/test containers apply to manifests too. Broad "spec"
-    // and "docs" hints cannot hide runtime app paths or named applications.
-    let runtime = parts
-        .iter()
-        .any(|p| ["src", "app", "pages", "api", "server", "components"].contains(p));
-    let test_dir = parts
-        .iter()
-        .any(|p| ["test", "tests", "__tests__", "fixtures", "__mocks__"].contains(p))
-        || (!runtime && parts.first().is_some_and(|p| ["spec", "specs"].contains(p)));
-    if test_dir
-        || (source
-            && ([".test.", ".spec.", "_test.", "_tests.", ".tests."]
-                .iter()
-                .any(|s| file.contains(s))
-                || file.starts_with("test_")
-                || file.starts_with("tests_")
-                || conventional_test_suffix(native_name)))
-        || ext == "bats"
+    if dirs
+        .first()
+        .is_some_and(|dir| ["tests", "test", "__tests__", "spec", "specs"].contains(dir))
     {
         return Class::Test;
     }
-    let marker = [
-        "package.json",
-        "cargo.toml",
-        "package.swift",
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-        "go.mod",
-        "manifest.json",
-    ]
-    .contains(&file)
-        || ext == "csproj";
-    if marker {
-        return if source { Class::Code } else { Class::Data };
+    if is_source(file)
+        && ([".test.", ".spec.", "_test.", "_tests.", ".tests."]
+            .iter()
+            .any(|suffix| {
+                file.rsplit_once('.')
+                    .is_some_and(|(stem, _)| stem.ends_with(suffix.trim_end_matches('.')))
+            })
+            || (dirs.is_empty() && ext == "py" && file.starts_with("test_"))
+            || conventional_test_suffix(native_name)
+            || ext == "bats")
+    {
+        return Class::Test;
     }
-    if ["md", "mdx", "rst", "txt", "adoc"].contains(&ext)
+    if ["md", "rst", "txt", "adoc"].contains(&ext)
         || ["license", "notice", "readme"].contains(&file)
-        || (!runtime
-            && parts
-                .first()
-                .is_some_and(|p| ["docs", "doc", "documentation"].contains(p)))
     {
         return Class::Docs;
     }
-    // SQL and HTML are code unless explicitly named or stored as dumps/exports.
-    if ["sql", "html"].contains(&ext)
-        && (parts.iter().any(|p| ["dumps", "exports"].contains(p))
-            || ["dump.sql", "dump.html", "export.sql", "export.html"].contains(&file)
-            || file.ends_with(".dump.sql")
-            || file.ends_with(".dump.html"))
-    {
+    // SQL, HTML, MDX and templates can execute and are never data dumps.
+    // A large structured-data suffix is positive evidence; small configuration
+    // and unknown formats remain in scope. No content is executed or loaded.
+    if size >= 1 << 20 && ["json", "jsonl", "ndjson", "csv", "tsv"].contains(&ext) {
         return Class::Data;
     }
-    if source {
-        Class::Code
-    } else {
-        Class::Data
-    }
+    Class::Code
+}
+
+pub fn classify_file(target: &Path, relative: &Path) -> Class {
+    let size = std::fs::symlink_metadata(target.join(relative))
+        .ok()
+        .filter(|m| m.is_file())
+        .map_or(0, |m| m.len());
+    classify_with_size(&display(relative), size)
 }
 
 fn conventional_test_suffix(file: &str) -> bool {
