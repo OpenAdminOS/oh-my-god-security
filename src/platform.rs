@@ -174,21 +174,15 @@ pub fn describe_path(path: &Path) -> String {
     }
 }
 
-/// Create a private directory, including when the caller reserved it earlier.
+/// Create private storage or validate a directory reserved earlier.
+#[cfg(unix)]
 pub fn private_dir(path: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
+    create_private_tree(path)
+}
+
+#[cfg(not(unix))]
+pub fn private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
     #[cfg(windows)]
     windows_private::restrict(path)?;
     Ok(())
@@ -211,6 +205,9 @@ pub fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Error, ErrorKind};
     let file =
         open_single_link(path)?.ok_or_else(|| Error::new(ErrorKind::NotFound, "file missing"))?;
+    #[cfg(unix)]
+    check_private_file(&file)
+        .map_err(|e| Error::other(format!("storage {}: {e}", path.display())))?;
     read_bounded_file(file, limit)
 }
 
@@ -233,14 +230,16 @@ pub fn read_bounded_in(target: &Path, relative: &Path, limit: u64) -> std::io::R
     with_file_in(target, relative, |file| read_bounded_file(file, limit))
 }
 
-/// Read private metadata, checking the opened leaf's Windows owner and DACL.
+/// Read private metadata, checking the opened leaf's owner, mode and ACL.
 pub fn read_private_bounded_in(
     target: &Path,
     relative: &Path,
     limit: u64,
 ) -> std::io::Result<Vec<u8>> {
     with_file_in(target, relative, |file| {
-        check_private_file(&file)?;
+        check_private_file(&file).map_err(|e| {
+            std::io::Error::other(format!("storage {}: {e}", target.join(relative).display()))
+        })?;
         read_bounded_file(file, limit)
     })
 }
@@ -529,6 +528,45 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn writable_metadata_and_lock_modes_are_refused_without_repair() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("omgs-leaf-mode-{}", random_nonce().unwrap()));
+        create_private_dir_new(&dir).unwrap();
+        let run = dir.join("run");
+        create_private_dir_new(&run).unwrap();
+        let metadata = run.join(crate::runmeta::FILE);
+        let lock = run.join(".omgs-run.lock");
+        for mode in [0o620, 0o602] {
+            std::fs::write(&metadata, "{}").unwrap();
+            std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(mode)).unwrap();
+            for error in [
+                crate::budget::metadata(&run).unwrap_err(),
+                crate::runmeta::read(&run).unwrap_err(),
+                crate::runmeta::write_atomic(&metadata, "changed").unwrap_err(),
+            ] {
+                assert!(error.contains(&metadata.display().to_string()), "{error}");
+                assert!(error.contains("not group- or world-writable"), "{error}");
+                assert!(error.contains("README.md#storage-migration"), "{error}");
+            }
+            assert_eq!(std::fs::read_to_string(&metadata).unwrap(), "{}");
+            assert_eq!(std::fs::metadata(&metadata).unwrap().mode() & 0o777, mode);
+            std::fs::write(&lock, "").unwrap();
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(crate::runmeta::with_lock(&run, || -> Result<(), String> {
+                panic!("unsafe lock admitted")
+            })
+            .is_err());
+        }
+        for leaf in [&metadata, &lock] {
+            std::fs::set_permissions(leaf, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        crate::runmeta::with_lock(&run, || crate::runmeta::write_atomic(&metadata, "{}")).unwrap();
+        assert!(crate::budget::metadata(&run).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn single_link_open_refuses_hardlinks_and_accepts_plain_files() {
         let d = std::env::temp_dir().join(format!("omgs-link-{}", std::process::id()));
@@ -579,6 +617,10 @@ mod diagnostic_tests {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[path = "macos_private.rs"]
+mod macos_private;
+
 #[cfg(windows)]
 #[path = "windows_private.rs"]
 mod windows_private;
@@ -601,6 +643,12 @@ pub fn check_private_dir(path: &Path) -> std::io::Result<()> {
                 path.display(), meta.uid(), meta.mode() & 0o7777,
             )));
         }
+        // Linux POSIX access ACLs expose ACL_MASK in the group mode bits.
+        // Mode 0700 therefore masks all named-user and group entries to ---;
+        // the mask cannot be wider than these bits. Creation with 0700/0600
+        // also constrains inherited default ACLs to the requested mode.
+        #[cfg(target_os = "macos")]
+        macos_private::check_dir(path, meta.uid())?;
         Ok(())
     }
     #[cfg(windows)]
@@ -620,16 +668,32 @@ pub fn open_private_write(path: &Path, create_new: bool) -> std::io::Result<std:
 }
 
 /// Validate an opened metadata or lock file before using its contents or lock.
-/// Unix storage relies on its owner-private parent directory.
 pub fn check_private_file(file: &std::fs::File) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         windows_private::check_file(file)
     }
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        // Linux's ACL mask is the group mode bits, so this also excludes
+        // effective POSIX ACL write grants to named users and groups.
+        // SAFETY: geteuid has no arguments or memory preconditions.
+        if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+            return Err(std::io::Error::other(format!(
+                "storage file must be regular, owned by the current user and not group- or world-writable; observed owner uid {}, mode {:04o}; see README.md#storage-migration",
+                meta.uid(), meta.mode() & 0o7777,
+            )));
+        }
+        #[cfg(target_os = "macos")]
+        macos_private::check_file(file, meta.uid())?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = file;
-        Ok(())
+        Err(std::io::Error::other("private storage checks unavailable"))
     }
 }
 
@@ -660,6 +724,9 @@ pub fn create_private_dir_new(path: &Path) -> std::io::Result<()> {
         builder
     };
     builder.create(path)?;
+    // Only an exclusive successful create authorizes changing this ACL.
+    #[cfg(target_os = "macos")]
+    macos_private::restrict_created_dir(path)?;
     #[cfg(windows)]
     windows_private::restrict(path)?;
     check_private_dir(path)

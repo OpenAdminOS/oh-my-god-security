@@ -32,6 +32,18 @@ pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         crate::platform::check_private_file(&file)
             .map_err(|e| std::io::Error::other(format!("storage {}: {e}", path.display())))?;
     }
+    #[cfg(unix)]
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Regular destinations are admitted before replacement. Links remain
+        // safe to replace as directory entries, without following their target.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        crate::platform::check_private_file(&file)
+            .map_err(|e| std::io::Error::other(format!("storage {}: {e}", path.display())))?;
+    }
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -58,9 +70,15 @@ pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
     };
-    if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+    if let Err(e) = crate::platform::check_private_file(&file)
+        .and_then(|_| file.write_all(bytes))
+        .and_then(|_| file.sync_all())
+    {
         let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+        return Err(std::io::Error::other(format!(
+            "storage {}: {e}",
+            tmp.display()
+        )));
     }
     drop(file);
     std::fs::rename(&tmp, path).inspect_err(|_| {
@@ -75,7 +93,6 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 
 pub fn read(dir: &Path) -> Result<Map<String, Value>, String> {
     let path = dir.join(FILE);
-    #[cfg(windows)]
     let text = {
         let file = crate::platform::open_single_link(&path)
             .map_err(|e| format!("read {}: {e}", path.display()))?
@@ -84,9 +101,6 @@ pub fn read(dir: &Path) -> Result<Map<String, Value>, String> {
             .map_err(|e| format!("storage {}: {e}", path.display()))?;
         std::io::read_to_string(file).map_err(|e| format!("read {}: {e}", path.display()))?
     };
-    #[cfg(not(windows))]
-    let text =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     match crate::shape::strict_json(&text) {
         Ok(Value::Object(m)) => {
             check_numeric_fields(&m)?;
@@ -120,11 +134,18 @@ pub fn with_lock_file<T>(
     #[cfg(windows)]
     let opened = crate::platform::open_private_write(lock_path, false);
     #[cfg(not(windows))]
-    let opened = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(lock_path);
+    let opened = {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        options.open(lock_path)
+    };
     let file = opened.map_err(|e| format!("open lock {}: {e}", lock_path.display()))?;
     crate::platform::check_private_file(&file)
         .map_err(|e| format!("storage {}: {e}", lock_path.display()))?;
