@@ -8,9 +8,11 @@ Measure whether agents find real boundary violations, whether fresh verifiers ke
 - **AI generated sample apps:** retain generation prompt hash, agent/model configuration and seed when supported. A human independently confirms each deliberately present defect using local synthetic fixtures and a regression test. A generation prompt or model label is not ground truth. Include repaired versions and realistic distractors.
 - **Clean negatives:** humans inspect and test specific surfaces with effective shared authorization, intentional public data, correct RLS, verified webhooks and UI guards backed by server controls. Record exactly which units are negative. A fixed commit is negative for its repaired defect, not automatically clean for every attack class.
 
-Stay within TypeScript, Next.js App Router, and Postgres or Supabase. No live targets, real user data, or external service validation. An unavailable local dependency, sandbox control, or external policy is a recorded blocker, not evidence of absence or a reason to execute elsewhere.
+Stay within the stacks with OMGS proof recipes: Node and TypeScript (including Next.js), Python, POSIX shell, PowerShell, and Swift. No live targets, real user data, or external service validation. An unavailable local dependency, sandbox control, or external policy is a recorded blocker, not evidence of absence or a reason to execute elsewhere.
 
 For the real post-cutoff cohort, record the latest known training knowledge cutoff for every model used in hunting, criticism, and verification. The vulnerability's earliest known public disclosure and public fix availability must both be later than that cutoff. Include dates and sources, not just the CVE assignment date. Unknown cutoff or earlier disclosure makes the case ineligible for a post-cutoff claim for that configuration; report it in a separate cohort. Post-cutoff selection reduces leakage risk, but does not prove absence of training contamination.
+
+The campaign configuration confirmed on 2026-10-28 has a latest participating cutoff of **2026-06-30**. Only campaign hunting and verification participants set this cutoff; development-only code reviewers do not participate. See the [corpus cutoff configuration](corpus/README.md#cutoff-configuration) for role assignments, cutoff sources and conservative date handling.
 
 ## Split and run protocol
 
