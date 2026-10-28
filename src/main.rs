@@ -11,7 +11,18 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 fn boolean_option(name: &str) -> bool {
-    ["--yes", "--no-sensors", "--live", "--help", "-h"].contains(&name)
+    [
+        "--yes",
+        "--dry-run",
+        "--install-skills",
+        "--replace",
+        "--verify-mxc",
+        "--no-sensors",
+        "--live",
+        "--help",
+        "-h",
+    ]
+    .contains(&name)
 }
 
 fn free_text_option(name: &str) -> bool {
@@ -57,7 +68,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>]\n  omgs budget --run <run-dir>\n  omgs bench score --cases <manifest> --runs <run-dir> [--runs <run-dir>]...\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--persona builder|inheritor|team] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs handoff --run <run-dir> [--finding <id>]\n  omgs stage --run <run-dir>\n    Only confirmed test_proven or higher with valid runner-attested proofs. Invalid proofs are excluded and reported; pending drafts stay in HANDOFF.md.\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes | --dry-run] [--from <skill-dir>] [--install-skills] [--replace] [--verify-mxc] [--write-policy <repo> --mode gate|advisory]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--base <ref>] [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>]\n  omgs gate --target <checkout> --base <base-sha> --head <head-sha> [--run <dir>]\n  omgs stage --run <run-dir>\n    Only confirmed test_proven or higher with valid runner-attested proofs. Invalid proofs are excluded and reported; pending drafts stay in HANDOFF.md.\n  omgs handoff --run <run-dir> [--finding <id>]\n  omgs intent propose --run <run-dir>\n  omgs budget --run <run-dir>\n  omgs bench score --cases <manifest> --runs <run-dir> [--runs <run-dir>]...\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--persona builder|inheritor|team] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nBoolean options: --replace, --yes, --dry-run, --install-skills, --verify-mxc, --no-sensors and --live. Every other option takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -65,10 +76,10 @@ fn usage() {
 /// Validate the complete option list before any command can mutate run state.
 fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
     let (allowed, positional): (&str, bool) = match cmd {
-        "setup" => ("--yes --from", false),
+        "setup" => ("--yes --from --dry-run --install-skills --replace --verify-mxc --write-policy --mode", false),
         "review" => ("--repo-url --mode --budget --no-sensors", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
-            "--target --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of",
+            "--target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of",
             true,
         ),
         "batch" if args.first().is_some_and(|a| a == "init") => {
@@ -97,6 +108,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "ledger" if args.first().is_some_and(|a| a == "set") => {
             ("--ledger --unit --status --evidence --note", true)
         }
+        "gate" => ("--target --base --head --run", false),
         "critic" | "budget" => ("--run", false),
         "status" => (
             "--run --stage --state --label --parent --detail --counter --log --accounting",
@@ -105,6 +117,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "watch" => ("--run --max-ms", false),
         "route" => ("--run --role --refused --reason --models", false),
         "intent" if args.first().is_some_and(|a| a == "list") => ("--stack --attack-class", true),
+        "intent" if args.first().is_some_and(|a| a == "propose") => ("--run", true),
         "intent" if args.first().is_some_and(|a| a == "answer") => {
             ("--target --id --answer --source --scope", true)
         }
@@ -197,7 +210,9 @@ fn main() -> ExitCode {
             println!("omgs {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        "gate" => cmd_gate(rest),
         "setup" => cmd_setup(rest),
+        "stage" => cmd_stage(rest),
         "review" => cmd_review(rest),
         "audit" => cmd_audit(rest),
         "validate" => cmd_validate(rest),
@@ -207,7 +222,6 @@ fn main() -> ExitCode {
         "approve" => cmd_approve(rest),
         "report" => cmd_report(rest),
         "handoff" => cmd_handoff(rest),
-        "stage" => cmd_stage(rest),
         "architecture" => cmd_architecture(rest),
         "ledger" => cmd_ledger(rest),
         "critic" => cmd_critic(rest),
@@ -232,6 +246,24 @@ fn main() -> ExitCode {
                 cli_error(&e);
                 ExitCode::from(2)
             }
+        }
+    }
+}
+
+fn cmd_gate(args: &[String]) -> Result<(), String> {
+    let outcome = (|| {
+        let target = flag(args, "--target").ok_or("gate requires --target")?;
+        let base = flag(args, "--base").ok_or("gate requires --base")?;
+        let head = flag(args, "--head").ok_or("gate requires --head")?;
+        let run = flag(args, "--run").map(PathBuf::from);
+        omgs::policy::gate(Path::new(&target), &base, &head, run.as_deref())
+    })();
+    match outcome {
+        Ok(0) => Ok(()),
+        Ok(_) => Err("__EXIT1__".into()),
+        Err(e) => {
+            cli_error(&e);
+            Err("__EXIT3__".into())
         }
     }
 }
@@ -1249,6 +1281,11 @@ fn cmd_stage(args: &[String]) -> Result<(), String> {
     }
     omgs::runmeta::write_atomic(&run.join("proposed-tests.patch"), &staged.patch)?;
     println!("wrote {}", run.join("proposed-tests.patch").display());
+    // Legacy runs can still export retained tests. Policy-aware runs also
+    // produce the owner-reviewable registry and intent proposal.
+    if run.join(omgs::runmeta::FILE).exists() && omgs::runmeta::read(&run)?.contains_key("policy") {
+        intent_propose_with_tests(&run, Some(&staged))?;
+    }
     Ok(())
 }
 
@@ -1584,14 +1621,26 @@ fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
         Ok(s) => s,
         Err(e) => return refuse(&e),
     };
-    if Path::new(&store.target) != target {
+    if !store.target.is_empty() && Path::new(&store.target) != target {
         return refuse("the reviewer's store for this path belongs to another target");
     }
+    let accepted = omgs::policy::snapshot(dir)
+        .ok()
+        .map(|s| s.policy.accepted_intent)
+        .unwrap_or_default();
     let total = answers.answers.len();
     let kept: Vec<_> = answers
         .answers
         .into_iter()
-        .filter(|a| store.answers.contains(a))
+        .filter(|a| {
+            store.answers.contains(a)
+                || accepted.iter().any(|p| {
+                    p.id == a.id
+                        && p.answer == a.answer
+                        && p.scope == a.scope
+                        && p.source == a.source
+                })
+        })
         .collect();
     if kept.len() < total {
         eprintln!(
@@ -1818,6 +1867,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     if flag(rest, "--budget").is_some() {
         return Err("--fix-of computes the budget; omit --budget".into());
     }
+    omgs::policy::snapshot(Path::new(&parent))?;
     omgs::budget::init_fix(Path::new(&parent), |root, original, remaining| {
         let target = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
         let target = std::fs::canonicalize(target).map_err(|e| e.to_string())?;
@@ -1868,21 +1918,71 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
     // Validate every input and read the answer store before claiming a run
     // directory, so a mistyped option or an untrusted store never leaves a
     // claimed, half-written run behind.
-    let persona = flag(rest, "--persona")
+    let base = flag(rest, "--base");
+    let mut policy = if let Some(parent) = flag(rest, "--fix-of") {
+        let inherited = omgs::policy::snapshot(Path::new(&parent))?;
+        if base.is_some() {
+            return Err("fix runs inherit base policy; omit --base".into());
+        }
+        inherited
+    } else {
+        omgs::policy::load_base(&target, base.as_deref())?
+    };
+    let committed = policy.original.is_some();
+    let selected_persona = flag(rest, "--persona");
+    let selected_mode = flag(rest, "--mode");
+    let selected_budget = flag(rest, "--budget")
+        .map(|v| {
+            v.parse::<u64>()
+                .map_err(|_| format!("--budget must be a whole number, got '{v}'"))
+        })
+        .transpose()?;
+    if committed
+        && (selected_mode
+            .as_ref()
+            .is_some_and(|m| m != policy.policy.mode.label())
+            || selected_persona
+                .as_ref()
+                .is_some_and(|p| Some(p) != policy.policy.persona.as_ref())
+            || (selected_budget.is_some()
+                && selected_budget != policy.policy.budget
+                && !has(rest, "--fix-of")))
+    {
+        return Err("CLI overrides conflict with committed base policy".into());
+    }
+    let persona = selected_persona
+        .or_else(|| policy.policy.persona.clone())
         .map(|p| omgs::persona::defaults(&p))
         .transpose()?;
-    let mode =
-        flag(rest, "--mode").unwrap_or_else(|| persona.map_or("advisory", |p| p.mode).into());
+    let mode = if committed {
+        policy.policy.mode.label().to_string()
+    } else {
+        selected_mode.unwrap_or_else(|| policy.policy.mode.label().into())
+    };
     if mode != "gate" && mode != "advisory" {
         return Err("--mode must be gate or advisory".into());
     }
-    let budget: Option<u64> = match flag(rest, "--budget") {
-        Some(v) => Some(
-            v.parse()
-                .map_err(|_| format!("--budget must be a whole number, got '{v}'"))?,
-        ),
-        None => persona.map(|p| p.budget),
+    let budget = if committed {
+        if has(rest, "--fix-of") {
+            selected_budget.map(|cap| policy.policy.budget.map_or(cap, |p| cap.min(p)))
+        } else {
+            policy.policy.budget
+        }
+    } else {
+        selected_budget
+            .or(policy.policy.budget)
+            .or(persona.map(|p| p.budget))
     };
+    if !committed {
+        policy.policy.mode = if mode == "gate" {
+            omgs::policy::Mode::Gate
+        } else {
+            omgs::policy::Mode::Advisory
+        };
+        policy.policy.persona = persona.map(|p| p.name.to_string());
+        policy.policy.budget = budget;
+        policy.sha256 = omgs::sha256::digest(omgs::policy::text(&policy.policy)?.as_bytes());
+    }
     let answers_src = trusted_store(&target)?;
     let answers = if answers_src.is_file() {
         let answers = read_store(&answers_src)?;
@@ -2011,7 +2111,9 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
         .unwrap_or(0);
     let first_party: Vec<String> = classified
         .iter()
-        .filter(|(_, class)| *class == omgs::paths::Class::Code)
+        .filter(|(path, class)| {
+            *class == omgs::paths::Class::Code && !omgs::policy::excludes(&policy.policy, path)
+        })
         .map(|(path, _)| path.clone())
         .collect();
     let projects = omgs::stacks::detect(&target, &native_paths);
@@ -2120,6 +2222,35 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             units.push(unit);
         }
     }
+    for prefix in &policy.policy.excluded_paths {
+        let mut paths: Vec<_> = rel_paths
+            .iter()
+            .filter(|p| *p == prefix || p.starts_with(&format!("{prefix}/")))
+            .cloned()
+            .collect();
+        paths.sort();
+        let mut unit = Unit::new(&format!("policy:excluded:{prefix}"), prefix, &[], "planned");
+        unit.note = Some(format!(
+            "{} policy-excluded file(s) require review before exclusion",
+            paths.len()
+        ));
+        unit.extra
+            .insert("excluded_count".into(), serde_json::json!(paths.len()));
+        unit.extra.insert(
+            "excluded_paths".into(),
+            serde_json::json!(&paths[..paths.len().min(20)]),
+        );
+        let sources: Vec<_> = paths.iter().filter(|p| omgs::paths::is_source(p)).collect();
+        unit.extra.insert(
+            "excluded_source_count".into(),
+            serde_json::json!(sources.len()),
+        );
+        unit.extra.insert(
+            "excluded_source_paths".into(),
+            serde_json::json!(&sources[..sources.len().min(20)]),
+        );
+        units.push(unit);
+    }
     let inventory_gaps: Vec<String> = omissions
         .0
         .iter()
@@ -2158,6 +2289,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
         "repo": repo, "target": target.to_string_lossy(), "source_ref": source_ref,
         "run_id": omgs::platform::random_nonce().map_err(|e| e.to_string())?,
         "mode": mode, "budget_agent_calls": budget, "profile": "standard",
+        "policy": policy,
         "persona": persona.map(|p| p.name), "report_depth": persona.map_or("full", |p| p.report_depth),
         "budget_profile": persona.map_or("standard", |p| p.budget_profile),
         "inventory_gaps": inventory_gaps,
@@ -2223,73 +2355,103 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
     }
     // Bring the reviewer's recorded intent answers for this exact target into
     // the run, so earlier answers resolve matching questions in the report.
-    if let Some(answers) = answers {
+    let mut answers = answers.unwrap_or_else(|| omgs::intent::Answers {
+        target: target.to_string_lossy().into(),
+        answers: vec![],
+    });
+    for a in &policy.policy.accepted_intent {
+        omgs::intent::record(
+            &mut answers,
+            omgs::intent::Answer {
+                id: a.id.clone(),
+                answer: a.answer.clone(),
+                scope: a.scope.clone(),
+                source: a.source.clone(),
+                recorded_unix: started_unix,
+            },
+        )?;
+    }
+    if !answers.answers.is_empty() {
         omgs::intent::save_answers(&out_abs.join("intent-answers.json"), &answers)
             .map_err(|e| format!("copy intent answers: {e}"))?;
     }
     Ok(out_abs)
 }
 
-fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    for entry in std::fs::read_dir(src).map_err(|e| e.to_string())?.flatten() {
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if from.is_dir() {
-            copy_dir(&from, &to)?;
-        } else {
-            std::fs::copy(&from, &to).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
+fn setup_prompt(prompt: &str, default: &str) -> Result<String, String> {
+    use std::io::Write;
+    print!("{prompt} [{default}]: ");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    Ok(if answer.trim().is_empty() {
+        default.into()
+    } else {
+        answer.trim().into()
+    })
 }
 
 fn cmd_setup(args: &[String]) -> Result<(), String> {
-    let from = flag(args, "--from")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("skill"));
-    let candidates = [
-        home().join(".claude/skills/omgs"),
-        home().join(".codex/skills/omgs"),
-        home().join(".agents/skills/omgs"),
-    ];
-    let detected: Vec<&PathBuf> = candidates
-        .iter()
-        .filter(|p| {
-            p.parent()
-                .and_then(|s| s.parent())
-                .map(|h| h.exists())
-                .unwrap_or(false)
-        })
-        .collect();
-    println!("skill source: {}", from.display());
-    if detected.is_empty() {
-        println!(
-            "no known agent home detected, default target: {}",
-            candidates[2].display()
-        );
+    use std::io::IsTerminal;
+    if has(args, "--yes") && has(args, "--dry-run") {
+        return Err("choose --yes or --dry-run".into());
     }
-    for target in &candidates {
+    let targets = omgs::setup::detected(&home());
+    for target in &targets {
         println!("skill target: {}", target.display());
     }
-    if !has(args, "--yes") {
-        println!("dry run. Rerun with --yes to install the skill pack into the targets above.");
+    if targets.is_empty() {
+        println!("no installed coding agent directories detected");
+    }
+    let explicit =
+        has(args, "--install-skills") || has(args, "--verify-mxc") || has(args, "--write-policy");
+    let wizard = !explicit
+        && !has(args, "--yes")
+        && !has(args, "--dry-run")
+        && std::io::stdin().is_terminal();
+    let mut install = has(args, "--yes") || has(args, "--install-skills");
+    let mut verify = has(args, "--yes") || has(args, "--verify-mxc");
+    let mut repo = flag(args, "--write-policy");
+    let mut mode = flag(args, "--mode").unwrap_or_else(|| "advisory".into());
+    if !["gate", "advisory"].contains(&mode.as_str()) {
+        return Err("--mode must be gate or advisory".into());
+    }
+    if wizard {
+        install = setup_prompt("Install skill into detected agents? yes/no", "yes")? == "yes";
+        verify = setup_prompt("Verify MXC with a live deny test? yes/no", "yes")? == "yes";
+        let chosen = setup_prompt("Repository for a new default policy (blank skips)", "")?;
+        if !chosen.is_empty() {
+            repo = Some(chosen);
+            mode = setup_prompt("Policy mode: gate/advisory", "advisory")?;
+        }
+    }
+    let policy_mode = match mode.as_str() {
+        "gate" => omgs::policy::Mode::Gate,
+        "advisory" => omgs::policy::Mode::Advisory,
+        _ => return Err("--mode must be gate or advisory".into()),
+    };
+    if has(args, "--dry-run") || (!wizard && !explicit && !has(args, "--yes")) {
+        println!("dry run; no files written and no live test run");
+        if let Some(repo) = repo {
+            println!("would create default {mode} policy in {repo}");
+        }
         return Ok(());
     }
-    if !from.exists() {
-        return Err(format!(
-            "skill source {} not found, run setup from the OMGS repository or pass --from",
-            from.display()
-        ));
+    if install && !targets.is_empty() {
+        let from = flag(args, "--from").map(PathBuf::from);
+        omgs::setup::install(from.as_deref(), &targets, has(args, "--replace"))?;
     }
-    let targets: Vec<&PathBuf> = if detected.is_empty() {
-        vec![&candidates[2]]
-    } else {
-        detected
-    };
-    for target in targets {
-        copy_dir(&from, target)?;
-        println!("installed: {}", target.display());
+    if let Some(repo) = repo {
+        let path = omgs::setup::write_policy(Path::new(&repo), policy_mode)?;
+        println!(
+            "created {}; review and commit it before using it as base policy",
+            path.display()
+        );
+    }
+    if verify {
+        cmd_doctor(&["--live".into()])?;
     }
     Ok(())
 }
@@ -2959,6 +3121,39 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn intent_propose(run: &Path) -> Result<(), String> {
+    intent_propose_with_tests(run, None)
+}
+
+fn intent_propose_with_tests(
+    run: &Path,
+    staged: Option<&omgs::handoff::StagedTests>,
+) -> Result<(), String> {
+    let answers = run_answers(Some(run))?;
+    let meta = omgs::runmeta::read(run)?;
+    let target = meta
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or("run needs target")?;
+    let store = read_store(&trusted_store(Path::new(target))?)?;
+    if !store.target.is_empty() && store.target != target {
+        return Err("intent store target mismatch".into());
+    }
+    let mut merged = answers;
+    for answer in store.answers {
+        omgs::intent::record(&mut merged, answer)?;
+    }
+    println!(
+        "owner review patch: {}",
+        match staged {
+            Some(tests) => omgs::policy::propose_staged(run, &merged, tests)?,
+            None => omgs::policy::propose(run, &merged)?,
+        }
+        .display()
+    );
+    Ok(())
+}
+
 fn cmd_intent(args: &[String]) -> Result<(), String> {
     let sub = args.first().map(|s| s.as_str());
     let rest = args.get(1..).unwrap_or_default();
@@ -2972,6 +3167,12 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
                     println!("  answers: {}", q.answers.join(" | "));
                 }
             }
+            Ok(())
+        }
+        Some("propose") => {
+            let run = flag(rest, "--run").ok_or("intent propose requires --run <dir>")?;
+            let run = Path::new(&run);
+            intent_propose(run)?;
             Ok(())
         }
         Some("answer") => {
@@ -3205,6 +3406,8 @@ mod cli_tests {
 
     const COMMANDS: &[(&str, &str)] = &[
         ("setup", ""),
+        ("gate", ""),
+        ("stage", ""),
         ("review", ""),
         ("audit", "init"),
         ("batch", "init"),
@@ -3227,6 +3430,7 @@ mod cli_tests {
         ("watch", ""),
         ("route", ""),
         ("intent", "list"),
+        ("intent", "propose"),
         ("intent", "answer"),
         ("check", ""),
         ("doctor", ""),
@@ -3325,6 +3529,10 @@ mod cli_tests {
                         "probe",
                         "version",
                         "opt",
+                        "no-pager",
+                        "no-replace-objects",
+                        "verify",
+                        "end-of-options",
                     ]
                     .contains(&name)
                 {

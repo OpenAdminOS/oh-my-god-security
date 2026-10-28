@@ -207,7 +207,8 @@ Asking your coding agent is the intended experience. Driving the CLI yourself wo
 
 ```sh
 cargo build --release
-./target/release/omgs setup --yes                      # install the skill into your agents (omit --yes for a dry run)
+./target/release/omgs setup --yes                      # install detected skills and verify MXC live
+./target/release/omgs setup --dry-run                  # list detected skill destinations only
 ./target/release/omgs audit init --target /path/to/your/repo
 ./target/release/omgs check --target /path/to/your/repo
 ```
@@ -216,7 +217,7 @@ Offline benchmark scoring: `omgs bench score --cases <manifest> --runs <run-dir>
 
 ## Persona defaults and accounting
 
-`omgs audit init --target <repo> --persona builder|inheritor|team` records the persona and selects presentation and spending defaults. Builder uses concise coverage detail and a budget of 24 calls/proofs, inheritor uses full detail and 64, and team uses full detail and 96. Every persona defaults to advisory; explicit `--mode` and `--budget` override the defaults. Without `--persona`, the existing budget behavior is unchanged. Proof rules, verdict semantics and the evidence required to confirm a finding are identical.
+`omgs audit init --target <repo> --persona builder|inheritor|team` records the persona and selects presentation and spending defaults. Builder uses concise coverage detail and a budget of 24 calls/proofs, inheritor uses full detail and 64, and team uses full detail and 96. Without a committed base policy, every persona defaults to advisory and explicit `--mode` and `--budget` override the defaults. Without `--persona`, the existing budget behavior is unchanged. A committed base policy takes precedence and conflicting overrides fail before run creation. Proof rules, verdict semantics and the evidence required to confirm a finding are identical.
 
 Inventory uses a heuristic path classifier for stack detection, first-party size statistics and hunting priority only. Code is the default, including unknown formats, SQL, HTML and templates. JSON, JSONL, NDJSON, CSV and TSV files of at least 1 MiB are prioritized as data, even though they may contain interpreted logic or renamed scripts. Documentation uses md, rst and adoc extensions or conventional notices. Only conventional notices such as README.txt, LICENSE.txt, NOTICE.txt, CHANGES.txt, AUTHORS.txt, CONTRIBUTING.txt and COPYING.txt classify as docs by the txt suffix; other txt files default to code. Conventional executable and build names (including CMakeLists.txt, Makefile, GNUmakefile, Dockerfile, Containerfile, Justfile, Rakefile, Gemfile, Gradle and CMake scripts, Jenkinsfile, Vagrantfile, BUILD, BUILD.bazel, WORKSPACE and meson.build) take precedence over docs/data rules. `requirements*.txt` is dependency configuration and classifies as code. Inventory-root test/spec and dependency containers and conventional test suffixes set test or vendored priority; nested directory hints, minified names and binary extensions alone cannot exclude a file.
 
@@ -260,3 +261,165 @@ Attack class packs and benchmark cases are the highest leverage contributions. E
 ## License
 
 Apache-2.0. See LICENSE and NOTICE.
+
+## Committed policy and gate
+
+Commit `.omgs/policy.json` under normal owner review, using the strict
+[policy schema](skill/schemas/policy.schema.json). Every field below is required,
+including explicit nulls. Unknown fields, duplicate JSON keys, missing fields,
+invalid intent IDs and duplicate intent/suppression identities are errors.
+
+```json
+{
+  "schema": "omgs-policy/1",
+  "mode": "advisory",
+  "persona": null,
+  "budget": null,
+  "severity_threshold": "high",
+  "excluded_paths": [],
+  "accepted_intent": [],
+  "suppressions": [],
+  "gate_tests": []
+}
+```
+
+These are also the defaults when no base policy exists. Null persona keeps full
+report depth and no persona selection; null budget is unbounded. An integer
+budget caps combined calls and proofs. Set persona to `builder`, `inheritor` or
+`team` for its presentation profile; committed budget remains explicit.
+Thresholds are `informational`, `low`, `medium`, `high`, `critical` in ascending
+order. Use `mode: "gate"` to enable blocking.
+
+```sh
+omgs audit init --target /path/to/repo --base origin/main --out /private/run --no-sensors
+omgs gate --target /path/to/repo --base "$BASE_SHA" --head "$HEAD_SHA" --run /private/run
+omgs intent propose --run /private/run
+```
+
+`--base` must resolve to a locally present commit. Initialization reads only that
+commit's `.omgs/policy.json`, never HEAD's policy or the working tree. Omit
+`--base` for an explicit local run using defaults and optional CLI overrides.
+A missing blob uses the defaults; a bad ref or malformed committed blob is an
+error. The resolved commit, source, exact blob, parsed policy and SHA-256 are
+saved in `run-metadata.json` under `policy` for review. Gate independently reads
+base policy from Git at invocation time; run metadata cannot authorize tests. Conflicting mode, persona or budget flags
+cannot override committed policy. Fix runs inherit the original snapshot and
+spend only the computed remaining budget.
+
+The object reader executes the following commands with a cleared environment,
+retaining only PATH and platform runtime variables. Each invocation is prefixed
+with `git --no-pager --no-replace-objects -c core.fsmonitor=false -c core.hooksPath=/dev/null -c diff.external= -c core.attributesFile=/dev/null -c protocol.allow=never`:
+
+```text
+rev-parse --verify --end-of-options <ref>^{commit}
+ls-tree -z <resolved-commit> -- .omgs/policy.json
+cat-file blob <blob-object-id>
+```
+
+`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null` (`NUL` on Windows),
+`GIT_NO_REPLACE_OBJECTS=1`, `GIT_NO_LAZY_FETCH=1` and
+`GIT_TERMINAL_PROMPT=0` are set. Git environment redirections and config injection
+are removed. These built-ins read objects without hooks, fsmonitor, checkout,
+filters, external diff or textconv. Transport is disabled, symlink/tree policy
+entries are rejected. Policy is bounded to 1 MiB, Git output to 64 MiB per call,
+and each Git child has a three-second deadline with process cleanup. Local
+`include` and `includeIf` sections are rejected before Git opens them, including
+FIFO includes. Redirected `.git` files, linked Git directories and common-dir
+redirection are rejected; use a standalone checkout. Explicit Git directory and
+worktree arguments override local worktree redirection. Missing objects fail locally.
+
+Excluded paths are literal relative file or directory prefixes using `/`, with
+no leading slash, trailing slash, traversal or backslash. They do not hide files
+from inventory. Each prefix creates a `planned` ledger unit with the matching
+count and first 20 sorted paths, including source counts and samples. Review it
+with evidence before exclusion, just like automatic inventory exclusions. Path
+exclusion does not suppress a confirmed finding.
+
+Accepted intent entries contain `id`, `answer`, `scope` (`repo` or a relative path
+prefix) and `source`. They seed run intent answers from the trusted base. Record
+new owner answers with `omgs intent answer`; `omgs intent propose --run <dir>`
+merges the reviewer's stored answers into the base policy and writes
+`<run>/policy.patch`, a unified diff for owner review. It never edits the target.
+Review and apply the patch separately, then commit it for future runs. A policy
+proposal has no effect on the current gate.
+
+Suppressions require a finding `fingerprint`, a nonempty `reason` and
+`expires_unix` as UTC Unix seconds through year 9999. Missing, null and out-of-range
+expiries are invalid. Expiry cannot be more than 365 days after the commit that
+last changed policy, so unrelated commits cannot extend it. Expired suppressions
+do not apply. Only the base policy supplies suppressions.
+
+`gate_tests` is the owner-reviewed registry. Each entry specifies `id`, committed
+`test` path, exact `command`, `expect_marker` (the `prove --expect-marker` recipe
+contract), `severity`, `timeout_ms`, and optional originating `fingerprint`.
+`omgs intent propose` and `omgs stage --run <dir>` add validated test-proven
+findings and their tests to a reviewable patch. Review the command, contract and
+test together. Applying a patch requires normal owner review before a future
+base commit can authorize the test.
+
+```json
+{
+  "id": "tenant-boundary",
+  "test": "tests/security/tenant.sh",
+  "command": "sh tests/security/tenant.sh",
+  "expect_marker": "TENANT_BOUNDARY",
+  "severity": "high",
+  "timeout_ms": 10000
+}
+```
+
+`omgs gate --target <checkout> --base <base-sha> --head <head-sha> [--run <dir>]`
+requires full immutable SHAs and checks the checkout's HEAD with safe Git reads.
+It exports committed head files into a fresh temporary checkout, ignoring dirty
+and untracked files. Registered tests at or above threshold that are not
+suppressed execute through the same MXC machinery as `omgs prove`, each with a
+fresh nonce. Exit 1 requires exit 1 plus both nonce-qualified boundary and control
+markers. Exit 0 means every active test passed (exit 0), or no tests were active.
+Invalid policy, missing tests, contract errors, unclean runs, unavailable MXC and
+head mismatch return 3. Gate currently requires regular committed files and
+refuses symlinks and submodules in the exported tree. Each blob is limited to
+64 MiB. Dependencies must already be part of the committed tree or available in
+the existing sandbox toolchain; gate installs nothing. The gate runs head content.
+Owners should protect registered test paths with CODEOWNERS or branch protection.
+Modified or deleted active tests print `registered gate test modified in head`
+in both modes; modifications retain the normal result.
+
+Once valid base policy establishes advisory mode, execution and infrastructure
+results are display-only and exit 0. Invalid base policy still returns 3 because
+it cannot establish advisory mode. Optional `--run` prints confirmed findings not
+yet registered as gate tests. Missing, corrupt or edited run artifacts never
+change the result. Only owner-authorized deterministic tests can block. See the
+[GitHub workflow example](docs/policy-workflow.md).
+
+## Setup wizard and scripts
+
+`omgs setup` at a terminal offers skill installation into detected agent roots,
+a live MXC deny test and an optional repository policy with gate or advisory
+mode. It installs the pack as `omgs-security-review`, the same name used by the
+Skills CLI. It detects existing `.claude`, `.codex`, `.agents`, `.cursor`,
+`.gemini`, `.copilot`, `.config/opencode` and `.codeium/windsurf` directories in
+your home. It leaves absent roots alone. No agent or tool is downloaded.
+
+```sh
+omgs setup --dry-run
+omgs setup --yes --from /path/to/skill
+omgs setup --install-skills --from /path/to/skill
+omgs setup --verify-mxc
+omgs setup --write-policy /path/to/repo --mode advisory
+omgs setup --install-skills --verify-mxc --write-policy /path/to/repo --mode gate
+```
+
+`--yes` installs skills and runs `doctor --live` without prompts. Explicit step
+flags perform only the selected steps without prompts. `--dry-run` performs no
+writes or live test and lists only detected destinations. Noninteractive setup
+without step flags or `--yes` is also a dry run. The live test has the same
+fail-closed exit behavior as `doctor --live`, including exit 3 when MXC cannot
+establish its controls. Policy creation requires `--write-policy` or an explicit
+wizard repository choice, and refuses to overwrite existing policy even with
+`--yes`. The complete skill pack is embedded in the release binary, so bootstrap
+checksum verification covers it and setup works from any working directory.
+`--from` explicitly selects a local source instead. Identical installs are
+no-ops. Differing content is refused with the file names. `--replace` stages a
+complete sibling tree, renames the old tree to a printed backup path, then
+publishes the replacement. A failed publish restores the backup without mixing
+trees; retain backups until you are satisfied with the install.

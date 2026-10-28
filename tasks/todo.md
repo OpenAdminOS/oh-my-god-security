@@ -83,8 +83,8 @@ parent-owned full-diff reviews and PR creation are separate from this implementa
 
 ## PR 4: committed policy, gate and setup (`feat/policy-gate-setup`)
 
-- [ ] `.omgs/policy.json` from the base ref only; `intent propose`; `omgs gate`
-- [ ] `omgs setup` wizard per DECISIONS
+- [x] `.omgs/policy.json` from the base ref only; `intent propose`; `omgs gate`
+- [x] `omgs setup` wizard per DECISIONS
 
 ## PR 5: onboarding, trust and distribution (`feat/onboarding-trust`)
 
