@@ -33,6 +33,25 @@ Also write OUTPUT_DIR/dispositions-HUNTER.json, with this inline schema: {"hunte
 traced effective control and evidence; blocked and deferred name the exact missing fact or budget
 limit. Stop on a complete candidate, decisive control, precise blocker or exhausted budget.
 
+## Write defensive records
+
+A candidate exists so the owner can verify and fix a weakness in their own code. Describe it as a
+defect, not as an attack:
+
+- `attacker capability` names the precondition in one line, such as "local process of another
+  user" or "authenticated tenant member"; it is not a walkthrough.
+- The source trace lists file, line and the check that is missing or wrong at each step.
+- `concrete result` states the violated invariant and its observable effect on the owner's data or
+  boundary, for example "another user's process is accepted as the helper's client".
+- The minimal proof plan describes a local synthetic test with dummy principals and data that fails
+  while the defect exists and passes once fixed.
+- Add a short fix direction in the evidence where it is clear.
+
+Never write step-by-step operational instructions, working payloads, weaponized commands,
+credential harvesting steps or guidance for use against systems other than the owner's local
+synthetic test. They are not evidence, the verifier does not need them, and the proof runs only
+inside the sandbox.
+
 ## Excluded file accountability
 
 Classification sets hunting priority only. Every assigned `tests:excluded`, `docs:excluded`,
