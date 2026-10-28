@@ -1,8 +1,8 @@
 # What this asks of you
 
-Review 1 confirmed findings and their fix briefs in HANDOFF.md. Obtain authorization before editing.
+Review 1 confirmed finding and their fix briefs in HANDOFF.md. Obtain authorization before editing.
 
-Verify 1 pending records before fixing. 1 leads were rejected after verification and need no action. Answer the intent questions below where recorded.
+Verify 1 pending record before fixing. 1 lead were rejected after verification and need no action. Answer the intent questions below where recorded.
 
 Repository: fixture/orders at abc123
 Mode: advisory

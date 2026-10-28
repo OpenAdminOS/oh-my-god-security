@@ -82,7 +82,7 @@ pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Hand
                             .is_some_and(|l| l.starts_with("Missing fact"))
                     })
                     .map(|p| p.body)
-                    .or_else(|| f.intent_question.clone())
+                    .or_else(|| crate::report::question_of(f))
                     .unwrap_or_else(|| f.evidence.clone())
             });
             let acceptance = if let Some(reference) = &f.proof_ref {
@@ -266,7 +266,7 @@ pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
             outside(run, Path::new(t))?;
         }
     }
-    let mut tests: BTreeMap<String, String> = BTreeMap::new();
+    let mut tests: BTreeMap<String, (String, bool)> = BTreeMap::new();
     for f in file
         .findings
         .iter()
@@ -286,14 +286,30 @@ pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
         } else {
             target.join(&test)
         };
+        if p.test_from.is_none() {
+            if p.test_sha256.is_none() || crate::sha256::digest_file(&source).ok() != p.test_sha256
+            {
+                return Err("accepted proof test digest changed".into());
+            }
+            continue;
+        }
         let bytes = crate::platform::read_bounded(&source, 16 << 20)
             .map_err(|e| format!("read proof test: {e}"))?;
         if Some(crate::sha256::digest(&bytes)) != p.test_sha256 {
             return Err("proof test digest changed".into());
         }
-        if p.test_from.is_none() {
-            continue;
-        }
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&source)
+                .map_err(|e| e.to_string())?
+                .permissions()
+                .mode()
+                & 0o111
+                != 0
+        };
+        #[cfg(not(unix))]
+        let executable = false;
         // Never propose replacement of an existing target entry, including dangling symlinks.
         if std::fs::symlink_metadata(target.join(&test)).is_ok() {
             return Err(format!("proposed path already exists in target: {test}"));
@@ -303,17 +319,21 @@ pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
         if text.contains('\0') {
             return Err("proof test contains NUL; cannot emit text patch".into());
         }
-        if tests.get(&test).is_some_and(|prior| prior != &text) {
+        if tests
+            .get(&test)
+            .is_some_and(|prior| prior != &(text.clone(), executable))
+        {
             return Err(format!("conflicting proof tests for {test}"));
         }
-        tests.insert(test, text);
+        tests.insert(test, (text, executable));
     }
     let mut patch = String::new();
-    for (path, text) in tests {
+    for (path, (text, executable)) in tests {
         let a = serde_json::to_string(&format!("a/{path}")).unwrap();
         let b = serde_json::to_string(&format!("b/{path}")).unwrap();
+        let mode = if executable { "100755" } else { "100644" };
         patch.push_str(&format!(
-            "diff --git {a} {b}\nnew file mode 100644\n--- /dev/null\n+++ {b}\n"
+            "diff --git {a} {b}\nnew file mode {mode}\n--- /dev/null\n+++ {b}\n"
         ));
         let lines: Vec<_> = text.split_inclusive('\n').collect();
         if !lines.is_empty() {

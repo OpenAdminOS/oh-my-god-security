@@ -2592,8 +2592,22 @@ fn stage_patch_applies_without_touching_target_and_rejects_bad_inputs() {
     let test = "first\r\nlast";
     p.test_sha256 = Some(omgs::sha256::digest(test.as_bytes()));
     write_private_fixture(dir.join("proofs/1/test-draft"), test).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir.join("proofs/1/test-draft"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
     omgs::proof::write(&dir, &p).unwrap();
     assert!(omgs::proof::validate_proofs(&file, &dir).is_empty());
+    let h = omgs::handoff::build(&dir, &file, None).unwrap();
+    let acceptance = h.records[0].acceptance.as_ref().unwrap();
+    assert!(
+        acceptance.command.contains("--test-from") && acceptance.command.contains("test-draft")
+    );
     let output = omgs(&["stage", "--run", dir.to_str().unwrap()]);
     assert!(
         output.status.success(),
@@ -2622,6 +2636,32 @@ fn stage_patch_applies_without_touching_target_and_rejects_bad_inputs() {
         std::fs::read(copy.join("tests/security/x.test.ts")).unwrap(),
         test.as_bytes()
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(std::fs::read_to_string(&patch)
+            .unwrap()
+            .contains("new file mode 100755"));
+        assert_ne!(
+            std::fs::metadata(copy.join("tests/security/x.test.ts"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+    }
+    // An accepted identical test needs no new-file diff.
+    std::fs::create_dir_all(target.join("tests/security")).unwrap();
+    std::fs::write(target.join("tests/security/x.test.ts"), test).unwrap();
+    assert!(omgs::handoff::stage(&dir, &file)
+        .unwrap_err()
+        .contains("already exists"));
+    p.test_from = None;
+    omgs::proof::write(&dir, &p).unwrap();
+    assert!(omgs::handoff::stage(&dir, &file).unwrap().is_empty());
+    p.test_from = Some("original-draft".into());
+    std::fs::remove_file(target.join("tests/security/x.test.ts")).unwrap();
     for bad in [
         "../escape.ts",
         "C:/escape.ts",

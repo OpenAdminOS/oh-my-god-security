@@ -35,7 +35,7 @@ pub struct ReportMeta {
 
 /// The intent question a record asks: its own text, else the library text
 /// for its `intent_id`.
-fn question_of(f: &Finding) -> Option<String> {
+pub(crate) fn question_of(f: &Finding) -> Option<String> {
     nonblank(&f.intent_question).map(String::from).or_else(|| {
         f.intent_id
             .as_deref()
@@ -207,9 +207,12 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
     let fix = if conf.is_empty() {
         "Nothing to fix from this run. No record reached confirmed.".into()
     } else {
-        format!("Review {} confirmed findings and their fix briefs in HANDOFF.md. Obtain authorization before editing.", conf.len())
+        format!(
+            "Review {} and their fix briefs in HANDOFF.md. Obtain authorization before editing.",
+            plural(conf.len(), "confirmed finding", "confirmed findings")
+        )
     };
-    let mut out = format!("# What this asks of you\n\n{fix}\n\nVerify {pending} pending records before fixing. {rejected} leads were rejected after verification and need no action. Answer the intent questions below where recorded.\n\nRepository: {} at {}\nMode: {}\nSandbox: {}\n\nConfirmed findings: {}\nNeeds validation: {pending}\nRejected after verification: {rejected}\n\n", meta.repo, meta.source_ref, meta.mode, meta.sandbox, conf.len());
+    let mut out = format!("# What this asks of you\n\n{fix}\n\nVerify {} before fixing. {} were rejected after verification and need no action. Answer the intent questions below where recorded.\n\nRepository: {} at {}\nMode: {}\nSandbox: {}\n\nConfirmed findings: {}\nNeeds validation: {pending}\nRejected after verification: {rejected}\n\n", plural(pending, "pending record", "pending records"), plural(rejected, "lead", "leads"), meta.repo, meta.source_ref, meta.mode, meta.sandbox, conf.len());
     if let Some(sensors) = &meta.sensors {
         out.push_str(&format!("Sensors: {sensors}\n\n"));
     }
