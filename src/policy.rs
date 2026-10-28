@@ -465,6 +465,27 @@ pub fn snapshot(run: &Path) -> Result<Snapshot, String> {
     Ok(s)
 }
 
+/// Re-read policy from the run's recorded base, using metadata only for the
+/// commit identity and expected digest, never for policy-derived authority.
+pub fn committed_snapshot(run: &Path, target: &Path) -> Result<Snapshot, String> {
+    let meta = crate::runmeta::read(run)?;
+    let recorded = meta.get("policy").ok_or("run has no policy snapshot")?;
+    let base = recorded
+        .get("base_commit")
+        .and_then(|v| v.as_str())
+        .ok_or("run policy has no recorded base commit")?;
+    let digest = recorded
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .ok_or("run policy has no recorded digest")?;
+    let committed = load_base(target, Some(base))
+        .map_err(|e| format!("cannot read committed base policy: {e}"))?;
+    if committed.sha256 != digest {
+        return Err("committed base policy digest differs from recorded snapshot digest".into());
+    }
+    Ok(committed)
+}
+
 pub fn excludes(p: &Policy, path: &str) -> bool {
     p.excluded_paths
         .iter()

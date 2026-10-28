@@ -1580,6 +1580,27 @@ fn read_store(path: &Path) -> Result<omgs::intent::Answers, String> {
     omgs::intent::load_answers(path)
 }
 
+/// A missing store is a new store for this exact target. Existing stores must
+/// name the target, including when they contain no answers.
+fn read_target_store(target: &Path) -> Result<omgs::intent::Answers, String> {
+    let path = trusted_store(target)?;
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(omgs::intent::Answers {
+                target: target.to_string_lossy().into_owned(),
+                answers: Vec::new(),
+            });
+        }
+        Err(e) => return Err(e.to_string()),
+        Ok(_) => {}
+    }
+    let store = read_store(&path)?;
+    if Path::new(&store.target) != target {
+        return Err("the reviewer's store for this path belongs to another target".into());
+    }
+    Ok(store)
+}
+
 /// The run's intent answers, only when they belong to the run's target as
 /// recorded in run metadata; anything else is ignored with a warning.
 fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
@@ -1613,21 +1634,19 @@ fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
     if Path::new(&answers.target) != target {
         return refuse("they belong to a different target");
     }
-    let store_path = match trusted_store(&target) {
-        Ok(p) => p,
-        Err(e) => return refuse(&e),
-    };
-    let store = match read_store(&store_path) {
+    let store = match read_target_store(&target) {
         Ok(s) => s,
         Err(e) => return refuse(&e),
     };
-    if !store.target.is_empty() && Path::new(&store.target) != target {
-        return refuse("the reviewer's store for this path belongs to another target");
-    }
-    let accepted = omgs::policy::snapshot(dir)
-        .ok()
-        .map(|s| s.policy.accepted_intent)
-        .unwrap_or_default();
+    // Run-local policy contents cannot attest owner acceptance. Read the
+    // committed blob again using the same object-only path as init and gate.
+    let accepted = match omgs::policy::committed_snapshot(dir, &target) {
+        Ok(s) => s.policy.accepted_intent,
+        Err(e) => {
+            eprintln!("warning: policy-derived intent answers not shown: {e}");
+            Vec::new()
+        }
+    };
     let total = answers.answers.len();
     let kept: Vec<_> = answers
         .answers
@@ -3135,10 +3154,7 @@ fn intent_propose_with_tests(
         .get("target")
         .and_then(|v| v.as_str())
         .ok_or("run needs target")?;
-    let store = read_store(&trusted_store(Path::new(target))?)?;
-    if !store.target.is_empty() && store.target != target {
-        return Err("intent store target mismatch".into());
-    }
+    let store = read_target_store(Path::new(target))?;
     let mut merged = answers;
     for answer in store.answers {
         omgs::intent::record(&mut merged, answer)?;

@@ -1223,3 +1223,105 @@ fn policy_proposal_applies_over_existing_crlf_policy() {
 fn policy_proposal_retains_executable_draft_mode() {
     proposal_preserves_draft("executable-proposal", false, true);
 }
+
+fn report_intent(root: &Path, run: &Path) -> (Output, String) {
+    let out = cli(
+        &root.join("home"),
+        &[
+            "report",
+            "--findings",
+            run.join("findings.json").to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "{}", output(&out));
+    let text = std::fs::read_to_string(run.join("REPORT.md")).unwrap();
+    (out, text)
+}
+
+#[test]
+fn report_intent_uses_committed_policy_and_rejects_untrusted_provenance() {
+    let root = scratch("report-intent-trust");
+    let repo = repo(&root);
+    let mut p = Policy::default();
+    p.accepted_intent.push(policy::AcceptedIntent {
+        id: omgs::intent::library().questions[0].id.clone(),
+        answer: "GENUINE OWNER ACCEPTANCE".into(),
+        scope: "repo".into(),
+        source: "maintainer".into(),
+    });
+    let base = commit_policy(&repo, &p);
+    let run = root.join("run");
+    let initialized = init(&root, &repo, &run, Some(&base));
+    assert!(initialized.status.success(), "{}", output(&initialized));
+    write(
+        &run.join("findings.json"),
+        &json!({"findings": [{
+            "title": "Intent trust fixture", "verdict": "needs_validation",
+            "fingerprint": omgs::fingerprint("access", "GET /x", "resource", "owner"),
+            "hunted_by": "reviewer", "verified_by": "verifier",
+            "proof_tier": "traced", "attack_class": "access",
+            "entry_point": "GET /x", "sink": "resource", "boundary": "owner",
+            "location": {"path": "main.rs", "line": 1},
+            "intent_id": p.accepted_intent[0].id
+        }]}),
+    );
+    let original = read(&run.join(omgs::runmeta::FILE));
+    let answers = read(&run.join("intent-answers.json"));
+    // There is no reviewer store. Committed acceptance still renders.
+    let (_, text) = report_intent(&root, &run);
+    assert!(text.contains("GENUINE OWNER ACCEPTANCE"));
+
+    // Change every internally checked snapshot field, including its digest.
+    // A self-consistent run-local snapshot still cannot authorize an answer.
+    let mut fabricated = p.accepted_intent[0].clone();
+    fabricated.answer = "FABRICATED OWNER ACCEPTANCE".into();
+    fabricated.scope = "main.rs".into();
+    p.accepted_intent.push(fabricated);
+    let raw = policy::text(&p).unwrap();
+    let mut forged = original.clone();
+    forged["policy"]["policy"] = serde_json::to_value(&p).unwrap();
+    forged["policy"]["original"] = json!(raw);
+    forged["policy"]["sha256"] = json!(omgs::sha256::digest(raw.as_bytes()));
+    write(&run.join(omgs::runmeta::FILE), &forged);
+    let mut forged_answers = answers.clone();
+    let mut fabricated_answer = answers["answers"][0].clone();
+    fabricated_answer["answer"] = json!("FABRICATED OWNER ACCEPTANCE");
+    fabricated_answer["scope"] = json!("main.rs");
+    forged_answers["answers"]
+        .as_array_mut()
+        .unwrap()
+        .push(fabricated_answer);
+    write(&run.join("intent-answers.json"), &forged_answers);
+    let (out, text) = report_intent(&root, &run);
+    assert!(!text.contains("FABRICATED OWNER ACCEPTANCE"));
+    assert!(output(&out).contains("committed base policy digest differs"));
+
+    // Editing policy contents alone cannot change the base-derived answers.
+    forged["policy"]["sha256"] = original["policy"]["sha256"].clone();
+    write(&run.join(omgs::runmeta::FILE), &forged);
+    let (_, text) = report_intent(&root, &run);
+    assert!(!text.contains("FABRICATED OWNER ACCEPTANCE"));
+
+    write(&run.join("intent-answers.json"), &answers);
+    let mut broken = original.clone();
+    broken["policy"]["base_commit"] = json!("0000000000000000000000000000000000000000");
+    write(&run.join(omgs::runmeta::FILE), &broken);
+    let (out, text) = report_intent(&root, &run);
+    assert!(!text.contains("GENUINE OWNER ACCEPTANCE"));
+    assert!(output(&out).contains("cannot read committed base policy"));
+
+    write(&run.join(omgs::runmeta::FILE), &original);
+    let store = omgs::intent::answers_file(&root.join("home/omgs-data"), &repo);
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    for target in ["", root.to_str().unwrap()] {
+        let mut invalid = answers.clone();
+        invalid["target"] = json!(target);
+        write(&store, &invalid);
+        let (out, text) = report_intent(&root, &run);
+        assert!(!text.contains("GENUINE OWNER ACCEPTANCE"));
+        assert!(output(&out).contains("store for this path belongs to another target"));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
