@@ -803,6 +803,7 @@ fn wait(
     child: &mut Child,
     wall_ms: u64,
     check_signals: bool,
+    cancellation: Option<&AtomicBool>,
     rx: &mpsc::Receiver<Message>,
     capture: &mut Capture,
     notes: &mut Vec<String>,
@@ -822,6 +823,11 @@ fn wait(
     let mut owns_leader = true;
     loop {
         capture.drain(rx, notes);
+        if cancellation.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+            waited.interrupted = true;
+            notes.push("scratch limit inspection requested workload shutdown".into());
+            break;
+        }
         #[cfg(any(unix, windows))]
         if check_signals && interruption::pending() {
             waited.interrupted = true;
@@ -2306,7 +2312,7 @@ mod sweep {
 /// does not expose whether it inherits the host environment; Linux scope wrapping
 /// reconstructs only get_envs and clears bus credentials before the executor.
 pub fn run(cmd: Command, limits: &Limits, markers: Option<&SweepMarkers>) -> Supervised {
-    run_inner(cmd, limits, markers, None, None, true)
+    run_inner(cmd, limits, markers, None, None, true, None)
 }
 
 pub fn run_marked(
@@ -2325,13 +2331,23 @@ pub fn run_contracted(
     nonce: &str,
     expect_marker: Option<&str>,
 ) -> Supervised {
-    run_inner(cmd, limits, markers, Some(nonce), expect_marker, true)
+    run_inner(cmd, limits, markers, Some(nonce), expect_marker, true, None)
 }
 
 /// Bounded cleanup inspection must still work after the user requested a stop.
 #[cfg(windows)]
 pub(crate) fn run_cleanup(cmd: Command, limits: &Limits) -> Supervised {
-    run_inner(cmd, limits, None, None, None, false)
+    run_inner(cmd, limits, None, None, None, false, None)
+}
+
+pub(crate) fn run_monitored(
+    cmd: Command,
+    limits: &Limits,
+    markers: Option<&SweepMarkers>,
+    nonce: &str,
+    stop: &AtomicBool,
+) -> Supervised {
+    run_inner(cmd, limits, markers, Some(nonce), None, true, Some(stop))
 }
 
 fn run_inner(
@@ -2341,6 +2357,7 @@ fn run_inner(
     nonce: Option<&str>,
     expect_marker: Option<&str>,
     check_signals: bool,
+    cancellation: Option<&AtomicBool>,
 ) -> Supervised {
     let start = Instant::now();
     let mut result = Supervised {
@@ -2547,6 +2564,7 @@ fn run_inner(
         &mut child,
         limits.wall_ms,
         check_signals,
+        cancellation,
         &rx,
         &mut capture,
         &mut result.notes,

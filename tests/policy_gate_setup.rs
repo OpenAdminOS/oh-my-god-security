@@ -851,6 +851,8 @@ fn bounded_gate(repo: &Path, base: &str) -> Output {
             "--head",
             base,
         ])
+        .env("OMGS_HOME", repo.parent().unwrap().join("data"))
+        .env("RUSTUP_AUTO_INSTALL", "0")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -892,7 +894,11 @@ fn fifo_config_includes_are_rejected_and_git_object_reads_have_a_deadline() {
         .unwrap();
         let o = bounded_gate(&repo, &base);
         assert_eq!(o.status.code(), Some(3), "{}", output(&o));
-        assert!(output(&o).contains("includes are blocked"));
+        assert!(
+            output(&o).contains("includes are blocked"),
+            "{}",
+            output(&o)
+        );
     }
     std::fs::write(&config, &original).unwrap();
     std::fs::write(
@@ -1902,5 +1908,271 @@ fn provenance_refuses_foreign_owned_record_on_every_read() {
     assert!(fix_init(&root, &repo, &run, &root.join("child"))
         .status
         .success());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_gate_export_cleans_scratch_for_sigint_and_sigterm() {
+    use std::time::{Duration, Instant};
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let root = scratch(&format!("export-interrupt-{signal}"));
+        let repo = repo(&root);
+        // Many immutable paths give the parent a deterministic observation
+        // window while export is still in progress, without running target code.
+        for n in 0..500 {
+            std::fs::write(repo.join(format!("file-{n:04}")), vec![b'x'; 1024]).unwrap();
+        }
+        let head = commit_policy(
+            &repo,
+            &Policy {
+                mode: Mode::Gate,
+                gate_tests: vec![registered()],
+                ..Policy::default()
+            },
+        );
+        let data = root.join("data");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .args([
+                "gate",
+                "--target",
+                repo.to_str().unwrap(),
+                "--base",
+                &head,
+                "--head",
+                &head,
+            ])
+            .env("OMGS_HOME", &data)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        loop {
+            let exporting = std::fs::read_dir(&data).ok().is_some_and(|mut dirs| {
+                dirs.any(|e| {
+                    let path = e.unwrap().path().join("payload/head");
+                    // At least one materialized blob proves interruption occurs
+                    // after the guard and scratch creation, during HEAD export.
+                    std::fs::read_dir(path).is_ok_and(|mut files| files.next().is_some())
+                })
+            });
+            if exporting {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "export did not start"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "gate exited before export"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // SAFETY: send only the requested signal to this test's live child.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        let start = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "interrupted gate did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{}", output(&out));
+        assert!(output(&out).contains("interrupted"), "{}", output(&out));
+        assert!(!std::fs::read_dir(data).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("omgs-gate-")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
+fn repeated_blob_export_cap_blocks_with_exit_three_without_expanding_data() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let root = scratch("repeated-blob-export-cap");
+    let repo = repo(&root);
+    let base = commit_policy(
+        &repo,
+        &Policy {
+            mode: Mode::Gate,
+            gate_tests: vec![registered()],
+            ..Policy::default()
+        },
+    );
+    std::fs::write(repo.join("blob"), vec![b'x'; 1 << 20]).unwrap();
+    git(&repo, &["add", "blob"]);
+    let blob = git(&repo, &["rev-parse", ":blob"]);
+    // Thousands of index entries share one object. No expanded 4 GiB fixture
+    // is written to the checkout or scratch.
+    let mut child = Command::new("git")
+        .current_dir(&repo)
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "update-index",
+            "--index-info",
+        ])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    for n in 0..4097 {
+        writeln!(input, "100644 {blob}\tfile-{n:04}").unwrap();
+    }
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    let tree = git(&repo, &["write-tree"]);
+    let head = git(
+        &repo,
+        &["commit-tree", &tree, "-p", &base, "-m", "Repeated fixture"],
+    );
+    git(&repo, &["update-ref", "HEAD", &head]);
+    let out = gate(&root, &repo, &base, &head, None, 3);
+    assert!(
+        output(&out).contains("gate export byte cap exceeded (limit 4294967296 bytes)"),
+        "{}",
+        output(&out)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recovery_storage_failure_obeys_valid_base_advisory_mode() {
+    let root = scratch("recovery-advisory");
+    let repo = repo(&root);
+    let advisory = commit_policy(&repo, &Policy::default());
+    let unavailable = root.join("unavailable");
+    std::fs::write(&unavailable, b"not a directory").unwrap();
+    let invoke = |base: &str| {
+        Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .args(["gate", "--target"])
+            .arg(&repo)
+            .args(["--base", base, "--head", base])
+            .env("OMGS_HOME", &unavailable)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .output()
+            .unwrap()
+    };
+    let out = invoke(&advisory);
+    assert_eq!(out.status.code(), Some(0), "{}", output(&out));
+    assert!(output(&out).contains("advisory: would block (infrastructure)"));
+    let strict = commit_policy(
+        &repo,
+        &Policy {
+            mode: Mode::Gate,
+            ..Default::default()
+        },
+    );
+    let out = invoke(&strict);
+    assert_eq!(out.status.code(), Some(3), "{}", output(&out));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn gate_export_caps_are_bounded_and_only_base_policy_can_raise_them() {
+    let root = scratch("gate-limits");
+    let repo = repo(&root);
+    let mut p = Policy {
+        mode: Mode::Gate,
+        gate_tests: vec![registered()],
+        gate_limits: Some(policy::GateLimits {
+            bytes: 1,
+            entries: 200_000,
+        }),
+        ..Default::default()
+    };
+    std::fs::write(repo.join(&p.gate_tests[0].test), test_source(false)).unwrap();
+    let base = commit_policy(&repo, &p);
+    p.gate_limits = Some(policy::GateLimits {
+        bytes: 8 << 30,
+        entries: 300_000,
+    });
+    let head = commit_policy(&repo, &p);
+    let out = gate(&root, &repo, &base, &head, None, 3);
+    assert!(
+        output(&out).contains("byte cap exceeded (limit 1 bytes)"),
+        "{}",
+        output(&out)
+    );
+    let parsed = policy::parse(&policy::text(&p).unwrap()).unwrap();
+    assert_eq!(parsed.gate_limits.unwrap().bytes, 8 << 30);
+    for (bytes, entries) in [
+        (0, 1),
+        (policy::GateLimits::MAX_BYTES + 1, 1),
+        (1, 0),
+        (1, policy::GateLimits::MAX_ENTRIES + 1),
+    ] {
+        p.gate_limits = Some(policy::GateLimits { bytes, entries });
+        assert!(policy::text(&p)
+            .unwrap_err()
+            .contains("gate_limits requires"));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn deep_gate_exports_are_cleaned_and_unsupported_depth_exits_three() {
+    let root = scratch("deep-gate-export");
+    let repo = repo(&root);
+    let base = commit_policy(
+        &repo,
+        &Policy {
+            mode: Mode::Gate,
+            gate_tests: vec![registered()],
+            ..Policy::default()
+        },
+    );
+    let blob = git(&repo, &["rev-parse", "HEAD:main.rs"]);
+    for depth in [
+        130,
+        omgs::scratch::GATE_EXPORT_DEPTH,
+        omgs::scratch::GATE_EXPORT_DEPTH + 1,
+    ] {
+        git(&repo, &["read-tree", &base]);
+        let path = format!("{}raw", "d/".repeat(depth));
+        git(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                &blob,
+                &path,
+            ],
+        );
+        let tree = git(&repo, &["write-tree"]);
+        let head = git(
+            &repo,
+            &["commit-tree", &tree, "-p", &base, "-m", "Deep fixture"],
+        );
+        git(&repo, &["update-ref", "HEAD", &head]);
+        let out = gate(&root, &repo, &base, &head, None, 3);
+        if depth <= omgs::scratch::GATE_EXPORT_DEPTH {
+            // This check runs only after all blobs have been exported. The
+            // deliberately missing registration avoids needing a sandbox here.
+            assert!(
+                output(&out).contains("registered test missing from head"),
+                "{}",
+                output(&out)
+            );
+        } else {
+            assert!(
+                output(&out).contains("gate export depth cap exceeded (limit 256 directories)"),
+                "{}",
+                output(&out)
+            );
+        }
+    }
     std::fs::remove_dir_all(root).unwrap();
 }

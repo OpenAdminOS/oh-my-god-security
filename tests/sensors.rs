@@ -571,6 +571,7 @@ fn unavailable_mxc_never_runs_a_sensor() {
             f.root.join("no-mxc").to_str().unwrap(),
         ])
         .env("PATH", &f.bin)
+        .env("OMGS_HOME", f.root.join("home"))
         .env("OMGS_MXC_EXEC", f.root.join("missing-mxc"))
         .output()
         .unwrap();
@@ -1090,4 +1091,75 @@ fn python_user_install_cannot_expose_shared_private_data() {
             .contains(&json!("trufflehog")),
         "{report}"
     );
+}
+
+#[test]
+fn scratch_overrun_stops_scanner_before_deadline_and_discards_output() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    f.tool("trufflehog", "raw-secret-must-be-discarded", 0);
+    std::fs::write(
+        f.target.join(".sensor-fixture/trufflehog.mode"),
+        "scratch-overrun",
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    let run = f.init("scratch-overrun");
+    // Includes discovery, preflight and Windows graceful cleanup. Half of the
+    // scanner's 120-second deadline still rejects waiting for that deadline,
+    // while allowing a slower host to write the real 1 GiB fixture first.
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(60),
+        "writer was not stopped promptly: {:?}",
+        start.elapsed()
+    );
+    let report = read(&run.join("sensors.json"));
+    assert!(report["hits"].as_array().unwrap().is_empty(), "{report}");
+    assert!(
+        report["gaps"]
+            .to_string()
+            .contains("writable sensor scratch byte limit exceeded (limit 1073741824 bytes)"),
+        "{report}"
+    );
+    assert_no_scratch(&f.root.join("home"));
+    assert!(!std::fs::read_to_string(run.join("sensors.json"))
+        .unwrap()
+        .contains("raw-secret-must-be-discarded"));
+}
+
+#[test]
+fn deep_scanner_writes_are_cancelled_and_fully_removed() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    f.tool("trufflehog", "raw-secret-must-be-discarded", 0);
+    std::fs::write(
+        f.target.join(".sensor-fixture/trufflehog.mode"),
+        "scratch-deep",
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    let run = f.init("scratch-deep");
+    assert!(start.elapsed() < std::time::Duration::from_secs(60));
+    let report = read(&run.join("sensors.json"));
+    assert!(report["hits"].as_array().unwrap().is_empty(), "{report}");
+    assert!(
+        report["gaps"]
+            .to_string()
+            .contains("scratch depth exceeded"),
+        "{report}"
+    );
+    assert!(
+        !report["gaps"]
+            .to_string()
+            .contains("scratch cleanup failed"),
+        "{report}"
+    );
+    assert_no_scratch(&f.root.join("home"));
+    assert!(!std::fs::read_to_string(run.join("sensors.json"))
+        .unwrap()
+        .contains("raw-secret-must-be-discarded"));
 }

@@ -197,3 +197,47 @@ destination, report stop-and-retry guidance, and clean remaining siblings.
 A failure after an earlier successful publication can leave a mix of complete,
 verified versions; retry completes the installation. Trusted owners must not
 rename or replace storage concurrently with a run or installation.
+
+## Disposable gate and sensor storage
+
+Gate and sensor scratch live directly under admitted OMGS data storage, using
+`omgs-gate-<nonce>` and `omgs-sensor-<nonce>` names. Each has a private owner
+record bound to its name and physical directory identity, a per-run OS file lock
+(the same `File::try_lock` mechanism as run storage), and one `payload` tree.
+The owner retains the lock throughout preparation, execution and cleanup.
+A parent storage lock serializes publication, recovery and removal, including
+closing the run lock for deletion on Windows. Active locks are never reaped.
+
+Immediate cleanup and crash recovery are separate guarantees. Signal guards
+cover scratch creation, gate export, sensor input copy, supervision and cleanup.
+Normal completion, errors and handled interruptions remove disposable data
+immediately. After an unhandled crash or forced kill, the next gate, sensor or
+doctor invocation validates both scratch kinds and removes only admitted,
+identity-matching layouts with free locks. Links are never followed during
+recovery. Recursive payload deletion unlinks links rather than traversing them.
+Foreign owners, unsafe permissions, links at the scratch or payload root,
+missing or mismatched ownership records and unexpected top-level entries are
+left alone with a diagnostic. Legacy scratch without ownership records and
+incomplete ownership publication require manual inspection. Trusted owners
+must not rename or replace storage concurrently, as with other OMGS storage.
+
+Fixed defaults, intentionally independent of target policy, are
+`GATE_EXPORT_BYTES` (4 GiB) and `GATE_EXPORT_ENTRIES` (200,000 files plus distinct
+directories), and `SENSOR_WRITE_BYTES` (1 GiB) and `SENSOR_WRITE_ENTRIES`
+(100,000 entries). Gate export accounts every path's expanded blob size,
+including repeated references to the same object, before writing any files.
+Exceeding either cap blocks gate mode with infrastructure exit 3. Advisory mode
+retains its display-only semantics. The existing bounded Git object reader
+also limits each blob and tree listing to 64 MiB.
+
+Pinned MXC does not expose a portable filesystem quota. Sensors retain the
+supervisor's per-file limit where the OS supports it, clamped to 1 GiB, and
+check writable scratch every 100 ms and after supervision. Usage is bounded
+by both byte and entry counts and traversal depth (64 levels). Unix counts
+the greater of logical bytes and allocated blocks per entry; Windows counts
+logical bytes including named NTFS streams. Traversal does not follow links. An observed overrun or an
+unavailable usage check discards scanner output, records a generic gap and
+fails closed. This polling fallback can overshoot between samples and cannot
+detect a file created and deleted entirely between samples; it is not a hard
+quota. Crash recovery bounds accumulation of eligible abandoned payloads on
+the next invocation, rather than imposing a global concurrent-run quota.
