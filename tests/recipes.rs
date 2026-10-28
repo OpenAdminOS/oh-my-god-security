@@ -180,6 +180,7 @@ fn check(recipe: Recipe) -> bool {
         ("missing marker", recipe.vulnerable, 1),
         ("missing control marker", recipe.vulnerable, 1),
         ("marker beyond cap", recipe.vulnerable, 1),
+        ("queued output flood", recipe.vulnerable, 1),
     ] {
         let spoof = match variant {
             "fixed marker collision" => Some((
@@ -215,7 +216,15 @@ fn check(recipe: Recipe) -> bool {
                 .replace("OMGS_CONTROL_", "CONTROL_MARKER_OMITTED_"),
             _ => recipe.harness.into(),
         };
-        let harness = if variant == "marker beyond cap" {
+        let harness = if variant == "queued output flood" {
+            // Output still queued in the runtime when the harness finishes
+            // must not cost the markers; Node pipe writes are asynchronous.
+            let flood = match recipe.runtime {
+                "node" => "process.stdout.write('y'.repeat(300000) + '\\n');\n",
+                _ => "",
+            };
+            format!("{flood}{harness}")
+        } else if variant == "marker beyond cap" {
             let flood = match recipe.runtime {
                 "sh" => "i=0; while [ $i -lt 3000 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n'; i=$((i+1)); done\n",
                 "python3" => "print('x' * 300000, flush=True)\n",
@@ -311,7 +320,8 @@ fn check(recipe: Recipe) -> bool {
             recipe.runtime,
             text(&validated)
         );
-        if exit != 2 && variant != "marker beyond cap" && !collision {
+        if exit != 2 && !variant.ends_with("cap") && variant != "queued output flood" && !collision
+        {
             let control = omgs::proof::control_marker(&proof.marker_nonce);
             let boundary =
                 omgs::proof::boundary_marker("BOUNDARY_ASSERTION_FAILED", &proof.marker_nonce);
@@ -395,7 +405,7 @@ fn node_recipe() -> Recipe {
         fixed: "exports.canRead = (actor, owner) => actor === owner;\n",
         broken: "require('./missing-dependency.cjs');\n", control_failure: "exports.canRead = () => false;\n",
         dependency_failure: "exports.canRead = (actor, owner) => { if (actor !== owner) require('./missing-dependency.cjs'); return true; };\n",
-        harness: "let forbidden;\ntry {\n  const {canRead} = require('./target.cjs');\n  if (canRead('owner', 'owner') !== true) throw new Error('AUTHORIZED_CONTROL_FAILED');\n  console.log('OMGS_CONTROL_' + process.env.OMGS_PROOF_NONCE);\n  forbidden = canRead('intruder', 'owner');\n} catch (error) { console.error(error); process.exit(2); }\nif (typeof forbidden !== 'boolean') { process.exit(2); }\nif (forbidden) { console.log('OMGS_BOUNDARY_' + process.env.OMGS_PROOF_NONCE + '_' + process.env.OMGS_PROOF_CONTRACT); process.exit(1); }\nconsole.log('BOUNDARY_ASSERTION_OK');\n",
+        harness: "function check() {\n  let forbidden;\n  try {\n    const {canRead} = require('./target.cjs');\n    if (canRead('owner', 'owner') !== true) throw new Error('AUTHORIZED_CONTROL_FAILED');\n    console.log('OMGS_CONTROL_' + process.env.OMGS_PROOF_NONCE);\n    forbidden = canRead('intruder', 'owner');\n  } catch (error) { console.error(error); return 2; }\n  if (typeof forbidden !== 'boolean') return 2;\n  if (forbidden) { console.log('OMGS_BOUNDARY_' + process.env.OMGS_PROOF_NONCE + '_' + process.env.OMGS_PROOF_CONTRACT); return 1; }\n  console.log('BOUNDARY_ASSERTION_OK');\n  return 0;\n}\n// process.exit() can drop queued pipe writes; exitCode lets them drain.\nprocess.exitCode = check();\n",
     }
 }
 fn powershell_recipe() -> Recipe {

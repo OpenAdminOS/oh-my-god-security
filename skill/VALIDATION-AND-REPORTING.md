@@ -134,24 +134,30 @@ tiers remain refused. Network and home denials above apply to PowerShell too.
 
 Use `test.cjs` to import the real local target module and check the authorized
 result inside `try`/`catch`; imports, control failures and unexpected target
-exceptions call `process.exit(2)`. Evaluate the unauthorized effect in the
+exceptions end with exit code 2. Evaluate the unauthorized effect in the
 same guarded block. Outside it, print the nonce-qualified boundary marker and exit 1
 only for the forbidden result; fixed code prints `BOUNDARY_ASSERTION_OK` and
-exits 0. Keep external effects synthetic.
+exits 0. Set `process.exitCode` and return instead of calling `process.exit()`,
+which can discard output still queued for a pipe, including the markers. Keep external effects synthetic.
 
 Example harness (replace the local target path and function with the real source):
 
 ```javascript
-let forbidden;
-try {
-  const {canRead} = require('./target.cjs');
-  if (canRead('owner', 'owner') !== true) throw new Error('AUTHORIZED_CONTROL_FAILED');
-  console.log('OMGS_CONTROL_' + process.env.OMGS_PROOF_NONCE);
-  forbidden = canRead('intruder', 'owner');
-} catch (error) { console.error(error); process.exit(2); }
-if (typeof forbidden !== 'boolean') { process.exit(2); }
-if (forbidden) { console.log('OMGS_BOUNDARY_' + process.env.OMGS_PROOF_NONCE + '_' + process.env.OMGS_PROOF_CONTRACT); process.exit(1); }
-console.log('BOUNDARY_ASSERTION_OK');
+function check() {
+  let forbidden;
+  try {
+    const {canRead} = require('./target.cjs');
+    if (canRead('owner', 'owner') !== true) throw new Error('AUTHORIZED_CONTROL_FAILED');
+    console.log('OMGS_CONTROL_' + process.env.OMGS_PROOF_NONCE);
+    forbidden = canRead('intruder', 'owner');
+  } catch (error) { console.error(error); return 2; }
+  if (typeof forbidden !== 'boolean') return 2;
+  if (forbidden) { console.log('OMGS_BOUNDARY_' + process.env.OMGS_PROOF_NONCE + '_' + process.env.OMGS_PROOF_CONTRACT); return 1; }
+  console.log('BOUNDARY_ASSERTION_OK');
+  return 0;
+}
+// process.exit() can drop queued pipe writes; exitCode lets them drain.
+process.exitCode = check();
 ```
 
 ```sh
