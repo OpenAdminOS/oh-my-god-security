@@ -819,6 +819,31 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+        if let Ok(located) = super::super::locate_executor() {
+            let scratch = d.join("scratch");
+            std::fs::create_dir(&scratch).unwrap();
+            let config = serde_json::json!({"version":"1.0.0", "containment":"process",
+                "process":{"commandLine":"cmd.exe /d /c exit /b 0", "cwd":platform_path(&scratch)},
+                "network":{"egress":{"default":"deny"}},
+                "filesystem":{"readonlyPaths":[platform_path(&linked)],
+                    "readwritePaths":[platform_path(&scratch)]}});
+            let config_path = d.join("config.json");
+            std::fs::write(&config_path, config.to_string()).unwrap();
+            let snapshot = WindowsAclSnapshot::capture([&linked]).unwrap();
+            assert_eq!(snapshot.0[0].path, std::fs::canonicalize(&target).unwrap());
+            let mut run = dry_run(&located.path, &config_path, &d);
+            assert!(dry_run_result(&run).is_ok(), "{run:?}");
+            let restored = windows_acl(&snapshot.0[0].path).unwrap() == snapshot.0[0].acl;
+            snapshot.verify(&mut run);
+            assert_eq!(run.cleanup_complete, restored, "{run:?}");
+            if !restored {
+                assert!(!run.success);
+                assert!(run
+                    .notes
+                    .iter()
+                    .any(|n| n.contains("granted root ACL changed")));
+            }
+        }
         let snapshot = WindowsAclSnapshot::capture([&linked]).unwrap();
         assert_eq!(snapshot.0[0].path, std::fs::canonicalize(&target).unwrap());
         let mut cmd = Command::new("cmd.exe");
