@@ -50,6 +50,15 @@ Commands and survivor command lines in proof records are redacted before writing
 
 OMGS is a multi-agent pipeline by default, not a single review pass. Red hunts in isolation, blue verifies independently, a separate evaluator adjudicates, and green proposes fixes. Each stage runs in its own fresh context so that no agent certifies its own work: the verifier never sees the hunters reasoning before submitting, and the evaluator is independent of both hunt and verify. A single combined pass that hunts, verifies, and reports in one context is not an OMGS review and must not be labelled as one, because it cannot deliver the adversarial separation the verdicts depend on. Where the host cannot isolate contexts, run sequential bounded passes with distinct instructions and disclose that limitation.
 
+Hand each role brief over **verbatim**, plus its explicit scope and resolved inputs. Do not paraphrase or summarize a brief. Use one shared red brief for every hunter, varying only boundary, units and packs:
+
+- Red: [agents/red-hunter.md](agents/red-hunter.md).
+- Blue: [agents/blue-verifier.md](agents/blue-verifier.md).
+- Evaluator: [agents/evaluator.md](agents/evaluator.md).
+- Green, only for explicitly approved fixes: [agents/green-fixer.md](agents/green-fixer.md).
+
+For initialization, `omgs audit init --target TARGET --persona builder|inheritor|team` selects defaults, report depth and budget profile. Builder uses concise coverage and 24 calls/proofs; inheritor uses full detail and 64; team uses full detail and 96. All default to advisory. Explicit --mode and --budget override defaults. The persona is recorded in run metadata and never changes the evidence bar, sandbox rules or verdict semantics. Without --persona, the existing unbounded budget remains unless --budget is supplied.
+
 1. **Initialize.** Run `omgs audit init` with the resolved setup values through the documented interface. Record source identity, trusted base policy, mode, limits, and locally available tools. Let deterministic sensors inspect secrets and supply chain data; do not spend model calls duplicating those sensors or execute target code for reconnaissance.
 2. **Map.** Read [RECONNAISSANCE.md](RECONNAISSANCE.md). Map architecture, principals, input surfaces, enforcement and delegated controls. Seed coverage ledger units as surface by boundary by attack class, with evidence paths and unexamined areas. Record the structured map in `architecture.json` per [schemas/architecture.schema.json](schemas/architecture.schema.json) and render it with `omgs architecture --in architecture.json --out OUTPUT_DIR`; the resulting `ARCHITECTURE.md` and offline `ARCHITECTURE.html` show how the target is built, its trust boundaries and attack surface, and what was not examined. This map is descriptive and never changes a verdict.
 3. **Hunt.** Read [HUNTING.md](HUNTING.md) and only the relevant [attack packs](#attack-packs). Dispatch several isolated hunters, normally one per boundary unit (for a privileged target, for example, one each for the installer trust decision, the IPC or XPC surface, and the download and resolver chain). Each hunter runs in its own fresh context, reads only its scope, cannot see the other hunters, and writes its structured candidates without severity to `OUTPUT_DIR/candidates-<hunter>.json`, with its own identity in each candidate's `hunter`. Use `omgs fingerprint` with attack class, entry point, sink symbol, and violated boundary for identity and deduplication.
@@ -85,8 +94,12 @@ Use focused text reads and shared maps instead of repeatedly loading the whole r
 - [generated-script-safety.md](packs/generated-script-safety.md): data becoming PowerShell, shell, or other executed code.
 - [feed-to-policy.md](packs/feed-to-policy.md): feeds and imports that write security policy.
 - [privileged-local-ops.md](packs/privileged-local-ops.md): elevated deletion, extraction, and helper execution.
+- [identity-binding.md](packs/identity-binding.md): identity, resource and delegated principal binding.
+- [fail-closed-semantics.md](packs/fail-closed-semantics.md): missing, unsupported and error decisions.
 - [powershell.md](packs/powershell.md): PowerShell scripts and modules, credentials, Graph calls, platform contracts.
 
 ## Reject these shortcuts
 
 Do not equate login with object authorization, absent in-repo checks with absent backend controls, or a UI redirect with endpoint protection. Do not confirm a grep hit, invent intent, assign severity to an unresolved candidate, or count a broken test harness as proof. Do not execute repository scripts directly, provision missing dependencies during proof, reuse real secrets, or test external systems. Do not let model output gate a merge: gate mode uses only committed proof tests and scanner rules; advisory mode blocks nothing. Only reviewed policy, intent answers, suppressions, and accepted proof tests belong in the target tree, never run output.
+
+Host accounting is optional and cumulative per role. Supply `--accounting red-hunter=12000,0.32,45000` on `omgs status` or `omgs report`, repeating the option for blue-verifier, evaluator and green-fixer. Values are tokens, USD cost and duration in milliseconds. Use `unknown` or an empty field for unavailable values. Omitted roles and values stay unknown, never zero; resubmission replaces that role's totals. Report reads saved status accounting. Never estimate missing usage from stage clocks.

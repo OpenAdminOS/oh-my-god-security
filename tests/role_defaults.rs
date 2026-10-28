@@ -160,6 +160,49 @@ fn monorepo_stacks_are_scoped_and_exclude_docs_tests_and_vendor() {
 }
 
 #[test]
+fn briefs_and_pack_intents_are_complete() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("skill");
+    let skill = std::fs::read_to_string(root.join("SKILL.md")).unwrap();
+    assert!(skill.contains("verbatim"));
+    assert!(skill.contains("Do not paraphrase"));
+    for role in ["red-hunter", "blue-verifier", "evaluator", "green-fixer"] {
+        let path = format!("agents/{role}.md");
+        assert!(skill.contains(&path));
+        let brief = std::fs::read_to_string(root.join(path)).unwrap();
+        for section in [
+            "## Inputs",
+            "## Allowed reads",
+            "## Output and schema",
+            "## Exact commands",
+            "## Never do",
+        ] {
+            assert!(brief.contains(section), "{role}: {section}");
+        }
+        assert!(brief.contains("outside omgs prove"));
+    }
+    for name in ["identity-binding", "fail-closed-semantics"] {
+        let pack = std::fs::read_to_string(root.join(format!("packs/{name}.md"))).unwrap();
+        for section in [
+            "## What to hunt",
+            "## Source patterns that matter",
+            "## Proof shape",
+            "## False leads a verifier should kill",
+            "## Intent questions",
+        ] {
+            assert!(pack.contains(section));
+        }
+    }
+    for entry in std::fs::read_dir(root.join("packs")).unwrap() {
+        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        let intents = text.split("## Intent questions").nth(1).unwrap();
+        for line in intents.lines().filter(|l| l.starts_with("- `")) {
+            let id = line.split('`').nth(1).unwrap();
+            assert!(omgs::intent::find(id).is_some(), "unknown intent {id}");
+        }
+    }
+}
+
+#[test]
 fn persona_defaults_and_explicit_overrides_are_recorded() {
     let dir = scratch("personas");
     let target = dir.join("repo");

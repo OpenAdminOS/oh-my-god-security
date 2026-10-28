@@ -113,6 +113,22 @@
       "question": "May an older version ever replace a newer installed version?",
       "why": "Downgrades reintroduce fixed vulnerabilities; most updaters intend never, or only with an explicit rollback flag.",
       "answers": ["never", "only with an explicit rollback action"]
+    },
+    {
+      "id": "identity.resource-binding",
+      "stacks": ["nextjs-app-router", "node", "aspnet", "python", "powershell", "swift", "shell", "browser-extension", "rust"],
+      "attack_classes": ["identity_binding"],
+      "question": "Must the requested resource belong to the authenticated identity or an explicitly authorized delegate?",
+      "why": "A valid identity must still be bound to the selected resource and operation.",
+      "answers": ["owner or explicit delegate only", "shared resources are allowed"]
+    },
+    {
+      "id": "policy.failure-behavior",
+      "stacks": ["nextjs-app-router", "node", "aspnet", "python", "powershell", "swift", "shell", "browser-extension", "rust"],
+      "attack_classes": ["fail_closed_semantics"],
+      "question": "Must an unavailable or unsupported security decision stop the protected operation?",
+      "why": "Error handling can widen authority when unknown is treated as permission.",
+      "answers": ["stop the operation", "use a reviewed restricted fallback"]
     }
   ]
 }
