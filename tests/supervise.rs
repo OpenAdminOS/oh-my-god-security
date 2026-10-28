@@ -407,7 +407,7 @@ fn executor_does_not_inherit_another_spawns_pipe() {
         unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
         0
     );
-    let path = std::env::temp_dir().join(format!(
+    let path = omgs::platform::temp_root().unwrap().join(format!(
         "omgs-inheritance-{}",
         omgs::platform::random_nonce().unwrap()
     ));

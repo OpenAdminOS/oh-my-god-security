@@ -86,6 +86,9 @@ jobs:
         run: cargo test --locked -- --skip recipes
       # Preinstalled runtimes: actions/runner-images macOS 15 arm64 and Ubuntu 24.04.
       # Windows augmentation refusal is asserted by the recipes themselves.
+      - name: Installer regression tests (local bundles only)
+        shell: bash
+        run: python3 tests/installers.py --allow-test-verifiers
       - name: Recipe regressions and summary
         shell: bash
         run: |

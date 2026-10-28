@@ -87,6 +87,108 @@ pub fn which(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Resolve only OS-selected internal temporary roots. User-supplied storage
+/// and installation paths must still pass strict, non-resolving admission.
+pub fn temp_root() -> std::io::Result<PathBuf> {
+    let root = std::fs::canonicalize(std::env::temp_dir())?;
+    // Git for Windows cannot consume extended canonical path prefixes. Keep
+    // the physically resolved location, using the ordinary DOS/UNC spelling.
+    #[cfg(windows)]
+    let root = PathBuf::from(mxc_path(&root));
+    Ok(root)
+}
+
+/// Admit the internal scratch parent without consulting OS temporary storage.
+/// Callers must reserve each child exclusively with create_private_dir_new.
+pub fn scratch_root() -> std::io::Result<PathBuf> {
+    let root =
+        data_dir().ok_or_else(|| std::io::Error::other("OMGS data directory unavailable"))?;
+    create_private_tree(&root)?;
+    // Git for Windows cannot consume extended canonical path prefixes.
+    Ok(PathBuf::from(mxc_path(&std::fs::canonicalize(root)?)))
+}
+
+/// One retained staging directory. Sources are leaf names, never caller paths.
+pub struct StagingDir(std::fs::File);
+impl StagingDir {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        check_private_dir(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options
+                .share_mode(0x1 | 0x2)
+                .custom_flags(0x0200_0000 | 0x0020_0000);
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_dir() || is_link(&file.metadata()?) {
+            return Err(std::io::Error::other("staging must be a real directory"));
+        }
+        Ok(Self(file))
+    }
+
+    pub fn read_verified(&self, name: &Path, expected: &str) -> std::io::Result<Vec<u8>> {
+        use std::io::Error;
+        if name.components().count() != 1
+            || !matches!(
+                name.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+            || expected.len() != 64
+            || !expected
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(Error::other(
+                "source must be a leaf name with a lowercase SHA-256",
+            ));
+        }
+        #[cfg(unix)]
+        let file = {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            use std::os::unix::ffi::OsStrExt;
+            let name = std::ffi::CString::new(name.as_os_str().as_bytes())?;
+            // SAFETY: the retained directory and NUL-terminated leaf stay live.
+            let fd = unsafe {
+                libc::openat(
+                    self.0.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(Error::last_os_error());
+            }
+            // SAFETY: openat returned a new descriptor owned by this File.
+            unsafe { std::fs::File::from_raw_fd(fd) }
+        };
+        #[cfg(windows)]
+        let file = windows_private::open_relative(&self.0, name)?;
+        #[cfg(not(any(unix, windows)))]
+        return Err(Error::other("staging handles unavailable"));
+        if !is_single_link_file(&file)? {
+            return Err(Error::other(
+                "staging source must be a single-link regular file",
+            ));
+        }
+        let bytes = read_bounded_file(file, 104857600)?;
+        if crate::sha256::digest(&bytes) != expected {
+            return Err(Error::other(format!(
+                "verified source checksum mismatch: {}",
+                name.display()
+            )));
+        }
+        Ok(bytes)
+    }
+}
+
 /// Open `path` for reading without following a final symlink (or reparse
 /// point on Windows) and without blocking on a FIFO, and accept it only when
 /// it is a regular file without hardlink aliases. An opened file may have
@@ -240,10 +342,7 @@ pub fn private_dir(path: &Path) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 pub fn private_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)?;
-    #[cfg(windows)]
-    windows_private::restrict(path)?;
-    Ok(())
+    create_private_tree(path)
 }
 
 /// Remove Windows extended path prefixes for both writer and validator.
@@ -548,7 +647,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn pinned_metadata_reader_allows_concurrent_atomic_publication() {
-        let dir = std::env::temp_dir().join(format!("omgs-share-delete-{}", std::process::id()));
+        let dir = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-share-delete-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         create_private_dir(&dir).unwrap();
         let run = dir.join("run");
@@ -589,7 +690,9 @@ mod tests {
     #[test]
     fn writable_metadata_and_lock_modes_are_refused_without_repair() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let dir = std::env::temp_dir().join(format!("omgs-leaf-mode-{}", random_nonce().unwrap()));
+        let dir = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-leaf-mode-{}", random_nonce().unwrap()));
         create_private_dir_new(&dir).unwrap();
         let run = dir.join("run");
         create_private_dir_new(&run).unwrap();
@@ -626,7 +729,9 @@ mod tests {
 
     #[test]
     fn single_link_open_refuses_hardlinks_and_accepts_plain_files() {
-        let d = std::env::temp_dir().join(format!("omgs-link-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         let a = d.join("a");
@@ -682,14 +787,78 @@ mod macos_private;
 #[path = "windows_private.rs"]
 mod windows_private;
 
+/// Admit every existing directory from the filesystem root to `path`.
+/// Missing suffixes are allowed for creation, but parent traversal and links
+/// are not. The leaf is a publication/storage directory, never a sticky anchor.
+/// No HOME, profile, or root-owned intermediate directory ends the walk.
+pub fn safe_path(path: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if absolute
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(Error::other(format!(
+            "storage {}: parent traversal is forbidden",
+            path.display()
+        )));
+    }
+    let mut chain: Vec<_> = absolute.ancestors().collect();
+    chain.reverse();
+    for entry in chain {
+        let meta = match std::fs::symlink_metadata(entry) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(Error::other(format!("storage {}: {e}", entry.display()))),
+        };
+        let check = || -> std::io::Result<()> {
+            if is_link(&meta) || !meta.is_dir() {
+                return Err(Error::other(
+                    "storage must be a directory without symlinks or reparse points",
+                ));
+            }
+            let ancestor = entry != absolute;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                // SAFETY: geteuid has no preconditions.
+                let user = unsafe { libc::geteuid() };
+                if meta.uid() != user && !(ancestor && meta.uid() == 0) {
+                    return Err(Error::other(
+                        "storage must be owned by the current user (or root for ancestors)",
+                    ));
+                }
+                if meta.mode() & 0o022 != 0 && !(ancestor && meta.mode() & 0o1000 != 0) {
+                    return Err(Error::other("storage must not be group- or world-writable (sticky is allowed only on ancestors)"));
+                }
+                // The next entry is checked independently for trusted ownership.
+                // Thus a sticky directory cannot protect an attacker-owned child.
+                #[cfg(target_os = "macos")]
+                macos_private::check_dir(entry, meta.uid())?;
+            }
+            #[cfg(windows)]
+            windows_private::check_path(entry, ancestor)?;
+            Ok(())
+        };
+        check().map_err(|e| {
+            Error::other(format!(
+                "storage {}: {e}; see README.md#storage-migration",
+                entry.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Run storage is trusted only while the owner prevents concurrent replacement.
 pub fn check_private_dir(path: &Path) -> std::io::Result<()> {
+    safe_path(path)?;
+    #[cfg(unix)]
     let meta = std::fs::symlink_metadata(path)?;
-    if is_link(&meta) || !meta.is_dir() {
-        return Err(std::io::Error::other(
-            "storage must be a directory without links",
-        ));
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -755,7 +924,7 @@ pub fn check_private_file(file: &std::fs::File) -> std::io::Result<()> {
 }
 
 /// Create owner-private storage or fail closed on an existing unsafe directory.
-/// Parent directories must already be trusted against concurrent replacement.
+/// The complete existing ancestor chain is admitted before creation.
 pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
     match create_private_dir_new(path) {
         Ok(()) => Ok(()),
@@ -772,6 +941,8 @@ pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
 
 /// Reserve a new directory exclusively with owner-private permissions.
 pub fn create_private_dir_new(path: &Path) -> std::io::Result<()> {
+    safe_path(path)?;
+    #[cfg(not(windows))]
     let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     let builder = {
@@ -780,12 +951,13 @@ pub fn create_private_dir_new(path: &Path) -> std::io::Result<()> {
         builder.mode(0o700);
         builder
     };
+    #[cfg(not(windows))]
     builder.create(path)?;
+    #[cfg(windows)]
+    windows_private::create_dir(path)?;
     // Only an exclusive successful create authorizes changing this ACL.
     #[cfg(target_os = "macos")]
     macos_private::restrict_created_dir(path)?;
-    #[cfg(windows)]
-    windows_private::restrict(path)?;
     check_private_dir(path)
 }
 

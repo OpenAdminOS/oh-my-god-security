@@ -69,7 +69,9 @@ mod tests {
 
     #[test]
     fn oversized_approval_store_is_refused() {
-        let data = std::env::temp_dir().join(format!("omgs-approval-large-{}", std::process::id()));
+        let data = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-approval-large-{}", std::process::id()));
         crate::platform::create_private_tree(&data).unwrap();
         crate::platform::write_private_new(&data.join(FILE), b"").unwrap();
         let file = std::fs::OpenOptions::new()
@@ -90,7 +92,9 @@ mod tests {
 
     #[test]
     fn approval_is_per_canonical_target() {
-        let data = std::env::temp_dir().join(format!("omgs-approval-{}", std::process::id()));
+        let data = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-approval-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&data);
         let a = Path::new("/work/a");
         assert!(!is_approved(&data, a).unwrap());

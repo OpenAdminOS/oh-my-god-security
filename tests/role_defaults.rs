@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 fn scratch(name: &str) -> PathBuf {
     static BASE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     let base = BASE.get_or_init(|| {
-        let base =
-            std::env::temp_dir().join(format!("omgs-private-fixtures-{}", std::process::id()));
+        let base = omgs::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-private-fixtures-{}", std::process::id()));
         omgs::platform::create_private_tree(&base).unwrap();
         base
     });
@@ -21,6 +22,10 @@ fn cli(args: &[&str]) -> std::process::Output {
         .output()
         .unwrap()
 }
+fn normalized(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn read(path: &Path) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
@@ -170,13 +175,13 @@ fn monorepo_stacks_are_scoped_and_exclude_docs_tests_and_vendor() {
 #[test]
 fn briefs_and_pack_intents_are_complete() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("skill");
-    let skill = std::fs::read_to_string(root.join("SKILL.md")).unwrap();
+    let skill = normalized(&std::fs::read_to_string(root.join("SKILL.md")).unwrap());
     assert!(skill.contains("verbatim"));
     assert!(skill.contains("Do not paraphrase"));
     for role in ["red-hunter", "blue-verifier", "evaluator", "green-fixer"] {
         let path = format!("agents/{role}.md");
         assert!(skill.contains(&path));
-        let brief = std::fs::read_to_string(root.join(path)).unwrap();
+        let brief = normalized(&std::fs::read_to_string(root.join(path)).unwrap());
         for section in [
             "## Inputs",
             "## Allowed reads",
@@ -184,7 +189,7 @@ fn briefs_and_pack_intents_are_complete() {
             "## Exact commands",
             "## Never do",
         ] {
-            assert!(brief.contains(section), "{role}: {section}");
+            assert!(brief.contains(&normalized(section)), "{role}: {section}");
         }
         assert!(brief.contains("outside omgs prove"));
     }
@@ -717,7 +722,7 @@ fn initial_proof_belongs_to_verifier_and_replay_to_evaluator() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let hunter = std::fs::read_to_string(root.join("skill/agents/red-hunter.md")).unwrap();
     assert!(!hunter.lines().any(|l| l.starts_with("omgs prove")));
-    assert!(hunter.contains("Only the verifier runs the initial proof"));
+    assert!(normalized(&hunter).contains("Only the verifier runs the initial proof"));
     for (path, command) in [
         (
             "skill/agents/blue-verifier.md",
@@ -732,7 +737,11 @@ fn initial_proof_belongs_to_verifier_and_replay_to_evaluator() {
             .unwrap()
             .contains(command));
     }
-    let skill = std::fs::read_to_string(root.join("skill/SKILL.md")).unwrap();
+    let skill = std::fs::read_to_string(root.join("skill/PIPELINE.md"))
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(skill
         .contains("Hunters hand proof plans and drafts to the verifier and never execute proofs"));
     assert!(skill.contains("The independent verifier submits"));
@@ -1557,6 +1566,15 @@ fn budget_refuses_storage_writable_by_other_principals() {
             .unwrap();
         assert!(status.success());
         assert_linked_budget_refused(&root, &fix, "writable by another principal");
+        // Admission never repairs existing storage. Explicitly undo only this
+        // disposable fixture's injected grant before the next case.
+        assert!(omgs::platform::private_dir(unsafe_dir).is_err());
+        assert!(std::process::Command::new("icacls.exe")
+            .arg(unsafe_dir)
+            .args(["/remove:g", "*S-1-1-0"])
+            .status()
+            .unwrap()
+            .success());
         omgs::platform::private_dir(unsafe_dir).unwrap();
     }
     assert!(omgs::budget::charge_proof(&fix).is_ok());

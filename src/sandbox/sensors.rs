@@ -76,8 +76,8 @@ pub fn run_sensor(mut req: SensorRequest<'_>) -> Result<(String, i32, Vec<String
     let _signals = supervise::interruption::Guard::install()
         .map_err(|_| "cannot install sensor interruption guard".to_string())?;
     let nonce = platform::random_nonce().map_err(|_| "cannot create sensor nonce")?;
-    let temp = std::fs::canonicalize(std::env::temp_dir())
-        .map_err(|_| "cannot resolve private sensor temp parent")?;
+    let temp = platform::scratch_root()
+        .map_err(|e| format!("cannot admit private sensor scratch parent: {e}"))?;
     let root = temp.join(format!("omgs-sensor-{}", &nonce[..16]));
     if overlapping_root(req.target, std::slice::from_ref(&root)).is_some() {
         return Err("private sensor scratch overlaps target; sensor not run".into());
@@ -94,7 +94,7 @@ pub fn run_sensor(mut req: SensorRequest<'_>) -> Result<(String, i32, Vec<String
     let result = run_in_scratch(req, &located, &scratch.0, list_parents, &nonce, &mut gaps);
     let removed = std::fs::remove_dir_all(&scratch.0).is_ok();
     if !removed {
-        return Err("private sensor scratch cleanup failed; raw scanner data may remain in the OS temporary directory".into());
+        return Err("private sensor scratch cleanup failed; raw scanner data may remain in the OMGS data directory".into());
     }
     result.map(|(output, code)| (output, code, gaps))
 }

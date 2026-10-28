@@ -1133,7 +1133,9 @@ mod tests {
         }
         let mut run = original.clone();
         run["observations"] = json!(observations);
-        let source = std::env::temp_dir().join(format!("omgs-colon-score-{}", std::process::id()));
+        let source = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-colon-score-{}", std::process::id()));
         copy_private(
             &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score/run-1"),
             &source,

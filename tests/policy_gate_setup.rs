@@ -4,7 +4,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn scratch(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("omgs-policy-{}-{name}", std::process::id()));
+    let parent = if cfg!(windows) {
+        PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+    } else {
+        omgs::platform::temp_root().unwrap()
+    };
+    let path = parent.join(format!("omgs-policy-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     omgs::platform::create_private_tree(&path).unwrap();
     std::fs::canonicalize(path).unwrap()
@@ -158,6 +163,14 @@ fn gate(root: &Path, repo: &Path, base: &str, head: &str, run: Option<&Path>, co
     }
     let o = cli(&root.join("home"), &args);
     assert_eq!(o.status.code(), Some(code), "{}", output(&o));
+    let data = root.join("home/omgs-data");
+    if data.exists() {
+        assert!(!std::fs::read_dir(data).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("omgs-gate-")));
+    }
     o
 }
 fn registered() -> policy::GateTest {
@@ -239,6 +252,29 @@ fn evidence(run: &Path, target: &Path) {
         "{:?}",
         omgs::proof::validate_proofs(&file, run)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_os_temp_supports_gate_and_run_storage() {
+    let root = scratch("temp-alias");
+    let physical = root.join("physical");
+    omgs::platform::create_private_dir_new(&physical).unwrap();
+    let alias = root.join("alias");
+    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "registered_gate_executes_immutable_head_and_ignores_advisory_artifacts",
+            "--nocapture",
+        ])
+        .env("TMPDIR", &alias)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", output(&out));
+    // Installation and explicit run destinations retain strict admission.
+    assert!(omgs::platform::create_private_tree(&alias.join("explicit-run")).is_err());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -599,6 +635,23 @@ fn setup_detects_only_existing_agents_and_writes_policy_only_on_request() {
             std::fs::read(source.join("SKILL.md")).unwrap()
         );
         assert!(installed.join("schemas/policy.schema.json").is_file());
+        for name in [
+            "PIPELINE.md",
+            "PROOF-CONTRACT.md",
+            "PROOF-RECIPES.md",
+            "POLICY-AND-GATE.md",
+            "BUDGETS-AND-ROUTING.md",
+            "EXECUTION-SAFETY.md",
+            "SETUP.md",
+            "HANDOFF-AND-PROGRESS.md",
+            "DECISION-RULES.md",
+        ] {
+            assert_eq!(
+                std::fs::read(installed.join(name)).unwrap(),
+                std::fs::read(source.join(name)).unwrap(),
+                "{name}"
+            );
+        }
     }
     assert!(!home.join(".agents").exists());
     assert!(!home.join(".cursor").exists());
@@ -948,6 +1001,11 @@ fn changed_registered_test_is_visible_before_sandbox_in_both_modes() {
                     "--head",
                     head,
                 ])
+                .env("OMGS_HOME", root.join("data"))
+                // Internal scratch must not consult ambient OS temp settings.
+                .env("TMPDIR", root.join("missing-temp"))
+                .env("TEMP", root.join("missing-temp"))
+                .env("TMP", root.join("missing-temp"))
                 .env("OMGS_MXC_EXEC", root.join("missing-executor"))
                 .output()
                 .unwrap()
@@ -1068,6 +1126,8 @@ fn default_setup_ignores_adjacent_and_checkout_sidecars() {
     );
     assert!(result.status.success(), "{}", output(&result));
     let installed = home.join(".agents/skills").join(omgs::setup::SKILL_NAME);
+    assert!(installed.join("HANDOFF-AND-PROGRESS.md").is_file());
+    assert!(!installed.join("HANDOFF.md").exists());
     for (path, bytes) in omgs::setup::BUNDLED {
         assert_eq!(std::fs::read(installed.join(path)).unwrap(), *bytes);
     }
