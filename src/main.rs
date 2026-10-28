@@ -1668,19 +1668,26 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
             f.strip_prefix(&target)
                 .unwrap_or(f)
                 .to_string_lossy()
-                .to_string()
+                .replace('\\', "/")
         })
         .collect();
-    let vendored_count = rel_paths
-        .iter()
-        .filter(|p| omgs::is_vendored_path(p))
-        .count();
+    let counts = omgs::architecture::path_counts(&rel_paths);
+    let vendored_count = counts
+        .get(&omgs::paths::Class::Vendored)
+        .copied()
+        .unwrap_or(0);
     let first_party: Vec<String> = rel_paths
         .iter()
-        .filter(|p| !omgs::is_vendored_path(p))
+        .filter(|p| omgs::paths::classify(p) == omgs::paths::Class::Code)
         .cloned()
         .collect();
-    let stacks = omgs::detect_stacks(&first_party);
+    let projects = omgs::stacks::detect(&target, &rel_paths);
+    let stacks: Vec<_> = projects
+        .iter()
+        .flat_map(|p| p.stacks.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let mut units = Vec::new();
     for rel in &first_party {
         let is_route = rel.ends_with("/route.ts")
@@ -1695,13 +1702,20 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
             ));
         }
     }
-    for stack in &stacks {
-        units.push(Unit::new(
-            &format!("stack:{stack}"),
-            ".",
-            &omgs::stack_attack_classes(stack),
-            "planned",
-        ));
+    for project in &projects {
+        for stack in &project.stacks {
+            let id = if project.root == "." {
+                format!("stack:{stack}")
+            } else {
+                format!("stack:{}:{stack}", project.root)
+            };
+            units.push(Unit::new(
+                &id,
+                &project.root,
+                &omgs::stack_attack_classes(stack),
+                "planned",
+            ));
+        }
     }
     if vendored_count > 0 {
         let mut unit = Unit::new(
@@ -1734,6 +1748,8 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         "mode": mode, "budget_agent_calls": budget, "profile": "standard",
         "execution_policy": "sandboxed-source-and-local-only", "run_status": "in_progress",
         "detected_stacks": stacks.clone(),
+        "subprojects": projects,
+        "path_classes": counts,
         "files_total": rel_paths.len(),
         "files_first_party": first_party.len(),
         "files_vendored_excluded": vendored_count,
@@ -1761,11 +1777,13 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         "source_ref": source_ref,
         "stack": {
             "notes": format!(
-                "Detected stacks: {}. Files: {} total, {} first party, {} vendored excluded.",
+                "Detected stacks: {}. Files: {} total, {} first party code, {} vendored excluded. Subprojects: {}. Classes: {}.",
                 if stacks.is_empty() { "none recognized".to_string() } else { stacks.join(", ") },
                 rel_paths.len(),
                 first_party.len(),
-                vendored_count
+                vendored_count,
+                projects.iter().map(|p| format!("{}: {}", p.root, p.stacks.join(", "))).collect::<Vec<_>>().join("; "),
+                serde_json::to_string(&counts).unwrap()
             )
         },
         "zones": [],
