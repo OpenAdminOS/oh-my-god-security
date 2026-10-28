@@ -48,7 +48,7 @@ function Admit-Staging([string]$Path) {
     $entry = Get-Item -LiteralPath $Path -Force
     $leaf = $true
     while ($null -ne $entry) {
-        if (-not $entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Unsafe staging ancestor: $($entry.FullName)" }
+        if (-not ($entry -is [IO.DirectoryInfo]) -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Unsafe staging ancestor: $($entry.FullName)" }
         $a = Get-Acl -LiteralPath $entry.FullName
         $owner = $a.GetOwner([Security.Principal.SecurityIdentifier]).Value
         if ($owner -notin $trusted) { throw "Unsafe staging owner: $($entry.FullName)" }

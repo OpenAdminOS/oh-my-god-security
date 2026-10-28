@@ -90,7 +90,12 @@ pub fn which(name: &str) -> Option<PathBuf> {
 /// Resolve only OS-selected internal temporary roots. User-supplied storage
 /// and installation paths must still pass strict, non-resolving admission.
 pub fn temp_root() -> std::io::Result<PathBuf> {
-    std::fs::canonicalize(std::env::temp_dir())
+    let root = std::fs::canonicalize(std::env::temp_dir())?;
+    // Git for Windows cannot consume extended canonical path prefixes. Keep
+    // the physically resolved location, using the ordinary DOS/UNC spelling.
+    #[cfg(windows)]
+    let root = PathBuf::from(mxc_path(&root));
+    Ok(root)
 }
 
 /// One retained staging directory. Sources are leaf names, never caller paths.

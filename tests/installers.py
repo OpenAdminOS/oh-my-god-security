@@ -65,7 +65,9 @@ Set-Acl -LiteralPath '{escaped}' -AclObject $acl
                         GH_CONFIG_DIR=str(self.root / 'gh-config'))
         # Exercise profile staging only inside this disposable fixture.
         profile = self.root / 'profile'
-        profile.mkdir(mode=0o700)
+        # Python's Windows mode 0700 creates OWNER RIGHTS ACEs. Inherit the
+        # explicit user DACL on the fixture root there instead.
+        profile.mkdir(mode=0o777 if self.windows else 0o700)
         self.env['LOCALAPPDATA' if self.windows else 'HOME'] = str(profile)
         self.script = self.skill / 'scripts' / ('install.ps1' if self.windows else 'install.sh')
 
