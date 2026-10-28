@@ -70,10 +70,17 @@ fn usage() {
     omgs::help::usage();
 }
 
-fn clone_root(args: &[String]) -> PathBuf {
-    flag(args, "--clone-root")
+fn clone_root(args: &[String]) -> Result<PathBuf, String> {
+    let path = flag(args, "--clone-root")
         .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir().join("targets"))
+        .unwrap_or_else(|| data_dir().join("targets"));
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(|e| e.to_string())
+    }
 }
 
 fn command_help(cmd: &str, args: &[String]) {
@@ -2911,7 +2918,7 @@ fn cmd_critic(args: &[String]) -> Result<(), String> {
 /// disabled and no prompts; a reused clone must have the same origin.
 fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
     let repo = omgs::batch::parse_repo_url(raw_url)?;
-    let targets = clone_root(args);
+    let targets = clone_root(args)?;
     let dest = targets.join(&repo.host).join(&repo.owner).join(&repo.name);
     let git_path = omgs::platform::which("git").ok_or("git not found on an absolute PATH entry")?;
     let git = || {
@@ -3037,7 +3044,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             }
             // The batch output must sit outside the targets area and every
             // target in the list, including ones that later fail to clone.
-            let targets_root = clone_root(rest);
+            let targets_root = clone_root(rest)?;
             let dests: Vec<PathBuf> = urls
                 .iter()
                 .filter_map(|u| omgs::batch::parse_repo_url(u).ok())

@@ -672,3 +672,46 @@ fn successful_fallback_keeps_refusal_details_in_both_indexes() {
         }
     }
 }
+
+#[test]
+fn batch_accepts_a_fresh_relative_clone_root_before_attempting_git() {
+    let f = Fixture::new();
+    let list = f.root.join("relative-repos.txt");
+    std::fs::write(&list, "https://example.com/team/synthetic\n").unwrap();
+    let empty_bin = f.root.join("empty-bin");
+    std::fs::create_dir(&empty_bin).unwrap();
+    let out_dir = f.root.join("relative-runs");
+    let out = Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .current_dir(&f.root)
+        .env("OMGS_HOME", f.root.join("state"))
+        .env("PATH", empty_bin)
+        .args([
+            "batch",
+            "init",
+            "--list",
+            list.to_str().unwrap(),
+            "--out",
+            out_dir.to_str().unwrap(),
+            "--clone-root",
+            "fresh-clones",
+            "--no-sensors",
+        ])
+        .output()
+        .unwrap();
+    // Git is deliberately absent so this reaches clone handling without network.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let batch = read(out_dir.join("batch.json"));
+    let target = Path::new(batch["runs"][0]["target"].as_str().unwrap());
+    assert!(target.is_absolute());
+    assert!(target.ends_with(Path::new("fresh-clones").join("example.com/team/synthetic")));
+    assert!(batch["runs"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("git not found"));
+    assert!(!f.root.join("fresh-clones").exists());
+}
