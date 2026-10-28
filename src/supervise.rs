@@ -42,6 +42,7 @@ pub struct Supervised {
     pub interrupted: bool,
     pub duration_ms: u64,
     pub output: String,
+    pub stdout: String,
     pub output_bytes_total: u64,
     pub capture_complete: bool,
     /// Every group signal, reap and survivor scan succeeded. False means the
@@ -125,9 +126,92 @@ pub mod interruption {
     }
 }
 
+#[cfg(windows)]
+pub mod interruption {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+    static SIGNAL: AtomicBool = AtomicBool::new(false);
+    static LOCK: Mutex<()> = Mutex::new(());
+    thread_local! { static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+        fn GetConsoleCP() -> u32;
+        fn AllocConsole() -> i32;
+        fn FreeConsole() -> i32;
+        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+    }
+    unsafe extern "system" fn handler(event: u32) -> i32 {
+        if matches!(event, 0 | 1 | 2 | 5 | 6) {
+            SIGNAL.store(true, Ordering::Relaxed);
+            1
+        } else {
+            0
+        }
+    }
+    pub fn pending() -> bool {
+        DEPTH.with(|d| d.get() != 0) && SIGNAL.load(Ordering::Relaxed)
+    }
+    pub struct Guard {
+        _lock: Option<MutexGuard<'static, ()>>,
+        allocated: bool,
+    }
+    impl Guard {
+        pub fn install() -> io::Result<Self> {
+            if DEPTH.with(|d| d.get() != 0) {
+                DEPTH.with(|d| d.set(d.get() + 1));
+                return Ok(Self {
+                    _lock: None,
+                    allocated: false,
+                });
+            }
+            let lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            // SSH and CI can lack a console; the executor must share one for Ctrl+Break.
+            let allocated = unsafe { GetConsoleCP() == 0 };
+            if allocated && unsafe { AllocConsole() } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
+                let error = io::Error::last_os_error();
+                if allocated {
+                    unsafe { FreeConsole() };
+                }
+                return Err(error);
+            }
+            SIGNAL.store(false, Ordering::Relaxed);
+            DEPTH.with(|d| d.set(1));
+            Ok(Self {
+                _lock: Some(lock),
+                allocated,
+            })
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get() - 1));
+            if self._lock.is_some() {
+                unsafe { SetConsoleCtrlHandler(Some(handler), 0) };
+                if self.allocated {
+                    unsafe { FreeConsole() };
+                }
+            }
+        }
+    }
+    pub fn stop(group: u32) -> io::Result<()> {
+        if unsafe { GenerateConsoleCtrlEvent(1, group) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Preparation loops cooperate with the same guard as executor supervision.
 pub fn check_interrupted() -> io::Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if interruption::pending() {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -454,7 +538,7 @@ fn wait(
     capture: &mut Capture,
     notes: &mut Vec<String>,
 ) -> Waited {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = check_signals;
     let start = Instant::now();
     let mut waited = Waited {
@@ -467,12 +551,10 @@ fn wait(
     let mut owns_leader = true;
     loop {
         capture.drain(rx, notes);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if check_signals && interruption::pending() {
             waited.interrupted = true;
-            notes.push(
-                "proof interrupted by SIGINT, SIGTERM or SIGHUP; executor cleanup required".into(),
-            );
+            notes.push("proof interrupted; executor cleanup required".into());
             break;
         }
         #[cfg(unix)]
@@ -514,6 +596,35 @@ fn wait(
         } else {
             notes.push("executor pid does not fit a process group id".into());
             waited.healthy = false;
+        }
+    }
+    #[cfg(windows)]
+    if waited.status.is_none() {
+        match interruption::stop(child.id()) {
+            Ok(()) => notes.push("Windows executor shutdown: Ctrl+Break requested; allowing 5000ms for MXC cleanup".into()),
+            Err(e) => notes.push(format!("Windows executor shutdown: Ctrl+Break request failed: {e}; allowing 5000ms before forced termination")),
+        }
+        let grace = Instant::now();
+        while grace.elapsed() < Duration::from_secs(5) {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    waited.status = Some(status);
+                    break;
+                }
+                Ok(None) => pause(rx, capture, notes, POLL),
+                Err(e) => {
+                    notes.push(format!("Windows executor shutdown: grace wait failed: {e}"));
+                    break;
+                }
+            }
+        }
+        if waited.status.is_some() {
+            notes.push(
+                "Windows executor shutdown: exited during cleanup grace; no forced termination"
+                    .into(),
+            );
+        } else {
+            notes.push("Windows executor shutdown: forced termination after cleanup grace; MXC DACL restoration not assured until next startup".into());
         }
     }
     #[cfg(not(unix))]
@@ -1009,6 +1120,7 @@ fn run_inner(
         interrupted: false,
         duration_ms: 0,
         output: String::new(),
+        stdout: String::new(),
         output_bytes_total: 0,
         capture_complete: false,
         cleanup_complete: false,
@@ -1046,8 +1158,8 @@ fn run_inner(
             .notes
             .push("survivor sweep not applied: only available on macOS".into());
     }
-    #[cfg(unix)]
-    let _signals = if nonce.is_some() {
+    #[cfg(any(unix, windows))]
+    let _signals = if cfg!(windows) || nonce.is_some() {
         match interruption::Guard::install() {
             Ok(guard) => Some(guard),
             Err(error) => {
@@ -1071,6 +1183,11 @@ fn run_inner(
             return result;
         }
     };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1131,7 +1248,7 @@ fn run_inner(
     let waited = wait(
         &mut child,
         limits.wall_ms,
-        nonce.is_some(),
+        true,
         &rx,
         &mut capture,
         &mut result.notes,
@@ -1180,14 +1297,15 @@ fn run_inner(
         result.exit_code = capture.evidence.exit_code;
         result.executor_error = !result.command_started && !result.interrupted && !result.killed;
     }
-    #[cfg(unix)]
-    if nonce.is_some() && interruption::pending() {
+    #[cfg(any(unix, windows))]
+    if interruption::pending() {
         result.interrupted = true;
         result.killed = true;
         result.executor_error = false;
         result.timed_out = false;
     }
     result.output_bytes_total = capture.total;
+    result.stdout = String::from_utf8_lossy(&capture.streams[0]).into_owned();
     result.output = capture.text();
     #[cfg(target_os = "linux")]
     if !pending_cgroups.is_empty() {

@@ -84,6 +84,8 @@ pub struct ProofRecord {
     pub config_sha256: String,
     pub enforced: Vec<String>,
     pub gaps: Vec<String>,
+    #[serde(default)]
+    pub notes: Vec<String>,
     pub output_sha256: String,
     pub output_bytes_total: u64,
     /// Capped and redacted; the digest covers exactly this saved text.
@@ -327,7 +329,9 @@ pub fn command_names(command: &str, test: &str) -> bool {
             quote = None;
         } else if quote.is_none() && (c == '\'' || c == '"') {
             quote = Some(c);
-        } else if quote.is_none() && (c == ' ' || c == '\t' || ";&|()<>".contains(c)) {
+        } else if quote.is_none()
+            && (matches!(c, ' ' | '\t' | '\r' | '\n') || ";&|()<>".contains(c))
+        {
             tokens.push(std::mem::take(&mut token));
         } else {
             token.push(c);
@@ -951,10 +955,10 @@ fn redact_line(line: &str, lower: &str) -> String {
     let mut quotes = QuoteCursor::default();
     let mut masked_until = 0;
     for (at, _) in lower.match_indices("bearer ") {
-        if at < masked_until {
+        let start = at + "bearer ".len();
+        if start < masked_until {
             continue;
         }
-        let start = at + "bearer ".len();
         if !lower[start..].starts_with("[omgs redacted]") {
             let (end, replacement) = value_mask(&line, start, quotes.at(&line, start));
             masked_until = end;
@@ -1036,6 +1040,32 @@ impl QuoteCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adjacent_bearer_values_are_redacted_idempotently() {
+        for line in [
+            "Bearer bearer TOP_SECRET",
+            "Bearer bearer bearer TOP_SECRET",
+        ] {
+            let masked = redact(line);
+            assert!(!masked.contains("TOP_SECRET"), "{masked}");
+            assert_eq!(redact(&masked), masked);
+        }
+    }
+
+    #[test]
+    fn multiline_commands_name_their_tests() {
+        for sep in ["\n", "\r", "\r\n"] {
+            assert!(command_names(
+                &format!("sh tests/check.sh{sep}exit 1"),
+                "tests/check.sh"
+            ));
+            assert!(!command_names(
+                &format!(r#"sh "tests/check.sh{sep}suffix""#),
+                "tests/check.sh"
+            ));
+        }
+    }
 
     #[test]
     fn long_credential_lines_have_bounded_redaction_time() {

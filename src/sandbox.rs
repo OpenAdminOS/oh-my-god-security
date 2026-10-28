@@ -5,7 +5,7 @@
 //! refuses and the finding stays at the tier it already earned.
 
 mod preflight;
-pub use preflight::{windows_build_report, windows_probe};
+pub use preflight::{windows_build_report, windows_policy, windows_probe};
 
 use crate::platform::mxc_path;
 use crate::{platform, sha256, supervise};
@@ -247,6 +247,7 @@ pub struct ProveResult {
     pub target_sha256: Option<String>,
     pub enforced: Vec<String>,
     pub gaps: Vec<String>,
+    pub notes: Vec<String>,
     pub run: supervise::Supervised,
 }
 
@@ -585,6 +586,7 @@ pub fn declared_controls(os: &str, tier: Tier) -> (Vec<String>, Vec<String>) {
         format!("mxc {MXC_VERSION} deny-by-default filesystem"),
         "target copied to a per-run workspace; the original is not mounted".to_string(),
         "external network egress denied".to_string(),
+        "MXC configuration accepted by executor --dry-run before workload execution".into(),
         "environment cleared to an allowlist with scratch home, temp and cache".to_string(),
     ];
     let mut gaps = vec![
@@ -612,7 +614,7 @@ pub fn declared_controls(os: &str, tier: Tier) -> (Vec<String>, Vec<String>) {
             .push("MXC PID namespace teardown kills descendants, including new sessions".into());
     }
     if os == "windows" {
-        gaps.push("supervisor wall clock expiry kills only the executor; descendant cleanup depends on MXC ProcessContainer teardown".into());
+        gaps.push("Windows expiry or interruption requests executor Ctrl+Break, waits up to 5000ms for MXC cleanup, then forces termination if needed; descendant cleanup depends on MXC ProcessContainer teardown".into());
         gaps.push("process tree owned by the MXC ProcessContainer; no per-process CPU, file size or open file limits on Windows".into());
     }
     (enforced, gaps)
@@ -704,6 +706,8 @@ fn retry_without_enumeration(os: &str, run: &supervise::Supervised) -> bool {
         && !run.command_started
         && run.enumerate_rejected
         && !run.timed_out
+        && !run.interrupted
+        && !run.killed
         && run.capture_complete
         && run.cleanup_complete
         && run.survivors.is_empty()
@@ -713,7 +717,7 @@ fn retry_without_enumeration(os: &str, run: &supervise::Supervised) -> bool {
 /// proof record lists what was actually applied on that run.
 pub fn declared_limits(os: &str) -> Vec<String> {
     let mut v = if os == "windows" {
-        vec!["supervisor wall clock expiry kills only the executor; descendant cleanup depends on MXC ProcessContainer teardown".to_string()]
+        vec!["Windows expiry or interruption requests executor Ctrl+Break, waits up to 5000ms for MXC cleanup, then forces termination if needed; descendant cleanup depends on MXC ProcessContainer teardown".to_string()]
     } else {
         vec!["wall clock limit; the process group is killed on expiry".to_string()]
     };
@@ -872,10 +876,16 @@ fn record_live_links(root: &Path, dst: &Path, links: &[PathBuf], gaps: &mut Vec<
             .filter(|rel| std::fs::canonicalize(dst.join(rel)).is_ok_and(|p| p.starts_with(root)))
             .collect();
         live.sort();
-        for rel in live {
+        for rel in live.iter().take(MAX_SPECIAL_PATHS) {
             gaps.push(format!(
                 "target link reaches live target from workspace: {}",
                 rel.display()
+            ));
+        }
+        if live.len() > MAX_SPECIAL_PATHS {
+            gaps.push(format!(
+                "{} additional target links reach live target from workspace",
+                live.len() - MAX_SPECIAL_PATHS
             ));
         }
     }
@@ -1136,7 +1146,7 @@ fn stage_workspace(
 }
 
 pub fn prove(req: &ProveRequest) -> ProveOutcome {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let _signals = match supervise::interruption::Guard::install() {
         Ok(guard) => guard,
         Err(e) => {
@@ -1284,17 +1294,17 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         Ok(staged) => staged,
         Err(reason) => return blocked(reason),
     };
-    let (list_parents, probe_fallback, windows_notes) = if os == "windows" {
+    let (list_parents, probe_fallback, mut notes, windows_gaps) = if os == "windows" {
         match preflight::windows_policy(windows_probe(&executor)) {
             Ok(policy) => policy,
             Err(reason) => return blocked(reason),
         }
     } else {
-        (false, false, Vec::new())
+        (false, false, Vec::new(), Vec::new())
     };
-    extra_gaps.extend(windows_notes);
+    extra_gaps.extend(windows_gaps);
     if os == "windows" {
-        extra_gaps.push(windows_build_report());
+        notes.push(windows_build_report());
     }
     let mut input = ConfigInput {
         os,
@@ -1346,7 +1356,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             && retry_without_enumeration(os, &validation)
         {
             input.list_parents = false;
-            extra_gaps.push(
+            notes.push(
                 "Windows enumeration fallback: dry-run refusal; retry without enumeratePaths"
                     .into(),
             );
@@ -1377,10 +1387,14 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             if digest != target_sha256 {
                 return blocked("target changed before MXC retry".into());
             }
-            extra_gaps.extend(retry_gaps);
+            for gap in retry_gaps {
+                if !extra_gaps.contains(&gap) {
+                    extra_gaps.push(gap);
+                }
+            }
             input.rust = rust;
             input.list_parents = false;
-            extra_gaps.push(
+            notes.push(
                 "Windows enumeration fallback: executor refusal; retry without enumeratePaths"
                     .into(),
             );
@@ -1409,12 +1423,12 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             .push("named proof test readability was not established inside the sandbox".into());
     }
     let (mut enforced, mut gaps) = declared_controls(os, req.tier);
-    enforced
-        .push("MXC configuration accepted by executor --dry-run before workload execution".into());
     enforced.extend(run.enforced.iter().cloned());
     gaps.extend(extra_gaps);
     for note in &run.notes {
-        if !gaps.contains(note) {
+        if note.starts_with("Windows executor shutdown:") {
+            notes.push(note.clone());
+        } else if !gaps.contains(note) {
             gaps.push(note.clone());
         }
     }
@@ -1442,6 +1456,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         target_sha256,
         enforced,
         gaps,
+        notes,
         run,
     }))
 }
@@ -1678,6 +1693,34 @@ mod tests {
         std::fs::remove_dir_all(d).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn live_target_link_gaps_are_sorted_and_capped() {
+        let d = std::env::temp_dir().join(format!("omgs-live-link-cap-{}", std::process::id()));
+        let root = d.join("target");
+        let copy = d.join("copy");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(root.join("file"), "data").unwrap();
+        let links: Vec<_> = (0..27)
+            .rev()
+            .map(|i| PathBuf::from(format!("link-{i:02}")))
+            .collect();
+        for link in &links {
+            std::os::unix::fs::symlink(root.join("file"), copy.join(link)).unwrap();
+        }
+        let mut gaps = Vec::new();
+        record_live_links(&root, &copy, &links, &mut gaps);
+        assert_eq!(gaps.len(), 21);
+        assert!(gaps[0].ends_with("link-00"));
+        assert!(gaps[19].ends_with("link-19"));
+        assert_eq!(
+            gaps[20],
+            "7 additional target links reach live target from workspace"
+        );
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
     #[test]
     fn invalid_commands_and_mxc_timeouts_are_refused() {
         for (command, timeout) in [
@@ -1706,6 +1749,7 @@ mod tests {
             timed_out: false,
             duration_ms: 1,
             output: String::new(),
+            stdout: String::new(),
             output_bytes_total: 0,
             capture_complete: true,
             cleanup_complete: true,
@@ -1726,6 +1770,38 @@ mod tests {
         run.capture_complete = true;
         run.timed_out = true;
         assert!(!retry_without_enumeration("windows", &run));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_dry_run_enumeration_refusal_allows_guarded_retry() {
+        let Ok(located) = locate_executor() else {
+            return;
+        };
+        let d = std::env::temp_dir().join(format!("omgs-enumerate-dry-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let config_path = d.join("config.json");
+        // LPAC is incompatible with BaseContainer on every host, requiring fallback.
+        let mut config = serde_json::json!({"version":"1.0.0", "containment":"process",
+            "process":{"commandLine":"cmd.exe /d /c echo workload > marker", "cwd":mxc_path(&d)},
+            "network":{"egress":{"default":"deny"}},
+            "filesystem":{"readwritePaths":[mxc_path(&d)]},
+            "processContainer":{"leastPrivilege":true, "filesystem":{"enumeratePaths":[mxc_path(&d)]}}});
+        std::fs::write(&config_path, config.to_string()).unwrap();
+        let first = preflight::dry_run(&located.path, &config_path, &d);
+        assert!(retry_without_enumeration("windows", &first), "{first:?}");
+        assert!(preflight::dry_run_result(&first)
+            .unwrap_err()
+            .contains("configuration rejection"));
+        config["processContainer"]
+            .as_object_mut()
+            .unwrap()
+            .remove("filesystem");
+        std::fs::write(&config_path, config.to_string()).unwrap();
+        let second = preflight::dry_run(&located.path, &config_path, &d);
+        assert!(preflight::dry_run_result(&second).is_ok(), "{second:?}");
+        assert!(!d.join("marker").exists());
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[cfg(windows)]

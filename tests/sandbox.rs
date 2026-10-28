@@ -1668,7 +1668,8 @@ fn missing_executor_is_explicit_in_live_doctor_and_free_text_prove() {
             .unwrap()
     };
     let out = run(&["doctor", "--live"]);
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+    assert!(!text(&out).contains("run omgs --help"));
     assert!(text(&out).contains("live check: not run, no verified executor"));
     for args in [
         vec!["prove", "--cmd", "--version"],
@@ -1894,21 +1895,35 @@ fn windows_records_bind_probe_selection_to_the_saved_config() {
     let out = omgs(&d.join("home"), &["prove", "--cmd", "echo ran"]);
     assert!(out.status.success(), "{}", text(&out));
     let record = record_from(&text(&out));
+    let notes: Vec<_> = record["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
     let gaps: Vec<_> = record["gaps"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|g| g.as_str().unwrap())
+        .map(|n| n.as_str().unwrap())
         .collect();
-    assert!(gaps.iter().any(|g| g.starts_with("Windows OS build")));
+    assert!(notes.iter().any(|n| n.starts_with("Windows OS build")));
+    assert!(!gaps
+        .iter()
+        .any(|n| n.starts_with("Windows OS build") || n.starts_with("Windows MXC probe:")));
     let probe =
         omgs::sandbox::windows_probe(&omgs::sandbox::locate_executor().unwrap().path).unwrap();
-    assert!(gaps
+    assert!(notes
         .iter()
-        .any(|g| g.contains("Windows capability selection: probe;")));
-    assert!(gaps
+        .any(|n| n.contains("Windows capability selection: probe;")));
+    assert!(notes
         .iter()
-        .any(|g| g.contains(&format!("tier={}", probe.tier))));
+        .any(|n| n.contains(&format!("tier={}", probe.tier.as_deref().unwrap()))));
+    if probe.needs_dacl_augmentation == Some(true) {
+        assert!(gaps.iter().any(|g| g.contains("temporarily adds host ACEs")
+            && g.contains("toolchain roots")
+            && g.contains("until MXC next starts")));
+    }
     let config: serde_json::Value = serde_json::from_slice(
         &std::fs::read(Path::new(record["proof_dir"].as_str().unwrap()).join("mxc-config.json"))
             .unwrap(),

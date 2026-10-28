@@ -704,6 +704,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         config_sha256: result.config_sha256.clone(),
         enforced: result.enforced.clone(),
         gaps: result.gaps.clone(),
+        notes: result.notes.clone(),
         output_sha256: omgs::sha256::digest(output.as_bytes()),
         output_bytes_total: s.output_bytes_total,
         output,
@@ -856,7 +857,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
     );
     println!("data directory: {}", data_dir().display());
     if os == "windows" {
-        println!("{}", omgs::sandbox::windows_build_report());
+        println!("note: {}", omgs::sandbox::windows_build_report());
     }
     let ready = match omgs::sandbox::locate_executor() {
         Ok(l) => {
@@ -867,18 +868,27 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
                 l.executor.containment
             );
             if os == "windows" {
-                match omgs::sandbox::windows_probe(&l.path) {
-                    Ok(p) => {
-                        for note in p.notes() {
-                            println!("{}", omgs::platform::escape_controls(&note));
+                match omgs::sandbox::windows_policy(omgs::sandbox::windows_probe(&l.path)) {
+                    Ok((_, _, notes, gaps)) => {
+                        for note in notes {
+                            println!("note: {}", omgs::platform::escape_controls(&note));
                         }
-                        if let Err(reason) = p.require_supported_tier() {
-                            println!("sandbox: not ready. {reason}");
-                            return Err("__EXIT1__".into());
+                        for gap in gaps {
+                            println!("  not enforced: {}", omgs::platform::escape_controls(&gap));
                         }
                     }
-                    Err(e) => println!("{}", omgs::platform::escape_controls(&format!(
-                        "Windows capability probe unavailable; proofs use guarded enumeration fallback: {e}"))),
+                    Err(reason) => {
+                        println!(
+                            "sandbox: not ready. {}",
+                            omgs::platform::escape_controls(&reason)
+                        );
+                        return Err(if has(args, "--live") {
+                            "__EXIT3__"
+                        } else {
+                            "__EXIT1__"
+                        }
+                        .into());
+                    }
                 }
             }
             true
@@ -949,6 +959,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
     if !ready {
         if has(args, "--live") {
             println!("live check: not run, no verified executor");
+            return Err("__EXIT3__".into());
         }
         return Err("__EXIT1__".into());
     }
@@ -993,7 +1004,11 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             ProveOutcome::Ran(r) => r,
             ProveOutcome::Blocked { reason } => {
                 let _ = std::fs::remove_dir_all(&probe);
-                return Err(reason);
+                eprintln!(
+                    "needs_validation: target code was not executed. {}",
+                    omgs::platform::escape_controls(&reason)
+                );
+                return Err("__EXIT3__".into());
             }
         };
         let out = outcome.run.output.clone();
@@ -1031,6 +1046,9 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         } else {
             println!("live check: the probe ran, read a nested workspace file, and was denied a file outside it");
         }
+        for note in &outcome.notes {
+            println!("note: {}", omgs::platform::escape_controls(note));
+        }
         println!("applied on that run:");
         for e in &outcome.enforced {
             println!("  {e}");
@@ -1062,7 +1080,19 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             stage: None,
             expected_tree_sha256: None,
         };
-        if let ProveOutcome::Ran(r) = prove(&reach) {
+        let reach_outcome = match prove(&reach) {
+            ProveOutcome::Ran(r) => r,
+            ProveOutcome::Blocked { reason } => {
+                let _ = std::fs::remove_dir_all(&probe);
+                eprintln!(
+                    "needs_validation: target code was not executed. {}",
+                    omgs::platform::escape_controls(&reason)
+                );
+                return Err("__EXIT3__".into());
+            }
+        };
+        {
+            let r = reach_outcome;
             let found = |n: &str| {
                 r.run
                     .output

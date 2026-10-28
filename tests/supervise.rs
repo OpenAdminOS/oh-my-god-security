@@ -356,10 +356,10 @@ fn windows_wall_clock_kills_executor_and_discloses_descendant_dependency() {
         result.timed_out && !result.success && result.cleanup_complete,
         "{result:?}"
     );
-    assert!(start.elapsed() < std::time::Duration::from_secs(3));
+    assert!(start.elapsed() < std::time::Duration::from_secs(8));
     assert!(omgs::sandbox::declared_limits("windows")
         .iter()
-        .any(|limit| limit.contains("kills only the executor")));
+        .any(|limit| limit.contains("Ctrl+Break")));
     assert!(
         omgs::sandbox::declared_controls("windows", omgs::sandbox::Tier::Test)
             .1

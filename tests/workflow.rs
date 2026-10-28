@@ -358,6 +358,7 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             config_sha256: omgs::sha256::digest(config.as_bytes()),
             enforced: omgs::sandbox::declared_controls(os, tier).0,
             gaps: omgs::sandbox::declared_controls(os, tier).1,
+            notes: vec![],
             output_sha256: omgs::sha256::digest(b""),
             output_bytes_total: 0,
             output: String::new(),
@@ -1577,6 +1578,53 @@ fn proof_validation_checks_target_test_and_declared_gaps() {
     omgs::proof::write(&dir, &record).unwrap();
     assert!(omgs::proof::validate_proofs(&findings, &dir).is_empty());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn multiline_records_validate_and_dry_run_evidence_is_required() {
+    for sep in ["\n", "\r\n"] {
+        let dir = scratch(if sep == "\n" {
+            "multiline-proof"
+        } else {
+            "crlf-proof"
+        });
+        let (_, _, findings) = complete_run();
+        let findings = attest(&dir, findings);
+        let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+        let command = format!("npm test -- tests/security/x.test.ts{sep}exit 1");
+        record.command = command.clone();
+        record.command_sha256 = omgs::sha256::digest(command.as_bytes());
+        let wrapped = omgs::sandbox::wrapped_command(
+            std::env::consts::OS,
+            &command,
+            &record.marker_nonce,
+            record.test.as_deref(),
+        );
+        record.wrapped_command_sha256 = omgs::sha256::digest(wrapped.as_bytes());
+        let config_path = dir.join("proofs/1/mxc-config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["process"]["commandLine"] = wrapped.into();
+        let text = config.to_string();
+        record.config_sha256 = omgs::sha256::digest(text.as_bytes());
+        std::fs::write(config_path, text).unwrap();
+        std::fs::write(dir.join("proofs/1/command.txt"), command).unwrap();
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(omgs::proof::validate_proofs(&findings, &dir).is_empty());
+        let mut old = serde_json::to_value(&record).unwrap();
+        old.as_object_mut().unwrap().remove("notes");
+        assert!(omgs::shape::proof(&old.to_string())
+            .unwrap()
+            .notes
+            .is_empty());
+        record.enforced.retain(|c| !c.contains("--dry-run"));
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "required control"
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[test]
