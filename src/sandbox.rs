@@ -1333,6 +1333,21 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         Ok(staged) => staged,
         Err(reason) => return blocked(reason),
     };
+    #[cfg(target_os = "macos")]
+    {
+        let safe = supervise::capture_root().and_then(|root| {
+            let grants: Vec<_> = [&workspace, &scratch]
+                .into_iter()
+                .chain(readonly.iter())
+                .cloned()
+                .chain(markers.iter().map(|m| m.allowed.clone()))
+                .collect();
+            supervise::validate_capture_grants(&root, &grants)
+        });
+        if let Err(e) = safe {
+            return blocked(format!("unsafe capture location: {e}"));
+        }
+    }
     extra_gaps.extend(windows_gaps);
     let mut input = ConfigInput {
         os,
@@ -1533,6 +1548,37 @@ mod tests {
             assert!(!roots.iter().any(|r| Path::new(denied).starts_with(r)));
         }
         assert!(roots.contains(&PathBuf::from("/opt/homebrew/Cellar")));
+    }
+
+    #[test]
+    fn linux_system_headers_are_an_explicit_readonly_grant() {
+        assert!(toolchain_roots("linux", None).contains(&PathBuf::from("/usr/include")));
+        let input = ConfigInput {
+            os: "linux",
+            containment: "bubblewrap",
+            command: "exit 0",
+            timeout_ms: 1000,
+            workspace: Path::new("/tmp/workspace"),
+            scratch: Path::new("/tmp/scratch"),
+            allowed_marker: None,
+            readonly: vec![PathBuf::from("/usr/include")],
+            denied: vec![],
+            rust: None,
+            list_parents: false,
+        };
+        let config = mxc_config(&input);
+        let text = serde_json::to_string(&config).unwrap();
+        assert!(text.contains("/usr/include"));
+        assert!(config["filesystem"]["readwritePaths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p != "/usr/include"));
+        assert!(config["filesystem"]["readonlyPaths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "/usr/include"));
     }
 
     #[test]

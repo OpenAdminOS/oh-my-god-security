@@ -486,6 +486,80 @@ fn reader<R: Read + Send + 'static>(
         .map(|_| ())
 }
 
+// Ignore HOME, TMPDIR and OMGS_HOME: each may point into a readable grant.
+// Darwin supplies a per-user directory that the pinned Seatbelt baseline denies.
+#[cfg(target_os = "macos")]
+pub(crate) fn capture_root() -> io::Result<PathBuf> {
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, MetadataExt},
+    };
+    let mut bytes = vec![0u8; 4096];
+    // SAFETY: confstr writes at most the supplied buffer length.
+    let size = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+        )
+    };
+    if size == 0 || size > bytes.len() {
+        return Err(io::Error::other(
+            "Darwin private temp directory unavailable",
+        ));
+    }
+    let base = std::fs::canonicalize(std::path::Path::new(std::ffi::OsStr::from_bytes(
+        &bytes[..size - 1],
+    )))?;
+    // This allowlist excludes every baseline-readable root, including /opt and
+    // /usr/local, and fails closed if Darwin changes its directory layout.
+    if !base.starts_with("/private/var/folders") {
+        return Err(io::Error::other(
+            "Darwin private temp directory is outside /private/var/folders",
+        ));
+    }
+    let dir = base.join("omgs-capture");
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = std::fs::symlink_metadata(&dir)?;
+    // SAFETY: geteuid has no preconditions.
+    if !meta.is_dir()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o777 != 0o700
+        || std::fs::canonicalize(&dir)? != dir
+    {
+        return Err(io::Error::other(
+            "unsafe capture directory ownership, mode or canonical location",
+        ));
+    }
+    let roots = crate::sandbox::toolchain_roots("macos", crate::platform::home().as_deref());
+    validate_capture_grants(
+        &dir,
+        &roots.into_iter().filter(|p| p.exists()).collect::<Vec<_>>(),
+    )?;
+    Ok(dir)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn validate_capture_grants(
+    root: &std::path::Path,
+    grants: &[PathBuf],
+) -> io::Result<()> {
+    for grant in grants {
+        let grant = std::fs::canonicalize(grant)?;
+        if root.starts_with(&grant) || grant.starts_with(root) {
+            return Err(io::Error::other(format!(
+                "capture directory overlaps sandbox grant {}",
+                grant.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 // Darwin's pipe()+fcntl() is not atomic against unrelated concurrent spawns.
 // Open anonymous FIFOs with O_CLOEXEC atomically instead, then unlink them.
 #[cfg(target_os = "macos")]
@@ -495,7 +569,7 @@ fn capture_pipe() -> io::Result<(std::fs::File, std::fs::File)> {
         ffi::OsStrExt,
         fs::{DirBuilderExt, OpenOptionsExt},
     };
-    let dir = std::env::temp_dir().join(format!("omgs-pipe-{}", crate::platform::random_nonce()?));
+    let dir = capture_root()?.join(format!("pipe-{}", crate::platform::random_nonce()?));
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     let path = dir.join("pipe");
     let result = (|| {
@@ -1530,6 +1604,31 @@ fn elapsed_ms(start: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_ignores_unsafe_tmpdir_and_rejects_overlapping_grants() {
+        if std::env::var_os("OMGS_CAPTURE_CHILD").is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "supervise::tests::capture_ignores_unsafe_tmpdir_and_rejects_overlapping_grants"])
+                .env("OMGS_CAPTURE_CHILD", "1")
+                .env("TMPDIR", "/usr/local/omgs-unsafe-temp/nonexistent")
+                .output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            return;
+        }
+        let root = capture_root().unwrap();
+        assert!(root.starts_with("/private/var/folders"));
+        assert!(!root.starts_with(std::env::temp_dir()));
+        let pair = capture_pipe().unwrap();
+        drop(pair);
+        assert!(validate_capture_grants(&root, std::slice::from_ref(&root)).is_err());
+        assert!(validate_capture_grants(&root, &[root.parent().unwrap().to_path_buf()]).is_err());
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        assert!(validate_capture_grants(&root, std::slice::from_ref(&alias)).is_err());
+        std::fs::remove_file(alias).unwrap();
+    }
+
     use super::*;
 
     #[cfg(unix)]

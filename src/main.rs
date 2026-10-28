@@ -848,6 +848,47 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn doctor_probe_command(name: &str) -> String {
+    match name {
+        "sh" => "sh -c 'exit 0'".into(),
+        "java" => "java -version".into(),
+        "go" => "go version".into(),
+        _ => format!("{name} --version"),
+    }
+}
+
+fn doctor_tool_failure(name: &str, reason: &str) -> String {
+    format!(
+        "{name} on host PATH but failed to launch inside MXC\n  reason: {}",
+        omgs::platform::escape_controls(reason)
+    )
+}
+
+fn doctor_probe_result(run: &omgs::supervise::Supervised) -> Result<(), String> {
+    if run.success
+        && run.command_started
+        && run.command_finished
+        && run.capture_complete
+        && run.cleanup_complete
+        && !run.executor_error
+        && !run.timed_out
+        && !run.killed
+        && !run.interrupted
+        && run.survivors.is_empty()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "timeout={}, capture_complete={}, cleanup_complete={}, executor_error={}, exit={:?}; {}",
+        run.timed_out,
+        run.capture_complete,
+        run.cleanup_complete,
+        run.executor_error,
+        run.exit_code,
+        run.output
+    ))
+}
+
 /// What this machine can and cannot do for OMGS. Executes no target code;
 /// `--live` runs one fixed command inside MXC to show a denial is enforced.
 fn cmd_doctor(args: &[String]) -> Result<(), String> {
@@ -930,8 +971,15 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             .collect()
     };
     let tools = found(&[
-        "swiftc", "cargo", "clang", "python3", "node", "npm", "pwsh", "go", "dotnet", "java",
+        "sh", "swiftc", "cargo", "clang", "python3", "node", "npm", "pwsh", "go", "dotnet", "java",
     ]);
+    for name in [
+        "sh", "swiftc", "cargo", "clang", "python3", "node", "npm", "pwsh", "go", "dotnet", "java",
+    ] {
+        if !tools.iter().any(|t| t == name) {
+            println!("{name} not on host PATH");
+        }
+    }
     println!(
         "toolchains on PATH: {}",
         if tools.is_empty() {
@@ -957,7 +1005,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         println!("hint: this kernel restricts unprivileged user namespaces (Ubuntu 24.04 and later). MXC needs them; see the README section on Linux for the AppArmor profile.");
     }
     if os == "windows" {
-        println!("note: PowerShell under MXC needs an interactive desktop session; over SSH (session 0) pwsh fails to start while cmd works.");
+        println!("note: upstream MXC issue https://github.com/microsoft/mxc/issues/1465 reports STATUS_DLL_INIT_FAILED for toolchains in Windows session 0; use an existing interactive desktop session when affected.");
     }
     if !ready {
         if has(args, "--live") {
@@ -1059,90 +1107,38 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         for g in &outcome.gaps {
             println!("  not enforced: {}", omgs::platform::escape_controls(g));
         }
-        // A toolchain on the host PATH may still be out of reach inside, for
-        // example under a version manager in the home directory.
-        let names: Vec<&str> = tools.iter().map(|t| t.as_str()).collect();
-        // Launch the tools: lookup cannot establish DLL or proxy readiness.
-        // The old Windows `for %t ...` also crossed a generated batch file,
-        // where percent expansion broke it ("do was unexpected at this time").
-        // Use fixed commands without loop variables or nested cmd invocations.
-        let mut cmd = names
-            .iter()
-            .map(|name| {
-                let flag = match *name {
-                    "java" => "-version",
-                    "go" => "version",
-                    _ => "--version",
-                };
-                format!("({name} {flag} > tool-{name}.txt 2>&1 && echo omgs-reach {name})")
-            })
-            .collect::<Vec<_>>()
-            .join(if os == "windows" { " & " } else { "; " });
-        if !cmd.is_empty() {
-            cmd.push_str(if os == "windows" { " & " } else { "; " });
-        }
-        cmd.push_str(if os == "windows" {
-            "exit /b 0"
-        } else {
-            "exit 0"
-        });
-        let reach = ProveRequest {
-            command: cmd,
-            test: None,
-            timeout_ms: 30_000,
-            target: None,
-            run_dir: probe.join("reach"),
-            tier: Tier::Test,
-            stage: None,
-            expected_tree_sha256: None,
-        };
-        let reach_outcome = match prove(&reach) {
-            ProveOutcome::Ran(r) => r,
-            ProveOutcome::Blocked { reason } => {
-                let _ = std::fs::remove_dir_all(&probe);
-                eprintln!(
-                    "needs_validation: target code was not executed. {}",
-                    omgs::platform::escape_controls(&reason)
-                );
-                return Err("__EXIT3__".into());
-            }
-        };
-        {
-            let r = reach_outcome;
-            if !r.run.success {
-                let _ = std::fs::remove_dir_all(&probe);
-                eprintln!(
-                    "needs_validation: toolchain reachability probe did not complete: {}",
-                    omgs::platform::escape_controls(&r.run.output)
-                );
-                return Err("__EXIT3__".into());
-            }
-            let found = |n: &str| {
-                r.run
-                    .output
-                    .lines()
-                    .any(|l| l.trim() == format!("omgs-reach {n}"))
+        let mut inside = Vec::new();
+        for name in &tools {
+            // Separate deadlines keep one hanging tool from hiding the rest.
+            let reach = ProveRequest {
+                command: doctor_probe_command(name),
+                test: None,
+                timeout_ms: 3_000,
+                target: None,
+                run_dir: probe.join(format!("reach-{name}")),
+                tier: Tier::Test,
+                stage: None,
+                expected_tree_sha256: None,
             };
-            let (inside, outside): (Vec<&str>, Vec<&str>) =
-                names.iter().copied().partition(|n| found(n));
-            println!(
-                "toolchains reachable inside the sandbox: {}",
-                if inside.is_empty() {
-                    "none".into()
-                } else {
-                    inside.join(", ")
-                }
-            );
-            if !outside.is_empty() {
-                println!(
-                    "on PATH here but NOT reachable inside the sandbox: {} (proofs that need them are blocked)",
-                    outside.join(", ")
-                );
-                for name in outside {
-                    println!("{name} not reachable inside the sandbox");
+            let result = match prove(&reach) {
+                ProveOutcome::Ran(r) => doctor_probe_result(&r.run),
+                ProveOutcome::Blocked { reason } => Err(reason),
+            };
+            match result {
+                Ok(()) => inside.push(name.as_str()),
+                Err(reason) => {
+                    println!("{}", doctor_tool_failure(name, &reason));
                 }
             }
         }
+        println!(
+            "toolchains reachable inside the sandbox: {}",
+            if inside.is_empty() {
+                "none".into()
+            } else {
+                inside.join(", ")
+            }
+        );
         let _ = std::fs::remove_dir_all(&probe);
     }
     Ok(())
@@ -2594,6 +2590,45 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod cli_tests {
+    #[test]
+    fn doctor_shell_probe_and_unreachable_reasons() {
+        assert_eq!(super::doctor_probe_command("sh"), "sh -c 'exit 0'");
+        assert_eq!(
+            super::doctor_tool_failure("node", "timeout=true"),
+            "node on host PATH but failed to launch inside MXC\n  reason: timeout=true"
+        );
+        let limits = omgs::supervise::Limits {
+            wall_ms: 100,
+            cpu_secs: None,
+            file_size_bytes: None,
+            open_files: None,
+            memory_bytes: None,
+            tasks: None,
+            output_cap_bytes: 1024,
+        };
+        #[cfg(unix)]
+        let mut command = std::process::Command::new("/bin/sh");
+        #[cfg(unix)]
+        command.args(["-c", "sleep 10"]);
+        #[cfg(windows)]
+        let mut command = std::process::Command::new("cmd.exe");
+        #[cfg(windows)]
+        command.args(["/d", "/c", "for /l %i in (1,0,2) do @rem"]);
+        let mut run = omgs::supervise::run(command, &limits, None);
+        assert!(super::doctor_probe_result(&run)
+            .unwrap_err()
+            .contains("timeout=true"));
+        run.timed_out = false;
+        run.success = true;
+        run.command_started = true;
+        run.command_finished = true;
+        run.capture_complete = false;
+        assert!(super::doctor_probe_result(&run).is_err());
+        run.capture_complete = true;
+        run.executor_error = true;
+        assert!(super::doctor_probe_result(&run).is_err());
+    }
+
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 

@@ -1167,6 +1167,7 @@ fn doctor_discloses_planned_controls_and_gaps_without_an_executor() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .arg("doctor")
         .env("OMGS_HOME", &d)
+        .env("PATH", "")
         .env("OMGS_MXC_EXEC", d.join("missing"))
         .output()
         .unwrap();
@@ -1176,6 +1177,9 @@ fn doctor_discloses_planned_controls_and_gaps_without_an_executor() {
         t.contains("planned proof controls if a verified MXC executor becomes available"),
         "{t}"
     );
+    for runtime in ["sh", "node", "pwsh", "python3", "swiftc"] {
+        assert!(t.contains(&format!("{runtime} not on host PATH")), "{t}");
+    }
     for gap in [
         "readable toolchain roots",
         "no total disk quota",

@@ -455,3 +455,65 @@ fn concurrent_short_marked_runs_complete_capture() {
         }
     });
 }
+
+// These children do not pass through prepare_unix or its sealing loop.
+#[cfg(target_os = "macos")]
+#[test]
+fn unsupervised_spawns_do_not_delay_capture() {
+    use std::os::unix::process::CommandExt;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+    let stop = Arc::new(AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let stop = stop.clone();
+                scope.spawn(move || {
+                    let mut children = Vec::new();
+                    while !stop.load(Ordering::Relaxed) {
+                        let mut command = Command::new("/bin/sleep");
+                        command.arg("1");
+                        // Select std's fork/exec path, without sealing descriptors.
+                        // SAFETY: the callback does nothing and is async-signal-safe.
+                        unsafe {
+                            command.pre_exec(|| Ok(()));
+                        }
+                        children.push(command.spawn().unwrap());
+                        if children.len() == 16 {
+                            for mut child in children.drain(..) {
+                                child.wait().unwrap();
+                            }
+                        }
+                    }
+                    for mut child in children {
+                        child.wait().unwrap();
+                    }
+                })
+            })
+            .collect();
+        // Stop workers even if an assertion fails.
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let guard = Stop(stop);
+        for _ in 0..256 {
+            let start = Instant::now();
+            let result = run(shell("printf short"), &limits(), None);
+            assert!(result.success && result.capture_complete, "{result:?}");
+            assert!(
+                start.elapsed() < Duration::from_millis(750),
+                "capture waited for an unrelated child: {result:?}"
+            );
+        }
+        drop(guard);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+}
