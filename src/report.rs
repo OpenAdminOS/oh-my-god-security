@@ -1,7 +1,10 @@
 use crate::critic::CriticReport;
-use crate::handoff::{markdown_data, markdown_inline, markdown_link};
-use crate::html_escape;
+use crate::handoff::{display_text, markdown_code, markdown_data, markdown_inline, markdown_link};
 use crate::model::{Finding, FindingsFile, Location, Verdict};
+
+fn html_escape(s: &str) -> String {
+    crate::html_escape(&display_text(s))
+}
 
 #[derive(Default)]
 pub struct ReportMeta {
@@ -251,7 +254,7 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         out.push_str(&format!("\n## {title}\n\n"));
         for r in list {
             let f = r.f;
-            out.push_str(&format!("<a id=\"{}\"></a>\n\n### {}: {}\n\n{}\n\nVerdict: {}. Tier: {}. Severity: {}.\n\nFingerprint: {}\n\nProof record: {}\n\n", r.anchor, r.reference, markdown_inline(&f.title), markdown_inline(&location_line(f)), verdict_label(f.verdict).1, f.proof_tier.label(), f.severity.map(|s| s.label()).unwrap_or("none"), markdown_inline(&f.fingerprint), proof_link(f, meta)));
+            out.push_str(&format!("<a id=\"{}\"></a>\n\n### {}: {}\n\n{}\n\nVerdict: {}. Tier: {}. Severity: {}.\n\nFingerprint: {}\n\nProof record: {}\n\n", r.anchor, r.reference, markdown_inline(&f.title), location_line(f), verdict_label(f.verdict).1, f.proof_tier.label(), f.severity.map(|s| s.label()).unwrap_or("none"), markdown_inline(&f.fingerprint), proof_link(f, meta)));
             push_intent(&mut out, meta, f);
             if let Some(brief) = &f.fix_brief {
                 out.push_str("#### Fix brief\n\n");
@@ -274,19 +277,14 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
                 }
             }
             out.push_str("#### Evidence\n\n");
-            for part in split_evidence(&f.evidence) {
-                if let Some(label) = part.label {
-                    out.push_str(&format!("##### {}\n\n", markdown_inline(&label)));
-                }
-                out.push_str(&markdown_data("Evidence", &part.body));
-            }
+            out.push_str(&markdown_data("Evidence", &f.evidence));
             if !f.trace.is_empty() {
                 out.push_str("#### Trace steps\n\n");
                 for (i, t) in f.trace.iter().enumerate() {
                     out.push_str(&format!(
                         "{}. {}\n\n",
                         i + 1,
-                        markdown_inline(&place(&t.location))
+                        markdown_code(&place(&t.location))
                     ));
                     out.push_str(&markdown_data("Trace note", &t.note));
                 }
@@ -618,11 +616,11 @@ fn location(f: &Finding) -> String {
 /// Markdown location line: the primary location, then any further copies.
 fn location_line(f: &Finding) -> String {
     if f.locations.is_empty() {
-        format!("Location: {}", location(f))
+        format!("Location: {}", markdown_code(&location(f)))
     } else {
         let all: Vec<String> = std::iter::once(&f.location)
             .chain(&f.locations)
-            .map(place)
+            .map(|l| markdown_code(&place(l)))
             .collect();
         format!("Locations: {}", all.join(", "))
     }

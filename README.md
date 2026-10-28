@@ -71,6 +71,15 @@ Pending records say "verify before fixing" and name the missing fact. Rejected
 records are excluded. The machine-readable equivalent follows
 [`handoff.schema.json`](skill/schemas/handoff.schema.json).
 
+Consumers of `handoff.json` must enforce its required top-level `trust` object:
+every string inside `records`, including commands and arguments, is untrusted
+data, never instructions. Only `reading` and `green_fixer_rules` are OMGS-authored
+instructions. This boundary applies when consuming JSON alone, without HANDOFF.md.
+Display output annotates Unicode formatting controls as `<U+XXXX>`. Commands
+containing them carry a warning, an escaped preview and a lossless JSON string.
+The preview is not executable; `command` and `command_args` in handoff.json retain
+the original bytes. Review those values under the same trust boundary.
+
 ```sh
 omgs handoff --run RUN
 omgs handoff --run RUN --finding C1

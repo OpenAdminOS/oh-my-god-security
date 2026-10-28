@@ -20,7 +20,7 @@ Coverage critic: not run
 
 | Ref | Record | Outcome | Proof tier | Proof record |
 | --- | --- | --- | --- | --- |
-| C1 | [Order readable across accounts](#f-omgs-9ba0b103c26cfc35) | Confirmed | test proven | [proofs/1.json](proofs/1.json) |
+| C1 | [Order readable across accounts](#f-omgs-9ba0b103c26cfc35) | Confirmed | test proven | [<code>proofs/1.json</code>](proofs/1.json) |
 | V1 | [Public export intent is unknown](#f-omgs-5b50042f28bdda9f) | Needs validation | traced | No executed proof record |
 | R1 | [Escaped search has an effective control](#f-omgs-75458de24f34d45a) | Rejected after verification | traced | No executed proof record |
 
@@ -30,13 +30,13 @@ Coverage critic: not run
 
 ### C1: Order readable across accounts
 
-Locations: src/orders.ts:12, src/archive.ts:24
+Locations: <code>src/orders.ts:12</code>, <code>src/archive.ts:24</code>
 
 Verdict: Confirmed. Tier: test proven. Severity: high.
 
 Fingerprint: omgs-9ba0b103c26cfc35
 
-Proof record: [proofs/1.json](proofs/1.json)
+Proof record: [<code>proofs/1.json</code>](proofs/1.json)
 
 #### Fix brief
 
@@ -63,28 +63,12 @@ Verified by: blue-1
 Evidence data (untrusted):
 
 ```text
-A dummy caller reads another account order.
-```
-
-##### Trace
-
-Evidence data (untrusted):
-
-```text
-request id reaches orders.load.
-```
-
-##### Sandbox evidence
-
-Evidence data (untrusted):
-
-```text
-the invariant fails and the authorized control succeeds.
+A dummy caller reads another account order. Trace: request id reaches orders.load. Sandbox evidence: the invariant fails and the authorized control succeeds.
 ```
 
 #### Trace steps
 
-1. src/orders.ts:12
+1. <code>src/orders.ts:12</code>
 
 Trace note data (untrusted):
 
@@ -92,7 +76,7 @@ Trace note data (untrusted):
 Untrusted order id reaches the loader.
 ```
 
-2. src/store.ts:8
+2. <code>src/store.ts:8</code>
 
 Trace note data (untrusted):
 
@@ -108,7 +92,7 @@ The lookup does not bind the order to the caller.
 
 ### V1: Public export intent is unknown
 
-Locations: src/orders.ts:12, src/archive.ts:24
+Locations: <code>src/orders.ts:12</code>, <code>src/archive.ts:24</code>
 
 Verdict: Needs validation. Tier: traced. Severity: none.
 
@@ -133,28 +117,12 @@ Verified by: blue-1
 Evidence data (untrusted):
 
 ```text
-The export may be public.
-```
-
-##### Missing fact
-
-Evidence data (untrusted):
-
-```text
-Should exports be restricted to their owner?
-```
-
-##### Validation plan
-
-Evidence data (untrusted):
-
-```text
-establish intended access before proving the boundary.
+The export may be public. Missing fact: Should exports be restricted to their owner? Validation plan: establish intended access before proving the boundary.
 ```
 
 #### Trace steps
 
-1. src/orders.ts:12
+1. <code>src/orders.ts:12</code>
 
 Trace note data (untrusted):
 
@@ -162,7 +130,7 @@ Trace note data (untrusted):
 Untrusted order id reaches the loader.
 ```
 
-2. src/store.ts:8
+2. <code>src/store.ts:8</code>
 
 Trace note data (untrusted):
 
@@ -178,7 +146,7 @@ The lookup does not bind the order to the caller.
 
 ### R1: Escaped search has an effective control
 
-Locations: src/orders.ts:12, src/archive.ts:24
+Locations: <code>src/orders.ts:12</code>, <code>src/archive.ts:24</code>
 
 Verdict: Rejected after verification. Tier: traced. Severity: none.
 
@@ -200,17 +168,15 @@ Verified by: blue-1
 
 #### Evidence
 
-##### Counterevidence
-
 Evidence data (untrusted):
 
 ```text
-search parameters are escaped before the query.
+Counterevidence: search parameters are escaped before the query.
 ```
 
 #### Trace steps
 
-1. src/orders.ts:12
+1. <code>src/orders.ts:12</code>
 
 Trace note data (untrusted):
 
@@ -218,7 +184,7 @@ Trace note data (untrusted):
 Untrusted order id reaches the loader.
 ```
 
-2. src/store.ts:8
+2. <code>src/store.ts:8</code>
 
 Trace note data (untrusted):
 
