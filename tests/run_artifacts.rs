@@ -259,3 +259,143 @@ fn run_relative_paths_cannot_escape() {
         assert!(read(&f.0, Path::new(name), 64).is_err(), "{name}");
     }
 }
+
+fn handoff_output(run: &Path) -> std::process::Output {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .arg("handoff")
+        .arg("--run")
+        .arg(run)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(3) {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("handoff metadata admission exceeded 3 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
+fn assert_handoff_refuses_metadata(plant: impl FnOnce(&Path)) {
+    let f = Fixture::new();
+    omgs::runmeta::write_atomic(&f.0.join("findings.json"), r#"{"findings":[]}"#).unwrap();
+    plant(&f.0.join(omgs::runmeta::FILE));
+    let output = handoff_output(&f.0);
+    assert!(
+        !output.status.success(),
+        "handoff accepted invalid metadata: {}; published outputs: {}",
+        String::from_utf8_lossy(&output.stdout),
+        f.0.join("HANDOFF.md").exists() || f.0.join("handoff.json").exists()
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("run artifact"), "{error}");
+    assert!(error.contains(omgs::runmeta::FILE), "{error}");
+    assert!(!f.0.join("HANDOFF.md").exists());
+    assert!(!f.0.join("handoff.json").exists());
+}
+
+#[test]
+fn handoff_refuses_metadata_directory() {
+    assert_handoff_refuses_metadata(|path| std::fs::create_dir(path).unwrap());
+}
+
+#[test]
+fn handoff_refuses_dangling_metadata_symlink() {
+    assert_handoff_refuses_metadata(|path| {
+        symlink_file(&path.with_file_name("missing-metadata"), path)
+    });
+}
+
+#[test]
+fn handoff_refuses_metadata_lookup_failure() {
+    // Following this self-link fails metadata lookup rather than reporting absence.
+    assert_handoff_refuses_metadata(|path| {
+        symlink_file(path, path);
+        assert!(std::fs::metadata(path).is_err());
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn handoff_refuses_metadata_fifo_without_blocking() {
+    assert_handoff_refuses_metadata(|path| {
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: valid NUL-terminated path inside the private fixture.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    });
+}
+
+#[test]
+fn handoff_allows_absent_metadata_and_preserves_valid_budget() {
+    let f = Fixture::new();
+    omgs::runmeta::write_atomic(&f.0.join("findings.json"), r#"{"findings":[]}"#).unwrap();
+    for metadata in [
+        None,
+        Some(r#"{"run_id":"handoff","budget_agent_calls":5,"agent_calls_used":2}"#),
+    ] {
+        if let Some(text) = metadata {
+            omgs::runmeta::write_atomic(&f.0.join(omgs::runmeta::FILE), text).unwrap();
+        }
+        let output = handoff_output(&f.0);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(f.0.join("HANDOFF.md").is_file());
+        let handoff: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(f.0.join("handoff.json")).unwrap())
+                .unwrap();
+        if metadata.is_some() {
+            assert!(handoff["budget"]
+                .as_str()
+                .unwrap()
+                .contains("2 used of 5; 3 remaining"));
+        } else {
+            assert!(handoff.get("budget").is_none());
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_artifact_reads_refuse_streams_and_default_stream_aliases() {
+    let f = Fixture::new();
+    omgs::runmeta::write_atomic(&f.0.join("findings.json"), "base").unwrap();
+    let named = f.0.join("findings.json:alternate");
+    std::fs::write(&named, "stream").unwrap();
+    assert_eq!(std::fs::read(&named).unwrap(), b"stream");
+    assert_eq!(
+        std::fs::read(f.0.join("findings.json::$DATA")).unwrap(),
+        b"base"
+    );
+    for name in [
+        "findings.json:alternate",
+        "findings.json:alternate:$DATA",
+        "findings.json::$DATA",
+        "missing.json:alternate",
+        "proofs:alternate/1.json",
+    ] {
+        let error = read(&f.0, Path::new(name), 64).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{name}");
+        assert!(error.to_string().contains("run artifact"), "{error}");
+        assert!(optional_text(&f.0, Path::new(name), 64).is_err(), "{name}");
+    }
+    assert!(text_path(&named, 64).unwrap_err().contains("stream syntax"));
+    assert_eq!(read(&f.0, Path::new("findings.json"), 64).unwrap(), b"base");
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_artifact_names_with_colons_remain_literal() {
+    let f = Fixture::new();
+    for name in ["findings.json:alternate", "findings.json::$DATA"] {
+        omgs::runmeta::write_atomic(&f.0.join(name), "literal").unwrap();
+        assert_eq!(read(&f.0, Path::new(name), 64).unwrap(), b"literal");
+    }
+}

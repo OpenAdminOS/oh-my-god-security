@@ -35,12 +35,26 @@ pub fn read_with_permissions(
     relative: &Path,
     limit: u64,
 ) -> std::io::Result<(Vec<u8>, std::fs::Permissions)> {
-    crate::platform::read_private_bounded_with_permissions_in(run, relative, limit).map_err(|e| {
+    let result = if cfg!(windows) && has_windows_stream_syntax(relative) {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact filename components must not contain Windows stream syntax",
+        ))
+    } else {
+        crate::platform::read_private_bounded_with_permissions_in(run, relative, limit)
+    };
+    result.map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!("read run artifact {}: {e}", run.join(relative).display()),
         )
     })
+}
+
+fn has_windows_stream_syntax(relative: &Path) -> bool {
+    relative
+        .components()
+        .any(|c| c.as_os_str().as_encoded_bytes().contains(&b':'))
 }
 
 pub fn text(run: &Path, relative: &Path, limit: u64) -> Result<String, String> {
@@ -70,4 +84,28 @@ pub fn text_path(path: &Path, limit: u64) -> Result<String, String> {
         Path::new(path.file_name().ok_or("artifact needs a filename")?),
         limit,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_stream_syntax_is_detected_in_every_component() {
+        for name in [
+            "findings.json:alternate",
+            "findings.json:alternate:$DATA",
+            "findings.json::$DATA",
+            "findings.json::$data",
+            "proofs/1.json:alternate",
+            "proofs/1.json::$DATA",
+            "proofs:alternate/1.json",
+            "proofs::$INDEX_ALLOCATION/1.json",
+        ] {
+            assert!(has_windows_stream_syntax(Path::new(name)), "{name}");
+        }
+        for name in ["findings.json", "proofs/1.json", "proofs/1/command.txt"] {
+            assert!(!has_windows_stream_syntax(Path::new(name)), "{name}");
+        }
+    }
 }

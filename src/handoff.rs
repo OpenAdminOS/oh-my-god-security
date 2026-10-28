@@ -179,7 +179,7 @@ pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Hand
         return Err("finding not found in actionable records (use C1, V1 or a fingerprint)".into());
     }
     Ok(Handoff {
-        budget: if run.join(crate::runmeta::FILE).is_file() {
+        budget: if crate::runmeta::read_optional(run)?.is_some() {
             Some(crate::budget::summary(run)?)
         } else {
             None
