@@ -4,7 +4,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn scratch(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("omgs-policy-{}-{name}", std::process::id()));
+    let parent = if cfg!(windows) {
+        PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+    } else {
+        omgs::platform::temp_root().unwrap()
+    };
+    let path = parent.join(format!("omgs-policy-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     omgs::platform::create_private_tree(&path).unwrap();
     std::fs::canonicalize(path).unwrap()
@@ -135,6 +140,14 @@ fn gate(root: &Path, repo: &Path, base: &str, head: &str, run: Option<&Path>, co
     }
     let o = cli(&root.join("home"), &args);
     assert_eq!(o.status.code(), Some(code), "{}", output(&o));
+    let data = root.join("home/omgs-data");
+    if data.exists() {
+        assert!(!std::fs::read_dir(data).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("omgs-gate-")));
+    }
     o
 }
 fn registered() -> policy::GateTest {
@@ -216,6 +229,29 @@ fn evidence(run: &Path, target: &Path) {
         "{:?}",
         omgs::proof::validate_proofs(&file, run)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_os_temp_supports_gate_and_run_storage() {
+    let root = scratch("temp-alias");
+    let physical = root.join("physical");
+    omgs::platform::create_private_dir_new(&physical).unwrap();
+    let alias = root.join("alias");
+    std::os::unix::fs::symlink(&physical, &alias).unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "registered_gate_executes_immutable_head_and_ignores_advisory_artifacts",
+            "--nocapture",
+        ])
+        .env("TMPDIR", &alias)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", output(&out));
+    // Installation and explicit run destinations retain strict admission.
+    assert!(omgs::platform::create_private_tree(&alias.join("explicit-run")).is_err());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -942,6 +978,11 @@ fn changed_registered_test_is_visible_before_sandbox_in_both_modes() {
                     "--head",
                     head,
                 ])
+                .env("OMGS_HOME", root.join("data"))
+                // Internal scratch must not consult ambient OS temp settings.
+                .env("TMPDIR", root.join("missing-temp"))
+                .env("TEMP", root.join("missing-temp"))
+                .env("TMP", root.join("missing-temp"))
                 .env("OMGS_MXC_EXEC", root.join("missing-executor"))
                 .output()
                 .unwrap()

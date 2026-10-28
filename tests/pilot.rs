@@ -10,7 +10,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let root = omgs::platform::temp_root().unwrap().join(format!(
             "omgs-pilot-{}",
             omgs::platform::random_nonce().unwrap()
         ));
@@ -264,7 +264,7 @@ fn command_help_and_intent_aliases_are_actionable() {
     ] {
         let o = f.cli(&[cmd, "--help"]);
         assert!(o.status.success());
-        let text = String::from_utf8_lossy(&o.stdout);
+        let text = String::from_utf8_lossy(&o.stderr);
         assert!(text.contains(&format!("omgs {cmd}")));
         assert!(!text.contains("omgs doctor"));
     }

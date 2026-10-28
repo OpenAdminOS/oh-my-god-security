@@ -55,7 +55,9 @@ fn ready(runtime: &str) -> bool {
             e.contains("MXC 1.0.1 leaves changed ACEs on granted folders"),
             "{e}"
         );
-        let d = std::env::temp_dir().join(format!("omgs-recipe-refusal-{}", std::process::id()));
+        let d = omgs::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-recipe-refusal-{}", std::process::id()));
         for args in [vec!["prove", "--cmd", "exit 0"], vec!["doctor", "--live"]] {
             let out = cli(&d, &args);
             assert_eq!(out.status.code(), Some(3), "{}", text(&out));
@@ -126,7 +128,7 @@ fn check(recipe: Recipe) -> bool {
     if !ready(recipe.runtime) {
         return false;
     }
-    let d = std::env::temp_dir().join(format!(
+    let d = omgs::platform::temp_root().unwrap().join(format!(
         "omgs-recipe-{}-{}",
         recipe.runtime,
         std::process::id()
@@ -477,7 +479,9 @@ fn windows_toolchains_launch_inside_mxc() {
     if !ready("cargo") {
         return;
     }
-    let d = std::env::temp_dir().join(format!("omgs-windows-tools-{}", std::process::id()));
+    let d = omgs::platform::temp_root()
+        .unwrap()
+        .join(format!("omgs-windows-tools-{}", std::process::id()));
     for (name, command, expected) in [
         ("cargo", "cargo --version", "cargo "),
         (

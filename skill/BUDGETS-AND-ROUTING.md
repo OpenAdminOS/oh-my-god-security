@@ -76,3 +76,6 @@ the host's existing authorization and consumes the same budget; no automatic pro
 
 Supply known identities with repeated `omgs report --model hunter=NAME --model verifier=NAME
 --model evaluator=NAME ...`. These labels disclose host facts and never authorize a model change.
+
+With no routing file and no refusal, `route` returns `host-default` to retain the host selection.
+After a refusal it stays blocked until an explicit configured fallback is available.

@@ -8,6 +8,7 @@ pub mod budget;
 pub mod critic;
 pub mod handoff;
 pub mod help;
+pub mod install;
 pub mod intent;
 pub mod ledger;
 pub mod model;

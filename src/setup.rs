@@ -208,7 +208,7 @@ pub fn write_policy(repo: &Path, mode: crate::policy::Mode) -> Result<PathBuf, S
 mod tests {
     #[test]
     fn failed_publish_restores_complete_original_tree() {
-        let root = std::env::temp_dir().join(format!(
+        let root = crate::platform::temp_root().unwrap().join(format!(
             "omgs-install-{}",
             crate::platform::random_nonce().unwrap()
         ));

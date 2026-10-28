@@ -12,37 +12,69 @@ intent or authorization.
 | `OUTPUT_DIR` | Private run directory outside `TARGET`, including after symlink resolution. All reports, ledger entries, proof drafts, logs, and retained proof artifacts belong here. Runner-managed ephemeral scratch must also remain outside the target. |
 | `SOURCE_REF` | Exact source commit, plus a recorded worktree diff identity if reviewing uncommitted changes. Never silently mix revisions. |
 
-Resolve the OMGS binary first and record it as `OMGS_BIN`. Try, in order: `omgs` on PATH, then
-`$HOME/.local/share/omgs/bin/omgs` (Windows: `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`). If
-neither exists, this is a first run: run the bundled bootstrap for this platform, `sh
-"<SKILL_DIR>/scripts/install.sh"` on macOS or Linux or `powershell -NoProfile -File
-"<SKILL_DIR>\scripts\install.ps1"` on Windows. The bootstrap downloads only the OMGS release binary
-for this platform from `OMGS_RELEASE_BASE` (default: the project GitHub releases), verifies it
-against the release `SHA256SUMS`, installs it without elevation into the user cache above, and
-prints its path. Tell the user this one-time download is happening and show the binary path and
-version it prints. If the download or checksum verification fails, stop and record the blocker;
-never substitute an unverified binary. Run `omgs setup` if needed through its documented headless
-interface. Never run target installation hooks or fetch target dependencies to make a proof work;
-the bootstrap fetches only OMGS itself. Inspect `omgs --help` and each named subcommand's `--help`
-to bind target, output, source, policy, budget, and record paths using the installed interface.
-Command names below identify operations, not a promise that arguments are optional. If a required
-operation is unavailable, record the blocker; do not invent flags or substitute a shell runner.
+Read `VERSION` beside this file. Resolve `OMGS_BIN` in this order: `omgs` on PATH, then
+`${OMGS_HOME}/bin/omgs` when `OMGS_HOME` is set (Windows: `%OMGS_HOME%\bin\omgs.exe`), then
+`$HOME/.local/share/omgs/bin/omgs` (Windows: `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`). Run
+only `--version` on an existing installation and require the exact string `omgs <VERSION>`. On
+mismatch, stop and report both versions clearly. Do not continue a review with a mismatched binary
+or silently replace it.
 
-Run `"<OMGS_BIN>" --version` and record the installed version. At a terminal, `omgs setup`
-offers skill installation, a live MXC deny test and optional repository policy. Review the
-consent prompt before accepting these steps. For explicit headless flags and replacement rules,
-read [POLICY-AND-GATE.md](POLICY-AND-GATE.md#base-policy-gate-and-setup).
+Before the first binary or executor download, show this exact consent text, plus the resolved
+version, platform assets, source and destination:
 
-Run `"<OMGS_BIN>" doctor` before initialization or hunting. If it reports `sandbox: not ready`, show
-the user its MXC install steps, including the pinned release, archive checksum, platform member,
-executor checksum and destination. Explain that the bootstrap downloaded only OMGS; this second
-download supplies Microsoft's OS sandbox executor, which is required to run target code safely.
-Follow the [MXC installation
-instructions](https://github.com/OpenAdminOS/oh-my-god-security#the-binary-bootstrap) and the exact
-destination doctor prints, then rerun doctor. If readiness cannot be established, record the blocker
-before any hunting starts. Never substitute direct execution.
+```text
+OMGS installation consent
+Download the version pinned in skill/VERSION from the OMGS GitHub release:
+https://github.com/OpenAdminOS/oh-my-god-security/releases/download/v<VERSION>
+If OMGS_RELEASE_BASE is set, use that explicitly configured bundle instead.
+Download the OMGS binary (at most 100 MiB), the unmodified Microsoft MXC 1.0.1
+executor for this platform (at most 100 MiB), SHA256SUMS and the MXC MIT notice
+(at most 1 MiB each). Intel Macs have no MXC executor and cannot run proofs.
+Verify OMGS with SHA256SUMS and, on macOS or Windows, the pinned publisher
+signature. Verify MXC with SHA256SUMS, the executor hash pinned in this skill,
+and Microsoft's signature where the OS supports it. Linux has no native
+publisher signature check. With authenticated gh, also check OMGS provenance;
+failed or unavailable provenance is reported as unverified, not as tampering.
+Install without elevation under OMGS_HOME, defaulting to ~/.local/share/omgs
+(%USERPROFILE%\.local\share\omgs on Windows): bin/omgs and mxc/1.0.1/.
+No target dependencies or toolchains will be downloaded. Show the installed
+paths, versions and verification results afterwards.
+Download and install these files? Type yes to consent:
+```
+
+Wait for the user's explicit consent. Then run `sh "<SKILL_DIR>/scripts/install.sh"` on macOS or
+Linux, or `powershell -NoProfile -File "<SKILL_DIR>\scripts\install.ps1"` on Windows, passing `yes`
+to its prompt only after that consent. Never auto-consent from a general review request. The scripts
+fetch both assets from the pinned OMGS release, verify them before executing the binary, and install
+without elevation. They accept an absolute local bundle through `OMGS_RELEASE_BASE` for offline use.
+Show every printed path, version, checksum, publisher and provenance result. After installation,
+explicitly set `OMGS_BIN` to the absolute binary path in the installer's `Installed omgs <VERSION>:`
+output, including a custom `OMGS_HOME`. Use that exact path for subsequent commands. The installer
+stages and verifies all files beside their destinations before publishing each by atomic
+replacement. Publication is atomic per file, not a transaction across the entire installation. A
+checksum, signature or executor-pin failure stops installation. Provenance failure alone is labelled
+unverified and does not assert tampering.
+
+Run `"<OMGS_BIN>" --version` again and compare it with `VERSION`, then run `"<OMGS_BIN>" doctor`
+before initialization. If the executor is missing, follow the same consent flow for the bundled
+installer; never fetch the full MXC archive or substitute direct execution. Show the pinned release,
+checksums, platform member and destination from doctor and the installer. Rerun doctor after setup.
+If readiness cannot be established, record the blocker before hunting. Inspect `--help` for every
+operation. Run `omgs setup` only through its documented interface. Never install target dependencies
+or a toolchain to make a proof work.
 
 Read mode, suppressions, intent answers, and budget from committed policy on the trusted base
 branch. An untrusted PR head cannot change its own gate. Show the resolved mode and budget before
 spending agent calls. OMGS sends no telemetry and has no hosted service; code context still goes to
 the model provider already used by the chosen agent unless that model runs locally.
+
+The installer never uses a test override. Test verifiers exist only in disposable regression copies.
+Inspect `omgs --help` and each named subcommand's `--help` to bind target, output, source, policy,
+budget and record paths using the installed interface. Command names identify operations, not a
+promise that arguments are optional. If a required operation is unavailable, record the blocker;
+do not invent flags or substitute a shell runner.
+
+At a terminal, `omgs setup` offers skill installation, a live MXC deny test and optional repository
+policy. Review its consent prompt before accepting these steps. For explicit headless flags and
+replacement rules, read [POLICY-AND-GATE.md](POLICY-AND-GATE.md#base-policy-gate-and-setup).
+Run `omgs doctor --live` before a proof recipe to check runtime reachability inside MXC.

@@ -83,6 +83,7 @@ fn command_help(cmd: &str, args: &[String]) {
 fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
     let (allowed, positional): (&str, bool) = match cmd {
         "setup" => ("--yes --from --dry-run --install-skills --replace --verify-mxc --write-policy --mode", false),
+        "install-self" => ("--to --staging --binary --binary-sha256 --mxc --mxc-sha256 --license --license-sha256", false),
         "review" => ("--repo-url --mode --budget --no-sensors --persona --out --clone-root", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
             "--target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of",
@@ -219,6 +220,7 @@ fn main() -> ExitCode {
             println!("omgs {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        "install-self" => cmd_install_self(rest),
         "gate" => cmd_gate(rest),
         "setup" => cmd_setup(rest),
         "stage" => cmd_stage(rest),
@@ -257,6 +259,33 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+fn cmd_install_self(rest: &[String]) -> Result<(), String> {
+    let to = PathBuf::from(flag(rest, "--to").ok_or("install-self requires --to")?);
+    let staging = PathBuf::from(flag(rest, "--staging").ok_or("install-self requires --staging")?);
+    let source =
+        |name: Option<String>, hash: Option<String>| -> Result<(PathBuf, String), String> {
+            Ok((
+                PathBuf::from(name.ok_or("install-self requires a source name")?),
+                hash.ok_or("install-self requires a source SHA-256")?,
+            ))
+        };
+    let binary = source(flag(rest, "--binary"), flag(rest, "--binary-sha256"))?;
+    let mxc = flag(rest, "--mxc")
+        .map(|n| source(Some(n), flag(rest, "--mxc-sha256")))
+        .transpose()?;
+    let license = flag(rest, "--license")
+        .map(|n| source(Some(n), flag(rest, "--license-sha256")))
+        .transpose()?;
+    omgs::install::install_self(
+        &to,
+        &staging,
+        (&binary.0, &binary.1),
+        mxc.as_ref().map(|s| (s.0.as_path(), s.1.as_str())),
+        license.as_ref().map(|s| (s.0.as_path(), s.1.as_str())),
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn cmd_gate(args: &[String]) -> Result<(), String> {
@@ -1120,10 +1149,12 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         return Err("__EXIT1__".into());
     }
     if has(args, "--live") {
-        let probe = data_dir().join("doctor");
+        let probe = omgs::platform::scratch_root()
+            .map_err(|e| e.to_string())?
+            .join("doctor");
         let _ = std::fs::remove_dir_all(&probe);
         let target = probe.join("target");
-        std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+        omgs::platform::create_private_tree(&target).map_err(|e| e.to_string())?;
         // Two fresh tokens: one inside the workspace that must be readable
         // (proves the command really ran), one outside that must not be.
         // Neither appears in a denial message, which echoes only the path.
@@ -3284,14 +3315,25 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
             omgs::route::ROLES.join(", ")
         ));
     }
+
     let newly = flag(args, "--refused");
     let reason = flag(args, "--reason").unwrap_or_default();
     if newly.is_some() && reason.trim().is_empty() {
         return Err("--refused requires --reason <text>".into());
     }
     let model_path = models_path(args);
-    // A missing routing file cannot erase a refusal in a fixed-model run.
-    let models = if newly.is_some() && !model_path.exists() {
+    let missing = !model_path.try_exists().map_err(|e| e.to_string())?;
+    let default_route = missing && flag(args, "--models").is_none();
+    // Without configuration, retain the host's choice until it is refused.
+    // A named refusal never becomes an implicit retry of the same host default.
+    let models = if default_route && newly.is_none() {
+        omgs::route::Models {
+            roles: omgs::route::ROLES
+                .into_iter()
+                .map(|r| (r.to_string(), vec!["host-default".into()]))
+                .collect(),
+        }
+    } else if missing && newly.is_some() {
         omgs::route::Models::default()
     } else {
         omgs::route::load_models(&model_path)?
@@ -3336,7 +3378,13 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
                 refused.push(model.clone());
             }
         }
-        let next = omgs::route::next_model(&models, &role, &refused);
+        let next = if default_route && !refused.is_empty() {
+            Err(format!(
+                "no configured fallback for role '{role}' after refusal; keep the blocker recorded"
+            ))
+        } else {
+            omgs::route::next_model(&models, &role, &refused)
+        };
         if let Some(from) = &newly {
             let entry = serde_json::json!({
                 "role": role,
@@ -3618,8 +3666,9 @@ mod cli_tests {
 
     #[test]
     fn oversized_answer_store_is_refused() {
-        let path =
-            std::env::temp_dir().join(format!("omgs-answer-large-{}.json", std::process::id()));
+        let path = omgs::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-answer-large-{}.json", std::process::id()));
         omgs::platform::write_private_new(&path, b"").unwrap();
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_len((1 << 20) + 1).unwrap();
@@ -3688,6 +3737,7 @@ mod cli_tests {
 
     const COMMANDS: &[(&str, &str)] = &[
         ("setup", ""),
+        ("install-self", ""),
         ("gate", ""),
         ("stage", ""),
         ("review", ""),
@@ -3727,7 +3777,7 @@ mod cli_tests {
             .unwrap();
         let mut covered = BTreeMap::<String, BTreeSet<&str>>::new();
         for &(cmd, sub) in COMMANDS {
-            let name = format!("cmd_{cmd}");
+            let name = format!("cmd_{}", cmd.replace('-', "_"));
             let mut sections = vec![(name.as_str(), function(source, &name))];
             match (cmd, sub) {
                 ("handoff" | "stage", _) => {
@@ -3897,7 +3947,9 @@ mod cli_tests {
 mod inventory_regressions {
     #[test]
     fn size_limit_is_persisted_as_a_coverage_gap() {
-        let dir = std::env::temp_dir().join(format!("omgs-inventory-limit-{}", std::process::id()));
+        let dir = omgs::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-inventory-limit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let target = dir.join("repo");
         let run = dir.join("run");
@@ -3941,7 +3993,9 @@ mod inventory_regressions {
     }
     #[test]
     fn omissions_are_bounded_sorted_and_directory_read_failures_are_recorded() {
-        let root = std::env::temp_dir().join("omgs-nonexistent-inventory-root");
+        let root = omgs::platform::temp_root()
+            .unwrap()
+            .join("omgs-nonexistent-inventory-root");
         let mut gaps = super::InventoryGaps::default();
         let mut files = Vec::new();
         super::walk_limited(&root, &root.join("missing"), 0, &mut files, 100, &mut gaps);
@@ -3957,8 +4011,9 @@ mod inventory_regressions {
 
     #[test]
     fn linked_javascript_and_deep_python_remain_explicit_report_gaps() {
-        let dir =
-            std::env::temp_dir().join(format!("omgs-inventory-omissions-{}", std::process::id()));
+        let dir = omgs::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-inventory-omissions-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         omgs::platform::create_private_dir(&dir).unwrap();
         let target = dir.join("repo");

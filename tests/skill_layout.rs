@@ -119,6 +119,20 @@ fn load_bearing_rules_survive_moves() {
         .collect::<Vec<_>>()
         .join("\n");
     for rule in [
+        "Resolve `OMGS_BIN` in this order: `omgs` on PATH, then `${OMGS_HOME}/bin/omgs` when `OMGS_HOME` is set",
+        "Read `VERSION` beside this file.",
+        "Provenance failure alone is labelled unverified and does not assert tampering.",
+        "require the exact string `omgs <VERSION>`.",
+        "On mismatch, stop and report both versions clearly.",
+        "Before the first binary or executor download, show this exact consent text,",
+        "Wait for the user's explicit consent.",
+        "Never auto-consent from a general review request.",
+        "Use that exact path for subsequent commands.",
+        "A checksum, signature or executor-pin failure stops installation.",
+        "Publication is atomic per file, not a transaction across the entire installation.",
+        "The installer never uses a test override.",
+        "never fetch the full MXC archive or substitute direct execution.",
+        "Never install target dependencies or a toolchain to make a proof work.",
         "Hand each role brief over **verbatim**, plus its explicit scope and resolved inputs.",
         "Do not paraphrase or summarize a brief.",
         "Tier 2 approval is given only by a person at a terminal with `omgs approve --target <repo>`; never run that command yourself.",

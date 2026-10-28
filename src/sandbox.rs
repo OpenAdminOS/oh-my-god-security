@@ -1613,7 +1613,9 @@ mod tests {
 
     #[test]
     fn blocked_proofs_remove_their_staging_directory() {
-        let d = std::env::temp_dir().join(format!("omgs-blocked-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-blocked-{}", std::process::id()));
         let req = |command: &str| ProveRequest {
             expect_marker: None,
             command: command.into(),
@@ -1776,7 +1778,9 @@ mod tests {
     #[test]
     fn copied_absolute_reentering_and_chained_links_disclose_live_target_access() {
         use std::os::unix::fs::symlink;
-        let d = std::env::temp_dir().join(format!("omgs-live-links-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-live-links-{}", std::process::id()));
         let src = d.join("target");
         std::fs::create_dir_all(&src).unwrap();
         let src = std::fs::canonicalize(src).unwrap();
@@ -1814,7 +1818,9 @@ mod tests {
     #[test]
     fn special_file_gaps_list_twenty_paths_then_the_remaining_count() {
         use std::os::unix::ffi::OsStrExt;
-        let d = std::env::temp_dir().join(format!("omgs-gap-cap-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-gap-cap-{}", std::process::id()));
         let src = d.join("target");
         std::fs::create_dir_all(&src).unwrap();
         for n in (0..27).rev() {
@@ -1840,7 +1846,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn live_target_link_gaps_are_sorted_and_capped() {
-        let d = std::env::temp_dir().join(format!("omgs-live-link-cap-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-live-link-cap-{}", std::process::id()));
         let root = d.join("target");
         let copy = d.join("copy");
         std::fs::create_dir_all(&root).unwrap();
@@ -1931,7 +1939,9 @@ mod tests {
         if probe.needs_dacl_augmentation != Some(true) {
             return;
         }
-        let d = std::env::temp_dir().join(format!("omgs-refusal-no-config-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-refusal-no-config-{}", std::process::id()));
         let before = preflight::config_invocations();
         let request = ProveRequest {
             expect_marker: None,
@@ -1955,7 +1965,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn readable_root_overlap_uses_canonical_case_insensitive_paths() {
-        let d = std::env::temp_dir().join(format!("OmGs-Overlap-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("OmGs-Overlap-{}", std::process::id()));
         let root = d.join("Toolchain");
         let run = root.join("proofs/1");
         std::fs::create_dir_all(&run).unwrap();
@@ -1968,7 +1980,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn junctions_accept_metacharacters_without_a_shell_and_staging_refuses_them() {
-        let d = std::env::temp_dir().join(format!("omgs-junction-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-junction-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let to = d.join("cache & echo injected ^ % ! (x)");
         let link = d.join("link & echo injected ^ % ! (x)");
@@ -1992,7 +2006,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn staging_never_writes_through_a_link_in_the_target() {
-        let d = std::env::temp_dir().join(format!("omgs-stage-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-stage-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let (ws, outside) = (d.join("ws"), d.join("outside"));
         std::fs::create_dir_all(&ws).unwrap();

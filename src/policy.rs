@@ -676,11 +676,14 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
             );
         }
     }
-    let dir = GateDir(std::env::temp_dir().join(format!(
-        "omgs-gate-{}",
-        crate::platform::random_nonce().map_err(|e| e.to_string())?
-    )));
-    crate::platform::create_private_dir_new(&dir.0).map_err(|e| e.to_string())?;
+    let path = crate::platform::scratch_root()
+        .map_err(|e| e.to_string())?
+        .join(format!(
+            "omgs-gate-{}",
+            crate::platform::random_nonce().map_err(|e| e.to_string())?
+        ));
+    crate::platform::create_private_dir_new(&path).map_err(|e| e.to_string())?;
+    let dir = GateDir(path);
     let checkout = dir.0.join("head");
     std::fs::create_dir(&checkout).map_err(|e| e.to_string())?;
     let paths = export_head(target, head, &checkout)?;
@@ -737,6 +740,7 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
             _ => return Err(format!("{}: test failed outside its recipe contract", t.id)),
         }
     }
+    std::fs::remove_dir_all(&dir.0).map_err(|e| format!("gate scratch cleanup failed: {e}"))?;
     Ok(blocked)
 }
 fn advisory_findings(run: &Path, p: &Policy) {

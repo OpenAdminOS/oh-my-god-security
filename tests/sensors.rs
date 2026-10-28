@@ -2,6 +2,23 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+fn fixture_parent() -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+    } else {
+        omgs::platform::temp_root().unwrap()
+    }
+}
+fn assert_no_scratch(data: &Path) {
+    if data.exists() {
+        assert!(!std::fs::read_dir(data).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("omgs-sensor-")));
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     bin: PathBuf,
@@ -11,7 +28,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
+        let root = fixture_parent().join(format!(
             "omgs-sensors-{}",
             &omgs::platform::random_nonce().unwrap()[..16]
         ));
@@ -22,7 +39,7 @@ impl Fixture {
         omgs::platform::create_private_dir_new(&root.join("temp")).unwrap();
         std::fs::write(root.join("rules.yaml"), "rules: []").unwrap();
         for path in [&bin, &target, &db] {
-            std::fs::create_dir(path).unwrap();
+            omgs::platform::create_private_dir_new(path).unwrap();
         }
         for name in [
             "src/main.rs",
@@ -68,8 +85,7 @@ impl Fixture {
     fn tool(&self, tool: &str, output: &str, exit: i32) {
         static LAUNCHER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         let launcher = LAUNCHER.get_or_init(|| {
-            let dir =
-                std::env::temp_dir().join(format!("omgs-sensor-fixture-{}", std::process::id()));
+            let dir = fixture_parent().join(format!("omgs-sensor-fixture-{}", std::process::id()));
             omgs::platform::create_private_dir(&dir).unwrap();
             let source = dir.join("sensor.rs");
             std::fs::write(&source, include_str!("fixtures/sensor.rs")).unwrap();
@@ -161,6 +177,7 @@ impl Fixture {
             std::fs::read_dir(temp).unwrap().next().is_none(),
             "leftover scanner scratch"
         );
+        assert_no_scratch(&self.root.join("home"));
         run
     }
 }
@@ -459,7 +476,7 @@ fn osv_versions_are_distinct_accountable_units() {
     }
 }
 
-// Run the helper in a child process so its private OS temp directory can be
+// Run the helper in a child process so its private data directory can be
 // selected without racing the environment of other tests.
 #[test]
 fn forced_timeout_removes_scratch() {
@@ -472,6 +489,7 @@ fn forced_timeout_removes_scratch() {
     let out = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "sensor_timeout_child", "--nocapture"])
         .env("OMGS_TIMEOUT_FIXTURE", &f.root)
+        .env("OMGS_HOME", f.root.join("home"))
         .env("TMPDIR", f.root.join("temp"))
         .env("TEMP", f.root.join("temp"))
         .env("TMP", f.root.join("temp"))
@@ -487,6 +505,7 @@ fn forced_timeout_removes_scratch() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    assert_no_scratch(&f.root.join("home"));
     assert!(std::fs::read_dir(f.root.join("temp"))
         .unwrap()
         .next()
@@ -555,7 +574,11 @@ fn unavailable_mxc_never_runs_a_sensor() {
         .env("OMGS_MXC_EXEC", f.root.join("missing-mxc"))
         .output()
         .unwrap();
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let r = read(&f.root.join("no-mxc/sensors.json"));
     assert!(r["tools_run"].as_array().unwrap().is_empty());
     assert!(r["gaps"]
@@ -592,8 +615,7 @@ fn scratch_inside_target_is_refused_before_creation() {
     f.tool("trufflehog", &truffle("src/main.rs").to_string(), 0);
     let out = Command::new(env!("CARGO_BIN_EXE_omgs"))
         .args([
-            "audit",
-            "init",
+            "check",
             "--target",
             f.target.to_str().unwrap(),
             "--out",
@@ -604,12 +626,17 @@ fn scratch_inside_target_is_refused_before_creation() {
             "OMGS_MXC_EXEC",
             omgs::sandbox::locate_executor().unwrap().path,
         )
+        .env("OMGS_HOME", &f.target)
         .env("TMPDIR", &f.target)
         .env("TEMP", &f.target)
         .env("TMP", &f.target)
         .output()
         .unwrap();
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let report = read(&f.root.join("overlap/sensors.json"));
     assert!(
         report["gaps"]
@@ -680,6 +707,7 @@ fn scratch_inside_artifacts_is_refused_before_creation() {
         f.tool("trufflehog", &truffle("src/main.rs").to_string(), 0);
         let run = f.root.join("artifact-overlap");
         omgs::platform::create_private_dir_new(&run).unwrap();
+        let audit = command[0] == "audit";
         let mut args = command;
         args.extend([
             "--target",
@@ -689,11 +717,20 @@ fn scratch_inside_artifacts_is_refused_before_creation() {
         ]);
         let out = f
             .command(&args)
+            .env("OMGS_HOME", &run)
             .env("TMPDIR", &run)
             .env("TEMP", &run)
             .env("TMP", &run)
             .output()
             .unwrap();
+        if audit {
+            // Policy provenance must reject this data/run overlap even before sensors.
+            assert!(!out.status.success());
+            assert!(String::from_utf8_lossy(&out.stderr)
+                .contains("trusted policy store must live outside the run directory"));
+            assert_no_scratch(&run);
+            continue;
+        }
         assert!(
             out.status.success(),
             "{}",
@@ -826,10 +863,15 @@ fn scratch_inside_readable_rules_is_refused_before_creation() {
             "--out",
             run.to_str().unwrap(),
         ])
+        .env("OMGS_HOME", &temp)
         .env("OMGS_SEMGREP_CONFIG", &temp)
         .output()
         .unwrap();
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let report = read(&run.join("sensors.json"));
     assert!(
         report["gaps"]
@@ -838,7 +880,7 @@ fn scratch_inside_readable_rules_is_refused_before_creation() {
         "{report}"
     );
     assert!(report["tools_run"].as_array().unwrap().is_empty());
-    assert!(std::fs::read_dir(temp).unwrap().next().is_none());
+    assert_no_scratch(&temp);
 }
 
 #[cfg(target_os = "linux")]
@@ -862,7 +904,11 @@ fn missing_linux_cgroup_scope_records_prove_gap() {
         .env("PATH", &f.bin)
         .output()
         .unwrap();
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let report = read(&run.join("sensors.json"));
     assert!(
         report["tools_run"]
@@ -995,7 +1041,11 @@ fn python_user_install_cannot_expose_shared_private_data() {
         .env("PATH", &bin)
         .output()
         .unwrap();
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let report = read(&run.join("sensors.json"));
     assert!(
         report["tools_run"]
@@ -1027,7 +1077,11 @@ fn python_user_install_cannot_expose_shared_private_data() {
         .env("USERPROFILE", &home)
         .output()
         .unwrap();
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let report = read(&f.root.join("python-boundary/sensors.json"));
     assert!(
         report["tools_run"]

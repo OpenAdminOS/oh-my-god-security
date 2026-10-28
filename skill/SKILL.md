@@ -44,22 +44,17 @@ canonical `TARGET`, private
 external `OUTPUT_DIR`, exact `SOURCE_REF` and `OMGS_BIN`. Keep reports, drafts, ledgers and retained
 artifacts outside the target, including after symlink resolution. Never silently mix revisions.
 
-Resolve the binary from PATH or the documented per-user cache. If missing, tell the user about the
-one-time verified OMGS bootstrap download before using the bundled platform script. Show its path
-and `omgs --version`, then inspect the installed command help. Stop on failed download or checksum
-checks.
-Run `omgs doctor` before initialization or hunting. If MXC is not ready, show its pinned release,
-checksums, platform member and destination, and follow the linked setup instructions. Rerun doctor;
-never substitute direct execution. Run `omgs doctor --live` before a proof recipe to check runtime
-reachability inside MXC.
+Follow SETUP.md for exact version matching, binary resolution (including `OMGS_HOME`), consent
+before downloads, and installer verification. Show the installed path, version and verification
+results. Run `omgs doctor` before initialization or hunting and `omgs doctor --live` before a proof
+recipe. Record readiness blockers; never substitute direct execution.
 
 Keep setup consent distinct from tier 2 consent. A general audit request does not approve tier 2.
 Only a person at a terminal may give that approval with `omgs approve --target <repo>`. Never run
-that command yourself. Review the setup consent prompt. Read
-[POLICY-AND-GATE.md](POLICY-AND-GATE.md) for headless
-options, replacement behavior and trusted-base policy. Show resolved mode and budget before calls.
-The bootstrap supplies OMGS only; MXC is a separate verified prerequisite. Proofs never install or
-fetch dependencies. Missing tools and offline databases are gaps, never permission to fetch.
+that command yourself. Read [POLICY-AND-GATE.md](POLICY-AND-GATE.md) for headless options,
+replacement behavior and trusted-base policy. Show resolved mode and budget before calls.
+Proofs never install or fetch dependencies. Missing tools and offline databases are gaps, never
+permission to fetch.
 
 ## Seven phases
 

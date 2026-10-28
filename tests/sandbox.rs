@@ -15,9 +15,10 @@ fn write_private_fixture(
 }
 
 fn scratch(name: &str) -> PathBuf {
-    let base = std::env::temp_dir()
+    let base = omgs::platform::temp_root()
+        .unwrap()
         .canonicalize()
-        .unwrap_or_else(|_| std::env::temp_dir());
+        .unwrap_or_else(|_| omgs::platform::temp_root().unwrap());
     static BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let base = BASE.get_or_init(|| {
         let base = base.join(format!("omgs-private-fixtures-{}", std::process::id()));
@@ -1165,6 +1166,7 @@ fn sensors_execute_resolved_paths_even_with_a_poisoned_current_directory() {
             d.join("reports").to_str().unwrap(),
         ])
         .env("PATH", format!(".:{}:/usr/bin:/bin", safe.display()))
+        .env("OMGS_HOME", d.join("data"))
         .env("OMGS_SEMGREP_CONFIG", rules)
         .env(
             "OMGS_MXC_EXEC",
@@ -1930,7 +1932,9 @@ fn socket_and_fifo_gaps_survive_validation_and_replay() {
     if !mxc_ready() {
         return;
     }
-    let d = PathBuf::from("/tmp").join(format!("omgs-s-{}", std::process::id()));
+    let d = std::fs::canonicalize("/tmp")
+        .unwrap()
+        .join(format!("omgs-s-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     omgs::platform::create_private_dir(&d).unwrap();
     let target = d.join("t");
@@ -2022,7 +2026,9 @@ fn symlink_proofs_replay_when_sockets_appear_or_disappear() {
     if !mxc_ready() {
         return;
     }
-    let d = PathBuf::from("/tmp").join(format!("omgs-sl-{}", std::process::id()));
+    let d = std::fs::canonicalize("/tmp")
+        .unwrap()
+        .join(format!("omgs-sl-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     omgs::platform::create_private_dir(&d).unwrap();
     let target = d.join("target");
