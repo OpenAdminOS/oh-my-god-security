@@ -71,6 +71,7 @@ fn usage() {
         "omgs {}\n\nUsage:\n  omgs setup [--yes | --dry-run] [--from <skill-dir>] [--install-skills] [--replace] [--verify-mxc] [--write-policy <repo> --mode gate|advisory]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--base <ref>] [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>]\n  omgs gate --target <checkout> --base <base-sha> --head <head-sha> [--run <dir>]\n  omgs stage --run <run-dir>\n    Only confirmed test_proven or higher with valid runner-attested proofs. Invalid proofs are excluded and reported; pending drafts stay in HANDOFF.md.\n  omgs handoff --run <run-dir> [--finding <id>]\n  omgs intent propose --run <run-dir>\n  omgs budget --run <run-dir>\n  omgs bench score --cases <manifest> --runs <run-dir> [--runs <run-dir>]...\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--persona builder|inheritor|team] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nBoolean options: --replace, --yes, --dry-run, --install-skills, --verify-mxc, --no-sensors and --live. Every other option takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
         env!("CARGO_PKG_VERSION")
     );
+    eprintln!("Sensors: trufflehog uses --no-verification --no-update; osv-scanner uses --offline-vulnerabilities and --offline with OMGS_OSV_DB (default: <OMGS data dir>/osv-db). No database download is automatic. See README for the explicit download step.");
 }
 
 /// Validate the complete option list before any command can mutate run state.
@@ -1500,8 +1501,23 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     if let Some(run) = &findings_dir {
         meta.artifact_base = omgs::report::artifact_base(dir, run)?;
     }
-    write_out(dir.join("REPORT.md"), render_markdown(&file, &meta)).map_err(|e| e.to_string())?;
-    write_out(dir.join("REPORT.html"), render_html(&file, &meta)).map_err(|e| e.to_string())?;
+    let sensors = findings_dir
+        .as_deref()
+        .map(omgs::sensors::read_report)
+        .transpose()?
+        .flatten();
+    let sensor_md = omgs::report::sensor_section(sensors.as_ref(), false);
+    let sensor_html = omgs::report::sensor_section(sensors.as_ref(), true);
+    write_out(
+        dir.join("REPORT.md"),
+        format!("{}{sensor_md}", render_markdown(&file, &meta)),
+    )
+    .map_err(|e| e.to_string())?;
+    write_out(
+        dir.join("REPORT.html"),
+        render_html(&file, &meta).replace("</body>", &format!("{sensor_html}</body>")),
+    )
+    .map_err(|e| e.to_string())?;
     write_out(dir.join("findings.sarif.json"), render_sarif(&file, &meta))
         .map_err(|e| e.to_string())?;
     write_handoff(dir, &handoff, &meta.artifact_base)?;
@@ -2277,7 +2293,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             "planned",
         ));
     }
-    let ledger = Ledger {
+    let mut ledger = Ledger {
         units,
         ..Ledger::default()
     };
@@ -2347,6 +2363,17 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
     .map_err(|e| e.to_string())?;
     if !has(rest, "--no-sensors") {
         let sensors = run_sensors(&target, &out_abs);
+        omgs::sensors::seed_units(&sensors, &mut ledger);
+        write_out(
+            out_abs.join("coverage-ledger.json"),
+            serde_json::to_string_pretty(&ledger).unwrap(),
+        )
+        .map_err(|e| e.to_string())?;
+        write_out(
+            out_abs.join("sensor-hits.json"),
+            serde_json::to_string_pretty(&sensors.hits).unwrap(),
+        )
+        .map_err(|e| e.to_string())?;
         write_out(
             out_abs.join("sensors.json"),
             serde_json::to_string_pretty(&sensors).unwrap_or_default(),
@@ -2505,8 +2532,16 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
             );
         }
     }
+    for gap in &sensors.gaps {
+        println!("sensor gap: {gap}");
+    }
     if let Some(out) = flag(args, "--out") {
         let dir = PathBuf::from(out);
+        write_out(
+            dir.join("sensor-hits.json"),
+            serde_json::to_string_pretty(&sensors.hits).unwrap(),
+        )
+        .map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         write_out(
             dir.join("sensors.json"),
@@ -3529,6 +3564,21 @@ mod cli_tests {
                         "probe",
                         "version",
                         "opt",
+                        "no-ignore-tag",
+                        "no-ignore",
+                        "no-git-ignore",
+                        "disable-nosem",
+                        "max-target-bytes",
+                        "max-memory",
+                        "jobs",
+                        "no-verification",
+                        "no-update",
+                        "json",
+                        "offline-vulnerabilities",
+                        "offline",
+                        "no-call-analysis",
+                        "no-resolve",
+                        "download-offline-databases",
                         "no-pager",
                         "no-replace-objects",
                         "verify",
