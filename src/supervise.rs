@@ -486,6 +486,44 @@ fn reader<R: Read + Send + 'static>(
         .map(|_| ())
 }
 
+// Darwin's pipe()+fcntl() is not atomic against unrelated concurrent spawns.
+// Open anonymous FIFOs with O_CLOEXEC atomically instead, then unlink them.
+#[cfg(target_os = "macos")]
+fn capture_pipe() -> io::Result<(std::fs::File, std::fs::File)> {
+    use std::ffi::CString;
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, OpenOptionsExt},
+    };
+    let dir = std::env::temp_dir().join(format!("omgs-pipe-{}", crate::platform::random_nonce()?));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let path = dir.join("pipe");
+    let result = (|| {
+        let name = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in temp path"))?;
+        // SAFETY: name is NUL terminated; the parent is private to this run.
+        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // std's Unix File opens set O_CLOEXEC in open(), without a race.
+        let read = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(&path)?;
+        let write = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        Ok((read, write))
+    })();
+    let unlink = std::fs::remove_file(&path);
+    let remove = std::fs::remove_dir(&dir);
+    let pair = result?;
+    unlink?;
+    remove?;
+    Ok(pair)
+}
+
 #[cfg(unix)]
 fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     let fd = pipe.as_raw_fd();
@@ -544,11 +582,26 @@ fn prepare_unix(cmd: &mut Command, limits: &Limits) -> io::Result<Vec<String>> {
             enforced.push(format!("{name}={value}{suffix}"));
         }
     }
+    #[cfg(target_os = "macos")]
+    let descriptor_bound = unsafe { libc::getdtablesize() };
     cmd.process_group(0);
-    // SAFETY: all data is prepared before fork; the callback uses only setrlimit
+    // SAFETY: all data is prepared before fork; the callback uses only fcntl, setrlimit
     // and errno access, which do not acquire Rust locks or allocate on success.
     unsafe {
         cmd.pre_exec(move || {
+            // Darwin has no pipe2(O_CLOEXEC). A concurrent spawn can fork
+            // between pipe() and fcntl(FD_CLOEXEC), inheriting another run's
+            // write end. Seal all non-stdio descriptors in the child before
+            // exec, including Rust's exec-error pipe (already CLOEXEC).
+            // Do this before lowering RLIMIT_NOFILE, which could hide fds.
+            #[cfg(target_os = "macos")]
+            for fd in 3..descriptor_bound {
+                if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                    && io::Error::last_os_error().raw_os_error() != Some(libc::EBADF)
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
             for (resource, value, _, _) in settings {
                 if let Some(value) = value {
                     let limit = libc::rlimit {
@@ -1289,9 +1342,23 @@ fn run_inner(
         }
         cmd.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(Stdio::null());
+    #[cfg(target_os = "macos")]
+    let (stdout, stderr) = match capture_pipe().and_then(|out| capture_pipe().map(|err| (out, err)))
+    {
+        Ok(((stdout, out), (stderr, err))) => {
+            cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
+            (stdout, stderr)
+        }
+        Err(error) => {
+            result.executor_error = true;
+            result.output = format!("failed to prepare output pipes: {error}");
+            result.notes.push(result.output.clone());
+            return result;
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -1302,6 +1369,9 @@ fn run_inner(
             return result;
         }
     };
+    // File-backed Stdio remains owned by Command after spawn. Close the
+    // parent's writers before reading, otherwise EOF could never arrive.
+    drop(cmd);
     #[cfg(windows)]
     result
         .enforced
@@ -1347,8 +1417,16 @@ fn run_inner(
             }
         };
     }
-    start_reader!(child.stdout.take(), 0);
-    start_reader!(child.stderr.take(), 1);
+    #[cfg(target_os = "macos")]
+    {
+        start_reader!(Some(stdout), 0);
+        start_reader!(Some(stderr), 1);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        start_reader!(child.stdout.take(), 0);
+        start_reader!(child.stderr.take(), 1);
+    }
     drop(tx);
     let waited = wait(
         &mut child,

@@ -375,3 +375,83 @@ fn windows_wall_clock_kills_executor_and_discloses_owner_job() {
                 .contains("an owned kill-on-close job terminates descendants if OMGS dies"))
     );
 }
+
+// Deliberately reproduce the Darwin pipe()/fcntl() window: the writer has no
+// CLOEXEC bit when the executor forks. A long unrelated child must not keep it.
+#[cfg(target_os = "macos")]
+#[test]
+fn executor_does_not_inherit_another_spawns_pipe() {
+    // Other tests deliberately spawn children without the supervisor. Isolate
+    // the intentionally inheritable descriptor so it cannot leak into them.
+    if std::env::var_os("OMGS_INHERITANCE_CHILD").is_none() {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "executor_does_not_inherit_another_spawns_pipe",
+                "--nocapture",
+            ])
+            .env("OMGS_INHERITANCE_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        return;
+    }
+    use std::io::Read;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let mut read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
+    assert_eq!(
+        unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    std::thread::scope(|scope| {
+        let child = scope.spawn(|| run(shell("sleep 1"), &limits(), None));
+        // Wait for a second child to inspect its own inherited writer. This
+        // also checks the descriptor directly, independent of EOF scheduling.
+        let result = run(
+            shell(&format!("test ! -e /dev/fd/{}", fds[1])),
+            &limits(),
+            None,
+        );
+        drop(write);
+        assert!(result.success, "{result:?}");
+        assert_eq!(read.read(&mut [0u8; 1]).unwrap(), 0);
+        assert!(child.join().unwrap().success);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_short_marked_runs_complete_capture() {
+    std::thread::scope(|scope| {
+        // Unmarked calls can spawn concurrently with marked calls even though
+        // the process-wide signal guard serializes marked supervisors.
+        let busy: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    for _ in 0..12 {
+                        let result =
+                            run(shell("sleep 0.02; printf background >&2"), &limits(), None);
+                        assert!(result.success && result.capture_complete, "{result:?}");
+                    }
+                })
+            })
+            .collect();
+        let marked: Vec<_> = (0..8).map(|_| scope.spawn(|| {
+            for _ in 0..12 {
+                let result = omgs::supervise::run_marked(
+                    shell("printf 'OMGS_START_stress\\nOMGS_END_stress:1\\n'; echo diagnostic >&2; exit 1"),
+                    &limits(), None, "stress");
+                assert!(result.capture_complete && result.cleanup_complete, "{result:?}");
+                assert!(result.command_started && result.command_finished, "{result:?}");
+                assert_eq!(result.exit_code, Some(1));
+            }
+        })).collect();
+        for thread in busy.into_iter().chain(marked) {
+            thread.join().unwrap();
+        }
+    });
+}
