@@ -1261,10 +1261,17 @@ mod sweep {
                 if !seen.contains(&identity) {
                     let command = match command(pid) {
                         Some(command) => command,
-                        // A matched process that exits on its own before its
-                        // command can be read did not survive the run.
+                        // It outlived the run, so it stays a survivor, but
+                        // exiting before its command was read is not a
+                        // cleanup failure. Rescan for anything it forked.
                         None if matches!(info(pid), Err(ref e) if e.raw_os_error() == Some(libc::ESRCH)) =>
                         {
+                            result.survivors.push(Survivor {
+                                pid,
+                                command: "exited before its command was read".into(),
+                            });
+                            seen.push(identity);
+                            found = true;
                             continue;
                         }
                         None => {
