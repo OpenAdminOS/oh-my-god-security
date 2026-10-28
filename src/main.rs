@@ -1062,17 +1062,30 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         // A toolchain on the host PATH may still be out of reach inside, for
         // example under a version manager in the home directory.
         let names: Vec<&str> = tools.iter().map(|t| t.as_str()).collect();
-        let cmd = if os == "windows" {
-            format!(
-                "cmd.exe /d /c for %t in ({}) do @where %t && echo omgs-reach %t",
-                names.join(" ")
-            )
+        // Launch the tools: lookup cannot establish DLL or proxy readiness.
+        // The old Windows `for %t ...` also crossed a generated batch file,
+        // where percent expansion broke it ("do was unexpected at this time").
+        // Use fixed commands without loop variables or nested cmd invocations.
+        let mut cmd = names
+            .iter()
+            .map(|name| {
+                let flag = if *name == "java" {
+                    "-version"
+                } else {
+                    "--version"
+                };
+                format!("({name} {flag} > tool-{name}.txt 2>&1 && echo omgs-reach {name})")
+            })
+            .collect::<Vec<_>>()
+            .join(if os == "windows" { " & " } else { "; " });
+        if !cmd.is_empty() {
+            cmd.push_str(if os == "windows" { " & " } else { "; " });
+        }
+        cmd.push_str(if os == "windows" {
+            "exit /b 0"
         } else {
-            format!(
-                "for t in {}; do command -v $t >/dev/null 2>&1 && echo omgs-reach $t; done; exit 0",
-                names.join(" ")
-            )
-        };
+            "exit 0"
+        });
         let reach = ProveRequest {
             command: cmd,
             test: None,
@@ -1096,6 +1109,14 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         };
         {
             let r = reach_outcome;
+            if !r.run.success {
+                let _ = std::fs::remove_dir_all(&probe);
+                eprintln!(
+                    "needs_validation: toolchain reachability probe did not complete: {}",
+                    omgs::platform::escape_controls(&r.run.output)
+                );
+                return Err("__EXIT3__".into());
+            }
             let found = |n: &str| {
                 r.run
                     .output
@@ -1114,9 +1135,12 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             );
             if !outside.is_empty() {
                 println!(
-                    "on PATH here but NOT reachable inside the sandbox: {} (proofs that need them fail; install them system wide)",
+                    "on PATH here but NOT reachable inside the sandbox: {} (proofs that need them are blocked)",
                     outside.join(", ")
                 );
+                for name in outside {
+                    println!("{name} not reachable inside the sandbox");
+                }
             }
         }
         let _ = std::fs::remove_dir_all(&probe);

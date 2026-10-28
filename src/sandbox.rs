@@ -442,6 +442,7 @@ pub fn environment_keys(os: &str) -> Vec<&'static str> {
             "TEMP",
             "TMP",
             "PATH",
+            "PATHEXT",
         ]
     } else {
         vec![
@@ -456,7 +457,12 @@ pub fn environment_keys(os: &str) -> Vec<&'static str> {
     if os == "macos" {
         keys.push("OPENSSL_CONF");
     }
-    keys.extend(["CARGO_HOME", "CARGO_NET_OFFLINE", "RUSTUP_HOME"]);
+    keys.extend([
+        "CARGO_HOME",
+        "CARGO_NET_OFFLINE",
+        "RUSTUP_HOME",
+        "RUSTUP_AUTO_INSTALL",
+    ]);
     keys
 }
 
@@ -473,7 +479,8 @@ pub fn environment(
             format!("LOCALAPPDATA={scratch}"),
             format!("TEMP={scratch}"),
             format!("TMP={scratch}"),
-            "PATH=C:\\Windows\\System32;C:\\Windows;C:\\Program Files\\PowerShell\\7;C:\\Program Files\\nodejs;C:\\Program Files\\Git\\cmd".into(),
+            format!("PATH={system_root}\\System32;{system_root};C:\\Program Files\\PowerShell\\7;C:\\Program Files\\nodejs;C:\\Program Files\\Git\\cmd"),
+            "PATHEXT=.COM;.EXE;.BAT;.CMD".into(),
         ]
     } else {
         let mut path = if os == "macos" {
@@ -508,6 +515,7 @@ pub fn environment(
             env.push(format!("RUSTUP_HOME={}", mxc_path(rh)));
         }
     }
+    env.push("RUSTUP_AUTO_INSTALL=0".into());
     env
 }
 
