@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "results": [
+        {
+          "fingerprints": {
+            "omgs/v1": "omgs-5b50042f28bdda9f"
+          },
+          "level": "note",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/orders.ts"
+                },
+                "region": {
+                  "startLine": 12
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/archive.ts"
+                },
+                "region": {
+                  "startLine": 24
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Public export intent is unknown: The export may be public. Missing fact: Should exports be restricted to their owner? Validation plan: establish intended access before proving the boundary."
+          },
+          "properties": {
+            "proof_ref": null,
+            "proof_tier": "traced",
+            "severity": null,
+            "verdict": "needs_validation"
+          },
+          "ruleId": "export_scope",
+          "ruleIndex": 0
+        },
+        {
+          "fingerprints": {
+            "omgs/v1": "omgs-9ba0b103c26cfc35"
+          },
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/orders.ts"
+                },
+                "region": {
+                  "startLine": 12
+                }
+              }
+            },
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "src/archive.ts"
+                },
+                "region": {
+                  "startLine": 24
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Order readable across accounts: A dummy caller reads another account order. Trace: request id reaches orders.load. Sandbox evidence: the invariant fails and the authorized control succeeds."
+          },
+          "properties": {
+            "proof_ref": "proofs/1.json",
+            "proof_tier": "test_proven",
+            "severity": "high",
+            "verdict": "confirmed"
+          },
+          "ruleId": "tenant_isolation",
+          "ruleIndex": 1
+        }
+      ],
+      "tool": {
+        "driver": {
+          "informationUri": "https://github.com/OpenAdminOS/oh-my-god-security",
+          "name": "omgs",
+          "rules": [
+            {
+              "fullDescription": {
+                "text": "Review the evidence, trust boundary and proof tier before acting."
+              },
+              "help": {
+                "text": "Fix only confirmed findings with authorization. Preserve the proof test and authorized control, rerun through omgs prove and obtain independent verification. Needs validation records require the missing fact before fixing."
+              },
+              "helpUri": "https://github.com/OpenAdminOS/oh-my-god-security#what-a-proof-record-does-and-does-not-prove",
+              "id": "export_scope",
+              "shortDescription": {
+                "text": "Security boundary: export_scope"
+              }
+            },
+            {
+              "fullDescription": {
+                "text": "Review the evidence, trust boundary and proof tier before acting."
+              },
+              "help": {
+                "text": "Fix only confirmed findings with authorization. Preserve the proof test and authorized control, rerun through omgs prove and obtain independent verification. Needs validation records require the missing fact before fixing."
+              },
+              "helpUri": "https://github.com/OpenAdminOS/oh-my-god-security#what-a-proof-record-does-and-does-not-prove",
+              "id": "tenant_isolation",
+              "shortDescription": {
+                "text": "Security boundary: tenant_isolation"
+              }
+            }
+          ],
+          "version": "0.1.0"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

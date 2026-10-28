@@ -76,9 +76,9 @@ parent-owned full-diff reviews and PR creation are separate from this implementa
 
 ## PR 3: output people can trust and act on (`feat/report-handoff`)
 
-- [ ] HANDOFF.md, handoff.json, `omgs handoff`
-- [ ] `omgs stage` proposed-tests.patch
-- [ ] REPORT.md parity, timeline, SARIF rules and levels, metadata defaults
+- [x] HANDOFF.md, handoff.json, `omgs handoff`
+- [x] `omgs stage` proposed-tests.patch
+- [x] REPORT.md parity, timeline, SARIF rules and levels, metadata defaults
 - [ ] trufflehog and osv-scanner run; sensor hits become candidates
 
 ## PR 4: committed policy, gate and setup (`feat/policy-gate-setup`)
