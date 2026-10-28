@@ -3661,6 +3661,76 @@ mod cli_tests {
     }
 
     #[test]
+    fn doctor_budget_stops_real_scratch_recovery() {
+        const MODE: &str = "OMGS_TEST_DOCTOR_RECOVERY";
+        if let Ok(mode) = std::env::var(MODE) {
+            if mode == "seed" {
+                let scratch = omgs::scratch::Scratch::create("sensor").unwrap();
+                std::fs::write(scratch.path().join("raw"), b"discard").unwrap();
+                // Process exit releases the lock without running owner cleanup.
+                std::mem::forget(scratch);
+                return;
+            }
+            let home = omgs::platform::scratch_root().unwrap();
+            let orphan = std::fs::read_dir(&home)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.join("payload/raw").is_file())
+                .expect("seeded orphan");
+            let result = super::doctor_live_with_budget(std::time::Duration::ZERO, |remaining| {
+                let recovery = omgs::scratch::recover();
+                println!(
+                    "recover_result={recovery:?}, orphan_exists={}",
+                    orphan.exists()
+                );
+                assert!(recovery
+                    .as_ref()
+                    .is_err_and(|e| e.contains("deadline exceeded")));
+                assert!(orphan.join("payload/raw").is_file());
+                assert_eq!(remaining.len(), super::DOCTOR_TOOLS.len() + 1);
+                recovery
+            });
+            assert_eq!(result, Err("__EXIT1__".into()));
+            // The next run can still validate ownership and finish recovery.
+            omgs::scratch::recover().unwrap();
+            assert!(!orphan.exists());
+            return;
+        }
+        let home = omgs::platform::temp_root().unwrap().join(format!(
+            "omgs-doctor-recovery-{}",
+            omgs::platform::random_nonce().unwrap()
+        ));
+        omgs::platform::create_private_dir_new(&home).unwrap();
+        for mode in ["seed", "recover"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli_tests::doctor_budget_stops_real_scratch_recovery",
+                    "--nocapture",
+                ])
+                .env("OMGS_HOME", &home)
+                .env(MODE, mode)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.status.success() || mode == "recover" {
+                std::fs::remove_dir_all(&home).unwrap();
+            }
+            assert!(output.status.success(), "{mode}: {stdout}\n{stderr}");
+            if mode == "recover" {
+                println!("{stdout}{stderr}");
+                assert!(stderr.contains("overall wall-clock deadline of 0s exceeded"));
+                for name in ["outside-file denial", "sh", "java"] {
+                    assert!(stdout.contains(&format!(
+                        "{name} not checked: overall doctor deadline exceeded"
+                    )));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn doctor_shell_probe_and_unreachable_reasons() {
         assert_eq!(super::doctor_probe_command("macos", "sh"), "sh -c 'exit 0'");
         for os in ["macos", "linux", "windows"] {

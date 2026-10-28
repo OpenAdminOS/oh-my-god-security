@@ -78,7 +78,8 @@ pub fn open(dir: &File, name: &OsStr, directory: bool) -> io::Result<File> {
 }
 
 #[cfg(unix)]
-pub fn names(dir: &File) -> io::Result<Vec<OsString>> {
+pub fn names_checked(dir: &File, check: &impl Fn() -> io::Result<()>) -> io::Result<Vec<OsString>> {
+    check()?;
     use std::os::fd::IntoRawFd;
     use std::os::unix::ffi::OsStrExt;
     // Open '.', rather than dup: each enumeration needs an independent offset.
@@ -99,6 +100,7 @@ pub fn names(dir: &File) -> io::Result<Vec<OsString>> {
     let stream = Stream(ptr);
     let mut names = Vec::new();
     loop {
+        check()?;
         #[cfg(target_os = "macos")]
         unsafe {
             *libc::__error() = 0;
@@ -123,7 +125,8 @@ pub fn names(dir: &File) -> io::Result<Vec<OsString>> {
 }
 
 #[cfg(windows)]
-pub fn names(dir: &File) -> io::Result<Vec<OsString>> {
+pub fn names_checked(dir: &File, check: &impl Fn() -> io::Result<()>) -> io::Result<Vec<OsString>> {
+    check()?;
     use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
     extern "system" {
         fn GetFileInformationByHandleEx(
@@ -138,6 +141,7 @@ pub fn names(dir: &File) -> io::Result<Vec<OsString>> {
     let mut class = 11; // FileIdBothDirectoryRestartInfo
     let mut names = Vec::new();
     loop {
+        check()?;
         if unsafe {
             GetFileInformationByHandleEx(
                 dir.as_raw_handle(),
@@ -159,6 +163,7 @@ pub fn names(dir: &File) -> io::Result<Vec<OsString>> {
             unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 8) };
         let mut offset = 0;
         loop {
+            check()?;
             let field = |at: usize| -> io::Result<usize> {
                 Ok(u32::from_ne_bytes(
                     bytes
@@ -233,6 +238,19 @@ fn delete_handle(file: &File) -> io::Result<()> {
     Ok(())
 }
 
+// Metadata teardown must remain a fixed number of leaf operations, even if
+// another process substitutes a directory after validation.
+pub fn remove_file(dir: &File, name: &OsStr) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        unlink(dir, name, false)
+    }
+    #[cfg(windows)]
+    {
+        delete_handle(&open(dir, name, false)?)
+    }
+}
+
 // Each frame owns a directory while it is inspected. Windows keeps all handles
 // to pin ancestor names against replacement. Unix keeps a bounded window and
 // reopens an evicted parent only through its held child's "..", checking the
@@ -247,9 +265,9 @@ struct RemovalFrame {
     identity: (u64, u64),
 }
 impl RemovalFrame {
-    fn new(dir: File, _name: &OsStr) -> io::Result<Self> {
+    fn new(dir: File, _name: &OsStr, check: &impl Fn() -> io::Result<()>) -> io::Result<Self> {
         Ok(Self {
-            entries: names(&dir)?.into_iter(),
+            entries: names_checked(&dir, check)?.into_iter(),
             #[cfg(unix)]
             identity: crate::platform::held_directory_identity(&dir)?,
             dir: Some(dir),
@@ -286,14 +304,24 @@ fn removal_directory(dir: &File, name: &OsStr) -> io::Result<Option<File>> {
 }
 
 pub fn remove(dir: &File, name: &OsStr) -> io::Result<()> {
+    remove_checked(dir, name, &|| Ok(()))
+}
+
+pub fn remove_checked(
+    dir: &File,
+    name: &OsStr,
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    check()?;
     let Some(child) = removal_directory(dir, name)? else {
         return Ok(());
     };
-    let mut stack = vec![RemovalFrame::new(child, name)?];
+    let mut stack = vec![RemovalFrame::new(child, name, check)?];
     while let Some(frame) = stack.last_mut() {
+        check()?;
         if let Some(entry) = frame.entries.next() {
             if let Some(child) = removal_directory(frame.dir.as_ref().unwrap(), &entry)? {
-                let next = RemovalFrame::new(child, &entry)?;
+                let next = RemovalFrame::new(child, &entry, check)?;
                 #[cfg(unix)]
                 if stack.len() >= 16 {
                     // Leave room for enumeration, locks and unrelated runtime

@@ -55,7 +55,7 @@ impl Scratch {
         }
         platform::check_private_dir(parent).map_err(|e| e.to_string())?;
         crate::runmeta::with_lock_file(&parent.join(LOCK), || {
-            report(recover_in(parent)?);
+            report(recover_in(parent)?)?;
             crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
             let name = format!(
                 "omgs-{kind}-{}",
@@ -135,6 +135,7 @@ impl Scratch {
                 &root,
                 &self.root,
                 &mut self.lock,
+                &|| Ok(()),
                 remove_payload,
             )
             .map_err(|e| format!("scratch cleanup failed: {e}"))?;
@@ -194,6 +195,14 @@ fn valid_name(name: &str) -> bool {
     })
 }
 fn validate_held(root: &File, name: &str) -> Result<(), String> {
+    validate_held_checked(root, name, &|| Ok(()))
+}
+fn validate_held_checked(
+    root: &File,
+    name: &str,
+    check: &impl Fn() -> std::io::Result<()>,
+) -> Result<(), String> {
+    check().map_err(|e| e.to_string())?;
     platform::check_private_dir_handle(root).map_err(|e| e.to_string())?;
     let owner_file =
         fs::open(root, std::ffi::OsStr::new(OWNER), false).map_err(|e| e.to_string())?;
@@ -210,7 +219,8 @@ fn validate_held(root: &File, name: &str) -> Result<(), String> {
     {
         return Err("scratch ownership record mismatch".into());
     }
-    for name in fs::names(root).map_err(|e| e.to_string())? {
+    for name in fs::names_checked(root, check).map_err(|e| e.to_string())? {
+        check().map_err(|e| e.to_string())?;
         if ![LOCK, OWNER, PAYLOAD].iter().any(|n| name == *n) {
             return Err("unexpected scratch layout".into());
         }
@@ -224,22 +234,30 @@ fn validate_held(root: &File, name: &str) -> Result<(), String> {
 
 /// Report invalid/foreign entries without deleting them. Active locks are skipped.
 pub fn recover() -> Result<(), String> {
+    crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
     let parent = platform::scratch_root().map_err(|e| e.to_string())?;
-    crate::runmeta::with_lock_file(&parent.join(LOCK), || {
-        report(recover_in(&parent)?);
-        Ok(())
-    })
+    crate::runmeta::with_lock_file_checked(
+        &parent.join(LOCK),
+        crate::supervise::check_interrupted,
+        || {
+            report(recover_in(&parent)?)?;
+            Ok(())
+        },
+    )
 }
-fn report(warnings: Vec<String>) {
+fn report(warnings: Vec<String>) -> Result<(), String> {
     for warning in warnings {
+        crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
         eprintln!("{}", platform::escape_controls(&warning));
     }
+    crate::supervise::check_interrupted().map_err(|e| e.to_string())
 }
 fn remove_layout(
     parent: &File,
     root: &File,
     path: &Path,
     lock: &mut Option<File>,
+    check: &impl Fn() -> std::io::Result<()>,
     remove_payload: impl FnOnce(&File) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     match remove_payload(root) {
@@ -247,24 +265,30 @@ fn remove_layout(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    fs::remove(root, std::ffi::OsStr::new(OWNER))?;
+    // Payload removal is resumable while both ownership files remain. Once
+    // it finishes, commit the fixed-size metadata teardown without another
+    // cancellation point that could strand an ownerless layout.
+    check()?;
+    fs::remove_file(root, std::ffi::OsStr::new(OWNER))?;
     // Retain the run lock on payload/owner failure so cleanup can safely retry.
     // A failure after taking it stays failed rather than claiming success.
     drop(lock.take());
-    fs::remove(root, std::ffi::OsStr::new(LOCK))?;
+    fs::remove_file(root, std::ffi::OsStr::new(LOCK))?;
     fs::remove_root(parent, path.file_name().unwrap(), root)
 }
 fn recover_in(parent: &Path) -> Result<Vec<String>, String> {
     let held = fs::open_parent(parent).map_err(|e| e.to_string())?;
-    recover_held(parent, &held, || {})
+    recover_held(parent, &held, &crate::supervise::check_interrupted, || {})
 }
 fn recover_held(
     parent: &Path,
     held: &File,
+    check: &impl Fn() -> std::io::Result<()>,
     mut after_validate: impl FnMut(),
 ) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
-    for name in fs::names(held).map_err(|e| e.to_string())? {
+    for name in fs::names_checked(held, check).map_err(|e| e.to_string())? {
+        check().map_err(|e| e.to_string())?;
         let name_text = name.to_string_lossy();
         if !name_text.starts_with("omgs-gate-") && !name_text.starts_with("omgs-sensor-") {
             continue;
@@ -278,7 +302,7 @@ fn recover_held(
                 Err(e) if e.raw_os_error() == Some(32) => return Ok(()),
                 Err(e) => return Err(e.to_string()),
             };
-            validate_held(&root, &name_text)?;
+            validate_held_checked(&root, &name_text, check)?;
             let lock = open_lock(&root)?;
             match lock.try_lock() {
                 Ok(()) => {}
@@ -286,10 +310,10 @@ fn recover_held(
                 Err(e) => return Err(e.to_string()),
             }
             let root = fs::pin_removal(&root).map_err(|e| e.to_string())?;
-            validate_held(&root, &name_text)?;
+            validate_held_checked(&root, &name_text, check)?;
             after_validate();
-            remove_layout(held, &root, &path, &mut Some(lock), |root| {
-                fs::remove(root, std::ffi::OsStr::new(PAYLOAD))
+            remove_layout(held, &root, &path, &mut Some(lock), check, |root| {
+                fs::remove_checked(root, std::ffi::OsStr::new(PAYLOAD), check)
             })
             .map_err(|e| e.to_string())
         };
@@ -297,12 +321,15 @@ fn recover_held(
             let mut reap = reap;
             reap()
         } {
+            // Cancellation is incomplete recovery, never an ignorable warning.
+            check().map_err(|e| e.to_string())?;
             warnings.push(format!(
                 "scratch recovery left {} alone: {e}",
                 path.display()
             ));
         }
     }
+    check().map_err(|e| e.to_string())?;
     Ok(warnings)
 }
 
@@ -713,6 +740,60 @@ mod tests {
         std::fs::remove_dir_all(parent).unwrap();
     }
     #[test]
+    fn interrupted_recovery_preserves_ownership_until_payload_removal_finishes() {
+        let parent = parent();
+        let scratch = Scratch::create_in(&parent, "gate", |_| Ok(())).unwrap();
+        let first = scratch.path().join("nested/first");
+        let second = scratch.path().join("nested/second");
+        std::fs::create_dir(first.parent().unwrap()).unwrap();
+        std::fs::write(&first, b"discard").unwrap();
+        std::fs::write(&second, b"discard").unwrap();
+        let root = abandon(scratch);
+        let held = fs::open_parent(&parent).unwrap();
+        let owner = std::fs::read(root.join(OWNER)).unwrap();
+        let timeout = || std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline exceeded");
+        let calls = std::cell::Cell::new(0);
+        for stage in ["enumeration", "recursive removal", "metadata teardown"] {
+            let error = recover_held(
+                &parent,
+                &held,
+                &|| {
+                    calls.set(calls.get() + 1);
+                    let stop = match stage {
+                        "enumeration" => calls.get() >= 3,
+                        "recursive removal" => !first.exists() || !second.exists(),
+                        _ => !root.join(PAYLOAD).exists(),
+                    };
+                    if stop {
+                        Err(timeout())
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {},
+            )
+            .unwrap_err();
+            assert!(error.contains("deadline exceeded"), "{stage}: {error}");
+            assert_eq!(std::fs::read(root.join(OWNER)).unwrap(), owner);
+            assert!(root.join(LOCK).is_file());
+            validate_held(
+                &fs::open_root(&held, root.file_name().unwrap()).unwrap(),
+                &name_for(&root).unwrap(),
+            )
+            .unwrap();
+            if stage == "enumeration" {
+                assert!(first.exists() && second.exists());
+            } else if stage == "recursive removal" {
+                assert_ne!(first.exists(), second.exists());
+            }
+        }
+        assert!(recover_in(&parent).unwrap().is_empty());
+        assert!(!root.exists());
+        drop(held);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
     fn recovery_reaps_abandoned_but_preserves_active_and_invalid() {
         let parent = parent();
         let abandoned = Scratch::create_in(&parent, "gate", |_| Ok(())).unwrap();
@@ -787,7 +868,7 @@ mod tests {
         let moved = parent.join("admitted-moved");
         let mut attempted = false;
         let mut swapped = false;
-        let warnings = recover_held(&parent, &held, || {
+        let warnings = recover_held(&parent, &held, &|| Ok(()), || {
             attempted = true;
             match std::fs::rename(&abandoned, &moved) {
                 Ok(()) => {}
