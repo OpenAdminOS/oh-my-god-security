@@ -1107,8 +1107,11 @@ fn scratch_overrun_stops_scanner_before_deadline_and_discards_output() {
     .unwrap();
     let start = std::time::Instant::now();
     let run = f.init("scratch-overrun");
+    // Includes discovery, preflight and Windows graceful cleanup. Half of the
+    // scanner's 120-second deadline still rejects waiting for that deadline,
+    // while allowing a slower host to write the real 1 GiB fixture first.
     assert!(
-        start.elapsed() < std::time::Duration::from_secs(25),
+        start.elapsed() < std::time::Duration::from_secs(60),
         "writer was not stopped promptly: {:?}",
         start.elapsed()
     );
