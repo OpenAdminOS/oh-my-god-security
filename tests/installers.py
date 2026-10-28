@@ -24,7 +24,8 @@ def sha(path):
 
 class Installers(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix='omgs-installer-')
+        self.tmp = tempfile.TemporaryDirectory(prefix='omgs-installer-',
+                                               dir=os.environ['USERPROFILE'] if os.name == 'nt' else None)
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.skill = self.root / 'skill'
@@ -113,6 +114,8 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
         # Use a custom root with spaces and seed all three previous files.
         home = self.root / 'custom install'
         self.env['OMGS_HOME'] = str(home)
+        initial = self.run_install()
+        self.assertEqual(initial.returncode, 0, initial.stdout + initial.stderr)
         previous = {
             Path('bin') / ('omgs.exe' if self.windows else 'omgs'): b'previous binary',
             Path('mxc/1.0.1') / ('wxc-exec.exe' if self.windows else 'mxc-exec-mac'): b'previous executor',
@@ -171,6 +174,115 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
             executor = next(p for p in files if p.name not in ('omgs', 'omgs.exe', 'MXC-LICENSE.txt'))
             self.assertEqual(sha(executor), self.executor_hash)
             self.assertEqual(sha(home / 'mxc/1.0.1/MXC-LICENSE.txt'), sha(self.bundle / 'MXC-LICENSE.txt'))
+
+    @unittest.skipIf(os.name == 'nt', 'Unix permissions')
+    def test_new_directories_are_private_under_permissive_umasks(self):
+        self.fake_verifiers()
+        for mask in (0o022, 0o000):
+            home = self.root / f'home-{mask:o}'
+            self.env['OMGS_HOME'] = str(home)
+            old = os.umask(mask)
+            try:
+                out = self.run_install()
+            finally:
+                os.umask(old)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            for directory in [home] + [p for p in home.rglob('*') if p.is_dir()]:
+                self.assertEqual(directory.stat().st_mode & 0o7777, 0o700, str(directory))
+
+    @unittest.skipIf(os.name == 'nt', 'Unix permissions')
+    def test_insecure_custom_home_and_ancestors_are_rejected(self):
+        self.fake_verifiers()
+        for relative, mode in [('bin', 0o777), ('mxc', 0o775), ('', 0o777)]:
+            with self.subTest(relative=relative):
+                home = self.root / ('unsafe-' + (relative or 'root'))
+                unsafe = home / relative
+                unsafe.mkdir(parents=True)
+                unsafe.chmod(mode)
+                self.env['OMGS_HOME'] = str(home)
+                out = self.run_install()
+                self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+                self.assertIn(str(unsafe), out.stderr)
+                self.assertIn('not be group- or world-writable', out.stderr)
+                self.assertEqual(unsafe.stat().st_mode & 0o7777, mode)
+                self.assertFalse(any(p.is_file() for p in home.rglob('*')))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACLs')
+    def test_windows_created_directories_have_owner_only_protected_dacl(self):
+        self.fake_verifiers()
+        out = self.run_install()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        home = self.env['OMGS_HOME'].replace("'", "''")
+        command = f"""
+$ErrorActionPreference = 'Stop'
+$user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$root = Get-Item -LiteralPath '{home}'
+foreach ($d in @($root) + @(Get-ChildItem -LiteralPath $root.FullName -Directory -Recurse)) {{
+    $a = Get-Acl -LiteralPath $d.FullName
+    if (-not $a.AreAccessRulesProtected -or $a.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $user) {{ throw 'Directory owner or protection mismatch' }}
+    $rules = @($a.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $user -or $rules[0].FileSystemRights -ne 'FullControl') {{ throw 'Directory is not owner-only' }}
+}}
+"""
+        subprocess.run(['powershell', '-NoProfile', '-Command', command],
+                       text=True, capture_output=True, check=True)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACLs')
+    def test_windows_users_write_acl_is_rejected(self):
+        self.fake_verifiers()
+        home = Path(self.env['OMGS_HOME'])
+        # First create the installation with the production private DACL.
+        out = self.run_install()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        destination = home / 'bin'
+        command = f"""
+$p = '{str(destination).replace("'", "''")}'
+$a = Get-Acl -LiteralPath $p
+$s = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+$r = [Security.AccessControl.FileSystemAccessRule]::new($s, 'Write', 'Allow')
+$a.AddAccessRule($r)
+Set-Acl -LiteralPath $p -AclObject $a
+"""
+        subprocess.run(['powershell', '-NoProfile', '-Command', command],
+                                text=True, capture_output=True, check=True)
+        out = self.run_install()
+        self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn('storage is writable by another principal', out.stderr)
+        self.assertIn(str(destination), out.stderr)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows sharing violations')
+    def test_locked_destinations_preserve_existing_files_and_clean_staging(self):
+        self.fake_verifiers()
+        original_script = self.script.read_text()
+        home = Path(self.env['OMGS_HOME'])
+        for relative in ('bin/omgs.exe', 'mxc/1.0.1/wxc-exec.exe'):
+            self.script.write_text(original_script)
+            out = self.run_install()
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            destination = home / relative
+            destination.write_bytes(b'previous locked file')
+            escaped = str(destination).replace("'", "''")
+            injection = f"    $held = [IO.File]::Open('{escaped}', 'Open', 'Read', 'Read')\n"
+            marker = '    Publish $stagedMxc (Join-Path $mxc $mxcFile)'
+            text = original_script.replace(marker, injection + marker)
+            text = text.replace('    foreach ($path in $staged) {',
+                                '    if ($held) { $held.Dispose() }\n    foreach ($path in $staged) {')
+            self.script.write_text(text)
+            out = self.run_install()
+            message = ' '.join((out.stdout + out.stderr).split())
+            self.assertNotEqual(out.returncode, 0, message)
+            for expected in ('Publication failed', str(destination), 'running omgs.exe or MXC',
+                             'Stop it and retry', 'mix of old and new files'):
+                self.assertIn(expected, message)
+            self.assertEqual(destination.read_bytes(), b'previous locked file')
+            files = [p for p in home.rglob('*') if p.is_file()]
+            self.assertEqual(len(files), 3, files)
+            for file in files:
+                if file != destination:
+                    expected = (self.original if file.name == 'omgs.exe' else
+                                self.executor_hash if file.name == 'wxc-exec.exe' else
+                                sha(self.bundle / 'MXC-LICENSE.txt'))
+                    self.assertEqual(sha(file), expected)
 
     def test_authenticated_attestation_failure_is_unverified(self):
         self.fake_verifiers()

@@ -114,12 +114,68 @@ if ! actual_version=$("$tmp/$asset" --version); then
   echo "version mismatch: skill expects omgs $VERSION; binary --version failed" >&2; exit 1
 fi
 [ "$actual_version" = "omgs $VERSION" ] || { echo "version mismatch: skill expects omgs $VERSION; binary reports $actual_version" >&2; exit 1; }
+# Existing storage is inspected, never repaired. Check every replaceable parent.
+# Outside HOME, a root-owned non-writable (or sticky) directory anchors the walk.
+umask 077
+storage_error() {
+  echo "owner-private installation storage $1: $2; see README.md#storage-migration" >&2
+  exit 1
+}
+check_storage() {
+  [ ! -L "$1" ] && [ -d "$1" ] || storage_error "$1" 'storage must be a directory without links'
+  if [ "$(uname -s)" = Darwin ]; then
+    info=$(stat -f '%u %OLp' "$1")
+  else
+    info=$(stat -c '%u %a' "$1")
+  fi
+  owner=${info%% *}
+  mode=${info#* }
+  bits=$((0$mode))
+  [ "$owner" = "$(id -u)" ] || [ "$2" = anchor -a "$owner" = 0 ] || storage_error "$1" 'storage must be owned by the current user'
+  [ $((bits & 0022)) -eq 0 ] || [ $((bits & 01000)) -ne 0 ] || storage_error "$1" 'storage must not be group- or world-writable without the sticky bit'
+}
+check_ancestors() {
+  current=$1
+  while :; do
+    if [ -e "$current" ] || [ -L "$current" ]; then
+      case "$current/" in
+        "$HOME/"*) check_storage "$current" ancestor ;;
+        *) check_storage "$current" anchor ;;
+      esac
+      [ "$current" != "$HOME" ] || break
+      # A custom root outside HOME can end at a non-replaceable system anchor.
+      if [ "$owner" = 0 ] && [ "$(id -u)" != 0 ]; then
+        check_storage "$current" anchor
+        break
+      fi
+    fi
+    [ "$current" != / ] || break
+    current=$(dirname -- "$current")
+  done
+}
+private_tree() (
+  directory=$1
+  if [ -e "$directory" ] || [ -L "$directory" ]; then
+    check_storage "$directory" destination
+  else
+    parent=$(dirname -- "$directory")
+    if [ ! -d "$parent" ]; then private_tree "$parent"; fi
+    mkdir -m 0700 -- "$directory"
+    # Remove inherited extended ACLs only on directories just created by us.
+    if [ "$(uname -s)" = Darwin ]; then chmod -N "$directory"; fi
+    chmod 0700 "$directory"
+    check_storage "$directory" destination
+  fi
+)
+check_ancestors "$DEST_ROOT/bin"
+check_ancestors "$DEST_ROOT/mxc/1.0.1"
+
 # Stage every file on its destination filesystem before publishing any file.
-mkdir -p "$DEST_ROOT/bin"
+private_tree "$DEST_ROOT/bin"
 staged_omgs=$(mktemp "$DEST_ROOT/bin/.omgs.XXXXXXXX")
 install -m 0755 "$tmp/$asset" "$staged_omgs"
 if [ -n "$mxc_asset" ]; then
-  mkdir -p "$DEST_ROOT/mxc/1.0.1"
+  private_tree "$DEST_ROOT/mxc/1.0.1"
   staged_mxc=$(mktemp "$DEST_ROOT/mxc/1.0.1/.mxc.XXXXXXXX")
   install -m 0755 "$tmp/$mxc_asset" "$staged_mxc"
   staged_license=$(mktemp "$DEST_ROOT/mxc/1.0.1/.license.XXXXXXXX")

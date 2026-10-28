@@ -111,6 +111,54 @@ function Provenance([string]$Path) {
     return $false
 }
 
+$StorageUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$TrustedStorageSids = @($StorageUser.Value, 'S-1-5-18', 'S-1-5-32-544')
+function Check-Storage([string]$Path, [bool]$Ancestor = $false) {
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "owner-private installation storage '$Path': storage must be a directory without links; see README.md#storage-migration"
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($owner -ne $StorageUser.Value -and -not ($Ancestor -and $owner -in $TrustedStorageSids)) {
+        throw "owner-private installation storage '$Path': storage must be owned by the current user with a restrictive DACL; see README.md#storage-migration"
+    }
+    $raw = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
+    if ($null -eq $raw.DiscretionaryAcl) { throw "owner-private installation storage '$Path': missing restrictive DACL" }
+    foreach ($ace in $raw.DiscretionaryAcl) {
+        # Like run storage, unknown ACEs fail closed and deny ACEs grant no access.
+        if ($ace.AceType -eq [Security.AccessControl.AceType]::AccessDenied) { continue }
+        if ($ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed) {
+            throw "owner-private installation storage '$Path': unsupported storage DACL ACE"
+        }
+        if (($ace.AccessMask -band 0x500d0156) -ne 0 -and $ace.SecurityIdentifier.Value -notin $TrustedStorageSids) {
+            throw "owner-private installation storage '$Path': storage is writable by another principal; see README.md#storage-migration"
+        }
+    }
+}
+function Check-Ancestors([string]$Path) {
+    $current = [IO.Path]::GetFullPath($Path)
+    while ($current) {
+        if (Test-Path -LiteralPath $current) { Check-Storage $current $true }
+        if ($current.TrimEnd('\') -ieq $env:USERPROFILE.TrimEnd('\')) { break }
+        $current = Split-Path $current -Parent
+    }
+}
+function New-PrivateTree([string]$Path) {
+    if (Test-Path -LiteralPath $Path) { Check-Storage $Path; return }
+    $parent = Split-Path $Path -Parent
+    if (-not (Test-Path -LiteralPath $parent)) { New-PrivateTree $parent }
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetOwner($StorageUser)
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new($StorageUser, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+    $acl.AddAccessRule($rule)
+    # Supply a protected owner-only DACL at creation, with no inherited grants.
+    $directory = [IO.DirectoryInfo]::new($Path)
+    $directory.Create($acl)
+    Check-Storage $Path
+}
+
 $staged = [Collections.Generic.List[string]]::new()
 function Stage([string]$Name, [string]$Destination) {
     $path = Join-Path (Split-Path $Destination -Parent) ('.omgs-' + [guid]::NewGuid().ToString('N') + [IO.Path]::GetExtension($Destination))
@@ -124,10 +172,15 @@ function Stage([string]$Name, [string]$Destination) {
     return $path
 }
 function Publish([string]$Path, [string]$Destination) {
-    if ([IO.File]::Exists($Destination)) {
-        [IO.File]::Replace($Path, $Destination, [NullString]::Value)
-    } else {
-        [IO.File]::Move($Path, $Destination)
+    try {
+        if ([IO.File]::Exists($Destination)) {
+            [IO.File]::Replace($Path, $Destination, [NullString]::Value)
+        } else {
+            [IO.File]::Move($Path, $Destination)
+        }
+    } catch {
+        Write-Output "Publication failed for '$Destination'."
+        throw "Publication failed for '$Destination'. A running omgs.exe or MXC executor may hold the file. Stop it and retry. The existing destination is preserved on a sharing violation. Earlier published files remain individually verified and complete, but the installation may contain a mix of old and new files until retry succeeds. Staged temporary files are cleaned up. Cause: $($_.Exception.Message)"
     }
 }
 
@@ -150,7 +203,10 @@ try {
     if ($LASTEXITCODE -ne 0 -or $actual -cne "omgs $Version") { throw "version mismatch: skill expects omgs $Version; binary reports $actual" }
     $bin = Join-Path $DestRoot 'bin'
     $mxc = Join-Path $DestRoot 'mxc/1.0.1'
-    New-Item -ItemType Directory -Force $bin, $mxc | Out-Null
+    Check-Ancestors $bin
+    Check-Ancestors $mxc
+    New-PrivateTree $bin
+    New-PrivateTree $mxc
     # Verify all destination siblings before the first atomic replacement.
     $stagedOmgs = Stage $asset (Join-Path $bin 'omgs.exe')
     $stagedMxc = Stage $mxcAsset (Join-Path $mxc $mxcFile)

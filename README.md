@@ -87,9 +87,11 @@ block execution and leave the finding pending.
 Pass the run's `HANDOFF.md` to the agent that will implement a fix, alongside the
 run directory and source revision. The handoff contains the fix brief and proof
 acceptance checks; keep the associated findings, tests and proof artifacts
-available. Handoff generation is delivered by the reporting change in parallel
-with this onboarding change. Until that lands, pass `REPORT.md`, `findings.json`
-and the relevant `proofs/` files explicitly. Treat all of them as sensitive.
+available. Run `omgs handoff --run RUN` to generate `HANDOFF.md` and
+`handoff.json`, optionally selecting a finding with `--finding C1`. Run
+`omgs stage --run RUN` to export verified retained tests as
+`RUN/proposed-tests.patch` for review before applying them. Treat all run
+artifacts as sensitive.
 
 ## Known limitations
 
