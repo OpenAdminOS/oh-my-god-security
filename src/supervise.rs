@@ -47,6 +47,8 @@ pub struct Supervised {
     pub duration_ms: u64,
     pub output: String,
     pub stdout: String,
+    /// Exact captured stdout, including non-UTF-8 Git blobs.
+    pub stdout_bytes: Vec<u8>,
     pub output_bytes_total: u64,
     pub capture_complete: bool,
     /// Every group signal, reap and survivor scan succeeded. False means the
@@ -1531,6 +1533,7 @@ mod sweep {
                 duration_ms: 0,
                 output: String::new(),
                 stdout: String::new(),
+                stdout_bytes: Vec::new(),
                 output_bytes_total: 0,
                 capture_complete: true,
                 cleanup_complete: false,
@@ -1790,6 +1793,7 @@ fn run_inner(
         duration_ms: 0,
         output: String::new(),
         stdout: String::new(),
+        stdout_bytes: Vec::new(),
         output_bytes_total: 0,
         capture_complete: false,
         cleanup_complete: false,
@@ -2014,6 +2018,7 @@ fn run_inner(
     }
     result.output_bytes_total = capture.total;
     result.stdout = String::from_utf8_lossy(&capture.streams[0]).into_owned();
+    result.stdout_bytes = capture.streams[0].clone();
     result.output = capture.text();
     #[cfg(target_os = "linux")]
     if !pending_cgroups.is_empty() {

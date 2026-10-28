@@ -1898,6 +1898,7 @@ mod tests {
             duration_ms: 1,
             output: String::new(),
             stdout: String::new(),
+            stdout_bytes: Vec::new(),
             output_bytes_total: 0,
             capture_complete: true,
             cleanup_complete: true,
