@@ -20,7 +20,9 @@ fn root() -> PathBuf {
     ROOT.get_or_init(|| {
         // Checked-out files can be owned by Administrators on Windows. Build
         // valid archived run fixtures using the same private writer as the CLI.
-        let dir = std::env::temp_dir().join(format!("omgs-score-source-{}", std::process::id()));
+        let dir = omgs::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-score-source-{}", std::process::id()));
         copy_private(
             &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score"),
             &dir,
