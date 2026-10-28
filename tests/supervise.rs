@@ -345,7 +345,7 @@ fn timeout_words_and_signal_death_are_not_timeouts() {
 
 #[cfg(windows)]
 #[test]
-fn windows_wall_clock_kills_executor_and_discloses_descendant_dependency() {
+fn windows_wall_clock_kills_executor_and_discloses_owner_job() {
     let mut cmd = Command::new("cmd.exe");
     cmd.args(["/d", "/q", "/c", "for /l %i in (1,0,2) do @rem"]);
     let mut limits = limits();
@@ -356,6 +356,13 @@ fn windows_wall_clock_kills_executor_and_discloses_descendant_dependency() {
         result.timed_out && !result.success && result.cleanup_complete,
         "{result:?}"
     );
+    assert!(
+        result
+            .enforced
+            .iter()
+            .any(|control| control == "Windows owner kill-on-close job"),
+        "{result:?}"
+    );
     assert!(start.elapsed() < std::time::Duration::from_secs(8));
     assert!(omgs::sandbox::declared_limits("windows")
         .iter()
@@ -364,6 +371,7 @@ fn windows_wall_clock_kills_executor_and_discloses_descendant_dependency() {
         omgs::sandbox::declared_controls("windows", omgs::sandbox::Tier::Test)
             .1
             .iter()
-            .any(|gap| gap.contains("descendant cleanup depends on MXC"))
+            .any(|gap| gap
+                .contains("an owned kill-on-close job terminates descendants if OMGS dies"))
     );
 }
