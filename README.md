@@ -79,8 +79,13 @@ omgs stage --run RUN
 
 `--finding` accepts the report reference (`C1`, `V1`) or a fingerprint and rewrites
 both handoff files with only that record. `omgs stage` writes
-`RUN/proposed-tests.patch`, a unified diff adding the retained external proof
-tests at their proposed target-relative paths. It never edits the target.
+`RUN/proposed-tests.patch`, a unified diff adding retained external proof tests
+at their proposed target-relative paths. Only confirmed findings at test proven
+or higher with a valid runner-attested proof may contribute tests. Pending and
+rejected records are excluded. Invalid confirmed proofs are excluded with an
+explicit diagnostic; other valid confirmed tests remain available. Pending
+drafts stay in HANDOFF.md under "verify before fixing", with their missing fact
+and any recorded proof test. Staging never edits the target.
 Already accepted tests need no patch. Conflicting tests, altered drafts, unsafe
 paths, binary tests and existing destination files stop staging. Review and apply
 the patch through the repository's normal process. No finding authorizes a fix;

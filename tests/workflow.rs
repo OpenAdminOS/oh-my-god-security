@@ -2858,3 +2858,100 @@ fn stage_refuses_unknown_or_internal_targets_even_without_findings() {
     assert!(!dir.join("proposed-tests.patch").exists());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn stage_includes_only_validated_confirmed_proofs_and_reports_exclusions() {
+    let dir = scratch("stage-admission");
+    let target = dir.with_extension("target");
+    omgs::platform::create_private_tree(&target).unwrap();
+    let snapshot = omgs::proof::tree_digest(&target).unwrap();
+    write_private_fixture(
+        dir.join("run-metadata.json"),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    let mut file = attest(
+        &dir,
+        file(vec![
+            record("accepted"),
+            record("pending"),
+            record("invalid"),
+        ]),
+    );
+    for (i, f) in file.findings.iter_mut().enumerate() {
+        let reference = f.proof_ref.as_deref().unwrap();
+        let mut p = omgs::proof::load(&dir, reference).unwrap();
+        p.target = Some(target.to_string_lossy().into());
+        p.target_sha256 = Some(snapshot.clone());
+        let test = format!("tests/{}.ts", ["accepted", "pending", "invalid"][i]);
+        p.test = Some(test.clone());
+        p.command = format!("node {test}");
+        p.command_sha256 = omgs::sha256::digest(p.command.as_bytes());
+        // Keep the config bound to the changed test and exact command.
+        let wrapped = omgs::sandbox::wrapped_command(
+            std::env::consts::OS,
+            &p.command,
+            &p.marker_nonce,
+            Some(&test),
+        );
+        let config_path = dir.join(format!("proofs/{}/mxc-config.json", p.n));
+        let mut config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["process"]["commandLine"] = wrapped.clone().into();
+        p.wrapped_command_sha256 = omgs::sha256::digest(wrapped.as_bytes());
+        let config = config.to_string();
+        p.config_sha256 = omgs::sha256::digest(config.as_bytes());
+        write_private_fixture(config_path, config).unwrap();
+        write_private_fixture(dir.join(format!("proofs/{}/command.txt", p.n)), &p.command).unwrap();
+        p.test_from = Some("external-draft".into());
+        let content = format!("retained {i}\n");
+        p.test_sha256 = Some(omgs::sha256::digest(content.as_bytes()));
+        write_private_fixture(dir.join(format!("proofs/{}/test-draft", p.n)), content).unwrap();
+        omgs::proof::write(&dir, &p).unwrap();
+        assert!(omgs::proof::validate_proofs(
+            &FindingsFile {
+                findings: vec![f.clone()]
+            },
+            &dir
+        )
+        .is_empty());
+        if i == 1 {
+            f.verdict = Verdict::NeedsValidation;
+            f.severity = None;
+            f.fix_brief = None;
+            f.evidence = "Missing fact: Should this resource be private?".into();
+        }
+    }
+    let h = omgs::handoff::markdown(&omgs::handoff::build(&dir, &file, None).unwrap());
+    assert!(
+        h.contains("verify before fixing")
+            && h.contains("tests/pending.ts")
+            && h.contains("Should this resource be private?")
+    );
+    // Break an attestation after proving the synthetic fixture was admitted.
+    let mut p = omgs::proof::load(&dir, "proofs/3.json").unwrap();
+    p.command_finished = false;
+    omgs::proof::write(&dir, &p).unwrap();
+    write_private_fixture(
+        dir.join("findings.json"),
+        serde_json::to_string(&file).unwrap(),
+    )
+    .unwrap();
+    let out = omgs(&["stage", "--run", dir.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let patch = std::fs::read_to_string(dir.join("proposed-tests.patch")).unwrap();
+    assert!(patch.contains("tests/accepted.ts"));
+    assert!(!patch.contains("tests/pending.ts") && !patch.contains("tests/invalid.ts"));
+    let diagnostic = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        diagnostic.contains(&file.findings[2].fingerprint)
+            && diagnostic.contains("did not finish cleanly")
+    );
+    assert_eq!(omgs::proof::tree_digest(&target).unwrap(), snapshot);
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(target).unwrap();
+}

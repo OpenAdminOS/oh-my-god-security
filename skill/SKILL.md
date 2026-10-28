@@ -97,8 +97,10 @@ the rest of the run artifacts.
 Use `omgs handoff --run OUTPUT_DIR [--finding C1]` to regenerate both handoff files,
 optionally selecting a report reference or fingerprint. Use
 `omgs stage --run OUTPUT_DIR` to write `proposed-tests.patch` for normal review.
-It proposes the digest-checked external proof tests at their target-relative paths
-and never changes TARGET. Accepted tests need no patch. Never treat patch
+It proposes only confirmed, digest-checked external tests backed by a valid
+runner-attested proof at test proven or higher, and never changes TARGET.
+Pending drafts remain in the handoff under "verify before fixing" with their
+missing fact. Invalid confirmed proofs are excluded with diagnostics. Accepted tests need no patch. Never treat patch
 creation as authorization to fix, weaken the proof, or bypass the shared budget.
 Follow [agents/green-fixer.md](agents/green-fixer.md) for the fix run.
 

@@ -367,3 +367,39 @@ pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
     }
     Ok(patch)
 }
+
+pub struct StagedTests {
+    pub patch: String,
+    pub excluded: Vec<String>,
+}
+
+/// Admit each confirmed record independently. Pending and rejected records
+/// cannot contribute tests, and invalid proofs are named instead of staged.
+pub fn stage_validated(run: &Path, file: &FindingsFile) -> Result<StagedTests, String> {
+    let mut admitted = FindingsFile::default();
+    let mut excluded = Vec::new();
+    for f in file
+        .findings
+        .iter()
+        .filter(|f| f.verdict == Verdict::Confirmed)
+    {
+        let one = FindingsFile {
+            findings: vec![f.clone()],
+        };
+        let mut errors = crate::model::validate(&one);
+        errors.extend(crate::proof::validate_proofs(&one, run));
+        if errors.is_empty() {
+            admitted.findings.push(f.clone());
+        } else {
+            excluded.push(format!("excluded {}: {}", f.fingerprint, errors.join("; ")));
+        }
+    }
+    let patch = stage(run, &admitted).map_err(|e| {
+        if excluded.is_empty() {
+            e
+        } else {
+            format!("{}\n{e}", excluded.join("\n"))
+        }
+    })?;
+    Ok(StagedTests { patch, excluded })
+}
