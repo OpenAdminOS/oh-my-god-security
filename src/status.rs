@@ -170,13 +170,16 @@ fn apply_locked(dir: &Path, u: &Update) -> Result<(), String> {
         }
     }
     let path = dir.join(FILE);
-    let mut doc: Map<String, Value> = match std::fs::read_to_string(&path) {
-        Ok(text) => match crate::shape::strict_json(&text) {
+    let mut doc: Map<String, Value> = match crate::run_artifact::optional_text(
+        dir,
+        Path::new(FILE),
+        crate::run_artifact::STATUS_BYTES,
+    )? {
+        Some(text) => match crate::shape::strict_json(&text) {
             Ok(Value::Object(m)) => m,
             _ => return Err(format!("{} is not a status object", path.display())),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Map::new(),
-        Err(e) => return Err(format!("read {}: {e}", path.display())),
+        None => Map::new(),
     };
     check_document(&doc).map_err(|e| format!("{}: {e}", path.display()))?;
     let now = now_ms();

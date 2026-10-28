@@ -59,8 +59,8 @@ fn run_path(path: &Path) -> Result<PathBuf, String> {
 fn read_run(run: &Path) -> Result<Map<String, Value>, String> {
     let boundary = run.parent().ok_or("run path needs a parent")?;
     let relative = Path::new(run.file_name().ok_or("run path needs a name")?).join(runmeta::FILE);
-    let bytes =
-        crate::platform::read_private_bounded_in(boundary, &relative, 16 << 20).map_err(|e| {
+    let bytes = crate::run_artifact::read(boundary, &relative, crate::run_artifact::METADATA_BYTES)
+        .map_err(|e| {
             format!(
                 "linked run {}: no-follow metadata read failed: {e}",
                 run.display()

@@ -1032,7 +1032,7 @@ fn critic_refuses_symlinked_candidate_files() {
     std::os::unix::fs::symlink(&real, dir.join("candidates-other.json")).unwrap();
     let err = omgs::critic::critique_run(&dir).unwrap_err();
     assert!(
-        err.contains("candidates-other.json is not a regular file"),
+        err.contains("read run artifact") && err.contains("candidates-other.json"),
         "{err}"
     );
     let _ = std::fs::remove_dir_all(&dir);

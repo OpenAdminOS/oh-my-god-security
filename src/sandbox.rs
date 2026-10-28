@@ -1007,6 +1007,18 @@ pub fn tier2_unavailable(os: &str) -> Option<String> {
 /// is a copy of the target, which controls its layout: a symlinked directory
 /// on the way would otherwise make this unsandboxed write land on the host.
 pub fn stage_file(workspace: &Path, rel: &str, draft: &Path) -> std::io::Result<()> {
+    // Caller-supplied source drafts follow the checkout content policy.
+    let source = platform::open_regular(draft)?;
+    let permissions = source.metadata()?.permissions();
+    stage_content(workspace, rel, source, permissions)
+}
+
+fn stage_content(
+    workspace: &Path,
+    rel: &str,
+    mut source: impl std::io::Read,
+    permissions: std::fs::Permissions,
+) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind, Write};
     let parts: Vec<&str> = rel
         .split(['/', '\\'])
@@ -1048,14 +1060,11 @@ pub fn stage_file(workspace: &Path, rel: &str, draft: &Path) -> std::io::Result<
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let mut source = platform::open_regular(draft)?;
-    let permissions = source.metadata()?.permissions();
     // create_new refuses an entry that appeared since, link or not.
     let mut out = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&dest)?;
-    use std::io::Read;
     let mut bytes = vec![0u8; 1 << 16];
     loop {
         supervise::check_interrupted()?;
@@ -1140,7 +1149,23 @@ fn stage_workspace(
         return Err("target snapshot differs from the recorded tree; refusing to replay".into());
     }
     if let Some((draft, rel)) = &req.stage {
-        stage_file(workspace, rel, draft)
+        // CLI drafts were retained beneath run_dir. Pin the original run
+        // boundary, including proofs/N, rather than treating N as trusted.
+        let boundary = req
+            .run_dir
+            .parent()
+            .and_then(Path::parent)
+            .ok_or("proof directory needs a run boundary")?;
+        let relative = draft
+            .strip_prefix(boundary)
+            .map_err(|_| "retained draft is outside its run boundary")?;
+        let (bytes, permissions) = crate::run_artifact::read_with_permissions(
+            boundary,
+            relative,
+            crate::run_artifact::DRAFT_BYTES,
+        )
+        .map_err(|e| e.to_string())?;
+        stage_content(workspace, rel, std::io::Cursor::new(bytes), permissions)
             .map_err(|e| format!("cannot stage the draft test at {rel}: {e}"))?;
     }
     for dir in [

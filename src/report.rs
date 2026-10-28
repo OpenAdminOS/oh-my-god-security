@@ -134,11 +134,13 @@ pub struct TimelineRow {
 }
 
 pub fn timeline(run: &std::path::Path) -> Result<Vec<TimelineRow>, String> {
-    let path = run.join(crate::status::FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    let Some(text) = crate::run_artifact::optional_text(
+        run,
+        std::path::Path::new(crate::status::FILE),
+        crate::run_artifact::STATUS_BYTES,
+    )?
+    else {
+        return Ok(Vec::new());
     };
     let doc = crate::shape::strict_json(&text)?;
     crate::status::check_document(doc.as_object().ok_or("pipeline status must be an object")?)?;
@@ -1449,5 +1451,115 @@ fn tier_label(f: &Finding) -> String {
         )
     } else {
         f.proof_tier.label().into()
+    }
+}
+
+/// Values rendered by a completed report. Counter usage is deliberately not
+/// copied back from that snapshot: concurrent charges remain authoritative.
+pub struct Completion {
+    pub hunters: Option<u32>,
+    pub verifier: Option<String>,
+    pub accounting: crate::accounting::Accounting,
+    pub complete: bool,
+}
+
+/// Publish initial counters, render without holding the run lock, then publish
+/// completion against fresh metadata under the lock. Rendering may overlap a
+/// charge from another process and must never restore its earlier allowance.
+pub fn publish(
+    run: Option<&std::path::Path>,
+    calls: Option<u32>,
+    models: &std::collections::BTreeMap<String, String>,
+    render: impl FnOnce() -> Result<Completion, String>,
+) -> Result<(), String> {
+    if let Some(run) = run {
+        crate::runmeta::update(run, |m| {
+            if let Some(n) = calls {
+                let old = m
+                    .get("agent_calls_used")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if u64::from(n) < old {
+                    return Err("--agent-calls cannot decrease recorded usage".into());
+                }
+                m.insert("agent_calls_used".into(), serde_json::json!(n));
+            }
+            let saved = m
+                .entry("models")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or("models must be an object")?;
+            for (role, model) in models {
+                saved.insert(role.clone(), serde_json::json!(model));
+            }
+            Ok(())
+        })?;
+    }
+    let completion = render()?;
+    if let Some(run) = run {
+        crate::runmeta::update(run, |m| {
+            if let Some(n) = completion.hunters {
+                m.insert("hunters".into(), serde_json::json!(n));
+            }
+            if let Some(v) = &completion.verifier {
+                m.insert("verifier".into(), serde_json::json!(v));
+            }
+            let mut usage = crate::accounting::read(m)?;
+            usage.extend(completion.accounting);
+            m.insert(
+                "accounting".into(),
+                serde_json::to_value(usage).map_err(|e| e.to_string())?,
+            );
+            m.insert(
+                "run_status".into(),
+                serde_json::json!(if completion.complete {
+                    "complete"
+                } else {
+                    "partial"
+                }),
+            );
+            m.insert(
+                "completed_unix".into(),
+                serde_json::json!(crate::runmeta::now_unix()),
+            );
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod publication_tests {
+    #[test]
+    fn report_cannot_restore_allowance_after_concurrent_call_charge() {
+        let root = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-report-publication-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let run = root.join("run");
+        crate::platform::create_private_tree(&run).unwrap();
+        crate::runmeta::write_atomic(
+            &run.join(crate::runmeta::FILE),
+            r#"{"run_id":"publication-test","budget_agent_calls":12,"agent_calls_used":0}"#,
+        )
+        .unwrap();
+        super::publish(Some(&run), Some(5), &Default::default(), || {
+            assert_eq!(crate::runmeta::read(&run)?["agent_calls_used"], 5);
+            crate::budget::charge_calls(&run, 1)?;
+            Ok(super::Completion {
+                hunters: None,
+                verifier: None,
+                accounting: Default::default(),
+                complete: true,
+            })
+        })
+        .unwrap();
+        let meta = crate::runmeta::read(&run).unwrap();
+        assert_eq!(meta["run_status"], "complete");
+        assert_eq!(meta["agent_calls_used"], 6);
+        assert!(crate::budget::summary(&run)
+            .unwrap()
+            .contains("6 used of 12; 6 remaining"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

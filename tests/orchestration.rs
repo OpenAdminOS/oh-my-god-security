@@ -1385,7 +1385,8 @@ fn watch_never_serves_a_linked_or_special_status_file() {
         start.elapsed() < std::time::Duration::from_secs(1),
         "FIFO must not block"
     );
-    assert_eq!(r.status, 200);
+    assert_eq!(r.status, 500);
+    assert!(String::from_utf8_lossy(&r.body).contains("Invalid run artifact"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

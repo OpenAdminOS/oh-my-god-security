@@ -26,6 +26,24 @@ pub fn now_ms() -> u64 {
 /// and a pre-planted temporary name is never followed either. Windows also
 /// refuses existing destinations that fail private, single-link admission.
 pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_content(path, bytes, None)
+}
+
+/// Retain a safely read draft's executable mode on the temporary descriptor,
+/// before publishing it. Never chmod a destination path that can be swapped.
+pub fn write_atomic_bytes_with_permissions(
+    path: &Path,
+    bytes: &[u8],
+    permissions: std::fs::Permissions,
+) -> std::io::Result<()> {
+    write_atomic_content(path, bytes, Some(permissions))
+}
+
+fn write_atomic_content(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
     use std::io::Write;
     #[cfg(windows)]
     if let Some(file) = crate::platform::open_single_link(path)? {
@@ -72,6 +90,10 @@ pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     };
     if let Err(e) = crate::platform::check_private_file(&file)
         .and_then(|_| file.write_all(bytes))
+        .and_then(|_| match permissions {
+            Some(p) => file.set_permissions(p),
+            None => Ok(()),
+        })
         .and_then(|_| file.sync_all())
     {
         let _ = std::fs::remove_file(&tmp);
@@ -92,16 +114,19 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 }
 
 pub fn read(dir: &Path) -> Result<Map<String, Value>, String> {
-    let path = dir.join(FILE);
-    let text = {
-        let file = crate::platform::open_single_link(&path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?
-            .ok_or_else(|| format!("read {}: file missing", path.display()))?;
-        crate::platform::check_private_file(&file)
-            .map_err(|e| format!("storage {}: {e}", path.display()))?;
-        std::io::read_to_string(file).map_err(|e| format!("read {}: {e}", path.display()))?
-    };
-    match crate::shape::strict_json(&text) {
+    let text =
+        crate::run_artifact::text(dir, Path::new(FILE), crate::run_artifact::METADATA_BYTES)?;
+    parse(&dir.join(FILE), &text)
+}
+
+pub fn read_optional(dir: &Path) -> Result<Option<Map<String, Value>>, String> {
+    crate::run_artifact::optional_text(dir, Path::new(FILE), crate::run_artifact::METADATA_BYTES)?
+        .map(|text| parse(&dir.join(FILE), &text))
+        .transpose()
+}
+
+fn parse(path: &Path, text: &str) -> Result<Map<String, Value>, String> {
+    match crate::shape::strict_json(text) {
         Ok(Value::Object(m)) => {
             check_numeric_fields(&m)?;
             Ok(m)

@@ -158,18 +158,6 @@ pub struct RunSummary {
     pub refusal_events: Vec<RefusalEvent>,
 }
 
-/// Contents of `path`, `None` only when no entry exists. Anything present
-/// but unreadable (a dangling link, a directory, bad permissions) is an error.
-fn read_present(path: &Path) -> Result<Option<String>, String> {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("inspect {}: {e}", path.display())),
-        Ok(_) => std::fs::read_to_string(path)
-            .map(Some)
-            .map_err(|e| format!("read {}: {e}", path.display())),
-    }
-}
-
 /// The run metadata fields the index reads must have their documented
 /// types; a wrong type is an error, never a silently empty value.
 pub fn check_meta_types(meta: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
@@ -231,7 +219,11 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
         return Ok(s);
     };
     let at = |name: &str, e: String| format!("{}: {name}: {e}", dir.display());
-    match read_present(&dir.join("findings.json"))? {
+    match crate::run_artifact::optional_text(
+        dir,
+        Path::new("findings.json"),
+        crate::run_artifact::FINDINGS_BYTES,
+    )? {
         Some(text) => {
             use crate::model::Verdict;
             let f = crate::shape::findings(&text).map_err(|e| at("findings.json", e))?;
@@ -245,7 +237,13 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
         }
         None => s.blockers.push("findings.json missing".into()),
     }
-    if read_present(&dir.join(crate::runmeta::FILE))?.is_some() {
+    if crate::run_artifact::optional_text(
+        dir,
+        Path::new(crate::runmeta::FILE),
+        crate::run_artifact::METADATA_BYTES,
+    )?
+    .is_some()
+    {
         let meta = crate::runmeta::read(dir)?;
         check_meta_types(&meta).map_err(|e| at(crate::runmeta::FILE, e))?;
         if let Some(st) = meta.get("run_status").and_then(|v| v.as_str()) {
@@ -270,7 +268,11 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
                 .extend(blocked.iter().filter_map(|b| b.as_str()).map(String::from));
         }
     }
-    if let Some(text) = read_present(&dir.join("coverage-ledger.json"))? {
+    if let Some(text) = crate::run_artifact::optional_text(
+        dir,
+        Path::new("coverage-ledger.json"),
+        crate::run_artifact::LEDGER_BYTES,
+    )? {
         let ledger = crate::shape::ledger(&text).map_err(|e| at("coverage-ledger.json", e))?;
         for u in ledger.units.iter().filter(|u| u.status == "blocked") {
             s.blockers.push(format!("blocked unit {}", u.id));

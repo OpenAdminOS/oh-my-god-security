@@ -157,10 +157,13 @@ pub fn candidates(text: &str) -> Result<crate::critic::CandidatesFile, String> {
 }
 
 pub fn load(run: &Path) -> Result<Option<Evaluation>, String> {
-    let path = run.join("evaluation.json");
     // Bounded, single-link and no-follow, like other run evidence. Only a
     // genuinely missing entry is optional; links and special files fail.
-    match crate::platform::read_bounded(&path, MAX_EVALUATION_BYTES) {
+    match crate::run_artifact::read(
+        run,
+        Path::new("evaluation.json"),
+        crate::run_artifact::EVALUATION_BYTES,
+    ) {
         Ok(bytes) => {
             let s = String::from_utf8(bytes)
                 .map_err(|_| "evaluation.json: not valid UTF-8".to_string())?;
@@ -172,8 +175,6 @@ pub fn load(run: &Path) -> Result<Option<Evaluation>, String> {
         Err(e) => Err(format!("read evaluation.json: {e}")),
     }
 }
-
-const MAX_EVALUATION_BYTES: u64 = 8 << 20;
 
 /// Same normalization as every other separation check.
 fn same_agent(a: &str, b: &str) -> bool {
@@ -193,7 +194,13 @@ pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String>
         });
     };
     let mut gaps = Vec::new();
-    let meta = if run.join(crate::runmeta::FILE).exists() {
+    let meta = if crate::run_artifact::optional_text(
+        run,
+        Path::new(crate::runmeta::FILE),
+        crate::run_artifact::METADATA_BYTES,
+    )?
+    .is_some()
+    {
         crate::runmeta::read(run)?
     } else {
         Default::default()
@@ -261,10 +268,11 @@ pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String>
         }
     }
     if !e.leads.is_empty() {
-        let ledger = crate::shape::ledger(
-            &std::fs::read_to_string(run.join("coverage-ledger.json"))
-                .map_err(|e| e.to_string())?,
-        )?;
+        let ledger = crate::shape::ledger(&crate::run_artifact::text(
+            run,
+            Path::new("coverage-ledger.json"),
+            crate::run_artifact::LEDGER_BYTES,
+        )?)?;
         for lead in &e.leads {
             if let Some(unit) = ledger.units.iter().find(|u| u.id == lead.unit_id) {
                 if unit.status == "out_of_scope"
@@ -323,7 +331,13 @@ pub fn report_lines(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, 
             .into_iter()
             .map(|g| format!("Adjudication gap: {g}")),
     );
-    if run.join(crate::runmeta::FILE).is_file() {
+    if crate::run_artifact::optional_text(
+        run,
+        Path::new(crate::runmeta::FILE),
+        crate::run_artifact::METADATA_BYTES,
+    )?
+    .is_some()
+    {
         let meta = crate::runmeta::read(run)?;
         if let Some(blockers) = meta.get("blockers").and_then(Value::as_array) {
             for b in blockers {
@@ -332,13 +346,13 @@ pub fn report_lines(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, 
         }
         lines.push(crate::budget::summary(run)?);
     }
-    if run.join("architecture.json").is_file() {
+    if let Some(text) = crate::run_artifact::optional_text(
+        run,
+        Path::new("architecture.json"),
+        crate::run_artifact::ARCHITECTURE_BYTES,
+    )? {
         let a: crate::architecture::ArchitectureFile =
-            serde_json::from_value(crate::shape::strict_json(
-                &std::fs::read_to_string(run.join("architecture.json"))
-                    .map_err(|e| e.to_string())?,
-            )?)
-            .map_err(|e| e.to_string())?;
+            serde_json::from_value(crate::shape::strict_json(&text)?).map_err(|e| e.to_string())?;
         for gap in a.unexamined {
             lines.push(format!("Unexamined: {gap}"));
         }

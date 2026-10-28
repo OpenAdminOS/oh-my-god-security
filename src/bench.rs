@@ -578,13 +578,9 @@ fn source_findings(
         return Err("source_run must be a relative directory within the repetition".into());
     }
     let root = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
-    let source =
-        std::fs::canonicalize(root.join(source)).map_err(|e| format!("source_run: {e}"))?;
-    if !source.starts_with(&root) {
-        return Err("source_run escapes the repetition".into());
-    }
-    let path = source.join("findings.json");
-    let input = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let relative = Path::new(source).join("findings.json");
+    let input = crate::run_artifact::text(&root, &relative, crate::run_artifact::FINDINGS_BYTES)?;
+    let source = root.join(source);
     let file = crate::shape::findings(&input)?;
     let errors = crate::model::validate(&file);
     if !errors.is_empty() {
@@ -710,11 +706,13 @@ fn evidence_errors(
 
 // Consume the host accounting shape without depending on report/status modules.
 fn accounting(dir: &Path) -> Result<Value> {
-    let path = dir.join("run-metadata.json");
-    let meta = if path.exists() {
-        read(&path)?
-    } else {
-        json!({})
+    let meta = match crate::run_artifact::optional_text(
+        dir,
+        Path::new(crate::runmeta::FILE),
+        crate::run_artifact::METADATA_BYTES,
+    )? {
+        Some(text) => crate::shape::strict_json(&text)?,
+        None => json!({}),
     };
     if !meta.is_object() {
         return Err("run metadata must be object".into());
@@ -816,7 +814,11 @@ pub fn score(cases: &Path, dirs: &[PathBuf]) -> Result<Value> {
         if !paths.insert(std::fs::canonicalize(dir).map_err(|e| e.to_string())?) {
             return Err("duplicate run directory".into());
         }
-        let r = read(&dir.join("benchmark-run.json"))?;
+        let r = crate::shape::strict_json(&crate::run_artifact::text(
+            dir,
+            Path::new("benchmark-run.json"),
+            crate::run_artifact::BENCHMARK_BYTES,
+        )?)?;
         validate_run(&r, &m)?;
         let bytes = serde_json::to_vec(&m).map_err(|e| e.to_string())?;
         if r["manifest_sha256"] != crate::sha256::digest(&bytes) {

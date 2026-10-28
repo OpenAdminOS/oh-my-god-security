@@ -392,11 +392,20 @@ pub fn read_private_bounded_in(
     relative: &Path,
     limit: u64,
 ) -> std::io::Result<Vec<u8>> {
+    read_private_bounded_with_permissions_in(target, relative, limit).map(|(bytes, _)| bytes)
+}
+
+pub(crate) fn read_private_bounded_with_permissions_in(
+    target: &Path,
+    relative: &Path,
+    limit: u64,
+) -> std::io::Result<(Vec<u8>, std::fs::Permissions)> {
     with_file_in(target, relative, |file| {
         check_private_file(&file).map_err(|e| {
             std::io::Error::other(format!("storage {}: {e}", target.join(relative).display()))
         })?;
-        read_bounded_file(file, limit)
+        let permissions = file.metadata()?.permissions();
+        read_bounded_file(file, limit).map(|bytes| (bytes, permissions))
     })
 }
 

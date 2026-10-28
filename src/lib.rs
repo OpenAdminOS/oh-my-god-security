@@ -19,6 +19,7 @@ pub mod policy;
 pub mod proof;
 pub mod report;
 pub mod route;
+pub mod run_artifact;
 pub mod runmeta;
 pub mod sandbox;
 pub mod sensors;

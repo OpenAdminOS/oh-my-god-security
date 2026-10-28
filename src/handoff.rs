@@ -415,16 +415,11 @@ fn outside(run: &Path, target: &Path) -> Result<(), String> {
 /// Accepted target tests are already retained and need no patch.
 pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
     let mut target_known = false;
-    match std::fs::symlink_metadata(run.join(crate::runmeta::FILE)) {
-        Ok(_) => {
-            let m = crate::runmeta::read(run)?;
-            if let Some(t) = m.get("target").and_then(|v| v.as_str()) {
-                outside(run, Path::new(t))?;
-                target_known = true;
-            }
+    if let Some(m) = crate::runmeta::read_optional(run)? {
+        if let Some(t) = m.get("target").and_then(|v| v.as_str()) {
+            outside(run, Path::new(t))?;
+            target_known = true;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("inspect run metadata: {e}")),
     }
     let mut tests: BTreeMap<String, (String, bool)> = BTreeMap::new();
     for f in file
@@ -454,8 +449,12 @@ pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
             }
             continue;
         }
-        let bytes = crate::platform::read_bounded(&source, 16 << 20)
-            .map_err(|e| format!("read proof test: {e}"))?;
+        let bytes = crate::run_artifact::read(
+            run,
+            &Path::new("proofs").join(p.n.to_string()).join("test-draft"),
+            crate::run_artifact::DRAFT_BYTES,
+        )
+        .map_err(|e| format!("read proof test: {e}"))?;
         if Some(crate::sha256::digest(&bytes)) != p.test_sha256 {
             return Err("proof test digest changed".into());
         }

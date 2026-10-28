@@ -77,8 +77,23 @@ pub fn respond(raw: &str, port: u16, run_dir: &Path) -> Response {
             body: DASHBOARD.as_bytes().to_vec(),
         },
         "/pipeline-status.json" => {
-            let body = read_status(&run_dir.join(crate::status::FILE))
-                .unwrap_or_else(|| EMPTY_STATUS.as_bytes().to_vec());
+            let body = match crate::run_artifact::read(
+                run_dir,
+                Path::new(crate::status::FILE),
+                crate::run_artifact::DASHBOARD_STATUS_BYTES,
+            ) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    EMPTY_STATUS.as_bytes().to_vec()
+                }
+                Err(_) => {
+                    return Response {
+                        status: 500,
+                        content_type: "text/plain; charset=utf-8",
+                        body: b"Invalid run artifact: pipeline-status.json".to_vec(),
+                    }
+                }
+            };
             Response {
                 status: 200,
                 content_type: "application/json",
@@ -108,20 +123,6 @@ fn write_until(stream: &mut TcpStream, mut bytes: &[u8], deadline: Instant) -> b
     true
 }
 
-/// The status file, only when it is a regular file with a single link that
-/// is opened without following a symlink and without blocking (a FIFO cannot
-/// stall the server), read up to the size cap. Anything else serves the
-/// empty status: a planted link must never expose another run file.
-fn read_status(path: &Path) -> Option<Vec<u8>> {
-    let file = crate::platform::open_single_link(path).ok()??;
-    if file.metadata().ok()?.len() > MAX_STATUS {
-        return None;
-    }
-    let mut body = Vec::new();
-    file.take(MAX_STATUS + 1).read_to_end(&mut body).ok()?;
-    (body.len() as u64 <= MAX_STATUS).then_some(body)
-}
-
 fn write_response(stream: &mut TcpStream, r: &Response, deadline: Instant) {
     let head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\nContent-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\nConnection: close\r\n\r\n",
@@ -138,8 +139,6 @@ fn write_response(stream: &mut TcpStream, r: &Response, deadline: Instant) {
 /// Total time one connection may take to send its request, so a client that
 /// trickles bytes cannot hold the single server thread.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
-/// Largest status file served; the dashboard needs a few kilobytes.
-const MAX_STATUS: u64 = 1024 * 1024;
 
 fn handle(mut stream: TcpStream, port: u16, run_dir: &Path) {
     // One absolute deadline covers reading the request and writing the reply.

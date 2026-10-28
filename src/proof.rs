@@ -256,7 +256,8 @@ pub fn load(run: &Path, proof_ref: &str) -> Result<ProofRecord, String> {
         ));
     }
     let path = record_path(run, n);
-    let text = read_text(&path, 2 << 20)?;
+    let text =
+        crate::run_artifact::text(run, Path::new(proof_ref), crate::run_artifact::PROOF_BYTES)?;
     // Strict like every other run input: duplicate keys and unknown fields
     // are errors.
     let record: ProofRecord =
@@ -267,17 +268,13 @@ pub fn load(run: &Path, proof_ref: &str) -> Result<ProofRecord, String> {
     Ok(record)
 }
 
-fn read_text(path: &Path, limit: u64) -> Result<String, String> {
-    crate::platform::read_bounded(path, limit)
-        .map_err(|e| format!("read {}: {e}", path.display()))
-        .and_then(|bytes| String::from_utf8(bytes).map_err(|e| e.to_string()))
-}
-
 /// Exact replay input stays beside the config; the record carries a redacted
 /// display and digests. Config and command artifacts may contain credentials.
 pub fn recorded_command(run: &Path, record: &ProofRecord) -> Result<String, String> {
-    let path = run.join(DIR).join(record.n.to_string()).join("command.txt");
-    let command = read_text(&path, 1 << 20)?;
+    let relative = Path::new(DIR)
+        .join(record.n.to_string())
+        .join("command.txt");
+    let command = crate::run_artifact::text(run, &relative, crate::run_artifact::COMMAND_BYTES)?;
     if crate::sha256::digest(command.as_bytes()) != record.command_sha256
         || redact(&command) != record.command
     {
@@ -476,14 +473,13 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
             crate::sandbox::MXC_VERSION
         ));
     }
-    if run.join(crate::runmeta::FILE).exists() {
-        if let Err(error) = crate::runmeta::read(run) {
+    let run_target = match crate::runmeta::read_optional(run) {
+        Ok(meta) => meta.and_then(|m| m.get("target").and_then(|v| v.as_str()).map(String::from)),
+        Err(error) => {
             errors.push(format!("invalid run metadata: {error}"));
+            None
         }
-    }
-    let run_target = crate::runmeta::read(run)
-        .ok()
-        .and_then(|m| m.get("target").and_then(|v| v.as_str()).map(String::from));
+    };
     if let Some(rt) = run_target {
         let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
         match &record.target {
@@ -497,11 +493,17 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
         errors.push("has no valid target snapshot digest".into());
     }
     if record.test_from.is_some() {
-        let draft = run.join(DIR).join(record.n.to_string()).join("test-draft");
-        if crate::sha256::digest_file(&draft).ok().as_ref() != record.test_sha256.as_ref()
-            || record.test_sha256.is_none()
-        {
-            errors.push("test-draft does not match test_sha256".into());
+        let draft = Path::new(DIR).join(record.n.to_string()).join("test-draft");
+        let digest = crate::run_artifact::read(run, &draft, crate::run_artifact::DRAFT_BYTES)
+            .map(|bytes| crate::sha256::digest(&bytes));
+        if digest.as_ref().ok() != record.test_sha256.as_ref() || record.test_sha256.is_none() {
+            errors.push(format!(
+                "test-draft does not match test_sha256: {}",
+                digest
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "digest mismatch".into())
+            ));
         }
     }
     if record.test_from.is_none() {
@@ -513,6 +515,9 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
             {
                 errors.push("test must be relative to the recorded target".into());
             } else if Path::new(target).exists() {
+                // Checkout content deliberately follows the target's symlinks.
+                // digest_file streams regular content with constant memory; run
+                // evidence must instead use run_artifact::read.
                 let digest = crate::sha256::digest_file(&Path::new(target).join(rel));
                 if digest.ok().as_ref() != record.test_sha256.as_ref()
                     || record.test_sha256.is_none()
@@ -527,11 +532,10 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
     if crate::sha256::digest(record.output.as_bytes()) != record.output_sha256 {
         errors.push("redacted output does not match output_sha256".into());
     }
-    let config = run
-        .join(DIR)
+    let config = Path::new(DIR)
         .join(record.n.to_string())
         .join("mxc-config.json");
-    match crate::platform::read_bounded(&config, 2 << 20) {
+    match crate::run_artifact::read(run, &config, crate::run_artifact::CONFIG_BYTES) {
         Ok(bytes) if crate::sha256::digest(&bytes) == record.config_sha256 => {
             match std::str::from_utf8(&bytes)
                 .map_err(|e| e.to_string())

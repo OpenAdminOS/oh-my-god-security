@@ -270,16 +270,15 @@ pub fn critique(
     }
 }
 
-fn read_in(dir: &Path, name: &str) -> Result<String, String> {
-    let path = dir.join(name);
-    std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))
-}
-
 /// Load a run directory's `findings.json` and critique it together with the
 /// ledger and candidates beside it.
 pub fn critique_run(dir: &Path) -> Result<CriticReport, String> {
-    let findings = crate::shape::findings(&read_in(dir, "findings.json")?)
-        .map_err(|e| format!("parse findings.json: {e}"))?;
+    let findings = crate::shape::findings(&crate::run_artifact::text(
+        dir,
+        Path::new("findings.json"),
+        crate::run_artifact::FINDINGS_BYTES,
+    )?)
+    .map_err(|e| format!("parse findings.json: {e}"))?;
     critique_dir(dir, &findings)
 }
 
@@ -287,9 +286,25 @@ pub fn critique_run(dir: &Path) -> Result<CriticReport, String> {
 /// `candidates*.json` in `dir`. Used by `omgs report`, so the critic result
 /// always describes the exact findings being rendered.
 pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport, String> {
-    let read = |name: &str| read_in(dir, name);
-    let ledger: Ledger = crate::shape::ledger(&read("coverage-ledger.json")?)
-        .map_err(|e| format!("parse coverage-ledger.json: {e}"))?;
+    critique_dir_inner(
+        dir,
+        findings,
+        #[cfg(test)]
+        || {},
+    )
+}
+
+fn critique_dir_inner(
+    dir: &Path,
+    findings: &FindingsFile,
+    #[cfg(test)] before_read: impl FnOnce(),
+) -> Result<CriticReport, String> {
+    let ledger: Ledger = crate::shape::ledger(&crate::run_artifact::text(
+        dir,
+        Path::new("coverage-ledger.json"),
+        crate::run_artifact::LEDGER_BYTES,
+    )?)
+    .map_err(|e| format!("parse coverage-ledger.json: {e}"))?;
     // Every candidates*.json must be a readable regular file: a symlink, a
     // directory, or an unreadable entry is an error, never silently skipped,
     // so no hunter handoff can disappear from reconciliation.
@@ -306,21 +321,19 @@ pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport,
         if !(name.starts_with("candidates") && name.ends_with(".json")) {
             continue;
         }
-        let kind = entry
-            .file_type()
-            .map_err(|e| format!("inspect {name}: {e}"))?;
-        if !kind.is_file() {
-            return Err(format!(
-                "{name} is not a regular file (symlinks and directories are refused)"
-            ));
-        }
         names.push(name);
     }
     names.sort();
+    #[cfg(test)]
+    before_read();
     let mut candidates = Vec::new();
     for name in &names {
-        let file: CandidatesFile =
-            crate::shape::candidates(&read(name)?).map_err(|e| format!("parse {name}: {e}"))?;
+        let file: CandidatesFile = crate::shape::candidates(&crate::run_artifact::text(
+            dir,
+            Path::new(name),
+            crate::run_artifact::CANDIDATES_BYTES,
+        )?)
+        .map_err(|e| format!("parse {name}: {e}"))?;
         candidates.extend(
             file.candidates
                 .into_iter()
@@ -364,4 +377,29 @@ pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport,
         }
     }
     Ok(report)
+}
+
+#[cfg(all(test, unix))]
+mod replacement_tests {
+    #[test]
+    fn candidate_replacement_after_enumeration_is_refused() {
+        let run = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-candidate-replace-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_tree(&run).unwrap();
+        crate::runmeta::write_atomic(&run.join("coverage-ledger.json"), r#"{"units":[]}"#).unwrap();
+        let candidate = run.join("candidates-1.json");
+        crate::runmeta::write_atomic(&candidate, r#"{"hunter":"one","candidates":[]}"#).unwrap();
+        let outside = run.join("outside.json");
+        crate::runmeta::write_atomic(&outside, r#"{"hunter":"one","candidates":[]}"#).unwrap();
+        let error = super::critique_dir_inner(&run, &Default::default(), || {
+            std::fs::remove_file(&candidate).unwrap();
+            std::os::unix::fs::symlink(&outside, &candidate).unwrap();
+        })
+        .expect_err("replacement must fail");
+        assert!(error.contains("candidates-1.json"), "{error}");
+        assert!(error.contains("run artifact"), "{error}");
+        std::fs::remove_dir_all(run).unwrap();
+    }
 }
