@@ -206,9 +206,14 @@ pub fn mxc_path(path: &Path) -> String {
 
 /// Read a bounded regular file from the descriptor checked above.
 pub fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    use std::io::{Error, ErrorKind, Read};
+    use std::io::{Error, ErrorKind};
     let file =
         open_single_link(path)?.ok_or_else(|| Error::new(ErrorKind::NotFound, "file missing"))?;
+    read_bounded_file(file, limit)
+}
+
+fn read_bounded_file(file: std::fs::File, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, Read};
     if file.metadata()?.len() > limit {
         return Err(Error::other("file exceeds byte limit"));
     }
@@ -218,6 +223,105 @@ pub fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
         return Err(Error::other("file exceeds byte limit"));
     }
     Ok(bytes)
+}
+
+/// Read an inventory file beneath a trusted target without traversing links.
+/// On Unix each component is opened relative to its pinned parent descriptor.
+pub fn read_bounded_in(target: &Path, relative: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    if !crate::paths::safe_relative(relative) {
+        return Err(std::io::Error::other(
+            "inventory path must be relative without parent traversal",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        let mut dir = std::fs::File::open(target)?;
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let name = std::ffi::CString::new(component.as_os_str().as_bytes())
+                .map_err(|_| std::io::Error::other("NUL in inventory path"))?;
+            let last = components.peek().is_none();
+            let flags = libc::O_RDONLY
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | if last {
+                    libc::O_NONBLOCK
+                } else {
+                    libc::O_DIRECTORY
+                };
+            // SAFETY: dir owns a live directory descriptor and name is NUL-terminated.
+            let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: successful openat returns a new descriptor owned here.
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            if last {
+                if !file.metadata()?.is_file() || link_count(&file)? != 1 {
+                    return Err(std::io::Error::other(
+                        "inventory content must be a single-link regular file",
+                    ));
+                }
+                return read_bounded_file(file, limit);
+            }
+            dir = file;
+        }
+        Err(std::io::Error::other("empty inventory path"))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Keep every ancestor open without delete sharing, preventing rename
+        // or replacement between checking an ancestor and opening its child.
+        let open = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1 | 0x2)
+                .custom_flags(0x0200_0000 | 0x0020_0000)
+                .open(path)
+        };
+        let mut path = std::fs::canonicalize(target)?;
+        let root = open(&path)?;
+        if is_link(&root.metadata()?) || !root.metadata()?.is_dir() {
+            return Err(std::io::Error::other(
+                "inventory target must be a directory without links",
+            ));
+        }
+        let mut pinned = vec![root];
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            path.push(component);
+            let file = open(&path)?;
+            let meta = file.metadata()?;
+            if is_link(&meta) {
+                return Err(std::io::Error::other("inventory links are excluded"));
+            }
+            if components.peek().is_none() {
+                if !meta.is_file() || link_count(&file)? != 1 {
+                    return Err(std::io::Error::other(
+                        "inventory content must be a single-link regular file",
+                    ));
+                }
+                return read_bounded_file(file, limit);
+            }
+            if !meta.is_dir() {
+                return Err(std::io::Error::other(
+                    "inventory ancestor must be a directory",
+                ));
+            }
+            pinned.push(file);
+        }
+        Err(std::io::Error::other("empty inventory path"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, limit);
+        Err(std::io::Error::other(
+            "contained inventory reads unavailable on this platform",
+        ))
+    }
 }
 
 #[cfg(unix)]

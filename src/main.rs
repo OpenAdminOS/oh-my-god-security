@@ -1507,14 +1507,21 @@ fn data_dir() -> PathBuf {
     omgs::platform::data_dir().unwrap_or_else(|| home().join(".local").join("share").join("omgs"))
 }
 
-fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> bool {
+    walk_limited(dir, depth, out, omgs::stacks::INVENTORY_LIMIT)
+}
+
+fn walk_limited(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, limit: usize) -> bool {
     if depth > 12 {
-        return;
+        return false;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return false;
     };
     for entry in entries.flatten() {
+        if out.len() >= limit {
+            return true;
+        }
         // Use the directory entry's own type so a symlink is never followed out
         // of the target tree (is_dir() would resolve the link target).
         let Ok(ftype) = entry.file_type() else {
@@ -1529,11 +1536,14 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             if ["node_modules", ".git", ".next", "target", "dist"].contains(&name.as_str()) {
                 continue;
             }
-            walk(&path, depth + 1, out);
+            if walk_limited(&path, depth + 1, out, limit) {
+                return true;
+            }
         } else if ftype.is_file() {
             out.push(path);
         }
     }
+    false
 }
 
 fn cmd_audit(args: &[String]) -> Result<(), String> {
@@ -1576,6 +1586,10 @@ fn resolve_existing_prefix(p: &Path) -> Result<PathBuf, String> {
 
 /// Initialize a run and return its directory.
 fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
+    audit_init_limited(rest, omgs::stacks::INVENTORY_LIMIT)
+}
+
+fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf, String> {
     let target_raw = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
     let target =
         std::fs::canonicalize(&target_raw).map_err(|e| format!("target {target_raw}: {e}"))?;
@@ -1589,8 +1603,8 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     let persona = flag(rest, "--persona")
         .map(|p| omgs::persona::defaults(&p))
         .transpose()?;
-    let defaults = persona.unwrap_or(omgs::persona::defaults("builder")?);
-    let mode = flag(rest, "--mode").unwrap_or_else(|| defaults.mode.into());
+    let mode =
+        flag(rest, "--mode").unwrap_or_else(|| persona.map_or("advisory", |p| p.mode).into());
     if mode != "gate" && mode != "advisory" {
         return Err("--mode must be gate or advisory".into());
     }
@@ -1694,15 +1708,14 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         .map(|h| h[..7].to_string())
         .unwrap_or_else(|| "working tree".into());
     let mut files = Vec::new();
-    walk(&target, 0, &mut files);
-    let rel_paths: Vec<String> = files
+    let inventory_limited = walk_limited(&target, 0, &mut files, inventory_limit);
+    let native_paths: Vec<PathBuf> = files
         .iter()
-        .map(|f| {
-            f.strip_prefix(&target)
-                .unwrap_or(f)
-                .to_string_lossy()
-                .replace('\\', "/")
-        })
+        .filter_map(|f| f.strip_prefix(&target).ok().map(Path::to_path_buf))
+        .collect();
+    let rel_paths: Vec<String> = native_paths
+        .iter()
+        .map(|p| omgs::paths::display(p))
         .collect();
     let counts = omgs::architecture::path_counts(&rel_paths);
     let vendored_count = counts
@@ -1714,7 +1727,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         .filter(|p| omgs::paths::classify(p) == omgs::paths::Class::Code)
         .cloned()
         .collect();
-    let projects = omgs::stacks::detect(&target, &rel_paths);
+    let projects = omgs::stacks::detect(&target, &native_paths);
     let stacks: Vec<_> = projects
         .iter()
         .flat_map(|p| p.stacks.iter().copied())
@@ -1750,14 +1763,47 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
             ));
         }
     }
-    if vendored_count > 0 {
-        let mut unit = Unit::new(
+    for project in projects.iter().filter(|p| p.stacks.is_empty()) {
+        units.push(Unit::new(
+            &format!("project:{}:generic", project.root),
+            &project.root,
+            &["missing_authz", "input_validation"],
+            "planned",
+        ));
+    }
+    for (class, id, label) in [
+        (
+            omgs::paths::Class::Vendored,
             "vendored:excluded",
-            &format!("{vendored_count} vendored or generated file(s)"),
-            &[],
-            "out_of_scope",
-        );
-        unit.note = Some("vendored or generated code is excluded from hunting by default".into());
+            "vendored or generated",
+        ),
+        (omgs::paths::Class::Docs, "docs:excluded", "documentation"),
+        (
+            omgs::paths::Class::Test,
+            "tests:excluded",
+            "test or fixture",
+        ),
+    ] {
+        let count = counts.get(&class).copied().unwrap_or(0);
+        if count > 0 {
+            let mut unit = Unit::new(id, &format!("{count} {label} file(s)"), &[], "out_of_scope");
+            unit.note = Some(format!(
+                "{count} {label} file(s) excluded from hunting by default"
+            ));
+            units.push(unit);
+        }
+    }
+    let inventory_gaps: Vec<String> = if inventory_limited {
+        vec![format!(
+            "inventory size limit of {} files reached; remaining paths were not inventoried",
+            inventory_limit
+        )]
+    } else {
+        Vec::new()
+    };
+    for gap in &inventory_gaps {
+        let mut unit = Unit::new("inventory:limit", ".", &[], "blocked");
+        unit.note = Some(gap.clone());
         units.push(unit);
     }
     if units.is_empty() {
@@ -1779,8 +1825,10 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     let mut meta = serde_json::json!({
         "repo": repo, "target": target.to_string_lossy(), "source_ref": source_ref,
         "mode": mode, "budget_agent_calls": budget, "profile": "standard",
-        "persona": defaults.name, "report_depth": defaults.report_depth,
-        "budget_profile": if persona.is_some() { defaults.budget_profile } else { "standard" },
+        "persona": persona.map(|p| p.name), "report_depth": persona.map_or("full", |p| p.report_depth),
+        "budget_profile": persona.map_or("standard", |p| p.budget_profile),
+        "inventory_gaps": inventory_gaps,
+        "inventory_limit": inventory_limit,
         "accounting": omgs::accounting::read(&serde_json::Map::new())?,
         "execution_policy": "sandboxed-source-and-local-only", "run_status": "in_progress",
         "detected_stacks": stacks.clone(),
@@ -1824,6 +1872,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         },
         "zones": [],
         "components": [],
+        "unexamined": inventory_gaps,
         "notes": "Seeded by omgs audit. The reconnaissance agent fills zones, components, principals, boundaries, flows, and input_surfaces, records what was not examined in 'unexamined', then renders the map with: omgs architecture --in architecture.json --out <run-dir>."
     });
     write_out(
@@ -2818,7 +2867,10 @@ mod cli_tests {
             let name = format!("cmd_{cmd}");
             let mut sections = vec![(name.as_str(), function(source, &name))];
             match (cmd, sub) {
-                ("audit", _) => sections.push(("audit_init", function(source, "audit_init"))),
+                ("audit", _) => {
+                    sections.push(("audit_init", function(source, "audit_init")));
+                    sections.push(("audit_init_limited", function(source, "audit_init_limited")));
+                }
                 ("route", _) => sections.push(("models_path", function(source, "models_path"))),
                 ("ledger", _) => {
                     let body = function(source, "ledger_locked");
@@ -2952,5 +3004,52 @@ mod cli_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod inventory_regressions {
+    #[test]
+    fn size_limit_is_persisted_as_a_coverage_gap() {
+        let dir = std::env::temp_dir().join(format!("omgs-inventory-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = dir.join("repo");
+        let run = dir.join("run");
+        std::fs::create_dir_all(&target).unwrap();
+        for i in 0..4 {
+            std::fs::write(target.join(format!("{i}.rs")), "").unwrap();
+        }
+        let args = vec![
+            "--target".into(),
+            target.to_string_lossy().into_owned(),
+            "--out".into(),
+            run.to_string_lossy().into_owned(),
+            "--no-sensors".into(),
+        ];
+        super::audit_init_limited(&args, 3).unwrap();
+        let read = |name| {
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(run.join(name)).unwrap(),
+            )
+            .unwrap()
+        };
+        let meta = read("run-metadata.json");
+        assert_eq!(meta["files_total"], 3);
+        assert_eq!(meta["inventory_limit"], 3);
+        assert!(meta["inventory_gaps"][0]
+            .as_str()
+            .unwrap()
+            .contains("3 files"));
+        let ledger = read("coverage-ledger.json");
+        assert!(ledger["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["id"] == "inventory:limit" && u["status"] == "blocked"));
+        assert_eq!(
+            read("architecture.json")["unexamined"],
+            meta["inventory_gaps"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

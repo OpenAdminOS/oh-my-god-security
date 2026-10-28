@@ -10,7 +10,7 @@ Read finalized records, structured candidate claims, relevant source, trusted in
 
 ## Output and schema
 
-Write OUTPUT_DIR/evaluation.json with this inline schema: {"evaluator": string, "source_ref": string, "decisions": [{"fingerprint": string, "decision": "uphold"|"adjust"|"overturn", "reason": string, "evidence": [string], "required_changes": [string]}], "gaps": [string]}. Include every finalized record, even rejected and pending ones. Cite replay record paths for every upheld proof. Adjustments must describe the exact corrected verdict, tier or severity and why; they return to the verifier for a schema-valid findings.json under schemas/findings.schema.json, followed by a new evaluation. New leads return to a fresh hunter as candidates under skill/schemas/candidates.schema.json. Never directly invent a finding.
+Write OUTPUT_DIR/evaluation.json with this inline schema: {"evaluator": string, "source_ref": string, "decisions": [{"fingerprint": string, "decision": "uphold"|"adjust"|"overturn", "reason": string, "evidence": [string], "required_changes": [string]}], "gaps": [string]}. Include every finalized record, even rejected and pending ones. Cite replay record paths for every upheld proof. Adjustments must describe the exact corrected verdict, tier or severity and why; they return to the verifier for a schema-valid findings.json under SKILL_DIR/schemas/findings.schema.json, followed by a new evaluation. New leads return to a fresh hunter as candidates under SKILL_DIR/schemas/candidates.schema.json. Never directly invent a finding.
 
 ## Exact commands
 

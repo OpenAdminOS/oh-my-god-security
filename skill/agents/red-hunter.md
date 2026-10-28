@@ -10,7 +10,7 @@ Read the assigned source as text, related enforcement helpers needed to trace th
 
 ## Output and schema
 
-Write OUTPUT_DIR/candidates-HUNTER.json as {"candidates": [...]} using every required field in skill/schemas/candidates.schema.json. Use the exact SOURCE_REF and HUNTER, stable identity inputs, unit_ids, attacker capability, ordered source trace, concrete result, checked counterevidence, missing fact and minimal proof plan. No severity. An empty hunt writes {"candidates": []}.
+Write OUTPUT_DIR/candidates-HUNTER.json as {"candidates": [...]} using every required field in SKILL_DIR/schemas/candidates.schema.json. Use the exact SOURCE_REF and HUNTER, stable identity inputs, unit_ids, attacker capability, ordered source trace, concrete result, checked counterevidence, missing fact and minimal proof plan. No severity. An empty hunt writes {"candidates": []}.
 
 Also write OUTPUT_DIR/dispositions-HUNTER.json, with this inline schema: {"hunter": string, "units": [{"unit_id": string, "disposition": "candidate"|"covered"|"blocked"|"deferred", "evidence": [string], "note": string}]}. Every assigned unit needs a disposition. Covered requires a traced effective control and evidence; blocked and deferred name the exact missing fact or budget limit. Stop on a complete candidate, decisive control, precise blocker or exhausted budget.
 
@@ -24,13 +24,7 @@ omgs intent list --attack-class CLASS
 omgs fingerprint --attack-class CLASS --entry-point ENTRY --sink SINK --boundary BOUNDARY
 ```
 
-Only if the assigned scope explicitly includes a minimal proof, run:
-
-```text
-omgs prove --run OUTPUT_DIR --finding FINGERPRINT --test RELATIVE_TEST --test-from OUTPUT_DIR/DRAFT --cmd COMMAND
-```
-
-Keep the printed proof reference as evidence, not a self-awarded verdict. Exit 3 means no workload ran, so record the blocker.
+Hand the minimal proof plan and external test draft to the independent verifier. Only the verifier runs the initial proof; the evaluator independently replays it. Hunters do not run proof commands or award verdicts.
 
 ## Never do
 

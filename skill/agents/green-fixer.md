@@ -2,7 +2,7 @@
 
 ## Inputs
 
-The host passes this brief verbatim plus TARGET, private external OUTPUT_DIR, SOURCE_REF, fixer identity FIXER, the explicit owner-approved list of finding fingerprints and allowed paths, adjudicated findings, fix briefs, retained proof tests, intended behavior, local prerequisites and call/time budget. Without explicit permission to change TARGET, produce proposed patches only. A review request alone does not authorize fixes.
+The host passes this brief verbatim plus TARGET, private external OUTPUT_DIR, SOURCE_REF, fixer identity FIXER, the explicit owner-approved list of finding fingerprints and allowed paths, adjudicated findings, fix briefs, retained proof tests, intended behavior, local prerequisites and call/time budget, the original run metadata and its remaining combined call/proof allowance REMAINING_BUDGET, and ORIGINAL_PERSONA (null when absent). Without explicit permission to change TARGET, produce proposed patches only. A review request alone does not authorize fixes.
 
 ## Allowed reads
 
@@ -10,7 +10,7 @@ Read the listed findings, their source and enforcement dependencies, trusted int
 
 ## Output and schema
 
-Write OUTPUT_DIR/fixes.json with this inline schema: {"fixer": string, "source_ref": string, "items": [{"fingerprint": string, "paths": [string], "change": string, "test_path": string, "before_proof_ref": string, "after_proof_ref": string|null, "status": "fixed"|"proposed"|"blocked", "blocker": string|null}]}. Include only listed items. Retain each original invariant test at its accepted target-relative path, or as an external draft with a proposed patch until accepted. Preserve baseline findings.json under schemas/findings.schema.json; do not rewrite history to turn the original confirmed finding into a rejection. Proof records remain runner-owned. Report the narrow fix, authorized success control, proof references and exact blockers.
+Write OUTPUT_DIR/fixes.json with this inline schema: {"fixer": string, "source_ref": string, "items": [{"fingerprint": string, "paths": [string], "change": string, "test_path": string, "before_proof_ref": string, "after_proof_ref": string|null, "status": "fixed"|"proposed"|"blocked", "blocker": string|null}]}. Include only listed items. Retain each original invariant test at its accepted target-relative path, or as an external draft with a proposed patch until accepted. Preserve baseline findings.json under SKILL_DIR/schemas/findings.schema.json; do not rewrite history to turn the original confirmed finding into a rejection. Proof records remain runner-owned. Report the narrow fix, authorized success control, proof references and exact blockers.
 
 ## Exact commands
 
@@ -24,9 +24,11 @@ omgs prove --run OUTPUT_DIR --replay N
 After an authorized edit, the old replay snapshot intentionally no longer matches. Initialize a new external run for the changed revision and rerun the same retained test and exact invariant assertion:
 
 ```text
-omgs audit init --target TARGET --out FIX_OUTPUT_DIR --no-sensors
+omgs audit init --target TARGET --out FIX_OUTPUT_DIR --no-sensors --budget REMAINING_BUDGET [--persona ORIGINAL_PERSONA]
 omgs prove --run FIX_OUTPUT_DIR --test RELATIVE_TEST --test-from OUTPUT_DIR/DRAFT --cmd COMMAND
 ```
+
+The host computes REMAINING_BUDGET from the original budget_agent_calls minus agent_calls_used and proof_runs_used across the original run and all earlier fix runs, including the baseline replay above. Reserve that allowance for this fix run and pause spending in the original run while it is active. Carry the exact original persona with --persona, omitting that option when persona is null. Explicit --budget overrides the persona default, including a remaining budget of zero. If the original run has no budget cap, omit --budget too; never invent a new cap or reset a consumed allowance. The host accounts for fix calls and proofs in the original total before any later dispatch. Stop when the shared allowance is exhausted.
 
 Omit --test-from only when the identical retained test is already accepted into TARGET. A fixed test passes while the authorized success control still succeeds. Record the new runner proof path; ask for independent verification and evaluation before closing the item. If prove exits 3, record that nothing ran and keep the fix blocked rather than claiming verification.
 

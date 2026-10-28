@@ -1,9 +1,11 @@
-//! Stack inventory grouped by nearest project marker. Nested packages never
-//! leak their stack into a parent project. Manifest content is read as data.
-use crate::paths::{classify, Class};
+//! Stack inventory grouped by nearest project marker. Native paths are used
+//! for reads; display paths are never converted back into filesystem paths.
+use crate::paths::{classify, display, safe_relative, Class};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+pub const INVENTORY_LIMIT: usize = 100_000;
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Project {
@@ -11,17 +13,25 @@ pub struct Project {
     pub stacks: Vec<&'static str>,
 }
 
-pub fn detect(target: &Path, paths: &[String]) -> Vec<Project> {
-    let paths: Vec<String> = paths.iter().map(|p| p.replace('\\', "/")).collect();
-    let mut roots = BTreeSet::from([String::new()]);
+pub fn detect(target: &Path, paths: &[PathBuf]) -> Vec<Project> {
+    let eligible: Vec<_> = paths
+        .iter()
+        .take(INVENTORY_LIMIT)
+        .filter(|p| {
+            safe_relative(p)
+                && !matches!(
+                    classify(&display(p)),
+                    Class::Vendored | Class::Docs | Class::Test
+                )
+        })
+        .collect();
+    let mut roots = BTreeSet::new();
     let mut extensions = BTreeSet::new();
-    for path in &paths {
-        if matches!(classify(path), Class::Vendored | Class::Docs | Class::Test) {
-            continue;
-        }
-        let (parent, file) = path.rsplit_once('/').unwrap_or(("", path));
+    for path in &eligible {
+        let parent = path.parent().unwrap_or(Path::new("")).to_path_buf();
+        let file = path.file_name().unwrap().to_string_lossy();
         let extension = file == "manifest.json"
-            && crate::platform::read_bounded(&target.join(path), 1 << 20)
+            && crate::platform::read_bounded_in(target, path, 1 << 20)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
                 .is_some_and(|v| {
@@ -31,7 +41,7 @@ pub fn detect(target: &Path, paths: &[String]) -> Vec<Project> {
                     )
                 });
         if extension {
-            extensions.insert(parent.to_string());
+            extensions.insert(parent.clone());
         }
         if extension
             || [
@@ -43,35 +53,45 @@ pub fn detect(target: &Path, paths: &[String]) -> Vec<Project> {
                 "setup.cfg",
                 "go.mod",
             ]
-            .contains(&file)
+            .contains(&file.as_ref())
             || file.ends_with(".csproj")
         {
-            roots.insert(parent.to_string());
+            roots.insert(parent);
         }
     }
-    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for path in &paths {
-        let root = roots
-            .iter()
-            .filter(|r| r.is_empty() || path.starts_with(&format!("{r}/")))
-            .max_by_key(|r| r.len())
-            .unwrap();
-        let rel = if root.is_empty() {
-            path.as_str()
-        } else {
-            &path[root.len() + 1..]
-        };
-        groups.entry(root.clone()).or_default().push(rel.into());
+    // Seed marker roots even if no supported stack can be inferred. Lookup
+    // walks ancestors rather than scanning every root for every inventory path.
+    let mut groups: BTreeMap<PathBuf, Vec<String>> =
+        roots.iter().map(|r| (r.clone(), Vec::new())).collect();
+    for path in eligible {
+        let root = path
+            .parent()
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .find(|p| roots.contains(*p))
+            .unwrap_or(Path::new(""));
+        groups
+            .entry(root.to_path_buf())
+            .or_default()
+            .push(display(path));
     }
     groups
         .into_iter()
         .filter_map(|(root, paths)| {
+            // Keep full paths for classification, including fixture ancestry.
             let mut stacks = crate::detect_stacks(&paths);
             if extensions.contains(&root) {
                 stacks.push("browser-extension");
             }
-            (!stacks.is_empty()).then(|| Project {
-                root: if root.is_empty() { ".".into() } else { root },
+            (!stacks.is_empty()
+                || roots.contains(&root)
+                || paths.iter().any(|p| classify(p) == Class::Code))
+            .then(|| Project {
+                root: if root.as_os_str().is_empty() {
+                    ".".into()
+                } else {
+                    display(&root)
+                },
                 stacks,
             })
         })
