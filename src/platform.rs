@@ -89,7 +89,8 @@ pub fn which(name: &str) -> Option<PathBuf> {
 
 /// Open `path` for reading without following a final symlink (or reparse
 /// point on Windows) and without blocking on a FIFO, and accept it only when
-/// it is a regular file with exactly one link. `Ok(None)` when it is missing.
+/// it is a regular file without hardlink aliases. An opened file may have
+/// zero links after a concurrent atomic replacement. `Ok(None)` when missing.
 /// Used for files whose content decides trust, so a planted symlink or
 /// hardlink cannot substitute another file.
 pub fn open_single_link(path: &Path) -> std::io::Result<Option<std::fs::File>> {
@@ -112,8 +113,7 @@ pub fn open_single_link(path: &Path) -> std::io::Result<Option<std::fs::File>> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let meta = file.metadata()?;
-    if !meta.is_file() || is_link(&meta) || link_count(&file)? != 1 {
+    if !is_single_link_file(&file)? {
         return Err(Error::other(format!(
             "{} must be a regular file with a single link",
             path.display()
@@ -174,21 +174,17 @@ pub fn describe_path(path: &Path) -> String {
     }
 }
 
-/// Create a private directory, including when the caller reserved it earlier.
+/// Create private storage or validate a directory reserved earlier.
+#[cfg(unix)]
 pub fn private_dir(path: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
+    create_private_tree(path)
+}
+
+#[cfg(not(unix))]
+pub fn private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(windows)]
+    windows_private::restrict(path)?;
     Ok(())
 }
 
@@ -206,9 +202,17 @@ pub fn mxc_path(path: &Path) -> String {
 
 /// Read a bounded regular file from the descriptor checked above.
 pub fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    use std::io::{Error, ErrorKind, Read};
+    use std::io::{Error, ErrorKind};
     let file =
         open_single_link(path)?.ok_or_else(|| Error::new(ErrorKind::NotFound, "file missing"))?;
+    #[cfg(unix)]
+    check_private_file(&file)
+        .map_err(|e| Error::other(format!("storage {}: {e}", path.display())))?;
+    read_bounded_file(file, limit)
+}
+
+fn read_bounded_file(file: std::fs::File, limit: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, Read};
     if file.metadata()?.len() > limit {
         return Err(Error::other("file exceeds byte limit"));
     }
@@ -218,6 +222,136 @@ pub fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
         return Err(Error::other("file exceeds byte limit"));
     }
     Ok(bytes)
+}
+
+/// Read an inventory file beneath a trusted target without traversing links.
+/// On Unix each component is opened relative to its pinned parent descriptor.
+pub fn read_bounded_in(target: &Path, relative: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    with_file_in(target, relative, |file| read_bounded_file(file, limit))
+}
+
+/// Read private metadata, checking the opened leaf's owner, mode and ACL.
+pub fn read_private_bounded_in(
+    target: &Path,
+    relative: &Path,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    with_file_in(target, relative, |file| {
+        check_private_file(&file).map_err(|e| {
+            std::io::Error::other(format!("storage {}: {e}", target.join(relative).display()))
+        })?;
+        read_bounded_file(file, limit)
+    })
+}
+
+fn with_file_in<T>(
+    target: &Path,
+    relative: &Path,
+    read: impl FnOnce(std::fs::File) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    if !crate::paths::safe_relative(relative) {
+        return Err(std::io::Error::other(
+            "inventory path must be relative without parent traversal",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        let mut dir = std::fs::File::open(target)?;
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let name = std::ffi::CString::new(component.as_os_str().as_bytes())
+                .map_err(|_| std::io::Error::other("NUL in inventory path"))?;
+            let last = components.peek().is_none();
+            let flags = libc::O_RDONLY
+                | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | if last {
+                    libc::O_NONBLOCK
+                } else {
+                    libc::O_DIRECTORY
+                };
+            // SAFETY: dir owns a live directory descriptor and name is NUL-terminated.
+            let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: successful openat returns a new descriptor owned here.
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            if last {
+                if !is_single_link_file(&file)? {
+                    return Err(std::io::Error::other(
+                        "inventory content must be a single-link regular file",
+                    ));
+                }
+                return read(file);
+            }
+            dir = file;
+        }
+        Err(std::io::Error::other("empty inventory path"))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Keep every ancestor open without delete sharing, preventing rename
+        // or replacement between checking an ancestor and opening its child.
+        // The leaf permits FILE_SHARE_DELETE so a lock holder can publish a
+        // replacement while this reader finishes reading its original handle.
+        let open = |path: &Path, leaf: bool| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0x1 | 0x2 | if leaf { 0x4 } else { 0 })
+                .custom_flags(0x0200_0000 | 0x0020_0000)
+                .open(path)
+        };
+        let mut path = std::fs::canonicalize(target)?;
+        let root = open(&path, false)?;
+        if is_link(&root.metadata()?) || !root.metadata()?.is_dir() {
+            return Err(std::io::Error::other(
+                "inventory target must be a directory without links",
+            ));
+        }
+        let mut pinned = vec![root];
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            path.push(component);
+            let file = open(&path, components.peek().is_none())?;
+            let meta = file.metadata()?;
+            if is_link(&meta) {
+                return Err(std::io::Error::other("inventory links are excluded"));
+            }
+            if components.peek().is_none() {
+                if !is_single_link_file(&file)? {
+                    return Err(std::io::Error::other(
+                        "inventory content must be a single-link regular file",
+                    ));
+                }
+                return read(file);
+            }
+            if !meta.is_dir() {
+                return Err(std::io::Error::other(
+                    "inventory ancestor must be a directory",
+                ));
+            }
+            pinned.push(file);
+        }
+        Err(std::io::Error::other("empty inventory path"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, read);
+        Err(std::io::Error::other(
+            "contained inventory reads unavailable on this platform",
+        ))
+    }
+}
+
+// A retired snapshot with zero directory links is safe to read through its
+// already-open handle. Two or more links can alias attacker-controlled storage.
+fn is_single_link_file(file: &std::fs::File) -> std::io::Result<bool> {
+    let meta = file.metadata()?;
+    Ok(meta.is_file() && !is_link(&meta) && link_count(file)? <= 1)
 }
 
 #[cfg(unix)]
@@ -341,6 +475,98 @@ mod tests {
         assert!(which("omgs-definitely-not-a-tool-xyz").is_none());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn metadata_publication_child() {
+        let Some(dir) = std::env::var_os("OMGS_TEST_PUBLICATION_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        crate::runmeta::with_lock(&dir, || {
+            crate::runmeta::write_atomic(&dir.join(crate::runmeta::FILE), "new")
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_metadata_reader_allows_concurrent_atomic_publication() {
+        let dir = std::env::temp_dir().join(format!("omgs-share-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_private_dir(&dir).unwrap();
+        let run = dir.join("run");
+        create_private_dir(&run).unwrap();
+        crate::runmeta::write_atomic(&run.join(crate::runmeta::FILE), "old").unwrap();
+        with_file_in(&dir, &Path::new("run").join(crate::runmeta::FILE), |file| {
+            check_private_file(&file)?;
+            // Ancestors remain pinned while the validated metadata leaf is open.
+            assert!(std::fs::rename(&run, dir.join("moved")).is_err());
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::tests::metadata_publication_child",
+                    "--nocapture",
+                ])
+                .env("OMGS_TEST_PUBLICATION_DIR", &run)
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            // Revalidate after publication too: replacement may have reduced
+            // the old handle's link count to zero, but it has no aliases.
+            assert!(is_single_link_file(&file)?);
+            check_private_file(&file)?;
+            assert_eq!(read_bounded_file(file, 100)?, b"old");
+            assert_eq!(std::fs::read(run.join(crate::runmeta::FILE))?, b"new");
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_metadata_and_lock_modes_are_refused_without_repair() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = std::env::temp_dir().join(format!("omgs-leaf-mode-{}", random_nonce().unwrap()));
+        create_private_dir_new(&dir).unwrap();
+        let run = dir.join("run");
+        create_private_dir_new(&run).unwrap();
+        let metadata = run.join(crate::runmeta::FILE);
+        let lock = run.join(".omgs-run.lock");
+        for mode in [0o620, 0o602] {
+            std::fs::write(&metadata, "{}").unwrap();
+            std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(mode)).unwrap();
+            for error in [
+                crate::budget::metadata(&run).unwrap_err(),
+                crate::runmeta::read(&run).unwrap_err(),
+                crate::runmeta::write_atomic(&metadata, "changed").unwrap_err(),
+            ] {
+                assert!(error.contains(&metadata.display().to_string()), "{error}");
+                assert!(error.contains("not group- or world-writable"), "{error}");
+                assert!(error.contains("README.md#storage-migration"), "{error}");
+            }
+            assert_eq!(std::fs::read_to_string(&metadata).unwrap(), "{}");
+            assert_eq!(std::fs::metadata(&metadata).unwrap().mode() & 0o777, mode);
+            std::fs::write(&lock, "").unwrap();
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(crate::runmeta::with_lock(&run, || -> Result<(), String> {
+                panic!("unsafe lock admitted")
+            })
+            .is_err());
+        }
+        for leaf in [&metadata, &lock] {
+            std::fs::set_permissions(leaf, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        crate::runmeta::with_lock(&run, || crate::runmeta::write_atomic(&metadata, "{}")).unwrap();
+        assert!(crate::budget::metadata(&run).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn single_link_open_refuses_hardlinks_and_accepts_plain_files() {
         let d = std::env::temp_dir().join(format!("omgs-link-{}", std::process::id()));
@@ -348,10 +574,15 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let a = d.join("a");
         std::fs::write(&a, b"x").unwrap();
-        assert!(open_single_link(&a).unwrap().is_some());
+        let held = open_single_link(&a).unwrap().unwrap();
         assert!(open_single_link(&d.join("missing")).unwrap().is_none());
         std::fs::hard_link(&a, d.join("b")).unwrap();
         assert!(open_single_link(&a).is_err());
+        assert!(!is_single_link_file(&held).unwrap());
+        std::fs::remove_file(d.join("b")).unwrap();
+        std::fs::remove_file(&a).unwrap();
+        assert!(is_single_link_file(&held).unwrap());
+        assert_eq!(read_bounded_file(held, 100).unwrap(), b"x");
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(d.join("c-target"), d.join("c")).unwrap();
@@ -384,4 +615,131 @@ mod diagnostic_tests {
             "a\\nb\\r\\t\\u{1b}[31m café"
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+#[path = "macos_private.rs"]
+mod macos_private;
+
+#[cfg(windows)]
+#[path = "windows_private.rs"]
+mod windows_private;
+
+/// Run storage is trusted only while the owner prevents concurrent replacement.
+pub fn check_private_dir(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if is_link(&meta) || !meta.is_dir() {
+        return Err(std::io::Error::other(
+            "storage must be a directory without links",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no arguments or memory preconditions.
+        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o7777 != 0o700 {
+            return Err(std::io::Error::other(format!(
+                "storage {} must be owned by the current user with mode 0700; observed owner uid {}, mode {:04o}; see README.md#storage-migration",
+                path.display(), meta.uid(), meta.mode() & 0o7777,
+            )));
+        }
+        // Linux POSIX access ACLs expose ACL_MASK in the group mode bits.
+        // Mode 0700 therefore masks all named-user and group entries to ---;
+        // the mask cannot be wider than these bits. Creation with 0700/0600
+        // also constrains inherited default ACLs to the requested mode.
+        #[cfg(target_os = "macos")]
+        macos_private::check_dir(path, meta.uid())?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        windows_private::check(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::other("private storage checks unavailable"))
+    }
+}
+
+/// Open a new private file or an existing lock without changing its ACL.
+#[cfg(windows)]
+pub fn open_private_write(path: &Path, create_new: bool) -> std::io::Result<std::fs::File> {
+    windows_private::open_write(path, create_new)
+}
+
+/// Validate an opened metadata or lock file before using its contents or lock.
+pub fn check_private_file(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows_private::check_file(file)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        // Linux's ACL mask is the group mode bits, so this also excludes
+        // effective POSIX ACL write grants to named users and groups.
+        // SAFETY: geteuid has no arguments or memory preconditions.
+        if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+            return Err(std::io::Error::other(format!(
+                "storage file must be regular, owned by the current user and not group- or world-writable; observed owner uid {}, mode {:04o}; see README.md#storage-migration",
+                meta.uid(), meta.mode() & 0o7777,
+            )));
+        }
+        #[cfg(target_os = "macos")]
+        macos_private::check_file(file, meta.uid())?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(std::io::Error::other("private storage checks unavailable"))
+    }
+}
+
+/// Create owner-private storage or fail closed on an existing unsafe directory.
+/// Parent directories must already be trusted against concurrent replacement.
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    match create_private_dir_new(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => check_private_dir(path),
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!(
+                "create storage {}: {e}; see README.md#storage-migration",
+                path.display()
+            ),
+        )),
+    }
+}
+
+/// Reserve a new directory exclusively with owner-private permissions.
+pub fn create_private_dir_new(path: &Path) -> std::io::Result<()> {
+    let builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = builder;
+        builder.mode(0o700);
+        builder
+    };
+    builder.create(path)?;
+    // Only an exclusive successful create authorizes changing this ACL.
+    #[cfg(target_os = "macos")]
+    macos_private::restrict_created_dir(path)?;
+    #[cfg(windows)]
+    windows_private::restrict(path)?;
+    check_private_dir(path)
+}
+
+/// Create missing storage ancestors privately, checking the requested directory.
+pub fn create_private_tree(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if !parent.exists() {
+                create_private_tree(parent)?;
+            }
+        }
+    }
+    create_private_dir(path)
 }

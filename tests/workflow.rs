@@ -3,6 +3,15 @@ use omgs::ledger::{add_unit, set_status, validate_ledger, Ledger, Unit};
 use omgs::model::{validate, Finding, FindingsFile, Location, ProofTier, Severity, Verdict};
 use omgs::report::{render_html, render_markdown, render_sarif, ReportMeta};
 
+// Valid storage fixtures must have the same owner and ACL as runtime files,
+// including when the Windows test process has an elevated token.
+fn write_private_fixture(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    omgs::runmeta::write_atomic_bytes(path.as_ref(), bytes.as_ref())
+}
+
 /// A valid confirmed record for `key`, hunted by red-1 and verified by blue-1.
 fn record(key: &str) -> Finding {
     let attack_class = format!("class_{key}");
@@ -541,9 +550,16 @@ fn report_renders_critic_result() {
 }
 
 fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("omgs-wf-{}-{name}", std::process::id()));
+    static BASE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(|| {
+        let base =
+            std::env::temp_dir().join(format!("omgs-private-fixtures-{}", std::process::id()));
+        omgs::platform::create_private_tree(&base).unwrap();
+        base
+    });
+    let dir = base.join(format!("omgs-wf-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    omgs::platform::private_dir(&dir).unwrap();
     dir
 }
 
@@ -562,7 +578,7 @@ fn cli_ledger_and_critic_end_to_end() {
     let mut ledger = ledger;
     ledger.units[0].status = "planned".into();
     ledger.units[0].evidence.clear();
-    let w = |name: &str, v: String| std::fs::write(dir.join(name), v).unwrap();
+    let w = |name: &str, v: String| write_private_fixture(dir.join(name), v).unwrap();
     w(
         "coverage-ledger.json",
         serde_json::to_string(&ledger).unwrap(),
@@ -655,7 +671,7 @@ fn critic_includes_findings_validation() {
 fn critic_rejects_a_misspelled_candidates_file() {
     let dir = scratch("misspelled");
     let (ledger, _cands, _findings) = complete_run();
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
     )
@@ -674,7 +690,7 @@ fn report_critic_describes_the_rendered_findings() {
     let dir = scratch("selected");
     let (ledger, cands, findings) = complete_run();
     let findings = attest(&dir, findings);
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
     )
@@ -736,7 +752,7 @@ fn ledger_requires_the_units_key() {
     let empty: Ledger = serde_json::from_str(r#"{"units": []}"#).unwrap();
     assert!(empty.units.is_empty());
     let dir = scratch("units-key");
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         r#"{"unit": [{"id": "sensitive-route", "status": "planned"}]}"#,
     )
@@ -761,7 +777,7 @@ fn findings_file_requires_the_findings_key() {
     let mut unit = Unit::new("u", ".", &[], "covered");
     unit.evidence = vec!["path/a.ts".into()];
     ledger.units.push(unit);
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
     )
@@ -902,7 +918,7 @@ fn critic_flags_blank_identity_inputs_on_merged_candidates() {
 fn critic_refuses_symlinked_candidate_files() {
     let dir = scratch("symlinked-candidates");
     let (ledger, cands, findings) = complete_run();
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
     )
@@ -954,7 +970,7 @@ fn array_shaped_and_null_inputs_are_errors() {
     // End to end: an otherwise complete run with a positional candidates file fails.
     let dir = scratch("array-shapes");
     let (ledger, _, findings) = complete_run();
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
     )
@@ -1038,9 +1054,9 @@ fn report_fails_on_malformed_companion_files() {
             dir.join("out").to_str().unwrap(),
         ])
     };
-    std::fs::write(dir.join("coverage-ledger.json"), "{").unwrap();
+    write_private_fixture(dir.join("coverage-ledger.json"), "{").unwrap();
     assert_eq!(report(&dir).status.code(), Some(2), "malformed ledger");
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
     )
@@ -1410,7 +1426,7 @@ fn saved_configs_are_checked_even_when_their_digest_matches() {
         "output_sha256"
     ));
     record.output.clear();
-    std::fs::write(
+    write_private_fixture(
         dir.join("run-metadata.json"),
         serde_json::json!({"target": dir.join("target")} ).to_string(),
     )
@@ -1565,7 +1581,7 @@ fn linked_proof_contract_requires_boundary_control_and_assertion_exit() {
 #[test]
 fn contract_deletions_nulls_and_downgrades_fail_validation_and_replay() {
     let dir = scratch("contract-tampering");
-    std::fs::write(dir.join(omgs::runmeta::FILE), "{}").unwrap();
+    write_private_fixture(dir.join(omgs::runmeta::FILE), "{}").unwrap();
     let (_, _, findings) = complete_run();
     let findings = attest(&dir, findings);
     let findings_path = dir.join("findings.json");
@@ -1998,7 +2014,7 @@ fn validation_and_replay_reject_special_tests_within_a_second() {
     let dir = scratch("special-proof-test");
     let (ledger, cands, findings) = complete_run();
     let findings = attest(&dir, findings);
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_vec(&ledger).unwrap(),
     )
@@ -2019,7 +2035,7 @@ fn validation_and_replay_reject_special_tests_within_a_second() {
     let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
     record.target = Some(target.to_string_lossy().into());
     record.target_sha256 = Some("0".repeat(64));
-    std::fs::write(
+    write_private_fixture(
         dir.join(omgs::runmeta::FILE),
         serde_json::json!({"target": target}).to_string(),
     )
@@ -2250,5 +2266,123 @@ fn windows_unc_proof_directories_match_writer_and_validator() {
             .enforced
             .push(format!("wall_clock={}ms", record.timeout_ms));
     }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn persona_never_changes_validation_critic_or_verdicts() {
+    let dir = scratch("persona-evidence");
+    let target = dir.join("repo");
+    std::fs::create_dir_all(target.join("tests/security")).unwrap();
+    std::fs::write(target.join("tests/security/x.test.ts"), "fixture").unwrap();
+    let mut outcomes = Vec::new();
+    for persona in ["builder", "inheritor", "team"] {
+        let run = dir.join(persona);
+        let out = omgs(&[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--persona",
+            persona,
+            "--no-sensors",
+        ]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (ledger, candidates, mut findings) = complete_run();
+        // Repeat identical accepted and broken proof inputs for all verdicts.
+        let mut results = Vec::new();
+        for verdict in [
+            Verdict::Confirmed,
+            Verdict::NeedsValidation,
+            Verdict::Rejected,
+        ] {
+            findings.findings[0].verdict = verdict;
+            findings.findings[0].severity = if verdict == Verdict::Confirmed {
+                Some(omgs::model::Severity::High)
+            } else {
+                None
+            };
+            let proven = attest(&run, findings.clone());
+            let saved_proof = run.join(proven.findings[0].proof_ref.as_ref().unwrap());
+            let mut record: omgs::proof::ProofRecord =
+                serde_json::from_str(&std::fs::read_to_string(&saved_proof).unwrap()).unwrap();
+            record.target = Some(target.canonicalize().unwrap().to_string_lossy().into());
+            record.target_sha256 = Some(omgs::proof::tree_digest(&target).unwrap());
+            record.test_sha256 = Some(omgs::sha256::digest(b"fixture"));
+            omgs::proof::write(&run, &record).unwrap();
+            std::fs::write(
+                run.join("findings.json"),
+                serde_json::to_string(&proven).unwrap(),
+            )
+            .unwrap();
+            write_private_fixture(
+                run.join("coverage-ledger.json"),
+                serde_json::to_string(&ledger).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                run.join("candidates-red-1.json"),
+                serde_json::json!({"candidates":[candidate_json(&candidates[0].candidate)]})
+                    .to_string(),
+            )
+            .unwrap();
+            let validate = || {
+                omgs(&[
+                    "validate",
+                    "--findings",
+                    run.join("findings.json").to_str().unwrap(),
+                ])
+                .status
+                .code()
+            };
+            let critic = || {
+                omgs(&["critic", "--run", run.to_str().unwrap()])
+                    .status
+                    .code()
+            };
+            let check = omgs(&[
+                "validate",
+                "--findings",
+                run.join("findings.json").to_str().unwrap(),
+            ]);
+            assert_eq!(
+                check.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&check.stderr)
+            );
+            assert_eq!(critic(), Some(0));
+            let proof_path = run.join(proven.findings[0].proof_ref.as_ref().unwrap());
+            let mut proof: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&proof_path).unwrap()).unwrap();
+            proof["command_finished"] = false.into();
+            std::fs::write(&proof_path, proof.to_string()).unwrap();
+            results.push((validate(), critic(), proven.findings[0].verdict));
+            assert_eq!(results.last().unwrap().0, Some(1));
+            assert_eq!(results.last().unwrap().1, Some(1));
+            // Traced evidence cannot confirm, for any persona.
+            let mut traced = proven.clone();
+            traced.findings[0].proof_tier = ProofTier::Traced;
+            traced.findings[0].proof_ref = None;
+            std::fs::write(
+                run.join("findings.json"),
+                serde_json::to_string(&traced).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                validate(),
+                Some(if verdict == Verdict::Confirmed { 1 } else { 0 })
+            );
+        }
+        outcomes.push(results);
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
+    assert_eq!(outcomes[1], outcomes[2]);
     std::fs::remove_dir_all(dir).unwrap();
 }

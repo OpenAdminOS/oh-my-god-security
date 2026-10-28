@@ -1,10 +1,14 @@
+pub mod accounting;
 pub mod approval;
 pub mod architecture;
 pub mod batch;
+pub mod budget;
 pub mod critic;
 pub mod intent;
 pub mod ledger;
 pub mod model;
+pub mod paths;
+pub mod persona;
 pub mod platform;
 pub mod proof;
 pub mod report;
@@ -14,6 +18,7 @@ pub mod sandbox;
 pub mod sensors;
 pub mod sha256;
 pub mod shape;
+pub mod stacks;
 pub mod status;
 pub mod supervise;
 pub mod watch;
@@ -37,36 +42,24 @@ pub fn fingerprint(attack_class: &str, entry_point: &str, sink: &str, boundary: 
     format!("omgs-{hash:016x}")
 }
 
-/// Paths that are almost certainly vendored or generated, excluded from
-/// hunting surfaces and flagged on sensor hits instead of counted as code.
+/// Compatibility wrapper shared by sensors and inventory consumers.
 pub fn is_vendored_path(rel_path: &str) -> bool {
-    let lower = rel_path.replace('\\', "/").to_lowercase();
-    let segments: Vec<&str> = lower.split('/').collect();
-    let vendored_dirs = [
-        "node_modules",
-        "vendor",
-        "third_party",
-        "thirdparty",
-        "external",
-        "monacoeditor",
-        "dist",
-        "build",
-        ".next",
-    ];
-    if segments.iter().any(|s| vendored_dirs.contains(s)) {
-        return true;
-    }
-    let file = segments.last().copied().unwrap_or("");
-    file.ends_with(".min.js")
-        || file.ends_with(".min.css")
-        || file.ends_with(".dll")
-        || file.ends_with(".exe")
-        || file.ends_with(".pdb")
-        || file.ends_with(".map")
+    paths::classify(rel_path) == paths::Class::Vendored
 }
 
 /// Stacks OMGS can seed meaningful coverage for, from relative file paths.
 pub fn detect_stacks(rel_paths: &[String]) -> Vec<&'static str> {
+    let eligible: Vec<String> = rel_paths
+        .iter()
+        .map(|p| p.replace('\\', "/"))
+        .filter(|p| {
+            matches!(paths::classify(p), paths::Class::Code)
+                || (paths::classify(p) == paths::Class::Data
+                    && ["package.json", "Cargo.toml", "pyproject.toml", "setup.cfg"]
+                        .contains(&p.rsplit('/').next().unwrap_or(p)))
+        })
+        .collect();
+    let rel_paths = &eligible;
     let has = |pred: &dyn Fn(&str) -> bool| rel_paths.iter().any(|p| pred(p));
     let count_ext = |exts: &[&str]| {
         rel_paths
@@ -98,6 +91,12 @@ pub fn detect_stacks(rel_paths: &[String]) -> Vec<&'static str> {
     }
     if stacks.is_empty() && has(&|p| p.ends_with("package.json")) {
         stacks.push("node");
+    }
+    if count_ext(&[".sh", ".bash", ".zsh", ".ksh", ".fish", ".cmd", ".bat"]) > 0 {
+        stacks.push("shell");
+    }
+    if count_ext(&[".rs"]) > 0 || has(&|p| p.ends_with("Cargo.toml")) {
+        stacks.push("rust");
     }
     stacks
 }
@@ -136,6 +135,8 @@ pub fn stack_attack_classes(stack: &str) -> Vec<&'static str> {
             "export_integrity",
             "unbounded_import_recursion",
         ],
+        "shell" => vec!["shell_injection", "path_traversal", "download_integrity"],
+        "browser-extension" => vec!["identity_binding", "missing_authz", "dom_injection"],
         "python" => vec!["command_injection", "deserialization", "path_traversal"],
         _ => vec!["missing_authz", "input_validation"],
     }

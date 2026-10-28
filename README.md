@@ -160,10 +160,39 @@ cargo build --release
 ./target/release/omgs check --target /path/to/your/repo
 ```
 
+## Persona defaults and accounting
+
+`omgs audit init --target <repo> --persona builder|inheritor|team` records the persona and selects presentation and spending defaults. Builder uses concise coverage detail and a budget of 24 calls/proofs, inheritor uses full detail and 64, and team uses full detail and 96. Every persona defaults to advisory; explicit `--mode` and `--budget` override the defaults. Without `--persona`, the existing budget behavior is unchanged. Proof rules, verdict semantics and the evidence required to confirm a finding are identical.
+
+Inventory uses a heuristic path classifier for stack detection, first-party size statistics and hunting priority only. Code is the default, including unknown formats, SQL, HTML and templates. JSON, JSONL, NDJSON, CSV and TSV files of at least 1 MiB are prioritized as data, even though they may contain interpreted logic or renamed scripts. Documentation uses md, rst and adoc extensions or conventional notices. Only conventional notices such as README.txt, LICENSE.txt, NOTICE.txt, CHANGES.txt, AUTHORS.txt, CONTRIBUTING.txt and COPYING.txt classify as docs by the txt suffix; other txt files default to code. Conventional executable and build names (including CMakeLists.txt, Makefile, GNUmakefile, Dockerfile, Containerfile, Justfile, Rakefile, Gemfile, Gradle and CMake scripts, Jenkinsfile, Vagrantfile, BUILD, BUILD.bazel, WORKSPACE and meson.build) take precedence over docs/data rules. `requirements*.txt` is dependency configuration and classifies as code. Inventory-root test/spec and dependency containers and conventional test suffixes set test or vendored priority; nested directory hints, minified names and binary extensions alone cannot exclude a file.
+
+Classification never removes accountability. Every nonempty test, docs, data or vendored class gets a `planned` coverage unit with its total count and first 20 sorted paths across all files, plus supplemental source counts and paths. A hunter must skim or sample each group, then either hunt (`covered` with evidence) or explicitly resolve it as `out_of_scope` with `reviewed, not security relevant: <reason>`. The disposition must cite at least one sampled path in its evidence. The reason must explain the review, not repeat the classifier label. Planned, candidate, blocked and deferred exclusions fail the critic. Ledger output and both reports show review reasons. Shell scripts and browser extensions with a valid manifest version are detected alongside existing stacks. Nested project markers produce separate subproject roots in run metadata, coverage units and the architecture seed.
+
+Supply host usage cumulatively per role with `--accounting ROLE=TOKENS,COST_USD,DURATION_MS` on status or report. The roles are `red-hunter`, `blue-verifier`, `evaluator` and `green-fixer`. Repeat the option for multiple roles. For example:
+
+```sh
+omgs status --run <run-dir> --stage hunt --state done --accounting red-hunter=12000,0.32,45000
+omgs report --findings <run-dir>/findings.json --out <run-dir> --accounting blue-verifier=8000,unknown,30000
+```
+
+Each supplied entry replaces that role's cumulative totals. Empty fields or `unknown` mean unavailable. Missing usage round-trips as JSON null and renders as `unknown`, including roles that have not run. Explicit zero means a measured zero. Reports reuse saved status accounting.
+
+`omgs budget --run <run-dir>` reports the shared cumulative calls/proofs and remaining allowance. Start each fix run with `omgs audit init --target <repo> --out <fix-run-dir> --no-sensors --fix-of <original-run-dir>` to register it and compute its cap. Each run records only its own spending; never fold fix usage into the original counters. Multiple fix rounds share the original cap. Exhaustion returns zero, an uncapped original returns null, and invalid links or counter overflow are errors. Fix runs must be direct siblings of the original in its trusted runs directory. Linked metadata records each run's random identity and the parent's identity, and accounting and charging verify these identities with no-follow reads. Symlinked runs, symlinked metadata and Windows reparse points are refused, as are links outside that directory. Old linked registrations lacking identities fail closed; start a new review family rather than guessing identity. Unidentified standalone legacy runs remain chargeable, but cannot start a linked fix family.
+
+### Storage migration
+
+Upgrade existing runs with care: older runs with automatic vendor exclusions now fail the critic. Re-review those exclusions and explicitly resolve them with review evidence and a reason, or start a fresh run. Never prepend `reviewed, not security relevant:` automatically to a legacy note.
+
+Budget guarantees require owner-private run storage that cannot change concurrently. The runs directory and every run directory must be owned by the current user, with mode 0700 on Unix and a Windows DACL whose write grants name only that user, SYSTEM, BUILTIN\Administrators or CREATOR OWNER (mapping to that user). This allowlist covers effective and inheritable grants, including files-only and inherit-only grants, and existing metadata and lock files. Existing profile subfolders carrying write grants for other principals are refused, even under a restrictive parent. Start fresh in a new private runs directory or secure the existing subfolders, metadata and lock files before reusing them. On Unix, existing storage directories must have mode 0700; metadata and lock files must be owned by the current user and must not be group- or world-writable. On macOS, extended ACL allow entries granting mutation rights to any principal other than the owner are refused, including inherited and inherit-only entries. Deny entries such as `everyone deny delete` and allow entries for the owner are admitted. New storage directories have their inherited macOS ACLs cleared immediately after exclusive creation, before creating children or publishing metadata. Existing directories and files are never repaired automatically. Refusals name the path and offending ACL entry or ownership and mode. Move to fresh private storage or have the owner review and secure the named object before retrying. Keep ancestor directories protected from replacement and do not rename or replace storage during a run. Sandboxed target code cannot write there. Metadata reads refuse links, but atomic publications use paths rather than retaining directory handles across validation and write.
+
+Inventory refuses symlink and reparse traversal and stops below depth 12. Skipped links, depth truncation, directory/entry read failures and the file limit produce blocked inventory units, architecture gaps and report coverage notes. Each records a reason, an omitted entry/subtree event count (not a file total) and at most 20 sorted path samples. Resolve every inventory gap explicitly before the critic can pass.
+
+Role contracts live under `skill/agents/`: red-hunter, blue-verifier, evaluator and green-fixer. The host passes each brief verbatim with its scope. The identity-binding and fail-closed-semantics packs add reusable intent questions and minimal proof shapes.
+
 ## Repository layout
 
 - `src/`: the deterministic Rust CLI (findings schema, finding identity across runs, stack detection, coverage ledger, redacted sensor execution, sandbox proof execution, report rendering to Markdown, a self contained HTML one pager, and SARIF, and the architecture map renderer).
-- `schemas/`: findings and coverage ledger JSON schemas (the agent-facing candidate and architecture schemas live in `skill/schemas/`).
+- `schemas/`: coverage ledger JSON schema. Findings, candidate and architecture schemas live in `skill/schemas/`.
 - `skill/`: the agent skill pack and attack class packs that your agent follows.
 - `.github/workflows/release.yml`: the signed, notarized, checksummed release pipeline.
 - `benchmark/`: the open benchmark design and case manifest format.

@@ -10,6 +10,17 @@
 //! fixed-iteration barycenter heuristic broken by input order then id, and never
 //! embeds a timestamp. The same input renders byte-identical output.
 
+/// Inventory counts use the same classifier as stack detection and sensors.
+pub fn path_counts(
+    paths: &[(String, crate::paths::Class)],
+) -> std::collections::BTreeMap<crate::paths::Class, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for (_, class) in paths {
+        *counts.entry(*class).or_insert(0) += 1;
+    }
+    counts
+}
+
 use crate::html_escape;
 use serde::Deserialize;
 

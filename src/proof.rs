@@ -195,7 +195,8 @@ pub fn valid_expect_marker(marker: &str) -> bool {
 /// directory, which fails if another prove took the number first.
 pub fn reserve(run: &Path) -> Result<(u32, PathBuf), String> {
     let dir = run.join(DIR);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    crate::platform::create_private_tree(&dir)
+        .map_err(|e| format!("create {}: {e}", dir.display()))?;
     let mut n = std::fs::read_dir(&dir)
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok())
@@ -212,14 +213,7 @@ pub fn reserve(run: &Path) -> Result<(u32, PathBuf), String> {
         .ok_or("proof numbers exhausted")?;
     loop {
         let d = dir.join(n.to_string());
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        match builder.create(&d) {
+        match crate::platform::create_private_dir_new(&d) {
             Ok(()) => return Ok((n, d)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < u32::MAX => n += 1,
             Err(e) => return Err(format!("create {}: {e}", d.display())),

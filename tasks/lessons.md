@@ -54,3 +54,15 @@ Rules for next time:
   is blocked, say so, say why, and keep it in scope until the user explicitly removes it.
 - Before calling a release ready, sweep IMPROVEMENTS.md, tasks/todo.md, DECISIONS.md, and
   benchmark/feature-coverage.md for open, partial, tracked, or deferred items and list them.
+
+
+## 2026-10-28: make inventory exclusions fail safe
+
+What happened: successive review rounds found production paths hidden by directory hints for docs,
+specs, tests, fixtures, dumps and exports. Name-by-name exceptions left the same coverage failure.
+
+Rules for next time:
+- Default unknown files to Code. Exclusion needs a specific convention, not a broad folder hint.
+- Runtime ancestry wins over directory hints; SQL, HTML and templates stay in hunting scope.
+- Record excluded counts and sorted path samples in the coverage ledger, including source paths.
+- Test adversarial runtime paths end to end, including the hunting units and critic result.
