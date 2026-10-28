@@ -253,6 +253,14 @@ pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String>
         )?;
         for lead in &e.leads {
             if let Some(unit) = ledger.units.iter().find(|u| u.id == lead.unit_id) {
+                if unit.status == "out_of_scope"
+                    && unit.evidence.iter().all(|e| e.trim().is_empty())
+                {
+                    gaps.push(format!(
+                        "evaluator lead {} requires scope evidence before exclusion",
+                        lead.unit_id
+                    ));
+                }
                 if !["covered", "out_of_scope"].contains(&unit.status.as_str()) {
                     gaps.push(format!(
                         "evaluator lead {} remains {}; partial handoff only",

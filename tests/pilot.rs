@@ -533,6 +533,18 @@ fn unresolved_evaluator_leads_keep_delivery_partial() {
             "partial"
         );
     }
+    let lead = ledger["units"].as_array_mut().unwrap().last_mut().unwrap();
+    lead["status"] = "out_of_scope".into();
+    lead["note"] = "Outside the reviewed source revision".into();
+    f.put("coverage-ledger.json", ledger.clone());
+    assert!(omgs::critic::critique_run(&f.run)
+        .unwrap()
+        .gaps
+        .iter()
+        .any(|g| g.contains("requires scope evidence")));
+    ledger["units"].as_array_mut().unwrap().last_mut().unwrap()["evidence"] = json!(["sample.ps1"]);
+    f.put("coverage-ledger.json", ledger);
+    assert!(omgs::critic::critique_run(&f.run).unwrap().passed());
 }
 
 #[cfg(unix)]
@@ -606,4 +618,57 @@ fn report_cannot_restore_allowance_after_concurrent_call_charge() {
     assert!(omgs::budget::summary(&f.run)
         .unwrap()
         .contains("6 used of 12; 6 remaining"));
+}
+
+#[test]
+fn successful_fallback_keeps_refusal_details_in_both_indexes() {
+    let f = Fixture::new();
+    let models = f.root.join("models.json");
+    omgs::runmeta::write_atomic(
+        &models,
+        &json!({"roles":{"verifier":["primarytest","fallbacktest"]}}).to_string(),
+    )
+    .unwrap();
+    let out = f.cli(&[
+        "route",
+        "--run",
+        f.run_str(),
+        "--role",
+        "verifier",
+        "--refused",
+        "primarytest",
+        "--reason",
+        "synthetic eligibility block",
+        "--models",
+        models.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let summary = omgs::batch::summarize(
+        &omgs::batch::BatchRun {
+            url: "https://example.com/team/synthetic".into(),
+            run_dir: Some(f.run_str().into()),
+            ..Default::default()
+        },
+        &f.root,
+    )
+    .unwrap();
+    assert!(!summary.blockers.iter().any(|b| b.contains("eligibility")));
+    assert_eq!(summary.refusal_events[0].from, "primarytest");
+    for text in [
+        omgs::batch::render_index_markdown(std::slice::from_ref(&summary)),
+        omgs::batch::render_index_html(&[summary]),
+    ] {
+        for expected in [
+            "primarytest",
+            "fallbacktest",
+            "synthetic eligibility block",
+            "verifier",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+    }
 }

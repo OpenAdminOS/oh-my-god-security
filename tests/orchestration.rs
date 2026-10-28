@@ -97,6 +97,7 @@ fn summary(url: &str, blockers: Vec<String>) -> RunSummary {
         agent_calls: Some(40),
         budget: None,
         reroutes: 1,
+        refusal_events: Vec::new(),
     }
 }
 
