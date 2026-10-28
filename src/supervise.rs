@@ -1151,7 +1151,7 @@ mod sweep {
         Ok(deny != 0)
     }
 
-    fn command(pid: i32, notes: &mut Vec<String>) -> String {
+    fn command(pid: i32) -> Option<String> {
         let mut buffer = [0u8; 4096];
         // SAFETY: buffer is writable for the specified byte count.
         let mut count =
@@ -1162,18 +1162,90 @@ mod sweep {
                 unsafe { libc::proc_name(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
         }
         if count <= 0 {
-            notes.push(format!("could not read command for survivor {pid}"));
-            return "unknown".into();
+            return None;
         }
         let length = (count as usize).min(buffer.len());
         let end = buffer[..length]
             .iter()
             .position(|b| *b == 0)
             .unwrap_or(length);
-        String::from_utf8_lossy(&buffer[..end]).into_owned()
+        Some(String::from_utf8_lossy(&buffer[..end]).into_owned())
+    }
+
+    const MAX_SCANS: usize = 20;
+
+    trait ProcessQueries {
+        fn pids(&mut self) -> io::Result<Vec<i32>>;
+        fn owned_pids(&mut self, uid: libc::uid_t, capacity: usize) -> io::Result<Vec<i32>>;
+        fn info(&mut self, pid: i32) -> io::Result<libc::proc_bsdinfo>;
+        fn matches(&mut self, pid: i32, allowed: &CString, denied: &CString) -> io::Result<bool>;
+        fn command(&mut self, pid: i32) -> Option<String>;
+        fn signal(&mut self, pid: i32, number: i32, notes: &mut Vec<String>) -> bool;
+        fn elapsed(&self) -> Duration;
+        fn pause(&mut self);
+    }
+
+    struct Libproc {
+        start: Instant,
+    }
+
+    impl ProcessQueries for Libproc {
+        fn pids(&mut self) -> io::Result<Vec<i32>> {
+            pids()
+        }
+
+        fn owned_pids(&mut self, uid: libc::uid_t, capacity: usize) -> io::Result<Vec<i32>> {
+            owned_pids(uid, capacity)
+        }
+
+        fn info(&mut self, pid: i32) -> io::Result<libc::proc_bsdinfo> {
+            info(pid)
+        }
+
+        fn matches(&mut self, pid: i32, allowed: &CString, denied: &CString) -> io::Result<bool> {
+            matches(pid, allowed, denied)
+        }
+
+        fn command(&mut self, pid: i32) -> Option<String> {
+            command(pid)
+        }
+
+        fn signal(&mut self, pid: i32, number: i32, notes: &mut Vec<String>) -> bool {
+            super::signal(pid, number, notes)
+        }
+
+        fn elapsed(&self) -> Duration {
+            self.start.elapsed()
+        }
+
+        fn pause(&mut self) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     pub(super) fn run(markers: &SweepMarkers, result: &mut Supervised) -> bool {
+        // SAFETY: getpid has no pointer arguments or preconditions.
+        let own = unsafe { libc::getpid() };
+        // SAFETY: geteuid has no pointer arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        run_with(
+            markers,
+            result,
+            &mut Libproc {
+                start: Instant::now(),
+            },
+            own,
+            uid,
+        )
+    }
+
+    fn run_with(
+        markers: &SweepMarkers,
+        result: &mut Supervised,
+        processes: &mut impl ProcessQueries,
+        own: i32,
+        uid: libc::uid_t,
+    ) -> bool {
         let (Ok(allowed), Ok(denied)) = (
             CString::new(markers.allowed.as_os_str().as_bytes()),
             CString::new(markers.denied.as_os_str().as_bytes()),
@@ -1193,15 +1265,10 @@ mod sweep {
             return false;
         }
         result.enforced.push("survivor_sweep".into());
-        // SAFETY: getpid has no pointer arguments or preconditions.
-        let own = unsafe { libc::getpid() };
-        // SAFETY: geteuid has no pointer arguments or preconditions.
-        let uid = unsafe { libc::geteuid() };
-        let start = Instant::now();
         let mut healthy = true;
         let mut seen = Vec::new();
-        for _ in 0..20 {
-            let pids = match pids() {
+        for _ in 0..MAX_SCANS {
+            let pids = match processes.pids() {
                 Ok(pids) => pids,
                 Err(error) => {
                     result
@@ -1210,7 +1277,7 @@ mod sweep {
                     return false;
                 }
             };
-            let owned = match owned_pids(uid, pids.len()) {
+            let owned = match processes.owned_pids(uid, pids.len()) {
                 Ok(owned) => owned,
                 Err(error) => {
                     result
@@ -1221,7 +1288,7 @@ mod sweep {
             };
             let mut found = false;
             for pid in pids {
-                if start.elapsed() >= DRAIN {
+                if processes.elapsed() >= DRAIN {
                     result
                         .notes
                         .push("survivor sweep time bound reached before a scan completed".into());
@@ -1230,7 +1297,7 @@ mod sweep {
                 if pid <= 0 || pid == own || owned.binary_search(&pid).is_err() {
                     continue;
                 }
-                let before = match info(pid) {
+                let before = match processes.info(pid) {
                     Ok(info) if info.pbi_uid == uid && info.pbi_status != 5 => info,
                     Ok(_) => continue,
                     Err(error) => {
@@ -1243,7 +1310,7 @@ mod sweep {
                         continue;
                     }
                 };
-                let matched = match matches(pid, &allowed, &denied) {
+                let matched = match processes.matches(pid, &allowed, &denied) {
                     Ok(matched) => matched,
                     Err(error) => {
                         if error.raw_os_error() != Some(libc::ESRCH) {
@@ -1258,52 +1325,410 @@ mod sweep {
                 if !matched {
                     continue;
                 }
-                let identity = (pid, before.pbi_start_tvsec, before.pbi_start_tvusec);
-                if !seen.contains(&identity) {
-                    result.survivors.push(Survivor {
-                        pid,
-                        command: command(pid, &mut result.notes),
-                    });
-                    seen.push(identity);
-                }
-                // Recheck identity after the policy calls, before signalling a pid.
-                let after = match info(pid) {
-                    Ok(info) => info,
-                    Err(error) => {
-                        if error.raw_os_error() != Some(libc::ESRCH) {
-                            result.notes.push(format!(
-                                "survivor identity recheck for {pid} failed: {error}"
-                            ));
-                            healthy = false;
-                        }
+                // Every match requires another scan, even if it exits or its pid
+                // is reused before the recheck. It may have forked another child.
+                found = true;
+                let identity = (
+                    pid,
+                    before.pbi_uid,
+                    before.pbi_start_tvsec,
+                    before.pbi_start_tvusec,
+                );
+                let unseen = !seen.contains(&identity);
+                let command = if unseen { processes.command(pid) } else { None };
+                // Check identity after the policy and command calls, before
+                // recording a survivor or signalling a potentially reused pid.
+                let (may_signal, exited) = match processes.info(pid) {
+                    Ok(after)
+                        if after.pbi_uid != before.pbi_uid
+                            || after.pbi_start_tvsec != before.pbi_start_tvsec
+                            || after.pbi_start_tvusec != before.pbi_start_tvusec =>
+                    {
                         continue;
                     }
+                    // A zombie cannot execute or fork, and awaits its own parent.
+                    Ok(after) => (after.pbi_status != 5, after.pbi_status == 5),
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => (false, true),
+                    Err(error) => {
+                        result.notes.push(format!(
+                            "survivor identity recheck for {pid} failed: {error}"
+                        ));
+                        healthy = false;
+                        (false, false)
+                    }
                 };
-                if after.pbi_uid != uid
-                    || after.pbi_start_tvsec != before.pbi_start_tvsec
-                    || after.pbi_start_tvusec != before.pbi_start_tvusec
-                {
-                    continue;
+                if unseen {
+                    let command = command.unwrap_or_else(|| {
+                        if exited {
+                            "exited before its command was read".into()
+                        } else {
+                            result
+                                .notes
+                                .push(format!("could not read command for survivor {pid}"));
+                            "unknown".into()
+                        }
+                    });
+                    // Exited matches still outlived the workload. Preserve their
+                    // proof record without reporting a cleanup failure.
+                    result.survivors.push(Survivor { pid, command });
+                    seen.push(identity);
                 }
-                // A killed zombie cannot execute or fork, and awaits its own parent.
-                if after.pbi_status == 5 {
-                    continue;
+                if may_signal {
+                    healthy &= processes.signal(pid, libc::SIGKILL, &mut result.notes);
                 }
-                found = true;
-                healthy &= signal(pid, libc::SIGKILL, &mut result.notes);
+            }
+            if processes.elapsed() >= DRAIN {
+                break;
             }
             if !found {
                 return healthy;
             }
-            if start.elapsed() >= DRAIN {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
+            processes.pause();
         }
         result
             .notes
             .push("survivor sweep reached its scan or time bound with matches present".into());
         false
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::VecDeque;
+
+        const OWN: i32 = 1;
+        const UID: libc::uid_t = 501;
+        const A: i32 = 101;
+        const B: i32 = 102;
+
+        enum Step {
+            Pids(Vec<i32>, Duration),
+            Info(i32, Result<libc::proc_bsdinfo, i32>),
+            Matches(i32),
+            Command(i32, Option<&'static str>),
+            Signal(i32),
+            Pause,
+        }
+
+        struct Scripted {
+            steps: VecDeque<Step>,
+            owned: Vec<i32>,
+            elapsed: Duration,
+            scans: usize,
+            signalled: Vec<i32>,
+        }
+
+        impl Scripted {
+            fn next(&mut self) -> Step {
+                self.steps.pop_front().expect("unexpected process query")
+            }
+        }
+
+        impl ProcessQueries for Scripted {
+            fn pids(&mut self) -> io::Result<Vec<i32>> {
+                let Step::Pids(pids, elapsed) = self.next() else {
+                    panic!("expected pid enumeration");
+                };
+                self.scans += 1;
+                self.elapsed = elapsed;
+                self.owned = pids.clone();
+                self.owned.sort_unstable();
+                Ok(pids)
+            }
+
+            fn owned_pids(&mut self, uid: libc::uid_t, capacity: usize) -> io::Result<Vec<i32>> {
+                assert_eq!(uid, UID);
+                assert_eq!(capacity, self.owned.len());
+                Ok(self.owned.clone())
+            }
+
+            fn info(&mut self, pid: i32) -> io::Result<libc::proc_bsdinfo> {
+                let Step::Info(expected, result) = self.next() else {
+                    panic!("expected info query for {pid}");
+                };
+                assert_eq!(pid, expected);
+                result.map_err(io::Error::from_raw_os_error)
+            }
+
+            fn matches(
+                &mut self,
+                pid: i32,
+                allowed: &CString,
+                denied: &CString,
+            ) -> io::Result<bool> {
+                let Step::Matches(expected) = self.next() else {
+                    panic!("expected sandbox query for {pid}");
+                };
+                assert_eq!(pid, expected);
+                assert_eq!(allowed.to_bytes(), b"/allowed");
+                assert_eq!(denied.to_bytes(), b"/denied");
+                Ok(true)
+            }
+
+            fn command(&mut self, pid: i32) -> Option<String> {
+                let Step::Command(expected, command) = self.next() else {
+                    panic!("expected command query for {pid}");
+                };
+                assert_eq!(pid, expected);
+                command.map(str::to_owned)
+            }
+
+            fn signal(&mut self, pid: i32, number: i32, _notes: &mut Vec<String>) -> bool {
+                let Step::Signal(expected) = self.next() else {
+                    panic!("unexpected signal to {pid}");
+                };
+                assert_eq!(pid, expected);
+                assert_eq!(number, libc::SIGKILL);
+                self.signalled.push(pid);
+                true
+            }
+
+            fn elapsed(&self) -> Duration {
+                self.elapsed
+            }
+
+            fn pause(&mut self) {
+                assert!(matches!(self.next(), Step::Pause));
+            }
+        }
+
+        fn live() -> libc::proc_bsdinfo {
+            // SAFETY: proc_bsdinfo is a plain C structure; these are test values.
+            let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+            info.pbi_uid = UID;
+            info.pbi_status = 2;
+            info.pbi_start_tvsec = 10;
+            info.pbi_start_tvusec = 20;
+            info
+        }
+
+        fn scan(pids: &[i32]) -> Step {
+            Step::Pids(pids.to_vec(), Duration::ZERO)
+        }
+
+        fn exercise(steps: Vec<Step>) -> (Supervised, Scripted) {
+            let mut processes = Scripted {
+                steps: steps.into(),
+                owned: Vec::new(),
+                elapsed: Duration::ZERO,
+                scans: 0,
+                signalled: Vec::new(),
+            };
+            let mut result = Supervised {
+                exit_code: Some(0),
+                executor_exit_code: Some(0),
+                command_started: true,
+                command_finished: true,
+                test_reachable: None,
+                boundary_marker_seen: false,
+                authorized_control_seen: false,
+                enumerate_rejected: false,
+                success: false,
+                timed_out: false,
+                executor_error: false,
+                killed: false,
+                interrupted: false,
+                duration_ms: 0,
+                output: String::new(),
+                stdout: String::new(),
+                output_bytes_total: 0,
+                capture_complete: true,
+                cleanup_complete: false,
+                survivors: Vec::new(),
+                enforced: Vec::new(),
+                notes: Vec::new(),
+            };
+            let markers = SweepMarkers {
+                allowed: "/allowed".into(),
+                denied: "/denied".into(),
+            };
+            result.cleanup_complete = run_with(&markers, &mut result, &mut processes, OWN, UID);
+            assert!(
+                processes.steps.is_empty(),
+                "sweep stopped before script ended"
+            );
+            (result, processes)
+        }
+
+        #[test]
+        fn vanished_match_rescans_and_kills_forked_child() {
+            let (result, processes) = exercise(vec![
+                scan(&[A]),
+                Step::Info(A, Ok(live())),
+                Step::Matches(A),
+                Step::Command(A, None),
+                Step::Info(A, Err(libc::ESRCH)),
+                Step::Pause,
+                scan(&[B]),
+                Step::Info(B, Ok(live())),
+                Step::Matches(B),
+                Step::Command(B, Some("child")),
+                Step::Info(B, Ok(live())),
+                Step::Signal(B),
+                Step::Pause,
+                scan(&[]),
+            ]);
+            assert!(result.cleanup_complete, "{result:?}");
+            assert!(result.notes.is_empty(), "{result:?}");
+            assert_eq!(processes.scans, 3);
+            assert_eq!(processes.signalled, [B]);
+            assert_eq!(result.survivors.len(), 2);
+            assert_eq!(result.survivors[0].pid, A);
+            assert_eq!(
+                result.survivors[0].command,
+                "exited before its command was read"
+            );
+            assert_eq!(result.survivors[1].pid, B);
+            assert_eq!(result.survivors[1].command, "child");
+        }
+
+        #[test]
+        fn identity_recheck_errors_keep_survivor_and_fail_cleanup() {
+            for error in [libc::EPERM, libc::EIO, libc::ENOENT] {
+                let (result, processes) = exercise(vec![
+                    scan(&[A]),
+                    Step::Info(A, Ok(live())),
+                    Step::Matches(A),
+                    Step::Command(A, None),
+                    Step::Info(A, Err(error)),
+                    Step::Pause,
+                    scan(&[]),
+                ]);
+                assert!(!result.cleanup_complete, "{result:?}");
+                assert_eq!(processes.scans, 2);
+                assert!(processes.signalled.is_empty());
+                assert_eq!(result.survivors.len(), 1);
+                assert_eq!(result.survivors[0].pid, A);
+                assert_eq!(result.survivors[0].command, "unknown");
+                assert!(result
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("identity recheck")));
+                assert!(result
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("could not read command")));
+            }
+        }
+
+        #[test]
+        fn reused_identity_is_omitted_without_signal_and_rescanned() {
+            for field in 0..3 {
+                let mut replacement = live();
+                match field {
+                    0 => replacement.pbi_uid += 1,
+                    1 => replacement.pbi_start_tvsec += 1,
+                    _ => replacement.pbi_start_tvusec += 1,
+                }
+                for command in [None, Some("replacement")] {
+                    let (result, processes) = exercise(vec![
+                        scan(&[A]),
+                        Step::Info(A, Ok(live())),
+                        Step::Matches(A),
+                        Step::Command(A, command),
+                        Step::Info(A, Ok(replacement)),
+                        Step::Pause,
+                        scan(&[]),
+                    ]);
+                    assert!(result.cleanup_complete, "{result:?}");
+                    assert!(result.notes.is_empty(), "{result:?}");
+                    assert!(result.survivors.is_empty(), "{result:?}");
+                    assert!(processes.signalled.is_empty());
+                    assert_eq!(processes.scans, 2);
+                }
+            }
+        }
+
+        #[test]
+        fn matched_zombie_is_recorded_without_cleanup_failure_or_signal() {
+            let mut zombie = live();
+            zombie.pbi_status = 5;
+            let (result, processes) = exercise(vec![
+                scan(&[A]),
+                Step::Info(A, Ok(live())),
+                Step::Matches(A),
+                Step::Command(A, None),
+                Step::Info(A, Ok(zombie)),
+                Step::Pause,
+                scan(&[]),
+            ]);
+            assert!(result.cleanup_complete, "{result:?}");
+            assert!(result.notes.is_empty(), "{result:?}");
+            assert_eq!(result.survivors.len(), 1);
+            assert_eq!(result.survivors[0].pid, A);
+            assert_eq!(
+                result.survivors[0].command,
+                "exited before its command was read"
+            );
+            assert!(processes.signalled.is_empty());
+            assert_eq!(processes.scans, 2);
+        }
+
+        #[test]
+        fn scan_bound_with_persistent_match_fails_cleanup() {
+            let mut steps = Vec::new();
+            for scan_number in 0..MAX_SCANS {
+                steps.extend([scan(&[A]), Step::Info(A, Ok(live())), Step::Matches(A)]);
+                if scan_number == 0 {
+                    steps.push(Step::Command(A, Some("persistent")));
+                }
+                steps.extend([Step::Info(A, Ok(live())), Step::Signal(A), Step::Pause]);
+            }
+            let (result, processes) = exercise(steps);
+            assert!(!result.cleanup_complete, "{result:?}");
+            assert_eq!(processes.scans, MAX_SCANS);
+            assert_eq!(processes.signalled, vec![A; MAX_SCANS]);
+            assert_eq!(result.survivors.len(), 1);
+            assert!(result
+                .notes
+                .iter()
+                .any(|note| note.contains("scan or time bound")));
+        }
+
+        #[test]
+        fn scan_bound_with_reused_identities_fails_without_recording_or_signalling() {
+            let mut steps = Vec::new();
+            let mut replacement = live();
+            replacement.pbi_start_tvusec += 1;
+            for _ in 0..MAX_SCANS {
+                steps.extend([
+                    scan(&[A]),
+                    Step::Info(A, Ok(live())),
+                    Step::Matches(A),
+                    Step::Command(A, None),
+                    Step::Info(A, Ok(replacement)),
+                    Step::Pause,
+                ]);
+            }
+            let (result, processes) = exercise(steps);
+            assert!(!result.cleanup_complete, "{result:?}");
+            assert_eq!(processes.scans, MAX_SCANS);
+            assert!(result.survivors.is_empty());
+            assert!(processes.signalled.is_empty());
+            assert!(result
+                .notes
+                .iter()
+                .any(|note| note.contains("scan or time bound")));
+        }
+
+        #[test]
+        fn time_bound_before_quiescence_fails_cleanup() {
+            for pids in [vec![B], vec![]] {
+                let (result, processes) = exercise(vec![
+                    scan(&[A]),
+                    Step::Info(A, Ok(live())),
+                    Step::Matches(A),
+                    Step::Command(A, None),
+                    Step::Info(A, Err(libc::ESRCH)),
+                    Step::Pause,
+                    Step::Pids(pids, DRAIN),
+                ]);
+                assert!(!result.cleanup_complete, "{result:?}");
+                assert_eq!(processes.scans, 2);
+                assert!(processes.signalled.is_empty());
+                assert!(result.notes.iter().any(|note| note.contains("time bound")));
+            }
+        }
     }
 }
 
