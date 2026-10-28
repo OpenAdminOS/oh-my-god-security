@@ -1,10 +1,14 @@
 # Handoff and progress
 
+This installed guide is `HANDOFF-AND-PROGRESS.md`. The generated handoff artifact is
+`OUTPUT_DIR/HANDOFF.md`; it is run output, not this guide.
+
 ### Handoff and retained tests
 
-`omgs report --findings OUTPUT_DIR/findings.json --out OUTPUT_DIR` also writes `HANDOFF.md` and
-`handoff.json` under [schemas/handoff.schema.json](schemas/handoff.schema.json). They explain
-verdicts and proof tiers first, then the green-fixer rules and cumulative budget, then confirmed
+`omgs report --findings OUTPUT_DIR/findings.json --out OUTPUT_DIR` also writes
+`OUTPUT_DIR/HANDOFF.md` and `OUTPUT_DIR/handoff.json` under
+[schemas/handoff.schema.json](schemas/handoff.schema.json). They explain verdicts and proof tiers
+first, then the green-fixer rules and cumulative budget, then confirmed
 records followed by pending records marked "verify before fixing" with their missing fact. Rejected
 records are excluded. Each record includes source locations, evidence, trace, fix brief and its
 retained proof test plus exact command and recipe contract, or an explicit proof blocker. The exact

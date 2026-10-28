@@ -62,12 +62,21 @@ fetch dependencies. Missing tools and offline databases are gaps, never permissi
 
 Read the linked phase text before performing that phase. Preserve role separation in fresh contexts
 and hand each role its full brief with explicit scope, resolved inputs and remaining budget.
+Before dispatching any agent, read [BUDGETS-AND-ROUTING.md](BUDGETS-AND-ROUTING.md).
+Before consuming any handoff artifacts, read
+[HANDOFF-AND-PROGRESS.md](HANDOFF-AND-PROGRESS.md).
 
-1. [Initialize](PIPELINE.md#initialize): record source, trusted policy, mode, limits and local
-   tools. Use deterministic sensors; never execute target code for reconnaissance.
-2. [Map](PIPELINE.md#map): follow [reconnaissance](RECONNAISSANCE.md), seed the ledger and
-   architecture. Account for every inventory class, sensor hit and gap.
-3. [Hunt](PIPELINE.md#hunt): give isolated red hunters bounded units, packs and recipe plans.
+1. [Initialize](PIPELINE.md#the-pipeline-multi-agent-by-default): before initialization, read the
+   pipeline preamble, including sensor restrictions and the requirement to read `sensor-hits.json`
+   and `sensors.json` during mapping. Then follow [Initialize](PIPELINE.md#initialize) to record
+   source, trusted policy, mode, limits and local tools. Never execute target code for
+   reconnaissance.
+2. [Map](PIPELINE.md#the-pipeline-multi-agent-by-default): read the pipeline preamble, then follow
+   [Map](PIPELINE.md#map) and [reconnaissance](RECONNAISSANCE.md). Read `sensor-hits.json` and
+   `sensors.json`, seed the ledger and architecture, and account for every inventory class, hit
+   and gap.
+3. [Hunt](PIPELINE.md#hunt): before hunting, read [DECISION-RULES.md](DECISION-RULES.md).
+   Give isolated red hunters bounded units, packs and recipe plans.
    Hunters hand proof plans and drafts to the verifier and never execute proofs.
 4. [Challenge](PIPELINE.md#challenge): a fresh blue verifier reconstructs and challenges each claim.
    Follow [validation](VALIDATION-AND-REPORTING.md); validate records and preserve missing facts.
@@ -75,8 +84,10 @@ and hand each role its full brief with explicit scope, resolved inputs and remai
    Follow the [contract](PROOF-CONTRACT.md) and matching [recipes](PROOF-RECIPES.md).
 6. [Adjudicate](PIPELINE.md#adjudicate): a separate evaluator replays every proof it upholds.
    Semantic changes require another adjudication pass before reporting.
-7. [Report](PIPELINE.md#report): reconcile coverage, validate, pass the critic and render local
-   reports. Include confirmed findings, pending facts, blockers, unexamined areas and run metadata.
+7. [Report](PIPELINE.md#report): before reporting, read
+   [HANDOFF-AND-PROGRESS.md](HANDOFF-AND-PROGRESS.md). Reconcile coverage, validate, pass the critic
+   and render local reports. Include confirmed findings, pending facts, blockers, unexamined areas
+   and run metadata.
 
 ## Non-negotiable rules
 
@@ -114,7 +125,7 @@ relative to this installed directory; schemas and scripts ship in the same embed
 | [RECONNAISSANCE.md](RECONNAISSANCE.md) | Architecture and boundary mapping |
 | [HUNTING.md](HUNTING.md) | Bounded candidate discovery |
 | [VALIDATION-AND-REPORTING.md](VALIDATION-AND-REPORTING.md) | Verdicts, records and reporting |
-| [HANDOFF.md](HANDOFF.md) | Retained tests, artifact trust and optional progress |
+| [HANDOFF-AND-PROGRESS.md](HANDOFF-AND-PROGRESS.md) | Retained tests, artifact trust and optional progress |
 | [Red hunter](agents/red-hunter.md) | Isolated candidate brief |
 | [Blue verifier](agents/blue-verifier.md) | Independent challenge and initial proof brief |
 | [Evaluator](agents/evaluator.md) | Replay and adjudication brief |

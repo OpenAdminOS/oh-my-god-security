@@ -64,8 +64,9 @@ null persona keeps the full form. Both reports include the recorded pipeline
 timeline and links to proof records. Markdown starts with what needs action,
 including an explicit "Nothing to fix" when no finding was confirmed.
 
-Share `HANDOFF.md` and the protected run directory with a fixer. It explains
-verdicts, proof tiers, retained tests, exact proof commands and cumulative fix
+The installed [handoff and progress guide](skill/HANDOFF-AND-PROGRESS.md) describes how to consume
+the generated `OUTPUT_DIR/HANDOFF.md`. Share that artifact and the protected run directory with a
+fixer. It explains verdicts, proof tiers, retained tests, exact proof commands and cumulative fix
 budgets without requiring the reader to know OMGS. Confirmed records come first.
 Pending records say "verify before fixing" and name the missing fact. Rejected
 records are excluded. The machine-readable equivalent follows

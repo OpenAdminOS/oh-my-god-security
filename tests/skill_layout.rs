@@ -5,6 +5,78 @@ fn normalized(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+// Inspect the entry's phase routing, not the concatenated bundle or detail index.
+fn phase_routes(entry: &str) -> Vec<String> {
+    let phases = entry
+        .split_once("## Seven phases\n")
+        .expect("phase list")
+        .1
+        .split_once("## Non-negotiable rules")
+        .expect("end of phase list")
+        .0;
+    let mut routes = Vec::new();
+    for line in phases.lines() {
+        if line.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            routes.push(String::new());
+        }
+        if let Some(route) = routes.last_mut() {
+            route.push_str(line);
+            route.push(' ');
+        }
+    }
+    routes.into_iter().map(|route| normalized(&route)).collect()
+}
+
+#[test]
+fn entry_routes_mandatory_reading_at_phase_boundaries() {
+    let entry = include_str!("../skill/SKILL.md");
+    let routes = phase_routes(entry);
+    assert_eq!(routes.len(), 7);
+    let preamble = "(PIPELINE.md#the-pipeline-multi-agent-by-default)";
+    for (index, phase) in [(0, "Initialize"), (1, "Map")] {
+        let route = &routes[index];
+        assert!(route.contains(&format!("[{phase}]{preamble}")));
+        for requirement in ["pipeline preamble", "`sensor-hits.json`", "`sensors.json`"] {
+            assert!(
+                route.contains(requirement),
+                "{phase}: missing {requirement}"
+            );
+        }
+    }
+    assert!(routes[0].contains("before initialization"));
+    assert!(routes[0].contains("sensor restrictions"));
+    assert!(routes[2].contains("before hunting, read [DECISION-RULES.md](DECISION-RULES.md)"));
+    assert!(routes[6]
+        .contains("before reporting, read [HANDOFF-AND-PROGRESS.md](HANDOFF-AND-PROGRESS.md)"));
+
+    // These prerequisites apply to every dispatch and every artifact consumer,
+    // so they must precede all phases rather than appear only in the file index.
+    let phase_intro = entry
+        .split_once("## Seven phases\n")
+        .unwrap()
+        .1
+        .split_once("1. [Initialize]")
+        .unwrap()
+        .0;
+    let phase_intro = normalized(phase_intro);
+    assert!(phase_intro.contains(
+        "Before dispatching any agent, read [BUDGETS-AND-ROUTING.md](BUDGETS-AND-ROUTING.md)"
+    ));
+    assert!(phase_intro.contains(
+        "Before consuming any handoff artifacts, read [HANDOFF-AND-PROGRESS.md](HANDOFF-AND-PROGRESS.md)"
+    ));
+
+    let pipeline = include_str!("../skill/PIPELINE.md");
+    let preamble = pipeline.split_once("### Initialize").unwrap().0;
+    assert!(preamble.contains("## The pipeline (multi-agent by default)"));
+    for rule in [
+        "never fall back\nto host execution",
+        "Read `sensor-hits.json` and `sensors.json` during mapping.",
+    ] {
+        assert!(preamble.contains(rule), "missing preamble rule: {rule}");
+    }
+}
+
 #[test]
 fn entry_is_short_and_guides_are_wrapped() {
     let entry = include_bytes!("../skill/SKILL.md");

@@ -584,7 +584,7 @@ fn setup_detects_only_existing_agents_and_writes_policy_only_on_request() {
             "BUDGETS-AND-ROUTING.md",
             "EXECUTION-SAFETY.md",
             "SETUP.md",
-            "HANDOFF.md",
+            "HANDOFF-AND-PROGRESS.md",
             "DECISION-RULES.md",
         ] {
             assert_eq!(
@@ -1062,6 +1062,8 @@ fn default_setup_ignores_adjacent_and_checkout_sidecars() {
         .unwrap();
     assert!(result.status.success(), "{}", output(&result));
     let installed = home.join(".agents/skills").join(omgs::setup::SKILL_NAME);
+    assert!(installed.join("HANDOFF-AND-PROGRESS.md").is_file());
+    assert!(!installed.join("HANDOFF.md").exists());
     for (path, bytes) in omgs::setup::BUNDLED {
         assert_eq!(std::fs::read(installed.join(path)).unwrap(), *bytes);
     }

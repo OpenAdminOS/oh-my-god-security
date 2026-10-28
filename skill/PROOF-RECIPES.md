@@ -250,4 +250,3 @@ but failed to launch inside MXC`, missing SDKs or local libraries, unavailable L
 (the runner grants `/usr/include` read-only), nested SwiftPM sandbox creation, denied daemon APIs
 and real root helpers. A compile/load failure earns no tier. Network and home denials above apply to
 Swift too; redirect temporary files into the workspace or scratch.
-

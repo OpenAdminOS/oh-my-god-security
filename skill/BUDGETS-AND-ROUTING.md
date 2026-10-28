@@ -48,4 +48,3 @@ blue-verifier, evaluator and green-fixer. Values are tokens, USD cost and durati
 Use `unknown` or an empty field for unavailable values. Omitted roles and values stay unknown, never
 zero; resubmission replaces that role's totals. Report reads saved status accounting. Never estimate
 missing usage from stage clocks.
-
