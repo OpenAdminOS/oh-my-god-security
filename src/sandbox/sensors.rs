@@ -456,12 +456,12 @@ fn scanner_runtime_roots(executable: &Path, semgrep: bool) -> Result<ScannerRunt
             // Other script runtimes use file-only grants, like native tools.
         }
     }
-    let venv = executable.parent().and_then(Path::parent).filter(|p| {
-        // The configuration is evidence of a venv; a directory name is not.
-        p.join("pyvenv.cfg").is_file()
-    });
+    let launcher_prefix = executable
+        .parent()
+        .and_then(Path::parent)
+        .filter(|p| p.join("pyvenv.cfg").is_file());
     if cfg!(windows) && semgrep && interpreter.is_none() {
-        if let Some(prefix) = venv {
+        if let Some(prefix) = launcher_prefix {
             let python = prefix.join("Scripts/python.exe");
             if !python.is_file() {
                 return Err(
@@ -474,9 +474,15 @@ fn scanner_runtime_roots(executable: &Path, semgrep: bool) -> Result<ScannerRunt
     }
     Ok(ScannerRuntime {
         roots,
-        python: interpreter.map(|interpreter| PythonRuntime {
-            interpreter,
-            venv: venv.map(Path::to_path_buf),
+        python: interpreter.map(|interpreter| {
+            // A config beside the entry script can be stale or unrelated.
+            // Only the selected interpreter's own configuration proves a venv.
+            let venv = interpreter
+                .parent()
+                .and_then(Path::parent)
+                .filter(|p| p.join("pyvenv.cfg").is_file())
+                .map(Path::to_path_buf);
+            PythonRuntime { interpreter, venv }
         }),
     })
 }
@@ -855,6 +861,21 @@ mod tests {
                 vec![scanner, std::fs::canonicalize(interpreter).unwrap()]
             );
             assert!(runtime.python.unwrap().venv.is_none());
+            let prefix = bin.parent().unwrap();
+            std::fs::write(prefix.join("pyvenv.cfg"), "version = 3.13.2\n").unwrap();
+            let proven = scanner_runtime_roots(&bin.join("semgrep"), true).unwrap();
+            assert_eq!(proven.python.unwrap().venv.as_deref(), Some(prefix));
+            assert!(proven.roots.iter().all(|p| p.is_file()));
         }
+        let interpreter = root.join("python3");
+        std::fs::write(&interpreter, "native fixture").unwrap();
+        let prefix = root.join("home/unrelated");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::write(prefix.join("pyvenv.cfg"), "version = 3.13.2\n").unwrap();
+        let scanner = prefix.join("bin/semgrep");
+        std::fs::write(&scanner, format!("#!{}\n", interpreter.display())).unwrap();
+        let runtime = scanner_runtime_roots(&scanner, true).unwrap();
+        assert!(runtime.python.unwrap().venv.is_none());
+        assert!(!runtime.roots.contains(&prefix));
     }
 }
