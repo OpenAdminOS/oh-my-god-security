@@ -2016,9 +2016,83 @@ fn repeated_blob_export_cap_blocks_with_exit_three_without_expanding_data() {
     git(&repo, &["update-ref", "HEAD", &head]);
     let out = gate(&root, &repo, &base, &head, None, 3);
     assert!(
-        output(&out).contains("gate export byte cap exceeded (4294967296 bytes)"),
+        output(&out).contains("gate export byte cap exceeded (limit 4294967296 bytes)"),
         "{}",
         output(&out)
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recovery_storage_failure_obeys_valid_base_advisory_mode() {
+    let root = scratch("recovery-advisory");
+    let repo = repo(&root);
+    let advisory = commit_policy(&repo, &Policy::default());
+    let unavailable = root.join("unavailable");
+    std::fs::write(&unavailable, b"not a directory").unwrap();
+    let invoke = |base: &str| {
+        Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .args(["gate", "--target"])
+            .arg(&repo)
+            .args(["--base", base, "--head", base])
+            .env("OMGS_HOME", &unavailable)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .output()
+            .unwrap()
+    };
+    let out = invoke(&advisory);
+    assert_eq!(out.status.code(), Some(0), "{}", output(&out));
+    assert!(output(&out).contains("advisory: would block (infrastructure)"));
+    let strict = commit_policy(
+        &repo,
+        &Policy {
+            mode: Mode::Gate,
+            ..Default::default()
+        },
+    );
+    let out = invoke(&strict);
+    assert_eq!(out.status.code(), Some(3), "{}", output(&out));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn gate_export_caps_are_bounded_and_only_base_policy_can_raise_them() {
+    let root = scratch("gate-limits");
+    let repo = repo(&root);
+    let mut p = Policy {
+        mode: Mode::Gate,
+        gate_tests: vec![registered()],
+        gate_limits: Some(policy::GateLimits {
+            bytes: 1,
+            entries: 200_000,
+        }),
+        ..Default::default()
+    };
+    std::fs::write(repo.join(&p.gate_tests[0].test), test_source(false)).unwrap();
+    let base = commit_policy(&repo, &p);
+    p.gate_limits = Some(policy::GateLimits {
+        bytes: 8 << 30,
+        entries: 300_000,
+    });
+    let head = commit_policy(&repo, &p);
+    let out = gate(&root, &repo, &base, &head, None, 3);
+    assert!(
+        output(&out).contains("byte cap exceeded (limit 1 bytes)"),
+        "{}",
+        output(&out)
+    );
+    let parsed = policy::parse(&policy::text(&p).unwrap()).unwrap();
+    assert_eq!(parsed.gate_limits.unwrap().bytes, 8 << 30);
+    for (bytes, entries) in [
+        (0, 1),
+        (policy::GateLimits::MAX_BYTES + 1, 1),
+        (1, 0),
+        (1, policy::GateLimits::MAX_ENTRIES + 1),
+    ] {
+        p.gate_limits = Some(policy::GateLimits { bytes, entries });
+        assert!(policy::text(&p)
+            .unwrap_err()
+            .contains("gate_limits requires"));
+    }
     std::fs::remove_dir_all(root).unwrap();
 }

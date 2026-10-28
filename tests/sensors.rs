@@ -1092,3 +1092,36 @@ fn python_user_install_cannot_expose_shared_private_data() {
         "{report}"
     );
 }
+
+#[test]
+fn scratch_overrun_stops_scanner_before_deadline_and_discards_output() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    f.tool("trufflehog", "raw-secret-must-be-discarded", 0);
+    std::fs::write(
+        f.target.join(".sensor-fixture/trufflehog.mode"),
+        "scratch-overrun",
+    )
+    .unwrap();
+    let start = std::time::Instant::now();
+    let run = f.init("scratch-overrun");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(25),
+        "writer was not stopped promptly: {:?}",
+        start.elapsed()
+    );
+    let report = read(&run.join("sensors.json"));
+    assert!(report["hits"].as_array().unwrap().is_empty(), "{report}");
+    assert!(
+        report["gaps"]
+            .to_string()
+            .contains("writable sensor scratch byte limit exceeded (limit 1073741824 bytes)"),
+        "{report}"
+    );
+    assert_no_scratch(&f.root.join("home"));
+    assert!(!std::fs::read_to_string(run.join("sensors.json"))
+        .unwrap()
+        .contains("raw-secret-must-be-discarded"));
+}

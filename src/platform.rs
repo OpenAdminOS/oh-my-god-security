@@ -260,6 +260,48 @@ pub fn directory_identity(path: &Path) -> std::io::Result<(u64, u64)> {
     }
 }
 
+/// Admit the object actually held open, without resolving its old pathname.
+pub(crate) fn check_private_dir_handle(file: &std::fs::File) -> std::io::Result<()> {
+    let meta = file.metadata()?;
+    if !meta.is_dir() || is_link(&meta) {
+        return Err(std::io::Error::other(
+            "scratch must be a non-reparse directory",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o7777 != 0o700 {
+            return Err(std::io::Error::other(
+                "scratch requires current owner and mode 0700",
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        macos_private::check_file(file, meta.uid())?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        windows_private::check_file(file)
+    }
+}
+
+pub(crate) fn held_directory_identity(file: &std::fs::File) -> std::io::Result<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok((meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        windows_file_identity(file).map(|(v, i)| (u64::from(v), i))
+    }
+}
+
+#[cfg(windows)]
+pub(crate) use windows_private::{open_scratch_lock, open_scratch_relative, open_scratch_view};
+
 /// Publish a private trust record exclusively. Existing entries are never replaced.
 pub fn write_private_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
@@ -367,7 +409,7 @@ pub fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     read_bounded_file(file, limit)
 }
 
-fn read_bounded_file(file: std::fs::File, limit: u64) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_bounded_file(file: std::fs::File, limit: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Error, Read};
     if file.metadata()?.len() > limit {
         return Err(Error::other("file exceeds byte limit"));
@@ -505,7 +547,7 @@ fn with_file_in<T>(
 
 // A retired snapshot with zero directory links is safe to read through its
 // already-open handle. Two or more links can alias attacker-controlled storage.
-fn is_single_link_file(file: &std::fs::File) -> std::io::Result<bool> {
+pub(crate) fn is_single_link_file(file: &std::fs::File) -> std::io::Result<bool> {
     let meta = file.metadata()?;
     Ok(meta.is_file() && !is_link(&meta) && link_count(file)? <= 1)
 }

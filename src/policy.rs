@@ -20,6 +20,20 @@ pub struct Policy {
     pub accepted_intent: Vec<AcceptedIntent>,
     pub suppressions: Vec<Suppression>,
     pub gate_tests: Vec<GateTest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_limits: Option<GateLimits>,
+}
+
+/// Owner-selected export bounds, trusted only from the immutable base policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateLimits {
+    pub bytes: u64,
+    pub entries: usize,
+}
+impl GateLimits {
+    pub const MAX_BYTES: u64 = 64 << 30;
+    pub const MAX_ENTRIES: usize = 2_000_000;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +97,7 @@ impl Default for Policy {
             accepted_intent: vec![],
             suppressions: vec![],
             gate_tests: vec![],
+            gate_limits: None,
         }
     }
 }
@@ -152,6 +167,19 @@ pub fn parse(text: &str) -> Result<Policy, String> {
         }
     }
     let p: Policy = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    if let Some(limits) = &p.gate_limits {
+        if limits.bytes == 0
+            || limits.bytes > GateLimits::MAX_BYTES
+            || limits.entries == 0
+            || limits.entries > GateLimits::MAX_ENTRIES
+        {
+            return Err(format!(
+                "gate_limits requires bytes in 1..={} and entries in 1..={}",
+                GateLimits::MAX_BYTES,
+                GateLimits::MAX_ENTRIES
+            ));
+        }
+    }
     if p.schema != "omgs-policy/1" {
         return Err("unsupported policy schema".into());
     }
@@ -319,8 +347,21 @@ fn git(target: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         None,
     );
     crate::supervise::check_interrupted().map_err(|_| "git object read interrupted")?;
-    if result.timed_out || !result.cleanup_complete || !result.capture_complete {
-        return Err("git object read deadline, output limit or child cleanup failure".into());
+    let mut failures = Vec::new();
+    if result.timed_out {
+        failures.push("deadline exceeded (limit 3000 ms)".to_string());
+    }
+    if result.output_bytes_total > (64 << 20) {
+        failures.push("output byte limit exceeded (limit 67108864 bytes)".into());
+    }
+    if !result.capture_complete {
+        failures.push("output capture incomplete".into());
+    }
+    if !result.cleanup_complete {
+        failures.push("child cleanup failure".into());
+    }
+    if !failures.is_empty() {
+        return Err(format!("git {} object read: {}; verify local objects and host load, then retry; diagnostics: {}", args[0], failures.join("; "), result.notes.join("; ")));
     }
     if !result.success {
         return Err(format!(
@@ -605,16 +646,16 @@ fn export_head_bounded(
             entries.insert(entry_path.clone());
             if entries.len() > entry_cap {
                 return Err(format!(
-                    "gate export entry cap exceeded ({entry_cap} entries)"
+                    "gate export entry cap exceeded (limit {entry_cap} entries); reduce the committed tree or raise gate_limits.entries in the base policy (hard maximum 2000000)"
                 ));
             }
         }
         let size: u64 = fields[3].parse().map_err(|_| "invalid blob size")?;
         bytes_total = bytes_total
             .checked_add(size)
-            .ok_or("gate export byte cap exceeded")?;
+            .ok_or_else(|| format!("gate export byte cap exceeded (limit {byte_cap} bytes); reduce the committed tree or raise gate_limits.bytes in the base policy"))?;
         if bytes_total > byte_cap {
-            return Err(format!("gate export byte cap exceeded ({byte_cap} bytes)"));
+            return Err(format!("gate export byte cap exceeded (limit {byte_cap} bytes); reduce the committed tree or raise gate_limits.bytes in the base policy (hard maximum 68719476736)"));
         }
         paths.insert(path.to_string());
         manifest.push((path, fields[0], fields[2], size));
@@ -643,14 +684,14 @@ fn export_head_bounded(
 }
 
 pub fn gate(target: &Path, base: &str, head: &str, run: Option<&Path>) -> Result<u8, String> {
-    crate::scratch::recover()?;
     if !oid(base) || !oid(head) {
         return Err("gate requires full immutable --base and --head SHAs".into());
     }
     let s = load_base(target, Some(base))?;
     // Once advisory is established by valid base policy, even infrastructure
     // errors are display-only. Invalid policy cannot establish advisory mode.
-    let outcome = gate_tests(target, base, head, &s.policy);
+    let outcome =
+        crate::scratch::recover().and_then(|()| gate_tests(target, base, head, &s.policy));
     if let Some(run) = run {
         advisory_findings(run, &s.policy);
     }
@@ -719,7 +760,11 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
     let mut dir = crate::scratch::Scratch::create("gate")?;
     let checkout = dir.path().join("head");
     std::fs::create_dir(&checkout).map_err(|e| e.to_string())?;
-    let paths = export_head(target, head, &checkout)?;
+    let paths = if let Some(limits) = &p.gate_limits {
+        export_head_bounded(target, head, &checkout, limits.bytes, limits.entries)?
+    } else {
+        export_head(target, head, &checkout)?
+    };
     let mut blocked = false;
     for (n, t) in tests.iter().enumerate() {
         if !paths.contains(&t.test) {
@@ -754,7 +799,7 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
             || !r.cleanup_complete
             || !r.survivors.is_empty()
         {
-            return Err(format!("{}: blocked or unclean gate execution", t.id));
+            return Err(format!("{}: blocked or unclean gate execution (started={}, finished={}, timeout={}, killed={}, executor_error={}, capture={}, cleanup={}, survivors={}): {}", t.id, r.command_started, r.command_finished, r.timed_out, r.killed, r.executor_error, r.capture_complete, r.cleanup_complete, r.survivors.len(), r.notes.join("; ")));
         }
         match r.exit_code {
             Some(0) => println!("passes {}", t.id),
@@ -979,7 +1024,7 @@ mod scratch_tests {
         std::fs::create_dir(&repo).unwrap();
         git_fixture(&repo, &["init"]);
         std::fs::create_dir(repo.join("nested")).unwrap();
-        let blob = vec![b'x'; 1 << 20];
+        let blob = vec![b'x'; 1024];
         std::fs::write(repo.join("one"), &blob).unwrap();
         std::fs::write(repo.join("nested/two"), &blob).unwrap();
         git_fixture(&repo, &["add", "."]);
@@ -987,18 +1032,22 @@ mod scratch_tests {
         let head = git_fixture(&repo, &["rev-parse", "HEAD"]);
         let out = root.join("out");
         std::fs::create_dir(&out).unwrap();
-        let error = export_head_bounded(&repo, &head, &out, (1 << 20) + 1, 10).unwrap_err();
+        let error = export_head_bounded(&repo, &head, &out, 1025, 10).unwrap_err();
         assert!(error.contains("byte cap exceeded"), "{error}");
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
-        let error = export_head_bounded(&repo, &head, &out, 3 << 20, 2).unwrap_err();
+        let error = export_head_bounded(&repo, &head, &out, 3072, 2).unwrap_err();
         assert!(error.contains("entry cap exceeded"), "{error}");
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
         assert_eq!(
-            export_head_bounded(&repo, &head, &out, 2 << 20, 3)
+            export_head_bounded(&repo, &head, &out, 2048, 3)
                 .unwrap()
                 .len(),
             2
         );
+        let default_out = root.join("default-out");
+        std::fs::create_dir(&default_out).unwrap();
+        assert_eq!(export_head(&repo, &head, &default_out).unwrap().len(), 2);
+        assert_eq!(std::fs::read(default_out.join("nested/two")).unwrap(), blob);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

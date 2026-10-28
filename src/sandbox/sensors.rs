@@ -227,10 +227,14 @@ fn run_in_scratch(
             .min(crate::scratch::SENSOR_WRITE_BYTES),
     );
     #[allow(unused_mut)]
-    let mut run = supervise::run_marked(cmd, &limits, markers.as_ref(), nonce);
+    let mut run =
+        supervise::run_monitored(cmd, &limits, markers.as_ref(), nonce, &usage.cancellation);
     #[cfg(windows)]
     acl.verify(&mut run);
     if let Err(reason) = usage.finish() {
+        if !run.cleanup_complete || !run.survivors.is_empty() {
+            return Err(format!("{reason}; workload cleanup could not be verified"));
+        }
         gaps.push(reason);
         return Ok((String::new(), 3));
     }

@@ -662,21 +662,37 @@ errors and handled interruption, including SIGINT or SIGTERM during HEAD
 export. Crash recovery runs on the next gate, sensor or doctor invocation.
 Recovery checks private ownership, safe paths, a name and directory identity
 record, the expected layout and a free per-run OS lock before removing an
-orphan. Active runs stay intact. Invalid, foreign and legacy directories are
+orphan. Admission, locking and recursive removal retain the parent and root
+handles. Unix deletion uses relative opens and unlink operations without following
+links. Windows opens relative to retained handles, denies delete sharing and
+deletes by handle. Active runs stay intact. Invalid, foreign and legacy directories are
 left alone and reported for manual inspection. Links are never followed.
 
-Gate export has fixed `GATE_EXPORT_BYTES` (4 GiB expanded content) and
+Gate export defaults to `GATE_EXPORT_BYTES` (4 GiB expanded content) and
 `GATE_EXPORT_ENTRIES` (200,000 files and distinct directories) caps. Repeated
 paths referencing one blob each consume their full expanded size. Both caps
 are checked before materializing files. Exceeding either cap blocks gate mode
 with exit 3 and a cap diagnostic; advisory mode remains display-only. Existing
 Git reads also have a 64 MiB per-object or tree-listing bound.
 
+For a large repository, the owner can commit an optional `gate_limits` object in
+`.omgs/policy.json`, for example `"gate_limits": {"bytes": 8589934592, "entries": 400000}`
+for 8 GiB and 400,000 entries. Both positive integer fields are required when the
+object is present. The hard maxima are 64 GiB (68,719,476,736 bytes) and 2,000,000
+entries. Existing policies without this object retain the defaults. Only the
+immutable base commit supplies these settings; a head-only policy edit cannot
+raise its own caps. Merge the owner-reviewed policy change into the base before
+retrying a larger export. The per-object Git read bound still applies.
+
 Writable sensor scratch has `SENSOR_WRITE_BYTES` (1 GiB) and
 `SENSOR_WRITE_ENTRIES` (100,000) caps, with a 64-level traversal limit. The
 per-file supervisor limit is retained where supported and clamped to 1 GiB.
 MXC exposes no portable disk quota, so OMGS checks usage every 100 ms and after
-supervision, discards output and records a gap on an observed overrun or failed
-inspection. Polling permits overshoot and can miss files created and deleted
+supervision. The first observed overrun or failed inspection requests the existing
+graceful then forced workload and descendant shutdown. OMGS verifies cleanup,
+discards output and records a gap. Diagnostics identify the byte limit, entry
+limit or unavailable inspection, include the configured limits and suggest a
+recovery step. Windows accounting includes named streams on files, directories
+and the traversal root. Polling permits overshoot and can miss files created and deleted
 between samples. Recovery removes eligible abandoned payloads on the next
 invocation; these limits do not cap aggregate storage across concurrent runs.
