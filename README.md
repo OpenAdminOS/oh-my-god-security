@@ -653,3 +653,30 @@ no-ops. Differing content is refused with the file names. `--replace` stages a
 complete sibling tree, renames the old tree to a printed backup path, then
 publishes the replacement. A failed publish restores the backup without mixing
 trees; retain backups until you are satisfied with the install.
+
+### Gate and sensor scratch limits and recovery
+
+Disposable gate and sensor data uses admitted OMGS data storage, never an
+arbitrary temporary directory. Immediate cleanup removes it on completion,
+errors and handled interruption, including SIGINT or SIGTERM during HEAD
+export. Crash recovery runs on the next gate, sensor or doctor invocation.
+Recovery checks private ownership, safe paths, a name and directory identity
+record, the expected layout and a free per-run OS lock before removing an
+orphan. Active runs stay intact. Invalid, foreign and legacy directories are
+left alone and reported for manual inspection. Links are never followed.
+
+Gate export has fixed `GATE_EXPORT_BYTES` (4 GiB expanded content) and
+`GATE_EXPORT_ENTRIES` (200,000 files and distinct directories) caps. Repeated
+paths referencing one blob each consume their full expanded size. Both caps
+are checked before materializing files. Exceeding either cap blocks gate mode
+with exit 3 and a cap diagnostic; advisory mode remains display-only. Existing
+Git reads also have a 64 MiB per-object or tree-listing bound.
+
+Writable sensor scratch has `SENSOR_WRITE_BYTES` (1 GiB) and
+`SENSOR_WRITE_ENTRIES` (100,000) caps, with a 64-level traversal limit. The
+per-file supervisor limit is retained where supported and clamped to 1 GiB.
+MXC exposes no portable disk quota, so OMGS checks usage every 100 ms and after
+supervision, discards output and records a gap on an observed overrun or failed
+inspection. Polling permits overshoot and can miss files created and deleted
+between samples. Recovery removes eligible abandoned payloads on the next
+invocation; these limits do not cap aggregate storage across concurrent runs.

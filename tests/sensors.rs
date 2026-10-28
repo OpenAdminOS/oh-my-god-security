@@ -571,6 +571,7 @@ fn unavailable_mxc_never_runs_a_sensor() {
             f.root.join("no-mxc").to_str().unwrap(),
         ])
         .env("PATH", &f.bin)
+        .env("OMGS_HOME", f.root.join("home"))
         .env("OMGS_MXC_EXEC", f.root.join("missing-mxc"))
         .output()
         .unwrap();

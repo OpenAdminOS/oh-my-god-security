@@ -1,0 +1,693 @@
+//! Disposable, admitted storage with live-owner locks and conservative recovery.
+use crate::platform;
+use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+pub const GATE_EXPORT_BYTES: u64 = 4 << 30;
+pub const GATE_EXPORT_ENTRIES: usize = 200_000;
+pub const SENSOR_WRITE_BYTES: u64 = 1 << 30;
+pub const SENSOR_WRITE_ENTRIES: usize = 100_000;
+const LOCK: &str = ".omgs-scratch.lock";
+const OWNER: &str = ".omgs-scratch.json";
+const PAYLOAD: &str = "payload";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Owner {
+    version: u8,
+    name: String,
+    identity: (u64, u64),
+}
+
+pub struct Scratch {
+    root: PathBuf,
+    lock: Option<File>,
+}
+impl Scratch {
+    pub fn create(kind: &str) -> Result<Self, String> {
+        Self::create_checked(kind, |_| Ok(()))
+    }
+
+    pub fn create_checked(
+        kind: &str,
+        check: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        let parent = platform::scratch_root().map_err(|e| e.to_string())?;
+        Self::create_in(&parent, kind, check)
+    }
+
+    fn create_in(
+        parent: &Path,
+        kind: &str,
+        check: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<Self, String> {
+        if !["gate", "sensor"].contains(&kind) {
+            return Err("invalid scratch kind".into());
+        }
+        platform::check_private_dir(parent).map_err(|e| e.to_string())?;
+        crate::runmeta::with_lock_file(&parent.join(LOCK), || {
+            report(recover_in(parent)?);
+            crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
+            let name = format!(
+                "omgs-{kind}-{}",
+                platform::random_nonce().map_err(|e| e.to_string())?
+            );
+            let root = parent.join(&name);
+            check(&root)?;
+            platform::create_private_dir_new(&root).map_err(|e| e.to_string())?;
+            // The parent lock excludes recovery until the owner record and run
+            // lock are published. A crash before publication remains invalid.
+            let initialized = || -> Result<File, String> {
+                platform::write_private_new(&root.join(LOCK), b"").map_err(|e| e.to_string())?;
+                let lock = open_lock(&root)?;
+                lock.try_lock().map_err(|e| e.to_string())?;
+                let owner = Owner {
+                    version: 1,
+                    name,
+                    identity: platform::directory_identity(&root).map_err(|e| e.to_string())?,
+                };
+                platform::write_private_new(
+                    &root.join(OWNER),
+                    &serde_json::to_vec(&owner).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
+                platform::create_private_dir_new(&root.join(PAYLOAD)).map_err(|e| e.to_string())?;
+                Ok(lock)
+            };
+            match initialized() {
+                Ok(lock) => Ok(Self {
+                    root,
+                    lock: Some(lock),
+                }),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&root);
+                    Err(e)
+                }
+            }
+        })
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.root.join(PAYLOAD)
+    }
+
+    pub fn cleanup(&mut self) -> Result<(), String> {
+        if self.lock.is_none() {
+            return Ok(());
+        }
+        let parent = self.root.parent().ok_or("scratch parent missing")?;
+        crate::runmeta::with_lock_file(&parent.join(LOCK), || {
+            validate(&self.root)?;
+            // Retain the run lock through payload removal. The parent lock
+            // covers the final Windows handle close and metadata deletion.
+            let lock = self.lock.take().ok_or("scratch lock missing")?;
+            remove_layout(&self.root, lock).map_err(|e| format!("scratch cleanup failed: {e}"))
+        })
+    }
+}
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Err(e) = self.cleanup() {
+            eprintln!("{}", platform::escape_controls(&e));
+        }
+    }
+}
+
+fn open_lock(root: &Path) -> Result<File, String> {
+    let file = platform::open_single_link(&root.join(LOCK))
+        .map_err(|e| e.to_string())?
+        .ok_or("scratch lock missing")?;
+    platform::check_private_file(&file).map_err(|e| e.to_string())?;
+    Ok(file)
+}
+fn valid_name(name: &str) -> bool {
+    ["omgs-gate-", "omgs-sensor-"].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            .is_some_and(|nonce| nonce.len() == 64 && nonce.bytes().all(|b| b.is_ascii_hexdigit()))
+    })
+}
+fn validate(root: &Path) -> Result<(), String> {
+    platform::check_private_dir(root).map_err(|e| e.to_string())?;
+    let name = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or("invalid scratch name")?;
+    let bytes = platform::read_private_bounded_in(root, Path::new(OWNER), 4096)
+        .map_err(|e| e.to_string())?;
+    let owner: Owner = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if !valid_name(name)
+        || owner.version != 1
+        || owner.name != name
+        || owner.identity != platform::directory_identity(root).map_err(|e| e.to_string())?
+    {
+        return Err("scratch ownership record mismatch".into());
+    }
+    for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if ![LOCK, OWNER, PAYLOAD]
+            .iter()
+            .any(|n| entry.file_name() == *n)
+        {
+            return Err("unexpected scratch layout".into());
+        }
+    }
+    // Payload is optional: a crash can precede its creation or interrupt deletion.
+    if std::fs::symlink_metadata(root.join(PAYLOAD)).is_ok() {
+        platform::check_private_dir(&root.join(PAYLOAD)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Report invalid/foreign entries without deleting them. Active locks are skipped.
+pub fn recover() -> Result<(), String> {
+    let parent = platform::scratch_root().map_err(|e| e.to_string())?;
+    crate::runmeta::with_lock_file(&parent.join(LOCK), || {
+        report(recover_in(&parent)?);
+        Ok(())
+    })
+}
+fn report(warnings: Vec<String>) {
+    for warning in warnings {
+        eprintln!("{}", platform::escape_controls(&warning));
+    }
+}
+fn remove_layout(root: &Path, lock: File) -> std::io::Result<()> {
+    // Preserve admission records until all potentially large payload data is
+    // gone, so interruption during recursive deletion remains recoverable.
+    if std::fs::symlink_metadata(root.join(PAYLOAD)).is_ok() {
+        std::fs::remove_dir_all(root.join(PAYLOAD))?;
+    }
+    // Windows may defer final deletion while a lock handle remains open.
+    // Keep the parent storage lock held across this close and final removal.
+    drop(lock);
+    std::fs::remove_file(root.join(OWNER))?;
+    std::fs::remove_file(root.join(LOCK))?;
+    std::fs::remove_dir(root)
+}
+fn recover_in(parent: &Path) -> Result<Vec<String>, String> {
+    platform::check_private_dir(parent).map_err(|e| e.to_string())?;
+    let mut warnings = Vec::new();
+    for entry in std::fs::read_dir(parent).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("omgs-gate-") && !name.starts_with("omgs-sensor-") {
+            continue;
+        }
+        let root = entry.path();
+        let reap = || -> Result<(), String> {
+            validate(&root)?;
+            let lock = open_lock(&root)?;
+            match lock.try_lock() {
+                Ok(()) => {}
+                Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+                Err(e) => return Err(e.to_string()),
+            }
+            validate(&root)?;
+            // Rust's recursive removal unlinks links in payload without ever
+            // traversing them. Only this validated three-entry layout is removed.
+            remove_layout(&root, lock).map_err(|e| e.to_string())
+        };
+        if let Err(e) = reap() {
+            warnings.push(format!(
+                "scratch recovery left {} alone: {e}",
+                root.display()
+            ));
+        }
+    }
+    Ok(warnings)
+}
+
+/// Polling is a fallback, not a filesystem quota. Latch any inspection failure
+/// or overrun, including transient overruns observed before final teardown.
+pub struct UsageMonitor {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<Result<(), String>>>,
+}
+impl UsageMonitor {
+    pub fn start(path: PathBuf) -> Self {
+        let (stop, rx) = std::sync::mpsc::channel();
+        let initial_failure = check_usage(&path, SENSOR_WRITE_BYTES, SENSOR_WRITE_ENTRIES).err();
+        let thread = std::thread::spawn(move || {
+            let mut failure = initial_failure;
+            loop {
+                if let Err(e) = check_usage(&path, SENSOR_WRITE_BYTES, SENSOR_WRITE_ENTRIES) {
+                    failure.get_or_insert(e);
+                }
+                if rx.recv_timeout(std::time::Duration::from_millis(100))
+                    != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
+                    // Always inspect after the supervised process has stopped.
+                    check_usage(&path, SENSOR_WRITE_BYTES, SENSOR_WRITE_ENTRIES)?;
+                    return failure.map_or(Ok(()), Err);
+                }
+            }
+        });
+        Self {
+            stop: Some(stop),
+            thread: Some(thread),
+        }
+    }
+    pub fn finish(mut self) -> Result<(), String> {
+        self.join()
+    }
+    fn join(&mut self) -> Result<(), String> {
+        self.stop.take();
+        self.thread.take().map_or(Ok(()), |t| {
+            t.join()
+                .unwrap_or_else(|_| Err("sensor scratch usage monitor failed".into()))
+        })
+    }
+}
+impl Drop for UsageMonitor {
+    fn drop(&mut self) {
+        let _ = self.join();
+    }
+}
+
+fn check_usage(path: &Path, bytes: u64, entries: usize) -> Result<(), String> {
+    usage::check(path, bytes, entries).map_err(|_| format!("writable sensor scratch cap exceeded or usage unavailable ({bytes} bytes, {entries} entries); scan discarded"))
+}
+
+#[cfg(unix)]
+mod usage {
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+    pub fn check(path: &Path, bytes: u64, entries: usize) -> io::Result<()> {
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        walk(&dir, &mut (0, 0), (bytes, entries), 0)
+    }
+    fn walk(
+        dir: &std::fs::File,
+        used: &mut (u64, usize),
+        cap: (u64, usize),
+        depth: usize,
+    ) -> io::Result<()> {
+        if depth > 64 {
+            return Err(io::Error::other("scratch depth exceeded"));
+        }
+        // SAFETY: duplicate a live descriptor with close-on-exec. The monitor
+        // runs while MXC is spawned, so no scratch handle may leak to it.
+        let fd = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd is an owned directory descriptor.
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            // SAFETY: fdopendir failed without taking ownership.
+            unsafe { libc::close(fd) };
+            return Err(io::Error::last_os_error());
+        }
+        struct Stream(*mut libc::DIR);
+        impl Drop for Stream {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+        let stream = Stream(stream);
+        loop {
+            // SAFETY: stream remains live, and the entry is used before readdir.
+            // SAFETY: errno is thread-local. Clear it to distinguish EOF from
+            // a failed readdir, which must make usage inspection fail closed.
+            #[cfg(target_os = "macos")]
+            unsafe {
+                *libc::__error() = 0;
+            }
+            #[cfg(target_os = "linux")]
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                if io::Error::last_os_error()
+                    .raw_os_error()
+                    .is_some_and(|e| e != 0)
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                break;
+            }
+            // SAFETY: readdir returns a NUL-terminated name.
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if [b".".as_slice(), b"..".as_slice()].contains(&name.to_bytes()) {
+                continue;
+            }
+            used.1 += 1;
+            if used.1 > cap.1 {
+                return Err(io::Error::other("scratch entries exceeded"));
+            }
+            let mut meta = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: name, dir and writable stat storage are live. Never follow links.
+            if unsafe {
+                libc::fstatat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    meta.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: successful fstatat initialized meta.
+            let meta = unsafe { meta.assume_init() };
+            used.0 = used.0.saturating_add(
+                (meta.st_size.max(0) as u64)
+                    .max((meta.st_blocks.max(0) as u64).saturating_mul(512)),
+            );
+            if used.0 > cap.0 {
+                return Err(io::Error::other("scratch bytes exceeded"));
+            }
+            if meta.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                // SAFETY: open a child relative to the retained parent, no link traversal.
+                let child = unsafe {
+                    libc::openat(
+                        dir.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if child < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: child is a new owned descriptor.
+                let child = unsafe { std::fs::File::from_raw_fd(child) };
+                walk(&child, used, cap, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+}
+#[cfg(windows)]
+mod usage {
+    use crate::platform;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::{io, path::Path};
+    pub fn check(path: &Path, bytes: u64, entries: usize) -> io::Result<()> {
+        walk(path, &mut (0, 0), (bytes, entries), 0)
+    }
+    fn walk(
+        path: &Path,
+        used: &mut (u64, usize),
+        cap: (u64, usize),
+        depth: usize,
+    ) -> io::Result<()> {
+        if depth > 64 {
+            return Err(io::Error::other("scratch depth exceeded"));
+        }
+        // No delete sharing: retain every ancestor until its traversal ends.
+        let dir = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .custom_flags(0x0200_0000 | 0x0020_0000)
+            .open(path)?;
+        if !dir.metadata()?.is_dir() || platform::is_link(&dir.metadata()?) {
+            return Err(io::Error::other("scratch directory replaced"));
+        }
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let meta = std::fs::symlink_metadata(entry.path())?;
+            used.1 += 1;
+            used.0 = used.0.saturating_add(meta.len());
+            if meta.is_file() && !platform::is_link(&meta) {
+                named_streams(&entry.path(), used, cap)?;
+            }
+            if used.0 > cap.0 || used.1 > cap.1 {
+                return Err(io::Error::other("scratch cap exceeded"));
+            }
+            if meta.is_dir() && !platform::is_link(&meta) {
+                walk(&entry.path(), used, cap, depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    // NTFS alternate streams consume scratch too. Pin the non-reparse file
+    // without delete sharing before enumerating streams by its stable path.
+    fn named_streams(path: &Path, used: &mut (u64, usize), cap: (u64, usize)) -> io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .custom_flags(0x0020_0000)
+            .open(path)?;
+        if !file.metadata()?.is_file() || platform::is_link(&file.metadata()?) {
+            return Err(io::Error::other("scratch file replaced"));
+        }
+        #[repr(C)]
+        struct StreamData {
+            size: i64,
+            name: [u16; 296],
+        }
+        extern "system" {
+            fn FindFirstStreamW(
+                path: *const u16,
+                level: u32,
+                data: *mut StreamData,
+                flags: u32,
+            ) -> *mut core::ffi::c_void;
+            fn FindNextStreamW(handle: *mut core::ffi::c_void, data: *mut StreamData) -> i32;
+            fn FindClose(handle: *mut core::ffi::c_void) -> i32;
+        }
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut data = std::mem::MaybeUninit::<StreamData>::zeroed();
+        // SAFETY: path and correctly sized stream storage remain live.
+        let handle = unsafe { FindFirstStreamW(wide.as_ptr(), 0, data.as_mut_ptr(), 0) };
+        if handle as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        struct Streams(*mut core::ffi::c_void);
+        impl Drop for Streams {
+            fn drop(&mut self) {
+                unsafe {
+                    FindClose(self.0);
+                }
+            }
+        }
+        let _streams = Streams(handle);
+        loop {
+            // SAFETY: successful FindFirstStreamW/FindNextStreamW initialized data.
+            let stream = unsafe { &*data.as_ptr() };
+            let end = stream
+                .name
+                .iter()
+                .position(|c| *c == 0)
+                .ok_or_else(|| io::Error::other("invalid stream name"))?;
+            let name = String::from_utf16_lossy(&stream.name[..end]);
+            if name != "::$DATA" {
+                used.1 += 1;
+                used.0 = used.0.saturating_add(stream.size.max(0) as u64);
+                if used.0 > cap.0 || used.1 > cap.1 {
+                    return Err(io::Error::other("scratch streams exceed cap"));
+                }
+            }
+            // SAFETY: handle and writable data remain live throughout enumeration.
+            if unsafe { FindNextStreamW(handle, data.as_mut_ptr()) } == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(38) {
+                    break;
+                } // ERROR_HANDLE_EOF
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+#[cfg(not(any(unix, windows)))]
+mod usage {
+    pub fn check(_: &std::path::Path, _: u64, _: usize) -> std::io::Result<()> {
+        Err(std::io::Error::other("scratch usage unavailable"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn parent() -> PathBuf {
+        let parent = if cfg!(windows) {
+            platform::home().unwrap()
+        } else {
+            platform::temp_root().unwrap()
+        };
+        let root = parent.join(format!(
+            "omgs-scratch-test-{}",
+            platform::random_nonce().unwrap()
+        ));
+        platform::create_private_dir_new(&root).unwrap();
+        root
+    }
+    #[test]
+    fn recovery_reaps_abandoned_but_preserves_active_and_invalid() {
+        let parent = parent();
+        let mut abandoned = Scratch::create_in(&parent, "gate", |_| Ok(())).unwrap();
+        std::fs::write(abandoned.path().join("raw"), "discard me").unwrap();
+        let abandoned_path = abandoned.root.clone();
+        // Explicitly free the simulated owner's lock. Concurrent process-spawn
+        // tests can briefly inherit a forked descriptor before close-on-exec.
+        abandoned.lock.take().unwrap().unlock().unwrap();
+        let active = Scratch::create_in(&parent, "sensor", |_| Ok(())).unwrap();
+        assert!(!abandoned_path.exists());
+        let invalid = parent.join(format!("omgs-gate-{}", platform::random_nonce().unwrap()));
+        platform::create_private_dir_new(&invalid).unwrap();
+        std::fs::write(invalid.join("foreign"), "preserve me").unwrap();
+        let warnings =
+            crate::runmeta::with_lock_file(&parent.join(LOCK), || recover_in(&parent)).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("scratch recovery left"));
+        assert!(active.path().is_dir());
+        assert!(invalid.join("foreign").is_file());
+        drop(active);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+    #[test]
+    fn recovery_refuses_unexpected_layout_and_copied_owner_record() {
+        let parent = parent();
+        let mut unexpected = Scratch::create_in(&parent, "gate", |_| Ok(())).unwrap();
+        std::fs::write(unexpected.root.join("foreign"), "preserve").unwrap();
+        unexpected.lock.take();
+        let mut copied = Scratch::create_in(&parent, "sensor", |_| Ok(())).unwrap();
+        let bytes = std::fs::read(unexpected.root.join(OWNER)).unwrap();
+        crate::runmeta::write_atomic_bytes(&copied.root.join(OWNER), &bytes).unwrap();
+        copied.lock.take();
+        crate::runmeta::with_lock_file(&parent.join(LOCK), || recover_in(&parent)).unwrap();
+        assert!(unexpected.root.join("foreign").is_file());
+        assert!(copied.root.is_dir());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn recovery_does_not_follow_root_or_payload_links() {
+        use std::os::unix::fs::symlink;
+        let parent = parent();
+        let outside = parent.join("outside");
+        platform::create_private_dir_new(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "keep").unwrap();
+        let link = parent.join(format!("omgs-gate-{}", platform::random_nonce().unwrap()));
+        symlink(&outside, &link).unwrap();
+        let mut scratch = Scratch::create_in(&parent, "sensor", |_| Ok(())).unwrap();
+        std::fs::remove_dir(scratch.path()).unwrap();
+        symlink(&outside, scratch.path()).unwrap();
+        scratch.lock.take();
+        recover_in(&parent).unwrap();
+        assert!(std::fs::symlink_metadata(link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(scratch.root.exists());
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"keep");
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+    #[test]
+    fn writable_usage_enforces_bytes_entries_and_monitor_latches_overruns() {
+        let parent = parent();
+        let path = parent.join("work");
+        platform::create_private_dir_new(&path).unwrap();
+        assert!(check_usage(&path, 1 << 20, 10).is_ok());
+        std::fs::write(path.join("one"), vec![0; 8192]).unwrap();
+        assert!(check_usage(&path, 4096, 10).is_err());
+        assert!(check_usage(&path, 1 << 20, 0).is_err());
+        let file = File::create(path.join("large")).unwrap();
+        file.set_len(SENSOR_WRITE_BYTES + 1).unwrap();
+        let monitor = UsageMonitor::start(path.clone());
+        // The initial sample observes the overrun, even though the final one
+        // will see a clean tree.
+        std::fs::remove_file(path.join("large")).unwrap();
+        assert!(monitor.finish().is_err());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    #[test]
+    #[ignore = "subprocess helper invoked by crash_recovery_after_owner_kill"]
+    fn scratch_owner_process() {
+        let parent = PathBuf::from(std::env::var_os("OMGS_TEST_SCRATCH_PARENT").unwrap());
+        let scratch = Scratch::create_in(&parent, "sensor", |_| Ok(())).unwrap();
+        std::fs::write(scratch.path().join("raw"), "discard").unwrap();
+        std::fs::write(parent.join("ready"), b"ready").unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    #[test]
+    fn crash_recovery_after_owner_kill() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+        let parent = if cfg!(windows) {
+            platform::home().unwrap()
+        } else {
+            platform::temp_root().unwrap()
+        };
+        let parent = parent.join(format!(
+            "omgs-crash-test-{}",
+            platform::random_nonce().unwrap()
+        ));
+        platform::create_private_dir_new(&parent).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "scratch::process_tests::scratch_owner_process",
+                "--ignored",
+            ])
+            .env("OMGS_TEST_SCRATCH_PARENT", &parent)
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        while !parent.join("ready").exists() {
+            assert!(start.elapsed() < Duration::from_secs(15));
+            assert!(child.try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            crate::runmeta::with_lock_file(&parent.join(LOCK), || recover_in(&parent))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(std::fs::read_dir(&parent).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("omgs-sensor-")));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            crate::runmeta::with_lock_file(&parent.join(LOCK), || recover_in(&parent))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!std::fs::read_dir(&parent).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("omgs-sensor-")));
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    #[test]
+    fn writable_usage_counts_alternate_streams() {
+        let parent = crate::platform::home().unwrap().join(format!(
+            "omgs-stream-test-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&parent).unwrap();
+        std::fs::write(parent.join("file"), b"x").unwrap();
+        std::fs::write(parent.join("file:extra"), vec![0; 8192]).unwrap();
+        assert!(super::check_usage(&parent, 4096, 10).is_err());
+        assert!(super::check_usage(&parent, 16384, 10).is_ok());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+}

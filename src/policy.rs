@@ -318,6 +318,7 @@ fn git(target: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
         },
         None,
     );
+    crate::supervise::check_interrupted().map_err(|_| "git object read interrupted")?;
     if result.timed_out || !result.cleanup_complete || !result.capture_complete {
         return Err("git object read deadline, output limit or child cleanup failure".into());
     }
@@ -531,13 +532,6 @@ fn rank(s: Severity) -> u8 {
     }
 }
 
-/// Temporary gate data is independent of advisory run storage and always removed.
-struct GateDir(std::path::PathBuf);
-impl Drop for GateDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 fn oid(s: &str) -> bool {
     [40, 64].contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -549,10 +543,29 @@ fn export_head(
     head: &str,
     out: &Path,
 ) -> Result<std::collections::BTreeSet<String>, String> {
+    export_head_bounded(
+        target,
+        head,
+        out,
+        crate::scratch::GATE_EXPORT_BYTES,
+        crate::scratch::GATE_EXPORT_ENTRIES,
+    )
+}
+fn export_head_bounded(
+    target: &Path,
+    head: &str,
+    out: &Path,
+    byte_cap: u64,
+    entry_cap: usize,
+) -> Result<std::collections::BTreeSet<String>, String> {
     let mut paths = std::collections::BTreeSet::new();
     let mut folded = std::collections::BTreeSet::new();
-    let tree = git(target, &["ls-tree", "-rz", head])?;
+    let tree = git(target, &["ls-tree", "-rlz", head])?;
+    let mut bytes_total = 0u64;
+    let mut entries = std::collections::BTreeSet::new();
+    let mut manifest = Vec::new();
     for entry in tree.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        crate::supervise::check_interrupted().map_err(|_| "gate export interrupted")?;
         let tab = entry
             .iter()
             .position(|b| *b == b'\t')
@@ -560,7 +573,7 @@ fn export_head(
         let header = std::str::from_utf8(&entry[..tab]).map_err(|e| e.to_string())?;
         let fields: Vec<_> = header.split_whitespace().collect();
         let path = std::str::from_utf8(&entry[tab + 1..]).map_err(|e| e.to_string())?;
-        if fields.len() != 3
+        if fields.len() != 4
             || !["100644", "100755"].contains(&fields[0])
             || fields[1] != "blob"
             || !oid(fields[2])
@@ -586,8 +599,33 @@ fn export_head(
         if !folded.insert(path.to_lowercase()) {
             return Err("case-colliding head paths are blocked".into());
         }
+        let mut entry_path = std::path::PathBuf::new();
+        for component in Path::new(path).components() {
+            entry_path.push(component);
+            entries.insert(entry_path.clone());
+            if entries.len() > entry_cap {
+                return Err(format!(
+                    "gate export entry cap exceeded ({entry_cap} entries)"
+                ));
+            }
+        }
+        let size: u64 = fields[3].parse().map_err(|_| "invalid blob size")?;
+        bytes_total = bytes_total
+            .checked_add(size)
+            .ok_or("gate export byte cap exceeded")?;
+        if bytes_total > byte_cap {
+            return Err(format!("gate export byte cap exceeded ({byte_cap} bytes)"));
+        }
         paths.insert(path.to_string());
-        let bytes = git(target, &["cat-file", "blob", fields[2]])?;
+        manifest.push((path, fields[0], fields[2], size));
+    }
+    for (path, _mode, blob, size) in manifest {
+        crate::supervise::check_interrupted().map_err(|_| "gate export interrupted")?;
+        let bytes = git(target, &["cat-file", "blob", blob])?;
+        crate::supervise::check_interrupted().map_err(|_| "gate export interrupted")?;
+        if bytes.len() as u64 != size {
+            return Err("gate blob size mismatch".into());
+        }
         let file = out.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
         std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
@@ -596,7 +634,7 @@ fn export_head(
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(
                 &file,
-                std::fs::Permissions::from_mode(if fields[0] == "100755" { 0o755 } else { 0o644 }),
+                std::fs::Permissions::from_mode(if _mode == "100755" { 0o755 } else { 0o644 }),
             )
             .map_err(|e| e.to_string())?;
         }
@@ -605,6 +643,7 @@ fn export_head(
 }
 
 pub fn gate(target: &Path, base: &str, head: &str, run: Option<&Path>) -> Result<u8, String> {
+    crate::scratch::recover()?;
     if !oid(base) || !oid(head) {
         return Err("gate requires full immutable --base and --head SHAs".into());
     }
@@ -676,15 +715,9 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
             );
         }
     }
-    let path = crate::platform::scratch_root()
-        .map_err(|e| e.to_string())?
-        .join(format!(
-            "omgs-gate-{}",
-            crate::platform::random_nonce().map_err(|e| e.to_string())?
-        ));
-    crate::platform::create_private_dir_new(&path).map_err(|e| e.to_string())?;
-    let dir = GateDir(path);
-    let checkout = dir.0.join("head");
+    let _signals = crate::supervise::interruption::Guard::install().map_err(|e| e.to_string())?;
+    let mut dir = crate::scratch::Scratch::create("gate")?;
+    let checkout = dir.path().join("head");
     std::fs::create_dir(&checkout).map_err(|e| e.to_string())?;
     let paths = export_head(target, head, &checkout)?;
     let mut blocked = false;
@@ -698,7 +731,7 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
             test: Some(t.test.clone()),
             timeout_ms: t.timeout_ms,
             target: Some(checkout.clone()),
-            run_dir: dir.0.join(format!("proof-{n}")),
+            run_dir: dir.path().join(format!("proof-{n}")),
             tier: crate::sandbox::Tier::Test,
             stage: None,
             expected_tree_sha256: None,
@@ -740,7 +773,7 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
             _ => return Err(format!("{}: test failed outside its recipe contract", t.id)),
         }
     }
-    std::fs::remove_dir_all(&dir.0).map_err(|e| format!("gate scratch cleanup failed: {e}"))?;
+    dir.cleanup()?;
     Ok(blocked)
 }
 fn advisory_findings(run: &Path, p: &Policy) {
@@ -903,4 +936,69 @@ fn file_patch(path: &str, old: &str, new: &str) -> String {
         }
     }
     diff
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::*;
+    use std::process::Command;
+    fn git_fixture(repo: &Path, args: &[&str]) -> String {
+        let result = Command::new(crate::platform::which("git").unwrap())
+            .current_dir(repo)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{:?}", result);
+        String::from_utf8(result.stdout).unwrap().trim().into()
+    }
+    #[test]
+    fn gate_export_bounds_charge_repeated_blobs_and_directory_entries() {
+        let parent = if cfg!(windows) {
+            crate::platform::home().unwrap()
+        } else {
+            crate::platform::temp_root().unwrap()
+        };
+        let root = parent.join(format!(
+            "omgs-export-test-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&root).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_fixture(&repo, &["init"]);
+        std::fs::create_dir(repo.join("nested")).unwrap();
+        let blob = vec![b'x'; 1 << 20];
+        std::fs::write(repo.join("one"), &blob).unwrap();
+        std::fs::write(repo.join("nested/two"), &blob).unwrap();
+        git_fixture(&repo, &["add", "."]);
+        git_fixture(&repo, &["commit", "-m", "Fixture"]);
+        let head = git_fixture(&repo, &["rev-parse", "HEAD"]);
+        let out = root.join("out");
+        std::fs::create_dir(&out).unwrap();
+        let error = export_head_bounded(&repo, &head, &out, (1 << 20) + 1, 10).unwrap_err();
+        assert!(error.contains("byte cap exceeded"), "{error}");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+        let error = export_head_bounded(&repo, &head, &out, 3 << 20, 2).unwrap_err();
+        assert!(error.contains("entry cap exceeded"), "{error}");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+        assert_eq!(
+            export_head_bounded(&repo, &head, &out, 2 << 20, 3)
+                .unwrap()
+                .len(),
+            2
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
