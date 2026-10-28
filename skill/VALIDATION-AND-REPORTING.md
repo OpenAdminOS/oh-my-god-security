@@ -22,6 +22,121 @@ Non-web and non-sandboxable targets need a documented proof recipe, because the 
 
 Do not rely on the sandbox to contain daemon-mediated effects. Under MXC on macOS, `defaults write`, `open`, `launchctl` and the clipboard are denied and Apple Events are not delivered (observed 2026-10-27), but a proof that needs such an API is testing the daemon, not the target. `NSTemporaryDirectory()` resolves to the real per-user temp dir, which MXC denies, so a harness that uses it fails rather than escaping. Cleaning up afterward never counts as containment: if an effect could leave the sandbox, the escape has already happened. Redirect temp to a scratch-relative path. For preferences, launchd, or similar daemon IPC, avoid the API in the proof or record a blocker and leave the record `needs_validation`; never rely on post-run cleanup as the containment, and never reach for an unsandboxed machine instead. A proof harness that crashes before reaching the code under test (a missing dynamic library, a load error, a build failure) must fail loudly and distinctly: never read a harness abort as the target refusing the operation, or a crash will masquerade as a passing control.
 
+## Proof by default: per-stack recipes
+
+For every candidate, attempt the cheapest decisive sandbox proof when its runtime
+is reachable locally, within the declared proof budget. A budget stop is also an
+exact blocker, never a silent omission. Hand the relevant recipe below to the
+hunter with its scope. The verifier checks the harness against the real source.
+Run `omgs doctor --live` first. Its `toolchains reachable inside the sandbox` list
+means a version command actually launched, not merely that a filename was found.
+A missing tool is printed as `<runtime> not reachable inside the sandbox` (for
+example `pwsh not reachable inside the sandbox`). Record that exact line and the
+startup output from `omgs prove`, or its printed `needs_validation` reason on
+exit 3. Do not suggest an installation during proof. No runtime, missing local
+modules, a refused OS tier, failed DLL initialization, syntax or build errors,
+and exhausted budgets remain blockers with `needs_validation`, never rejection.
+
+All commands below run from the reviewer's shell. Replace `RUN`, `FP` and `DRAFT`
+with the resolved external run directory, fingerprint and draft file. Staged test
+paths are relative to the target. The invariant must fail with an explicit
+assertion and exit 1 through 125 on vulnerable source, then pass with exit 0 on
+the fixed source; require an authorized success control in both. Import or compile
+the real unmodified target implementation, never a copy of its decision logic.
+Tiny executable examples for all five recipes live in `tests/recipes.rs`; its
+fixtures are staged into disposable targets, and every execution, including
+runtime probes and compilation, uses the actual `omgs prove` CLI.
+
+Every recipe uses the same deny-by-default MXC policy: external network denied,
+host home and credentials unreadable except the disclosed read-only toolchain
+roots and caches, scratch home/temp/cache, and writes only to the workspace copy
+and scratch. Readable caches may contain private source. Read each proof's actual
+controls and gaps, including OS limits; never infer broader containment. No
+package downloads, real services or root operations are part of these recipes.
+
+### PowerShell
+
+Use a `test.ps1` harness with `$ErrorActionPreference = 'Stop'`, dot-source the
+actual target script or import its local module, check the authorized control,
+then explicitly `exit 1` if the forbidden result occurs and `exit 0` otherwise.
+Do not mock the authorization or policy-writing operation under test. A startup
+exception must be distinguishable from the boundary assertion. For inline checks,
+`pwsh -NoProfile -NonInteractive -Command ...` is also supported.
+
+```sh
+omgs prove --run RUN --finding FP --test test.ps1 --test-from DRAFT --cmd "pwsh -NoProfile -NonInteractive -File test.ps1"
+```
+
+Common blockers: `pwsh not reachable inside the sandbox`, absent local modules,
+Graph/network calls requiring real services, and Windows session 0
+`STATUS_DLL_INIT_FAILED`. Use an existing interactive desktop session for the
+Windows container; never grant home access or change ACLs. Windows augmentation
+tiers remain refused. Network and home denials above apply to PowerShell too.
+
+### Node
+
+Use `test.cjs` with `node:assert/strict`, import the real local target module,
+assert the authorized result and the denied cross-principal effect. A failing
+boundary assertion exits 1; fixed code exits 0. Keep external effects synthetic.
+
+```sh
+omgs prove --run RUN --finding FP --test test.cjs --test-from DRAFT --cmd "node test.cjs"
+```
+
+Common blockers: `node not reachable inside the sandbox`, missing local
+`node_modules`, unsupported module formats and denied absolute-path enumeration
+on Windows builds without that capability. No npm install or registry access;
+network and home denials above apply to Node too.
+
+### Python
+
+Use `test.py` with the authorized assertion followed by the boundary assertion.
+Run isolated mode; `-I` removes the script directory from the import path, so
+load a local file explicitly with `runpy.run_path('./target.py')` or use an
+explicit local module search path in the harness. Do not load host user packages.
+Assertion failure exits 1; the same harness exits 0 on fixed code.
+
+```sh
+omgs prove --run RUN --finding FP --test test.py --test-from DRAFT --cmd "python3 -I test.py"
+```
+
+Common blockers: `python3 not reachable inside the sandbox`, unavailable local
+packages and fixtures expecting user-site imports. Never run pip; network and
+home denials above apply to Python too.
+
+### Shell
+
+Use `test.sh` to source the real local implementation, verify the authorized
+control, and explicitly exit 1 when the forbidden effect is observed. Exit 0
+only after checking denied behavior and resulting synthetic state. Prefer POSIX
+`sh` and explicit status checks so a pipeline's final command cannot hide failure.
+
+```sh
+omgs prove --run RUN --finding FP --test test.sh --test-from DRAFT --cmd "sh test.sh"
+```
+
+Common blockers: `sh not reachable inside the sandbox`, absent commands or a
+non-POSIX target requiring an unavailable interpreter. No host shell fallback on
+Windows. Network and home denials above apply to shell subprocesses too.
+
+### Swift
+
+Keep the XCTest regression draft, but when SwiftPM's nested sandbox is blocked,
+compile the real module plus a `main.swift` invariant harness directly. Assert an
+authorized success, print a specific boundary failure and `exit(1)` on the
+vulnerable path, then exit 0 on fixed code. Disclose the runner substitution.
+
+```sh
+omgs prove --run RUN --finding FP --test main.swift --test-from DRAFT --cmd "swiftc target.swift main.swift -o fixture && ./fixture"
+```
+
+For modules needing a library, use `swiftc -emit-library` inside the same proof
+and link an explicit workspace-relative library path. Common blockers:
+`swiftc not reachable inside the sandbox`, missing SDKs or local libraries,
+nested SwiftPM sandbox creation, denied daemon APIs and real root helpers. A
+compile/load failure earns no tier. Network and home denials above apply to
+Swift too; redirect temporary files into the workspace or scratch.
+
 ## Write a regression test
 
 1. Use the target's existing test framework and conventions. Write a draft beneath the external output directory, with a proposed target-relative path for later human acceptance. The runner stages the test into the workspace copy; never write audit logs or generated fixture data into the target.

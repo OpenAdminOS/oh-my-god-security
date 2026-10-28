@@ -38,7 +38,8 @@ Target controlled code, including builds, tests and the running app at level 2, 
 - An empty environment built from an explicit allowlist, with scratch local home, temp and cache directories. Dummy principals and dummy secrets only.
 - A read only target and toolchain. The target process writes only inside its assigned scratch directory and a per-run copy of the target; the original target is never mounted.
 - Explicit limits on CPU, memory, processes, per-file size and wall clock time where supported. There is no total disk quota. Unix limits each file to 1 GiB; Windows has no per-file limit.
-- No dependency installation and no network fetching during proof execution. Only tools and dependencies already present locally are used.
+- No dependency installation and no network fetching during proof execution. Only tools and dependencies already present locally are used. Rust proxies receive `RUSTUP_AUTO_INSTALL=0`.
+- Attempt a sandbox proof for every candidate whose runtime is reachable, within the declared budget. Use the per-stack recipes; record exact runtime, sandbox or budget blockers when an attempt cannot proceed. Runtime reachability means a successful version-command launch inside MXC, not a PATH lookup.
 - Execution stops at the minimum local effect that proves the boundary violation.
 
 Declared minimum set per OS (amended on 2026-10-27, replacing the rule that every control above must hold everywhere, because no OS sandbox offers all of them). Below this set OMGS refuses to run target code:
