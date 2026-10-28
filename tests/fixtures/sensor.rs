@@ -138,6 +138,28 @@ fn main() {
         // access must produce a scan gap instead of a successful empty report.
         std::process::exit(if fs::read(library).is_err() { 42 } else { 43 });
     }
+    if mode == "scratch-overrun" {
+        // Many modest files exceed the aggregate cap without RLIMIT_FSIZE
+        // stopping a single file. Continue until the supervisor terminates us.
+        use std::io::Write;
+        let block = vec![b'x'; 1 << 20];
+        for n in 0..100_000 {
+            let mut file = fs::File::create(tmp.join(format!("flood-{n}"))).unwrap();
+            for _ in 0..8 { file.write_all(&block).unwrap(); }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    if mode == "scratch-deep" {
+        let mut path = tmp.clone();
+        for _ in 0..160 {
+            path.push("d");
+            fs::create_dir(&path).unwrap();
+        }
+        fs::write(path.join("raw"), b"raw-secret-must-be-discarded").unwrap();
+        // The monitor's depth refusal must cancel this scanner, then cleanup
+        // must remove the entire tree rather than leave an unreapable payload.
+        std::thread::sleep(Duration::from_secs(120));
+    }
     if mode == "timeout" {
         std::thread::sleep(Duration::from_secs(30));
     }

@@ -985,6 +985,7 @@ fn doctor_probe_result(run: &omgs::supervise::Supervised) -> Result<(), String> 
 /// What this machine can and cannot do for OMGS. Executes no target code;
 /// `--live` runs one fixed command inside MXC to show a denial is enforced.
 fn cmd_doctor(args: &[String]) -> Result<(), String> {
+    omgs::scratch::recover()?;
     use omgs::platform::which;
     let os = std::env::consts::OS;
     println!(

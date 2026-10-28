@@ -19,6 +19,7 @@ pub mod report;
 pub mod route;
 pub mod runmeta;
 pub mod sandbox;
+pub mod scratch;
 pub mod sensors;
 pub mod setup;
 pub mod sha256;
