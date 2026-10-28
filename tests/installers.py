@@ -108,6 +108,70 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
         for text in ['Installed omgs 0.1.0:', 'Installed MXC 1.0.1:', 'SHA256SUMS verified:', 'Publisher signature verified:', 'provenance: unverified']:
             self.assertIn(text, out.stdout + out.stderr)
 
+    def assert_existing_install_survives(self, failure):
+        self.fake_verifiers()
+        # Use a custom root with spaces and seed all three previous files.
+        home = self.root / 'custom install'
+        self.env['OMGS_HOME'] = str(home)
+        previous = {
+            Path('bin') / ('omgs.exe' if self.windows else 'omgs'): b'previous binary',
+            Path('mxc/1.0.1') / ('wxc-exec.exe' if self.windows else 'mxc-exec-mac'): b'previous executor',
+            Path('mxc/1.0.1/MXC-LICENSE.txt'): b'previous notice',
+        }
+        for relative, data in previous.items():
+            path = home / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+        text = self.script.read_text()
+        if self.windows:
+            marker = '    Checksum $asset $stagedOmgs'
+            injection = {
+                'abort': "    throw 'simulated staging failure'",
+                'checksum': "    [IO.File]::WriteAllText($stagedLicense, 'corrupt staged bytes')",
+                'signature': "    $MicrosoftSubject = 'CN=wrong staged signer'",
+            }[failure]
+        else:
+            marker = 'checksum "$asset" "$staged_omgs"'
+            injection = {
+                'abort': "echo 'simulated staging failure' >&2; exit 1",
+                'checksum': "printf 'corrupt staged bytes' > \"$staged_license\"",
+                'signature': "MICROSOFT_TEAM_ID=wrong-staged-signer\nverify_signature() { echo 'publisher signature rejected: staged file' >&2; exit 1; }",
+            }[failure]
+        self.assertEqual(text.count(marker), 1)
+        self.script.write_text(text.replace(marker, injection + '\n' + marker))
+        out = self.run_install()
+        self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+        expected = {'abort': 'simulated staging failure', 'checksum': 'checksum mismatch',
+                    'signature': 'publisher signature rejected'}[failure]
+        self.assertIn(expected, out.stdout + out.stderr)
+        for relative, data in previous.items():
+            self.assertEqual((home / relative).read_bytes(), data)
+        self.assertEqual({p.relative_to(home) for p in home.rglob('*') if p.is_file()}, set(previous))
+
+    def test_failure_after_staging_preserves_previous_install(self):
+        self.assert_existing_install_survives('abort')
+
+    def test_staged_checksum_failure_preserves_previous_install(self):
+        self.assert_existing_install_survives('checksum')
+
+    def test_staged_signature_failure_preserves_previous_install(self):
+        self.assert_existing_install_survives('signature')
+
+    def test_successful_replacement_preserves_complete_bytes(self):
+        self.fake_verifiers()
+        for _ in range(2):
+            out = self.run_install()
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            home = Path(self.env['OMGS_HOME'])
+            files = [p for p in home.rglob('*') if p.is_file()]
+            self.assertEqual(len(files), 3)
+            binary = home / 'bin' / ('omgs.exe' if self.windows else 'omgs')
+            self.assertEqual(sha(binary), self.original)
+            self.assertIn(str(binary), out.stdout)
+            executor = next(p for p in files if p.name not in ('omgs', 'omgs.exe', 'MXC-LICENSE.txt'))
+            self.assertEqual(sha(executor), self.executor_hash)
+            self.assertEqual(sha(home / 'mxc/1.0.1/MXC-LICENSE.txt'), sha(self.bundle / 'MXC-LICENSE.txt'))
+
     def test_authenticated_attestation_failure_is_unverified(self):
         self.fake_verifiers()
         if self.windows:

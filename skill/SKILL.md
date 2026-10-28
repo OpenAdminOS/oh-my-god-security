@@ -33,8 +33,9 @@ Resolve these values before starting. Discover safe local facts; ask only for co
 | `OUTPUT_DIR` | Private run directory outside `TARGET`, including after symlink resolution. All reports, ledger entries, proof drafts, logs, and retained proof artifacts belong here. Runner-managed ephemeral scratch must also remain outside the target. |
 | `SOURCE_REF` | Exact source commit, plus a recorded worktree diff identity if reviewing uncommitted changes. Never silently mix revisions. |
 
-Read `VERSION` beside this file. Resolve `OMGS_BIN` from PATH, then
-`$HOME/.local/share/omgs/bin/omgs` (Windows: `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`).
+Read `VERSION` beside this file. Resolve `OMGS_BIN` in this order: `omgs` on PATH, then
+`${OMGS_HOME}/bin/omgs` when `OMGS_HOME` is set (Windows:
+`%OMGS_HOME%\bin\omgs.exe`), then `$HOME/.local/share/omgs/bin/omgs` (Windows: `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`).
 Run only `--version` on an existing installation and require the exact string
 `omgs <VERSION>`. On mismatch, stop and report both versions clearly. Do not
 continue a review with a mismatched binary or silently replace it.
@@ -69,6 +70,11 @@ from a general review request. The scripts fetch both assets from the pinned OMG
 release, verify them before executing the binary, and install without elevation.
 They accept an absolute local bundle through `OMGS_RELEASE_BASE` for offline use.
 Show every printed path, version, checksum, publisher and provenance result.
+After installation, explicitly set `OMGS_BIN` to the absolute binary path in the
+installer's `Installed omgs <VERSION>:` output, including a custom `OMGS_HOME`.
+Use that exact path for subsequent commands. The installer stages and verifies
+all files beside their destinations before publishing each by atomic replacement.
+Publication is atomic per file, not a transaction across the entire installation.
 A checksum, signature or executor-pin failure stops installation. Provenance
 failure alone is labelled unverified and does not assert tampering.
 

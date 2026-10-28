@@ -80,13 +80,13 @@ function Fetch([string]$Name, [long]$Limit) {
     } else { throw 'OMGS_RELEASE_BASE must be HTTPS or an absolute local bundle' }
     if ((Get-Item -LiteralPath $to).Length -gt $Limit) { throw "oversize download: $Name" }
 }
-function Checksum([string]$Name) {
+function Checksum([string]$Name, [string]$Path = (Join-Path $tmp $Name)) {
     $entries = @(Get-Content (Join-Path $tmp 'SHA256SUMS') | ForEach-Object {
         $parts = $_ -split '\s+'
         if ($parts.Count -eq 2 -and ($parts[1] -ceq $Name -or $parts[1] -ceq "*$Name")) { $parts[0] }
     })
     if ($entries.Count -ne 1 -or $entries[0] -cnotmatch '^[0-9a-f]{64}$') { throw "missing or invalid checksum: $Name" }
-    if ((Get-FileHash -LiteralPath (Join-Path $tmp $Name) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $entries[0]) { throw "checksum mismatch: $Name" }
+    if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $entries[0]) { throw "checksum mismatch: $Name" }
     Write-Output "SHA256SUMS verified: $Name"
 }
 function Signature([string]$Path, [string]$Subject) {
@@ -111,6 +111,26 @@ function Provenance([string]$Path) {
     return $false
 }
 
+$staged = [Collections.Generic.List[string]]::new()
+function Stage([string]$Name, [string]$Destination) {
+    $path = Join-Path (Split-Path $Destination -Parent) ('.omgs-' + [guid]::NewGuid().ToString('N') + [IO.Path]::GetExtension($Destination))
+    # CreateNew reserves a unique sibling without overwriting an existing file.
+    $output = [IO.File]::Open($path, [IO.FileMode]::CreateNew)
+    $staged.Add($path)
+    try {
+        $inputFile = [IO.File]::OpenRead((Join-Path $tmp $Name))
+        try { $inputFile.CopyTo($output) } finally { $inputFile.Dispose() }
+    } finally { $output.Dispose() }
+    return $path
+}
+function Publish([string]$Path, [string]$Destination) {
+    if ([IO.File]::Exists($Destination)) {
+        [IO.File]::Replace($Path, $Destination, [NullString]::Value)
+    } else {
+        [IO.File]::Move($Path, $Destination)
+    }
+}
+
 try {
     Fetch 'SHA256SUMS' 1048576
     Fetch $asset 104857600
@@ -131,9 +151,23 @@ try {
     $bin = Join-Path $DestRoot 'bin'
     $mxc = Join-Path $DestRoot 'mxc/1.0.1'
     New-Item -ItemType Directory -Force $bin, $mxc | Out-Null
-    Copy-Item -LiteralPath (Join-Path $tmp $mxcAsset) -Destination (Join-Path $mxc $mxcFile) -Force
-    Copy-Item -LiteralPath (Join-Path $tmp 'MXC-LICENSE.txt') -Destination $mxc -Force
-    Copy-Item -LiteralPath (Join-Path $tmp $asset) -Destination (Join-Path $bin 'omgs.exe') -Force
+    # Verify all destination siblings before the first atomic replacement.
+    $stagedOmgs = Stage $asset (Join-Path $bin 'omgs.exe')
+    $stagedMxc = Stage $mxcAsset (Join-Path $mxc $mxcFile)
+    $stagedLicense = Stage 'MXC-LICENSE.txt' (Join-Path $mxc 'MXC-LICENSE.txt')
+    Checksum $asset $stagedOmgs
+    Signature $stagedOmgs $OmgsSubject
+    Checksum $mxcAsset $stagedMxc
+    Signature $stagedMxc $MicrosoftSubject
+    Checksum 'MXC-LICENSE.txt' $stagedLicense
+    Publish $stagedMxc (Join-Path $mxc $mxcFile)
+    Publish $stagedLicense (Join-Path $mxc 'MXC-LICENSE.txt')
+    Publish $stagedOmgs (Join-Path $bin 'omgs.exe')
     Write-Output "Installed MXC 1.0.1: $(Join-Path $mxc $mxcFile)"
     Write-Output "Installed $actual`: $(Join-Path $bin 'omgs.exe')"
-} finally { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+} finally {
+    foreach ($path in $staged) {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+}

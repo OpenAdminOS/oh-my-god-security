@@ -50,7 +50,17 @@ printf 'Resolved: OMGS %s; source %s; destination %s; binary %s; executor %s\n' 
 IFS= read -r answer || answer=''
 [ "$answer" = yes ] || { echo 'Installation cancelled before downloads' >&2; exit 1; }
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+staged_omgs=''
+staged_mxc=''
+staged_license=''
+cleanup() {
+  for staged in "$staged_omgs" "$staged_mxc" "$staged_license"; do
+    [ -z "$staged" ] || rm -f -- "$staged"
+  done
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 fetch() {
   case "$BASE" in
     /*) cp "$BASE/$1" "$tmp/$1" ;;
@@ -66,7 +76,7 @@ digest() {
 checksum() {
   expected=$(awk -v a="$1" '$2 == a || $2 == "*" a {print $1}' "$tmp/SHA256SUMS")
   printf '%s' "$expected" | grep -Eq '^[0-9a-f]{64}$' || { echo "missing or invalid checksum: $1" >&2; exit 1; }
-  [ "$(digest "$tmp/$1")" = "$expected" ] || { echo "checksum mismatch: $1" >&2; exit 1; }
+  [ "$(digest "${2:-$tmp/$1}")" = "$expected" ] || { echo "checksum mismatch: $1" >&2; exit 1; }
   echo "SHA256SUMS verified: $1"
 }
 verify_signature() {
@@ -104,12 +114,26 @@ if ! actual_version=$("$tmp/$asset" --version); then
   echo "version mismatch: skill expects omgs $VERSION; binary --version failed" >&2; exit 1
 fi
 [ "$actual_version" = "omgs $VERSION" ] || { echo "version mismatch: skill expects omgs $VERSION; binary reports $actual_version" >&2; exit 1; }
+# Stage every file on its destination filesystem before publishing any file.
 mkdir -p "$DEST_ROOT/bin"
+staged_omgs=$(mktemp "$DEST_ROOT/bin/.omgs.XXXXXXXX")
+install -m 0755 "$tmp/$asset" "$staged_omgs"
 if [ -n "$mxc_asset" ]; then
   mkdir -p "$DEST_ROOT/mxc/1.0.1"
-  install -m 0755 "$tmp/$mxc_asset" "$DEST_ROOT/mxc/1.0.1/$mxc_file"
-  install -m 0644 "$tmp/MXC-LICENSE.txt" "$DEST_ROOT/mxc/1.0.1/MXC-LICENSE.txt"
+  staged_mxc=$(mktemp "$DEST_ROOT/mxc/1.0.1/.mxc.XXXXXXXX")
+  install -m 0755 "$tmp/$mxc_asset" "$staged_mxc"
+  staged_license=$(mktemp "$DEST_ROOT/mxc/1.0.1/.license.XXXXXXXX")
+  install -m 0644 "$tmp/MXC-LICENSE.txt" "$staged_license"
+fi
+checksum "$asset" "$staged_omgs"
+verify_signature "$staged_omgs" "$OMGS_TEAM_ID"
+if [ -n "$mxc_asset" ]; then
+  checksum "$mxc_asset" "$staged_mxc"
+  verify_signature "$staged_mxc" "$MICROSOFT_TEAM_ID"
+  checksum MXC-LICENSE.txt "$staged_license"
+  mv -f -- "$staged_mxc" "$DEST_ROOT/mxc/1.0.1/$mxc_file"
+  mv -f -- "$staged_license" "$DEST_ROOT/mxc/1.0.1/MXC-LICENSE.txt"
   echo "Installed MXC 1.0.1: $DEST_ROOT/mxc/1.0.1/$mxc_file"
 fi
-install -m 0755 "$tmp/$asset" "$DEST_ROOT/bin/omgs"
+mv -f -- "$staged_omgs" "$DEST_ROOT/bin/omgs"
 echo "Installed $actual_version: $DEST_ROOT/bin/omgs"
