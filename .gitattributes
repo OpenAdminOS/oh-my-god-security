@@ -1,0 +1,2 @@
+# Archived proof digests cover exact bytes on every platform.
+benchmark/fixtures/score/**/proofs/** -text
