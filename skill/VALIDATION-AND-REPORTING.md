@@ -168,7 +168,13 @@ Common blockers: `node not on host PATH` or
 `node on host PATH but failed to launch inside MXC`, missing local
 `node_modules`, unsupported module formats and denied absolute-path enumeration
 on Windows builds without that capability. No npm install or registry access;
-network and home denials above apply to Node too.
+network and home denials above apply to Node too. Because the harness returns
+instead of calling `process.exit()`, a target that leaves a timer, server or
+other open handle keeps Node running until the wall clock expires; a timed out
+run never supports a proof, even with both markers printed. Close target-owned
+resources in the harness through the target's own cleanup API (for example
+`server.close()` or `clearInterval`) before `check()` returns, and record the
+timeout as the blocker if the target offers no way to release them.
 
 ### Python
 
