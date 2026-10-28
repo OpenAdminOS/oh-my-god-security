@@ -1700,6 +1700,7 @@ mod tests {
         let root = d.join("target");
         let copy = d.join("copy");
         std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
         std::fs::create_dir_all(&copy).unwrap();
         std::fs::write(root.join("file"), "data").unwrap();
         let links: Vec<_> = (0..27)
