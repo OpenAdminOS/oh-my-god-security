@@ -53,6 +53,44 @@ OMGS is a multi-agent pipeline by default, not a single review pass. Each stage 
 
 Proof tiers decide what confirmed means. Traced is a source argument only. Test proven is a failing test run in the sandbox. Sandbox exploited is a locally built app exercised in the sandbox on dummy data. Only the top two tiers can be confirmed, severity is assigned only after confirmation, and only committed proof tests or scanner rules can ever block a merge in gate mode. OMGS publishes no score and no coverage percentage; it names what it did not examine.
 
+## Hand results to a fixer
+
+`omgs report --findings RUN/findings.json --out RUN` writes `REPORT.md`,
+`REPORT.html`, `findings.sarif.json`, `HANDOFF.md` and `handoff.json` outside
+of the reviewed repository. Saved `run-metadata.json` supplies repo, ref, mode,
+persona and sandbox defaults. Explicit `--repo`, `--ref`, `--mode`, `--persona`
+and `--sandbox` flags override them. Builder reports are short; an absent or
+null persona keeps the full form. Both reports include the recorded pipeline
+timeline and links to proof records. Markdown starts with what needs action,
+including an explicit "Nothing to fix" when no finding was confirmed.
+
+Share `HANDOFF.md` and the protected run directory with a fixer. It explains
+verdicts, proof tiers, retained tests, exact proof commands and cumulative fix
+budgets without requiring the reader to know OMGS. Confirmed records come first.
+Pending records say "verify before fixing" and name the missing fact. Rejected
+records are excluded. The machine-readable equivalent follows
+[`handoff.schema.json`](skill/schemas/handoff.schema.json).
+
+```sh
+omgs handoff --run RUN
+omgs handoff --run RUN --finding C1
+omgs stage --run RUN
+```
+
+`--finding` accepts the report reference (`C1`, `V1`) or a fingerprint and rewrites
+both handoff files with only that record. `omgs stage` writes
+`RUN/proposed-tests.patch`, a unified diff adding the retained external proof
+tests at their proposed target-relative paths. It never edits the target.
+Already accepted tests need no patch. Conflicting tests, altered drafts, unsafe
+paths, binary tests and existing destination files stop staging. Review and apply
+the patch through the repository's normal process. No finding authorizes a fix;
+keep the original invariant and authorized control, rerun only through
+`omgs prove`, and follow the cumulative budget rules in the handoff.
+
+SARIF includes rule help and verdict properties. Critical and high findings use
+`error`, medium and low use `warning`, and informational findings use `note`.
+Pending records always use `note`, without severity. Rejected records are omitted.
+
 ## The binary bootstrap
 
 In the primary flow the only thing you install by hand is the skill. On first run the skill resolves the binary in order: `omgs` on `PATH`, then `~/.local/share/omgs/bin/omgs` (Windows: `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`), then the bundled bootstrap in the skill's `scripts/` directory. The bootstrap:

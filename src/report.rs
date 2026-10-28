@@ -4,6 +4,8 @@ use crate::model::{Finding, FindingsFile, Location, Verdict};
 
 #[derive(Default)]
 pub struct ReportMeta {
+    pub artifact_base: String,
+    pub timeline: Vec<TimelineRow>,
     pub accounting: crate::accounting::Accounting,
     pub persona: String,
     pub report_depth: String,
@@ -117,104 +119,210 @@ fn confirmed(file: &FindingsFile) -> Vec<&crate::model::Finding> {
         .collect()
 }
 
+/// A recorded pipeline stage or child, in saved order. Times are UTC.
+#[derive(Default)]
+pub struct TimelineRow {
+    pub label: String,
+    pub state: String,
+    pub started: String,
+    pub ended: String,
+    pub detail: String,
+}
+
+pub fn timeline(run: &std::path::Path) -> Result<Vec<TimelineRow>, String> {
+    let path = run.join(crate::status::FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let doc = crate::shape::strict_json(&text)?;
+    crate::status::check_document(doc.as_object().ok_or("pipeline status must be an object")?)?;
+    fn row(v: &serde_json::Value, parent: &str) -> TimelineRow {
+        let clock = |key: &str| {
+            v.get(key)
+                .and_then(|v| v.as_u64())
+                .map(crate::runmeta::clock)
+                .unwrap_or_else(|| "not recorded".into())
+        };
+        TimelineRow {
+            label: format!("{parent}{}", v["label"].as_str().unwrap_or_default()),
+            state: v["status"].as_str().unwrap_or_default().into(),
+            started: clock("started_ms"),
+            ended: clock("ended_ms"),
+            detail: v["detail"].as_str().unwrap_or_default().into(),
+        }
+    }
+    let mut rows = Vec::new();
+    if let Some(stages) = doc["stages"].as_array() {
+        for v in stages {
+            rows.push(row(v, ""));
+            if let Some(children) = v["children"].as_array() {
+                for child in children {
+                    rows.push(row(
+                        child,
+                        &format!("{} / ", v["label"].as_str().unwrap_or_default()),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn short(meta: &ReportMeta) -> bool {
+    meta.persona == "builder"
+}
+fn md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace(['\r', '\n'], " ")
+}
+fn proof_link(f: &Finding, meta: &ReportMeta) -> String {
+    f.proof_ref
+        .as_ref()
+        .map(|p| format!("[{}]({}{})", p, meta.artifact_base, p))
+        .unwrap_or_else(|| "No executed proof record".into())
+}
+const GLOSSARY: &[(&str, &str)] = &[
+    ("Confirmed", "Decided by executed proof at the test proven or sandbox exploited tier. Traced evidence alone is never confirmed."),
+    ("Needs validation", "A named fact or question about intent is still open. Verify before fixing; this is not a confirmed vulnerability."),
+    ("Rejected after verification", "Concrete counterevidence defeats the claimed result."),
+    ("Proof: traced", "Input to sink trace read from source, not executed."),
+    ("Proof: test proven", "A security invariant test failed on the real code path inside the sandbox."),
+    ("Proof: sandbox exploited", "Shown against a locally built copy of the app on synthetic data, inside the sandbox."),
+    ("Fingerprint", "Stable identity from attack class, entry point, sink and boundary."),
+];
+
 pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
     let conf = confirmed(file);
-    let mut out = String::new();
-    out.push_str(&format!(
-        "# OMGS Security Review\n\nRepository: {} at {}\nMode: {}\nSandbox: {}\n\n",
-        meta.repo, meta.source_ref, meta.mode, meta.sandbox
-    ));
     let pending = file
         .findings
         .iter()
         .filter(|f| f.verdict == Verdict::NeedsValidation)
         .count();
-    let rejected: Vec<_> = file
+    let rejected = file
         .findings
         .iter()
         .filter(|f| f.verdict == Verdict::Rejected)
-        .collect();
-    let mut families = std::collections::BTreeSet::new();
-    for f in &file.findings {
-        families.insert(f.family.clone().unwrap_or_else(|| f.attack_class.clone()));
-    }
-    out.push_str(&format!(
-        "Confirmed findings: {}\nNeeds validation: {}\nRejected after verification: {}\nFinding families: {}\n\n",
-        conf.len(),
-        pending,
-        rejected.len(),
-        families.len()
-    ));
+        .count();
+    let fix = if conf.is_empty() {
+        "Nothing to fix from this run. No record reached confirmed.".into()
+    } else {
+        format!("Review {} confirmed findings and their fix briefs in HANDOFF.md. Obtain authorization before editing.", conf.len())
+    };
+    let mut out = format!("# What this asks of you\n\n{fix}\n\nVerify {pending} pending records before fixing. {rejected} leads were rejected after verification and need no action. Answer the intent questions below where recorded.\n\nRepository: {} at {}\nMode: {}\nSandbox: {}\n\nConfirmed findings: {}\nNeeds validation: {pending}\nRejected after verification: {rejected}\n\n", meta.repo, meta.source_ref, meta.mode, meta.sandbox, conf.len());
     if let Some(sensors) = &meta.sensors {
         out.push_str(&format!("Sensors: {sensors}\n\n"));
     }
-    out.push_str(&format!("Run: {}\n\n", run_meta_text(meta)));
-    out.push_str(&format!("Coverage critic: {}\n\n", critic_text(meta)));
+    out.push_str(&format!(
+        "Run: {}\n\nCoverage critic: {}\n\n",
+        run_meta_text(meta),
+        critic_text(meta)
+    ));
     if let Some(models) = models_text(meta) {
         out.push_str(&format!("Models: {models}\n\n"));
     }
-    for f in &conf {
+    out.push_str("## Index of records\n\n| Ref | Record | Outcome | Proof tier | Proof record |\n| --- | --- | --- | --- | --- |\n");
+    let ids = anchors(file);
+    let all = [
+        records(file, &ids, Verdict::Confirmed, 'C'),
+        records(file, &ids, Verdict::NeedsValidation, 'V'),
+        records(file, &ids, Verdict::Rejected, 'R'),
+    ];
+    for r in all.iter().flatten() {
         out.push_str(&format!(
-            "## {} ({}, {})\n\n{}\n\n{}\n\n",
-            f.title,
-            f.severity.map(|s| s.label()).unwrap_or("none"),
-            f.proof_tier.label(),
-            location_line(f),
-            f.evidence
+            "| {} | [{}](#{}) | {} | {} | {} |\n",
+            r.reference,
+            md_cell(&r.f.title),
+            r.anchor,
+            verdict_label(r.f.verdict).1,
+            r.f.proof_tier.label(),
+            proof_link(r.f, meta)
         ));
-        if let Some(brief) = &f.fix_brief {
-            out.push_str(&format!("Fix brief: {brief}\n\n"));
-        }
-        push_intent(&mut out, meta, f);
     }
-    let intent: Vec<_> = file
-        .findings
-        .iter()
-        .filter(|f| f.verdict == Verdict::NeedsValidation)
-        .collect();
-    if !intent.is_empty() {
-        out.push_str("## Needs validation\n\n");
-        for f in intent {
-            out.push_str(&format!(
-                "### {}\n\n{}\n\n{}\n\n",
-                f.title,
-                location_line(f),
-                f.evidence
-            ));
-            if let Some(p) = &f.prerequisites {
-                out.push_str(&format!("Prerequisites: {p}\n\n"));
+    for (list, title) in all.iter().zip([
+        "Confirmed findings",
+        "Needs validation",
+        "Rejected after verification",
+    ]) {
+        out.push_str(&format!("\n## {title}\n\n"));
+        for r in list {
+            let f = r.f;
+            out.push_str(&format!("<a id=\"{}\"></a>\n\n### {}: {}\n\n{}\n\nVerdict: {}. Tier: {}. Severity: {}.\n\nFingerprint: {}\n\nProof record: {}\n\n", r.anchor, r.reference, f.title, location_line(f), verdict_label(f.verdict).1, f.proof_tier.label(), f.severity.map(|s| s.label()).unwrap_or("none"), f.fingerprint, proof_link(f, meta)));
+            push_intent(&mut out, meta, f);
+            if let Some(brief) = &f.fix_brief {
+                out.push_str(&format!("#### Fix brief\n\n{brief}\n\n"));
             }
-            push_intent(&mut out, meta, f);
+            if !short(meta) {
+                for (name, value) in [
+                    ("Entry point", Some(f.entry_point.as_str())),
+                    ("Sink", Some(f.sink.as_str())),
+                    ("Boundary", Some(f.boundary.as_str())),
+                    ("Class", Some(f.attack_class.as_str())),
+                    ("Family", f.family.as_deref()),
+                    ("Prerequisites", f.prerequisites.as_deref()),
+                    ("Hunted by", f.hunted_by.as_deref()),
+                    ("Verified by", f.verified_by.as_deref()),
+                ] {
+                    if let Some(value) = value {
+                        out.push_str(&format!("{name}: {value}\n\n"));
+                    }
+                }
+            }
+            out.push_str("#### Evidence\n\n");
+            for part in split_evidence(&f.evidence) {
+                if let Some(label) = part.label {
+                    out.push_str(&format!("##### {label}\n\n"));
+                }
+                out.push_str(&format!("{}\n\n", part.body));
+            }
+            if !f.trace.is_empty() {
+                out.push_str("#### Trace steps\n\n");
+                for (i, t) in f.trace.iter().enumerate() {
+                    out.push_str(&format!("{}. {}: {}\n", i + 1, place(&t.location), t.note));
+                }
+                out.push('\n');
+            }
         }
     }
-    if !rejected.is_empty() {
-        out.push_str("## Rejected after verification\n\n");
-        for f in rejected {
+    out.push_str("## Pipeline timeline\n\n");
+    if meta.timeline.is_empty() {
+        out.push_str("No pipeline timeline recorded.\n\n");
+    } else {
+        out.push_str("| Stage | State | Started (UTC) | Ended (UTC) | Detail |\n| --- | --- | --- | --- | --- |\n");
+        for r in &meta.timeline {
             out.push_str(&format!(
-                "### {}\n\n{}\n\n{}\n\n",
-                f.title,
-                location_line(f),
-                f.evidence
+                "| {} | {} | {} | {} | {} |\n",
+                md_cell(&r.label),
+                md_cell(&r.state),
+                r.started,
+                r.ended,
+                md_cell(&r.detail)
             ));
-            push_intent(&mut out, meta, f);
         }
+        out.push('\n');
     }
-    if !meta.coverage.is_empty() {
-        out.push_str("## Coverage\n\n");
+    out.push_str("## Coverage\n\n");
+    if short(meta) {
+        out.push_str("See findings.json and the full coverage ledger for details.\n\n");
+    } else {
         for line in &meta.coverage {
             out.push_str(&format!("- {line}\n"));
         }
         out.push('\n');
     }
     if let Some(critic) = meta.critic.as_ref().filter(|c| !c.passed()) {
-        out.push_str("## Coverage critic gaps\n\n");
+        out.push_str("### Coverage critic gaps\n\n");
         for gap in &critic.gaps {
             out.push_str(&format!("- {gap}\n"));
         }
         out.push('\n');
     }
-    out.push_str("Full evidence lives in findings.json. Anything not listed as examined in coverage was not examined.\n");
-    out
+    out.push_str("## Glossary\n\n");
+    for (term, definition) in GLOSSARY {
+        out.push_str(&format!("- **{term}**: {definition}\n"));
+    }
+    out.push_str("\nFull evidence lives in findings.json. Anything not listed as examined in coverage was not examined.\n");
+    crate::handoff::normalized(&out)
 }
 
 /// One labelled block of evidence prose, for example "Trace" or "Missing fact".
@@ -488,7 +596,7 @@ fn nonblank(value: &Option<String>) -> Option<&str> {
 fn place(l: &Location) -> String {
     format!(
         "{}{}",
-        l.path,
+        crate::handoff::path_text(&l.path),
         l.line.map(|n| format!(":{n}")).unwrap_or_default()
     )
 }
@@ -644,6 +752,25 @@ fn render_finding(r: &Record, meta: &ReportMeta) -> String {
     } else {
         String::new()
     };
+    let mut evidence = evidence;
+    if !f.trace.is_empty() {
+        evidence.push_str("<h4>Trace steps</h4><ol>");
+        for t in &f.trace {
+            evidence.push_str(&format!(
+                "<li><code>{}</code>: {}</li>",
+                html_escape(&place(&t.location)),
+                html_escape(&t.note)
+            ));
+        }
+        evidence.push_str("</ol>");
+    }
+    if let Some(p) = &f.proof_ref {
+        evidence.push_str(&format!(
+            "<p>Proof record: <a href=\"{}\">{}</a></p>",
+            html_escape(&format!("{}{p}", meta.artifact_base)),
+            html_escape(p)
+        ));
+    }
     let fingerprint = if f.fingerprint.trim().is_empty() {
         "not recorded".to_string()
     } else {
@@ -657,7 +784,7 @@ fn render_finding(r: &Record, meta: &ReportMeta) -> String {
         title = html_escape(&f.title),
         loc = html_escape(&location(f)),
         tags = render_tags(f),
-        facts = render_facts(f),
+        facts = if short(meta) { String::new() } else { render_facts(f) },
     )
 }
 
@@ -773,7 +900,7 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
     };
     let summary = render_section(
         "summary",
-        "Summary",
+        "What this asks of you",
         "",
         &format!(
             "<p class=\"lede\">Outcome of {}: {} confirmed, {} needs validation, {} rejected after verification.</p><ul class=\"counts\">{}{}{}</ul><div class=\"asks\"><h3>What this asks of you</h3><ul><li><strong>Fix</strong> {fix_line}</li><li><strong>Decide</strong> {decide_line}</li><li><strong>Validate</strong> {validate_line}</li><li><strong>No action</strong> {cleared_line}</li></ul></div><p class=\"note\">{} across {}. Severity appears only on confirmed findings.</p>",
@@ -938,7 +1065,7 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
         items.push_str("</ul>");
         items
     };
-    if meta.report_depth == "concise" {
+    if short(meta) {
         coverage_body =
             format!("<details><summary>Coverage details</summary>{coverage_body}</details>");
     }
@@ -967,12 +1094,40 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
         &format!("{coverage_body}{critic_body}"),
     );
 
+    let glossary: String = GLOSSARY
+        .iter()
+        .map(|(term, definition)| {
+            format!(
+                "<div><dt>{}</dt><dd>{}</dd></div>",
+                html_escape(term),
+                html_escape(definition)
+            )
+        })
+        .collect();
     let reading_html = render_section(
         "reading",
-        "Reading this report",
+        "Glossary",
         "",
-        "<dl class=\"reading\"><div><dt>Confirmed</dt><dd>Decided by executed proof at the test proven or sandbox exploited tier. Traced evidence alone is never confirmed.</dd></div><div><dt>Needs validation</dt><dd>A complete trace exists, but a named fact or a question about intent is still open. Not a confirmed vulnerability.</dd></div><div><dt>Rejected after verification</dt><dd>An independent check found concrete counterevidence that defeats the claimed result.</dd></div><div><dt>Proof: traced</dt><dd>Input to sink trace read from source, not executed.</dd></div><div><dt>Proof: test proven</dt><dd>A security invariant test failed on the real code path inside the sandbox, under the project's test runner or an equivalent harness exercising the unmodified target code.</dd></div><div><dt>Proof: sandbox exploited</dt><dd>Shown against a locally built copy of the app on synthetic data, inside the sandbox.</dd></div><div><dt>Fingerprint</dt><dd>Stable identity from attack class, entry point, sink, and boundary, so a record keeps its anchor across runs.</dd></div></dl>",
+        &format!("<dl class=\"reading\">{glossary}</dl>"),
     );
+    let mut timeline_body = String::new();
+    if meta.timeline.is_empty() {
+        timeline_body.push_str("<p>No pipeline timeline recorded.</p>");
+    } else {
+        timeline_body.push_str("<table class=\"index\"><thead><tr><th>Stage</th><th>State</th><th>Started (UTC)</th><th>Ended (UTC)</th><th>Detail</th></tr></thead><tbody>");
+        for r in &meta.timeline {
+            timeline_body.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                html_escape(&r.label),
+                html_escape(&r.state),
+                html_escape(&r.started),
+                html_escape(&r.ended),
+                html_escape(&r.detail)
+            ));
+        }
+        timeline_body.push_str("</tbody></table>");
+    }
+    let timeline_html = render_section("timeline", "Pipeline timeline", "", &timeline_body);
 
     let footer = format!(
         "<footer class=\"colophon\"><div class=\"wrap\"><p>Generated by omgs {version} from findings.json. The same input renders the same report. Full evidence lives in findings.json and REPORT.md.</p><p>Mode: {mode}. Sandbox: {sandbox}. Sensors: {sensors}. Run: {run}.</p><p>No OMGS cloud. No telemetry. This page loads no external resources and runs no scripts.</p></div></footer>",
@@ -984,7 +1139,7 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
     );
 
     format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><title>OMGS security review: {repo}</title><style>{CSS}</style></head><body><a class=\"skip\" href=\"#main\">Skip to report</a>{masthead}{nav}<main id=\"main\"><div class=\"wrap\">{summary}{index}{confirmed_html}{intent_html}{pending_html}{rejected_html}{coverage_html}{reading_html}</div></main>{footer}</body></html>\n",
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><title>OMGS security review: {repo}</title><style>{CSS}</style></head><body><a class=\"skip\" href=\"#main\">Skip to report</a>{masthead}{nav}<main id=\"main\"><div class=\"wrap\">{summary}{index}{confirmed_html}{intent_html}{pending_html}{rejected_html}{timeline_html}{coverage_html}{reading_html}</div></main>{footer}</body></html>\n",
         repo = html_escape(&meta.repo),
     )
 }
@@ -1122,33 +1277,87 @@ a{color:inherit;text-decoration:none}
 }
 "#;
 
-pub fn render_sarif(file: &FindingsFile, meta: &ReportMeta) -> String {
-    let results: Vec<serde_json::Value> = confirmed(file)
+pub fn render_sarif(file: &FindingsFile, _meta: &ReportMeta) -> String {
+    use crate::model::Severity;
+    let actionable: Vec<_> = file
+        .findings
         .iter()
-        .map(|f| {
-            serde_json::json!({
-                "ruleId": f.attack_class,
-                "level": "error",
-                "message": { "text": format!("{}: {}", f.title, f.evidence) },
-                "fingerprints": { "omgs/v1": f.fingerprint },
-                "locations": std::iter::once(&f.location)
-                    .chain(&f.locations)
-                    .map(|l| serde_json::json!({ "physicalLocation": {
-                        "artifactLocation": { "uri": l.path },
-                        "region": { "startLine": l.line.unwrap_or(1) }
-                    }}))
-                    .collect::<Vec<_>>()
-            })
-        })
+        .filter(|f| f.verdict != Verdict::Rejected)
         .collect();
-    serde_json::to_string_pretty(&serde_json::json!({
+    let classes: std::collections::BTreeSet<_> =
+        actionable.iter().map(|f| &f.attack_class).collect();
+    let rules: Vec<_> = classes.iter().map(|class| serde_json::json!({
+        "id": class,
+        "shortDescription": {"text": format!("Security boundary: {class}")},
+        "fullDescription": {"text": "Review the evidence, trust boundary and proof tier before acting."},
+        "helpUri": "https://github.com/OpenAdminOS/oh-my-god-security#what-a-proof-record-does-and-does-not-prove",
+        "help": {"text": "Fix only confirmed findings with authorization. Preserve the proof test and authorized control, rerun through omgs prove and obtain independent verification. Needs validation records require the missing fact before fixing."}
+    })).collect();
+    let results: Vec<_> = actionable.iter().map(|f| {
+        let level = if f.verdict == Verdict::NeedsValidation { "note" } else {
+            match f.severity { Some(Severity::Critical | Severity::High) => "error", Some(Severity::Medium | Severity::Low) => "warning", _ => "note" }
+        };
+        serde_json::json!({
+            "ruleId": f.attack_class,
+            "ruleIndex": classes.iter().position(|class| **class == f.attack_class).unwrap(),
+            "level": level,
+            "message": { "text": format!("{}: {}", f.title, f.evidence) },
+            "fingerprints": { "omgs/v1": f.fingerprint },
+            "properties": {"verdict": f.verdict, "proof_tier": f.proof_tier, "severity": f.severity, "proof_ref": f.proof_ref},
+            "locations": std::iter::once(&f.location).chain(&f.locations).map(|l| serde_json::json!({ "physicalLocation": {
+                "artifactLocation": { "uri": artifact_uri(&l.path) },
+                "region": { "startLine": l.line.unwrap_or(1) }
+            }})).collect::<Vec<_>>()
+        })
+    }).collect();
+    format!("{}\n", serde_json::to_string_pretty(&serde_json::json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
         "runs": [{
-            "tool": { "driver": { "name": "omgs", "informationUri": "https://github.com/", "version": env!("CARGO_PKG_VERSION") } },
-            "originalUriBaseIds": { "PROJECTROOT": { "uri": meta.repo } },
+            "tool": { "driver": { "name": "omgs", "informationUri": "https://github.com/OpenAdminOS/oh-my-god-security", "version": env!("CARGO_PKG_VERSION"), "rules": rules } },
             "results": results
         }]
-    }))
-    .unwrap_or_default()
+    })).unwrap())
+}
+
+fn artifact_uri(path: &str) -> String {
+    crate::handoff::path_text(path)
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// Relative links keep archived reports usable when the entire run is moved.
+pub fn artifact_base(out: &std::path::Path, run: &std::path::Path) -> Result<String, String> {
+    let from = std::fs::canonicalize(out).map_err(|e| e.to_string())?;
+    let to = std::fs::canonicalize(run).map_err(|e| e.to_string())?;
+    let a: Vec<_> = from.components().collect();
+    let b: Vec<_> = to.components().collect();
+    let common = a.iter().zip(&b).take_while(|(a, b)| a == b).count();
+    if common == 0 {
+        // Different Windows volumes cannot have relative links.
+        let path = crate::handoff::path_text(&to.to_string_lossy());
+        let path = path.strip_prefix("//?/").unwrap_or(&path);
+        return Ok(format!(
+            "file:///{}/",
+            artifact_uri(path).replace("%3A", ":")
+        ));
+    }
+    let mut parts = vec!["..".to_string(); a.len() - common];
+    parts.extend(
+        b[common..]
+            .iter()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned()),
+    );
+    if parts.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!("{}/", artifact_uri(&parts.join("/"))))
+    }
 }

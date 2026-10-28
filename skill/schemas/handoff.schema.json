@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OMGS handoff",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "reading",
+    "green_fixer_rules",
+    "records"
+  ],
+  "properties": {
+    "schema": {
+      "const": "omgs-handoff/1"
+    },
+    "reading": {
+      "type": "string"
+    },
+    "green_fixer_rules": {
+      "type": "string"
+    },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "fingerprint": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "what_is_wrong": {
+            "type": "string"
+          },
+          "verdict": {
+            "enum": [
+              "confirmed",
+              "needs_validation"
+            ]
+          },
+          "proof_tier": {
+            "enum": [
+              "traced",
+              "test_proven",
+              "sandbox_exploited"
+            ]
+          },
+          "locations": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          },
+          "trace": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "location",
+                "note"
+              ],
+              "properties": {
+                "location": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "path"
+                  ],
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    },
+                    "line": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  }
+                },
+                "note": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "fix_brief": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "missing_fact": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "acceptance": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "proof_ref": {
+                    "type": "string",
+                    "pattern": "^proofs/[1-9][0-9]*\\.json$"
+                  },
+                  "test_path": {
+                    "type": "string"
+                  },
+                  "command": {
+                    "type": "string"
+                  },
+                  "command_args": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "recipe_contract": {
+                    "oneOf": [
+                      {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "kind"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "const": "none"
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "kind",
+                          "expect_marker",
+                          "boundary_marker_seen",
+                          "authorized_control_seen"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "const": "recipe"
+                          },
+                          "expect_marker": {
+                            "type": "string"
+                          },
+                          "boundary_marker_seen": {
+                            "type": "boolean"
+                          },
+                          "authorized_control_seen": {
+                            "type": "boolean"
+                          }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "proof_ref",
+                  "test_path",
+                  "command",
+                  "command_args",
+                  "recipe_contract"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "acceptance_blocker": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "fingerprint",
+          "title",
+          "what_is_wrong",
+          "verdict",
+          "proof_tier",
+          "locations",
+          "trace",
+          "fix_brief",
+          "missing_fact",
+          "acceptance",
+          "acceptance_blocker"
+        ]
+      }
+    }
+  }
+}

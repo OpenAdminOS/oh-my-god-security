@@ -2386,3 +2386,405 @@ fn persona_never_changes_validation_critic_or_verdicts() {
     assert_eq!(outcomes[1], outcomes[2]);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// Presentation fixtures are synthetic runner artifacts, never executable claims.
+fn report_fixture(name: &str) -> (std::path::PathBuf, FindingsFile) {
+    let dir = scratch(name);
+    let mut file: FindingsFile =
+        serde_json::from_str(include_str!("fixtures/report-run/findings.json")).unwrap();
+    for f in &mut file.findings {
+        f.fingerprint = omgs::fingerprint(&f.attack_class, &f.entry_point, &f.sink, &f.boundary);
+    }
+    let file = attest(&dir, file);
+    let mut p = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    p.contract = omgs::proof::Contract::Recipe {
+        expect_marker: "BOUNDARY_ASSERTION_FAILED".into(),
+        boundary_marker_seen: true,
+        authorized_control_seen: true,
+    };
+    bind_contract(&dir, &mut p);
+    omgs::proof::write(&dir, &p).unwrap();
+    write_private_fixture(
+        dir.join("findings.json"),
+        serde_json::to_string_pretty(&file).unwrap(),
+    )
+    .unwrap();
+    write_private_fixture(
+        dir.join("pipeline-status.json"),
+        include_str!("fixtures/report-run/pipeline-status.json"),
+    )
+    .unwrap();
+    (dir, file)
+}
+
+fn golden(name: &str, actual: &str) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/report")
+        .join(name);
+    let actual = omgs::handoff::normalized(actual);
+    if std::env::var_os("OMGS_UPDATE_GOLDENS").is_some() {
+        std::fs::write(&path, &actual).unwrap();
+    }
+    assert_eq!(
+        omgs::handoff::normalized(&std::fs::read_to_string(path).unwrap()),
+        actual,
+        "golden {name}"
+    );
+}
+
+#[test]
+fn report_handoff_and_sarif_golden_contract() {
+    let (dir, file) = report_fixture("report-golden");
+    assert!(validate(&file).is_empty());
+    assert!(omgs::proof::validate_proofs(&file, &dir).is_empty());
+    let meta = ReportMeta {
+        repo: "fixture/orders".into(),
+        source_ref: "abc123".into(),
+        mode: "advisory".into(),
+        sandbox: "MXC".into(),
+        timeline: omgs::report::timeline(&dir).unwrap(),
+        ..Default::default()
+    };
+    let h = omgs::handoff::build(&dir, &file, None).unwrap();
+    let normalize =
+        |text: String| text.replace(&omgs::handoff::path_text(&dir.to_string_lossy()), "RUN");
+    let md = normalize(omgs::handoff::markdown(&h));
+    let json = normalize(format!("{}\n", serde_json::to_string_pretty(&h).unwrap()));
+    golden("HANDOFF.md", &md);
+    golden("handoff.json", &json);
+    golden("REPORT.md", &render_markdown(&file, &meta));
+    let sarif = render_sarif(&file, &meta);
+    golden("findings.sarif.json", &sarif);
+    assert!(md.starts_with("# How to read verdicts and proof tiers"));
+    assert!(md.find("## Green-fixer rules").unwrap() < md.find("## C1:").unwrap());
+    assert!(md.find("## C1:").unwrap() < md.find("## V1:").unwrap());
+    assert!(
+        md.contains("verify before fixing")
+            && md.contains("Should exports be restricted to their owner?")
+    );
+    assert!(!md.contains("Escaped search") && !json.contains(&file.findings[1].fingerprint));
+    assert!(md.contains("--expect-marker") && md.contains("BOUNDARY_ASSERTION_FAILED"));
+    assert!(md.contains("--timeout-ms") && md.contains("tests/security/x.test.ts"));
+    let selected = omgs::handoff::build(&dir, &file, Some("V1")).unwrap();
+    assert_eq!(selected.records.len(), 1);
+    assert_eq!(selected.records[0].id, "V1");
+    assert!(omgs::handoff::build(&dir, &file, Some(&file.findings[1].fingerprint)).is_err());
+    let html = render_html(&file, &meta);
+    let markdown = render_markdown(&file, &meta);
+    for text in [
+        "What this asks of you",
+        "Index of records",
+        "Trace",
+        "Sandbox evidence",
+        "Pipeline timeline",
+        "Hunt / Tenant boundary",
+        "00:00:03",
+        "proofs/1.json",
+        "Glossary",
+    ] {
+        assert!(html.contains(text), "HTML missing {text}");
+        assert!(markdown.contains(text), "Markdown missing {text}");
+    }
+    assert!(markdown.starts_with("# What this asks of you"));
+    let zero = FindingsFile {
+        findings: file
+            .findings
+            .iter()
+            .filter(|f| f.verdict != Verdict::Confirmed)
+            .cloned()
+            .collect(),
+    };
+    assert!(render_markdown(&zero, &meta).contains("Nothing to fix"));
+    assert!(render_html(&zero, &meta).contains("Nothing to fix"));
+    let short = ReportMeta {
+        persona: "builder".into(),
+        ..Default::default()
+    };
+    assert!(
+        render_markdown(&file, &short).len() < render_markdown(&file, &ReportMeta::default()).len()
+    );
+    assert!(!render_markdown(&file, &short).contains("Hunted by:"));
+    assert!(!render_html(&file, &short).contains("<dt>Hunted by</dt>"));
+    assert!(render_html(&file, &ReportMeta::default()).contains("<dt>Hunted by</dt>"));
+    let v: serde_json::Value = serde_json::from_str(&sarif).unwrap();
+    check_sarif_structure(&v);
+    assert_eq!(v["runs"][0]["results"].as_array().unwrap().len(), 2);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn check_sarif_structure(v: &serde_json::Value) {
+    assert_eq!(v["version"], "2.1.0");
+    assert!(v["$schema"].as_str().unwrap().starts_with("https://"));
+    for run in v["runs"].as_array().unwrap() {
+        let driver = &run["tool"]["driver"];
+        assert_eq!(driver["name"], "omgs");
+        assert_eq!(
+            driver["informationUri"],
+            "https://github.com/OpenAdminOS/oh-my-god-security"
+        );
+        let rules = driver["rules"].as_array().unwrap();
+        for rule in rules {
+            assert!(!rule["id"].as_str().unwrap().is_empty());
+            assert!(!rule["help"]["text"].as_str().unwrap().is_empty());
+        }
+        for result in run["results"].as_array().unwrap() {
+            let rule = &rules[result["ruleIndex"].as_u64().unwrap() as usize];
+            assert_eq!(rule["id"], result["ruleId"]);
+            assert!(["error", "warning", "note"].contains(&result["level"].as_str().unwrap()));
+            assert!(!result["message"]["text"].as_str().unwrap().is_empty());
+            if result["properties"]["verdict"] == "needs_validation" {
+                assert_eq!(result["level"], "note");
+            }
+            for loc in result["locations"].as_array().unwrap() {
+                assert!(!loc["physicalLocation"]["artifactLocation"]["uri"]
+                    .as_str()
+                    .unwrap()
+                    .contains('\\'));
+                assert!(
+                    loc["physicalLocation"]["region"]["startLine"]
+                        .as_u64()
+                        .unwrap()
+                        > 0
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn sarif_severity_levels_and_portable_locations() {
+    let mut file: FindingsFile =
+        serde_json::from_str(include_str!("fixtures/report-run/findings.json")).unwrap();
+    file.findings.retain(|f| f.verdict == Verdict::Confirmed);
+    for (severity, level) in [
+        (Severity::Critical, "error"),
+        (Severity::High, "error"),
+        (Severity::Medium, "warning"),
+        (Severity::Low, "warning"),
+        (Severity::Informational, "note"),
+    ] {
+        file.findings[0].severity = Some(severity);
+        file.findings[0].location.path = "src\\order id#.ts".into();
+        let v: serde_json::Value =
+            serde_json::from_str(&render_sarif(&file, &ReportMeta::default())).unwrap();
+        check_sarif_structure(&v);
+        assert_eq!(v["runs"][0]["results"][0]["level"], level);
+        assert_eq!(
+            v["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
+                ["uri"],
+            "src/order%20id%23.ts"
+        );
+    }
+}
+
+#[test]
+fn stage_patch_applies_without_touching_target_and_rejects_bad_inputs() {
+    let (dir, file) = report_fixture("stage-patch");
+    let target = dir.with_extension("target");
+    omgs::platform::create_private_tree(&target).unwrap();
+    std::fs::write(target.join("source.txt"), "unchanged\n").unwrap();
+    let before = omgs::proof::tree_digest(&target).unwrap();
+    let mut p = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+    p.target = Some(target.to_string_lossy().into());
+    p.target_sha256 = Some(before.clone());
+    p.test_from = Some("original-draft".into());
+    // Preserve CRLF and missing final newline byte-for-byte in the patch.
+    let test = "first\r\nlast";
+    p.test_sha256 = Some(omgs::sha256::digest(test.as_bytes()));
+    write_private_fixture(dir.join("proofs/1/test-draft"), test).unwrap();
+    omgs::proof::write(&dir, &p).unwrap();
+    assert!(omgs::proof::validate_proofs(&file, &dir).is_empty());
+    let output = omgs(&["stage", "--run", dir.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(omgs::proof::tree_digest(&target).unwrap(), before);
+    let copy = dir.with_extension("copy");
+    std::fs::create_dir(&copy).unwrap();
+    std::fs::copy(target.join("source.txt"), copy.join("source.txt")).unwrap();
+    let patch = dir.join("proposed-tests.patch");
+    for args in [vec!["apply", "--check"], vec!["apply"]] {
+        let out = std::process::Command::new("git")
+            .current_dir(&copy)
+            .args(args)
+            .arg(&patch)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert_eq!(
+        std::fs::read(copy.join("tests/security/x.test.ts")).unwrap(),
+        test.as_bytes()
+    );
+    for bad in [
+        "../escape.ts",
+        "C:/escape.ts",
+        "/escape.ts",
+        ".git/config",
+        "tests/../../escape.ts",
+        "tests\n/escape.ts",
+    ] {
+        p.test = Some(bad.into());
+        omgs::proof::write(&dir, &p).unwrap();
+        assert!(omgs::handoff::stage(&dir, &file).is_err(), "{bad}");
+    }
+    p.test = Some("tests/security/x.test.ts".into());
+    omgs::proof::write(&dir, &p).unwrap();
+    write_private_fixture(dir.join("proofs/1/test-draft"), "altered").unwrap();
+    assert!(omgs::handoff::stage(&dir, &file)
+        .unwrap_err()
+        .contains("digest"));
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(target).unwrap();
+    std::fs::remove_dir_all(copy).unwrap();
+}
+
+#[test]
+fn report_metadata_defaults_explicit_overrides_and_handoff_cli() {
+    let (dir, file) = report_fixture("metadata-defaults");
+    let meta = serde_json::json!({"repo":"saved/repo", "source_ref":"saved-ref", "mode":"gate", "sandbox":"saved-sandbox", "persona":"builder"});
+    write_private_fixture(dir.join("run-metadata.json"), meta.to_string()).unwrap();
+    let out_dir = dir.join("rendered");
+    let findings_path = dir.join("findings.json");
+    let render = |extra: &[&str]| {
+        let mut args = vec![
+            "report",
+            "--findings",
+            findings_path.to_str().unwrap(),
+            "--out",
+            out_dir.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let out = omgs(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(out_dir.join("REPORT.md")).unwrap()
+    };
+    let md = render(&[]);
+    for text in [
+        "saved/repo at saved-ref",
+        "Mode: gate",
+        "Sandbox: saved-sandbox",
+        "Persona builder, report depth concise",
+    ] {
+        assert!(md.contains(text), "{md}");
+    }
+    assert!(!md.contains("Hunted by:"));
+    assert!(md.contains("](../proofs/1.json)"));
+    assert!(std::fs::read_to_string(out_dir.join("REPORT.html"))
+        .unwrap()
+        .contains("href=\"../proofs/1.json\""));
+    assert!(std::fs::read_to_string(out_dir.join("HANDOFF.md"))
+        .unwrap()
+        .contains("](../proofs/1.json)"));
+    assert!(out_dir.join("HANDOFF.md").is_file() && out_dir.join("handoff.json").is_file());
+    let md = render(&[
+        "--repo",
+        "override/repo",
+        "--ref",
+        "override-ref",
+        "--mode",
+        "advisory",
+        "--sandbox",
+        "override-sandbox",
+        "--persona",
+        "inheritor",
+    ]);
+    for text in [
+        "override/repo at override-ref",
+        "Mode: advisory",
+        "Sandbox: override-sandbox",
+        "Persona inheritor, report depth full",
+        "Hunted by:",
+    ] {
+        assert!(md.contains(text), "{md}");
+    }
+    let mut meta = meta;
+    meta["persona"] = serde_json::Value::Null;
+    meta["report_depth"] = "concise".into();
+    write_private_fixture(dir.join("run-metadata.json"), meta.to_string()).unwrap();
+    let md = render(&[]);
+    assert!(
+        md.contains("Hunted by:"),
+        "null persona gets full form even with stale depth"
+    );
+    for id in ["C1", file.findings[0].fingerprint.as_str()] {
+        let out = omgs(&["handoff", "--run", dir.to_str().unwrap(), "--finding", id]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let h: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("handoff.json")).unwrap())
+                .unwrap();
+        assert_eq!(h["records"].as_array().unwrap().len(), 1);
+    }
+    let out = omgs(&["handoff", "--run", dir.to_str().unwrap(), "--finding", "R1"]);
+    assert!(!out.status.success());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn portable_rendering_and_handoff_schema_fields() {
+    let (dir, file) = report_fixture("portable-report");
+    let mut alternate = file.clone();
+    for f in &mut alternate.findings {
+        f.location.path = f.location.path.replace('/', "\\");
+        for l in &mut f.locations {
+            l.path = l.path.replace('/', "\\");
+        }
+        for t in &mut f.trace {
+            t.location.path = t.location.path.replace('/', "\\");
+        }
+        f.evidence = f.evidence.replace('\n', "\r\n");
+    }
+    let a = omgs::handoff::build(&dir, &file, None).unwrap();
+    let b = omgs::handoff::build(&dir, &alternate, None).unwrap();
+    assert_eq!(omgs::handoff::markdown(&a), omgs::handoff::markdown(&b));
+    assert_eq!(
+        render_markdown(&file, &ReportMeta::default()),
+        render_markdown(&alternate, &ReportMeta::default())
+    );
+    assert_eq!(
+        render_sarif(&file, &ReportMeta::default()),
+        render_sarif(&alternate, &ReportMeta::default())
+    );
+    let h = serde_json::to_value(a).unwrap();
+    let schema: serde_json::Value =
+        serde_json::from_str(include_str!("../skill/schemas/handoff.schema.json")).unwrap();
+    fn required(schema: &serde_json::Value, value: &serde_json::Value) {
+        for key in schema["required"].as_array().unwrap() {
+            assert!(value.get(key.as_str().unwrap()).is_some(), "missing {key}");
+        }
+        let properties = schema["properties"].as_object().unwrap();
+        for key in value.as_object().unwrap().keys() {
+            assert!(properties.contains_key(key), "unknown {key}");
+        }
+    }
+    required(&schema, &h);
+    let item = &schema["properties"]["records"]["items"];
+    for record in h["records"].as_array().unwrap() {
+        required(item, record);
+        assert!(item["properties"]["verdict"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&record["verdict"]));
+        if record["acceptance"].is_object() {
+            required(
+                &item["properties"]["acceptance"]["anyOf"][0],
+                &record["acceptance"],
+            );
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

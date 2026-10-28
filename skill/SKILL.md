@@ -82,6 +82,32 @@ Every inventory class stays accountable. Test, docs, data and vendored groups ea
 6. **Adjudicate.** A separate evaluator, independent of both the hunt and the verify, reviews every finalized record against the source and the proof artifacts: it upholds, adjusts, or overturns each verdict, checks that each proof exercises the real target code and that the proof tier matches the evidence reached, and catches over- and under-statement. It is never the author of a record it judges. When it surfaces a lead no hunter raised, that lead goes back through a fresh hunter as a new candidate (and then the verifier), because every record must trace to a hunter candidate and be verified by someone else; the evaluator never adds a record directly. This pass is load-bearing: it is where overclaimed confirmations and mislabelled proofs are caught. Adjudication is the last step that may change a record; any semantic change after it (a new verdict, severity, proof tier, or fingerprint) requires another adjudication pass on the changed record before reporting.
 7. **Report.** Let the coverage critic reconcile every ledger unit against the adjudicated records (reconciliation adds coverage dispositions, it does not change a verdict). Record each unit's disposition with `omgs ledger set --ledger OUTPUT_DIR/coverage-ledger.json --unit <id> --status <status> --evidence <fingerprint or path>` (a `covered` unit needs evidence; `deferred`, `blocked`, and `out_of_scope` need `--note`). Run `omgs validate`, then `omgs critic --run OUTPUT_DIR` until it passes, then `omgs report` with `--hunters <n> --verifier <id> --agent-calls <n>` so the run metadata (and any batch index) records who ran the review and at what cost. Verify `findings.json`, SARIF, `REPORT.md`, and offline `REPORT.html` agree and all live under `OUTPUT_DIR`, alongside the `ARCHITECTURE.md` and `ARCHITECTURE.html` map from the Map phase. Report confirmed findings with tier and severity, pending questions, exact blockers, what was not examined, and mode/budget/model/sandbox metadata. Do not publish a score or coverage percentage.
 
+### Handoff and retained tests
+
+`omgs report --findings OUTPUT_DIR/findings.json --out OUTPUT_DIR` also writes
+`HANDOFF.md` and `handoff.json` under [schemas/handoff.schema.json](schemas/handoff.schema.json).
+They explain verdicts and proof tiers first, then the green-fixer rules and
+cumulative budget, then confirmed records followed by pending records marked
+"verify before fixing" with their missing fact. Rejected records are excluded.
+Each record includes source locations, evidence, trace, fix brief and its retained
+proof test plus exact command and recipe contract, or an explicit proof blocker.
+The exact saved command can contain sensitive input; protect the handoff with
+the rest of the run artifacts.
+
+Use `omgs handoff --run OUTPUT_DIR [--finding C1]` to regenerate both handoff files,
+optionally selecting a report reference or fingerprint. Use
+`omgs stage --run OUTPUT_DIR` to write `proposed-tests.patch` for normal review.
+It proposes the digest-checked external proof tests at their target-relative paths
+and never changes TARGET. Accepted tests need no patch. Never treat patch
+creation as authorization to fix, weaken the proof, or bypass the shared budget.
+Follow [agents/green-fixer.md](agents/green-fixer.md) for the fix run.
+
+Report flags override saved repo, source ref, mode, persona and sandbox metadata.
+Builder reports are concise; null or absent persona reports are full. Markdown
+and HTML include structured evidence, the pipeline timeline, proof links and a
+glossary. A zero-confirmed report explicitly says "Nothing to fix". SARIF carries
+rule help, verdicts and severity levels; pending records are notes, never errors.
+
 ### Live progress (optional)
 
 For a long run, the orchestrator may expose a progress view of the pipeline (which hunters are running, what the verifier decided, the proof outcomes). It is optional and never changes a verdict. Start `omgs watch --run OUTPUT_DIR` in the background at Initialize and print the URL it reports for the user; do not open a browser. It binds `127.0.0.1` only, serves just the dashboard and `pipeline-status.json` (never findings or reports), rejects foreign Host headers, and exits on its own shortly after `omgs report` marks the run complete. Update progress at each milestone with `omgs status --run OUTPUT_DIR --stage <id> --state active|done|failed` (add `--parent hunt` for each hunter, `--counter candidates=N`, `--log <message>`) instead of writing the JSON by hand. The page and its status schema live in [progress/](progress/).
