@@ -23,7 +23,7 @@ const KINDS: &[(&str, u64)] = &[
     ("benchmark-run.json", BENCHMARK_BYTES),
 ];
 
-struct Fixture(PathBuf);
+struct Fixture(PathBuf, PathBuf);
 impl Fixture {
     fn new() -> Self {
         let root = omgs::platform::temp_root().unwrap().join(format!(
@@ -31,7 +31,9 @@ impl Fixture {
             omgs::platform::random_nonce().unwrap()
         ));
         omgs::platform::create_private_tree(&root).unwrap();
-        Self(root)
+        let run = root.join("run");
+        omgs::platform::create_private_dir(&run).unwrap();
+        Self(run, root)
     }
     fn leaf(&self, name: &str) -> PathBuf {
         let path = self.0.join(name);
@@ -41,7 +43,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.1);
     }
 }
 
