@@ -293,7 +293,8 @@ pub fn toolchain_roots(os: &str, home: Option<&Path>) -> Vec<PathBuf> {
             "/usr/local/lib".into(),
             "/usr/local/microsoft".into(),
         ],
-        "linux" => vec!["/opt".into(), "/usr/local".into()],
+        // MXC mounts system binaries/libraries, but not compiler headers.
+        "linux" => vec!["/opt".into(), "/usr/local".into(), "/usr/include".into()],
         "windows" => vec![
             r"C:\Program Files\PowerShell\7".into(),
             r"C:\Program Files\nodejs".into(),

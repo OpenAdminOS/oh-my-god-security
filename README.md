@@ -92,7 +92,9 @@ are reported as `<runtime> not reachable inside the sandbox`; retain that line
 and the proof startup diagnostic with the pending finding. No installation or
 unsandboxed fallback is attempted. Windows gets an explicit safe `PATHEXT`,
 scratch `CARGO_HOME`, the existing `RUSTUP_HOME` and `RUSTUP_AUTO_INSTALL=0`.
-Host credentials and broad home access stay outside the grants.
+Host credentials and broad home access stay outside the grants. Linux explicitly
+grants read-only `/usr/include` for local compiler headers; MXC does not mount
+that system directory by default.
 
 ## What a proof record does and does not prove
 

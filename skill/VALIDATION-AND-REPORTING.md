@@ -133,6 +133,7 @@ omgs prove --run RUN --finding FP --test main.swift --test-from DRAFT --cmd "swi
 For modules needing a library, use `swiftc -emit-library` inside the same proof
 and link an explicit workspace-relative library path. Common blockers:
 `swiftc not reachable inside the sandbox`, missing SDKs or local libraries,
+unavailable Linux system headers (the runner grants `/usr/include` read-only),
 nested SwiftPM sandbox creation, denied daemon APIs and real root helpers. A
 compile/load failure earns no tier. Network and home denials above apply to
 Swift too; redirect temporary files into the workspace or scratch.
