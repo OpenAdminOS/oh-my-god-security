@@ -552,8 +552,9 @@ fn report_renders_critic_result() {
 fn scratch(name: &str) -> std::path::PathBuf {
     static BASE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     let base = BASE.get_or_init(|| {
-        let base =
-            std::env::temp_dir().join(format!("omgs-private-fixtures-{}", std::process::id()));
+        let base = omgs::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-private-fixtures-{}", std::process::id()));
         omgs::platform::create_private_tree(&base).unwrap();
         base
     });

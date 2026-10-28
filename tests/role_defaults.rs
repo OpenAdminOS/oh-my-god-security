@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 fn scratch(name: &str) -> PathBuf {
     static BASE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     let base = BASE.get_or_init(|| {
-        let base =
-            std::env::temp_dir().join(format!("omgs-private-fixtures-{}", std::process::id()));
+        let base = omgs::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-private-fixtures-{}", std::process::id()));
         omgs::platform::create_private_tree(&base).unwrap();
         base
     });
@@ -1565,6 +1566,15 @@ fn budget_refuses_storage_writable_by_other_principals() {
             .unwrap();
         assert!(status.success());
         assert_linked_budget_refused(&root, &fix, "writable by another principal");
+        // Admission never repairs existing storage. Explicitly undo only this
+        // disposable fixture's injected grant before the next case.
+        assert!(omgs::platform::private_dir(unsafe_dir).is_err());
+        assert!(std::process::Command::new("icacls.exe")
+            .arg(unsafe_dir)
+            .args(["/remove:g", "*S-1-1-0"])
+            .status()
+            .unwrap()
+            .success());
         omgs::platform::private_dir(unsafe_dir).unwrap();
     }
     assert!(omgs::budget::charge_proof(&fix).is_ok());

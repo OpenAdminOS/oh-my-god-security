@@ -1,0 +1,6 @@
+# MXC 1.0.1: platform member release-asset sha256
+Darwin/arm64 arm64/mxc-exec-mac mxc-1.0.1-macos-arm64 c54390e48a25187fdae10758c6a286bede49416cb610c88c6705fd8445e97f60
+Linux/aarch64 arm64/lxc-exec mxc-1.0.1-linux-arm64 e8391d55c566ce95c6c838d349941fa0797f037fa617aa0fa4ec39443c6ccddf
+Linux/x86_64 x64/lxc-exec mxc-1.0.1-linux-x64 5bd6bdf45bc6c0ecc9bccf372762b571de1f468142c4b2ff80fdb4c540922f26
+Windows/ARM64 arm64/wxc-exec.exe mxc-1.0.1-windows-arm64.exe 91aa4171e8809f33f19622c381116188eab7d8c8cffad231230a31b58146ee77
+Windows/AMD64 x64/wxc-exec.exe mxc-1.0.1-windows-x64.exe 090f5d1f7bb93104ab08dcd4e8034ef954aeefcdaf6658dde5f7dff4cfc12f3a

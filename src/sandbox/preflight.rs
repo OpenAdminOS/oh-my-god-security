@@ -671,7 +671,9 @@ pub(super) mod tests {
         if refuse_augmented_fixture(&located.path) {
             return;
         }
-        let d = std::env::temp_dir().join(format!("omgs-dry-run-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-dry-run-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let d = std::fs::canonicalize(d).unwrap();
         let marker = d.join("ran");
@@ -737,7 +739,9 @@ pub(super) mod tests {
             return;
         }
         let _console = supervise::interruption::Guard::install().unwrap();
-        let d = std::env::temp_dir().join(format!("omgs-dacl-timeout-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-dacl-timeout-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let granted = d.join("granted");
         std::fs::create_dir_all(&granted).unwrap();
@@ -843,7 +847,9 @@ pub(super) mod tests {
     #[test]
     fn linked_readonly_root_checks_the_target_after_a_completed_wrapper() {
         let _console = supervise::interruption::Guard::install().unwrap();
-        let d = std::env::temp_dir().join(format!("omgs-linked-acl-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-linked-acl-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let target = d.join("target");
         let linked = d.join("readonly");
@@ -930,7 +936,9 @@ pub(super) mod tests {
     #[test]
     fn acl_checks_cover_all_dry_run_outcomes_and_ignore_pending_interrupts() {
         let _console = supervise::interruption::Guard::install().unwrap();
-        let d = std::env::temp_dir().join(format!("omgs-dry-acl-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-dry-acl-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         for outcome in ["accept", "reject", "interrupt", "timeout"] {
             let root = d.join(outcome);
@@ -977,7 +985,9 @@ pub(super) mod tests {
     #[test]
     fn replaced_acl_root_is_not_mistaken_for_the_original_object() {
         let _console = supervise::interruption::Guard::install().unwrap();
-        let d = std::env::temp_dir().join(format!("omgs-acl-identity-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-acl-identity-{}", std::process::id()));
         let root = d.join("root");
         std::fs::create_dir_all(&root).unwrap();
         let snapshot = WindowsAclSnapshot::capture([&root]).unwrap();
@@ -1027,7 +1037,9 @@ pub(super) mod tests {
             fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
             fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
         }
-        let d = std::env::temp_dir().join(format!("omgs-owner-death-{}", std::process::id()));
+        let d = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-owner-death-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let mut owner = Command::new(std::env::current_exe().unwrap())
             .args([
