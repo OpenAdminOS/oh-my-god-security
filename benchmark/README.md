@@ -147,8 +147,10 @@ pairs, FP counts distinct independently refuted findings per snapshot. Repeated
 FP detections on fixed snapshots remain in each run's result. The union recall
 uses distinct positive defects and the same denominator as every single run.
 
-Mean recall and variance objects contain the distribution, known-sample
-numerator and total-repetition denominator. Standard deviation is the population
+Mean recall reports the sum of recovered defect counts over all repetitions
+divided by positive defects times `k`, equivalent to the arithmetic mean because
+every repetition has the same frozen denominator. Variance objects contain the
+distribution, known-sample numerator and total-repetition denominator. Standard deviation is the population
 standard deviation (divide by `k`). Zero denominators and unavailable values
 produce null. Any unknown sample makes complete-distribution mean, range and
 standard deviation null, rather than silently selecting a cheaper executable

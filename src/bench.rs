@@ -812,7 +812,7 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[(Value, Value)]) -> Resu
         per_run.push(json!({"run_id":r["run_id"],"recall":ratio(recovered.len(),denominator),"false_positives":ratio(fp,1),"true_positive_detections":ratio(tp.len(),1),"false_discovery_fraction":ratio(fp,tp.len()+fp),"negative_unit_rate":ratio(fp_units.len(),negative_units),"verifier_false_rejection_rate":ratio(rejected.len(),submitted.len()),"true_candidates_pending":ratio(pending.len(),submitted.len()),"needs_validation":ratio(needs_validation,1),"unexpected_confirmations":unexpected,"blocked_or_exhausted":blocked,"paired_outcomes":paired,"snapshot_context":snapshot_context}));
     }
     Ok(
-        json!({"cohort":cohort,"context":cases,"runs":per_run,"mean_recall":stats(recalls.clone()),"union_recall":ratio(union.len(),denominator),"recall_variance":stats(recalls),"false_positive_variance":stats(fps),"detection_frequency":frequency.into_iter().map(|(id,n)|json!({"defect":id,"frequency":ratio(n,runs.len())})).collect::<Vec<_>>()}),
+        json!({"cohort":cohort,"context":cases,"runs":per_run,"mean_recall":ratio(frequency.values().sum(),denominator * runs.len()),"union_recall":ratio(union.len(),denominator),"recall_variance":stats(recalls),"false_positive_variance":stats(fps),"detection_frequency":frequency.into_iter().map(|(id,n)|json!({"defect":id,"frequency":ratio(n,runs.len())})).collect::<Vec<_>>()}),
     )
 }
 
@@ -846,7 +846,7 @@ pub fn markdown(result: &Value) -> String {
             display(&c["union_recall"])
         ));
     }
-    s.push_str("\n| Cohort | Mean recall | Samples |\n| --- | --- | --- |\n");
+    s.push_str("\n| Cohort | Mean recall | Detections / opportunities |\n| --- | --- | --- |\n");
     for c in result["cohorts"].as_array().unwrap() {
         s.push_str(&format!(
             "| {} | {} | {}/{} |\n",
@@ -854,7 +854,7 @@ pub fn markdown(result: &Value) -> String {
                 .as_str()
                 .unwrap()
                 .replace(['|', '\n', '\r'], " "),
-            c["mean_recall"]["mean"],
+            c["mean_recall"]["value"],
             c["mean_recall"]["numerator"],
             c["mean_recall"]["denominator"]
         ));

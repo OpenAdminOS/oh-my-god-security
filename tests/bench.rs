@@ -21,7 +21,7 @@ fn golden_hand_computed_metrics() {
     let c = &s["cohorts"][0];
     let actual = json!({
         "recalls":c["runs"].as_array().unwrap().iter().map(|r|r["recall"].clone()).collect::<Vec<_>>(),
-        "union":c["union_recall"],"recall_variance":c["recall_variance"],
+        "union":c["union_recall"],"mean_recall":c["mean_recall"],"recall_variance":c["recall_variance"],
         "false_positives":c["runs"].as_array().unwrap().iter().map(|r|r["false_positives"].clone()).collect::<Vec<_>>(),
         "fdr":c["runs"].as_array().unwrap().iter().map(|r|r["false_discovery_fraction"].clone()).collect::<Vec<_>>(),
         "negative_unit_rate":c["runs"].as_array().unwrap().iter().map(|r|r["negative_unit_rate"].clone()).collect::<Vec<_>>(),
@@ -35,7 +35,7 @@ fn golden_hand_computed_metrics() {
     let expected: Value =
         serde_json::from_str(include_str!("../benchmark/fixtures/score/expected.json")).unwrap();
     assert_eq!(actual, expected);
-    assert_eq!(c["mean_recall"], c["recall_variance"]);
+    assert_eq!(c["mean_recall"]["value"], c["recall_variance"]["mean"]);
     assert_eq!(
         c["runs"][0]["unexpected_confirmations"]
             .as_array()

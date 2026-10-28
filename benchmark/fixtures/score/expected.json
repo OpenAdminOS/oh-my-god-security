@@ -171,5 +171,10 @@
     "denominator": 2,
     "cohort": "entire_campaign"
   },
-  "cli_calls": 0
+  "cli_calls": 0,
+  "mean_recall": {
+    "numerator": 3,
+    "denominator": 8,
+    "value": 0.375
+  }
 }
