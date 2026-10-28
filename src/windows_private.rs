@@ -2,6 +2,7 @@
 use std::ffi::c_void;
 use std::io::{Error, Result};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::ptr::{null_mut, NonNull};
 
@@ -11,8 +12,8 @@ extern "system" {
     fn OpenProcessToken(process: Ptr, access: u32, token: *mut Ptr) -> i32;
     fn GetTokenInformation(token: Ptr, class: u32, data: Ptr, size: u32, needed: *mut u32) -> i32;
     fn EqualSid(a: Ptr, b: Ptr) -> i32;
-    fn GetNamedSecurityInfoW(
-        path: *const u16,
+    fn GetSecurityInfo(
+        handle: Ptr,
         kind: u32,
         info: u32,
         owner: *mut Ptr,
@@ -21,6 +22,14 @@ extern "system" {
         sacl: *mut Ptr,
         descriptor: *mut Ptr,
     ) -> u32;
+    fn IsWellKnownSid(sid: Ptr, kind: u32) -> i32;
+    fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        descriptor: Ptr,
+        revision: u32,
+        info: u32,
+        text: *mut *mut u16,
+        len: *mut u32,
+    ) -> i32;
     fn GetAce(acl: Ptr, index: u32, ace: *mut Ptr) -> i32;
     fn ConvertSidToStringSidW(sid: Ptr, text: *mut *mut u16) -> i32;
     fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -92,14 +101,24 @@ fn wide(path: &Path) -> Result<Vec<u16>> {
 }
 
 pub fn check(path: &Path) -> Result<()> {
-    let path = wide(path)?;
+    use std::os::windows::fs::OpenOptionsExt;
+    let result = std::fs::OpenOptions::new()
+        .access_mode(0x0002_0000) // READ_CONTROL
+        .share_mode(0x1 | 0x2 | 0x4)
+        .custom_flags(0x0200_0000 | 0x0020_0000) // backup semantics, no reparse traversal
+        .open(path)
+        .and_then(|file| check_file(&file));
+    result.map_err(|e| Error::other(format!("storage {}: {e}", path.display())))
+}
+
+pub(super) fn check_file(file: &std::fs::File) -> Result<()> {
     let token = user()?;
     // SAFETY: the descriptor owns all returned SID/ACL pointers until Local
     // drops. GetAce supplies validated ACE pointers within that descriptor.
     unsafe {
         let (mut owner, mut acl, mut sd) = (null_mut(), null_mut(), null_mut());
-        let code = GetNamedSecurityInfoW(
-            path.as_ptr(),
+        let code = GetSecurityInfo(
+            file.as_raw_handle(),
             1,
             5,
             &mut owner,
@@ -112,9 +131,26 @@ pub fn check(path: &Path) -> Result<()> {
             return Err(Error::from_raw_os_error(code as i32));
         }
         let _sd = local(sd)?;
+        let mut summary = null_mut();
+        if ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, 5, &mut summary, null_mut())
+            == 0
+        {
+            return Err(Error::last_os_error());
+        }
+        let _summary = local(summary.cast())?;
+        let mut len = 0;
+        while *summary.add(len) != 0 {
+            len += 1;
+        }
+        let summary = String::from_utf16_lossy(std::slice::from_raw_parts(summary, len));
+        let refuse = |reason| {
+            Error::other(format!(
+                "{reason}; owner and DACL: {summary}; see README.md#storage-migration"
+            ))
+        };
         if owner.is_null() || EqualSid(owner, token[0] as Ptr) == 0 || acl.is_null() {
-            return Err(Error::other(
-                "directory must be owned by the current user with a restrictive DACL",
+            return Err(refuse(
+                "storage must be owned by the current user with a restrictive DACL",
             ));
         }
         // ACL header: revision, reserved, size (u16), AceCount (u16), reserved.
@@ -125,22 +161,27 @@ pub fn check(path: &Path) -> Result<()> {
                 return Err(Error::last_os_error());
             }
             let header = ace.cast::<u8>();
-            if *header.add(1) & 8 != 0 {
-                continue;
-            } // INHERIT_ONLY_ACE
             match *header {
                 0 => {
                     let mask = *header.add(4).cast::<u32>();
+                    let sid = header.add(8) as Ptr;
+                    // Apply the same allowlist to effective and inheritable ACEs,
+                    // including files-only and inherit-only grants. CREATOR OWNER
+                    // is safe only because the owner above is this token's user.
+                    // Well-known SID kinds: SYSTEM 22, Administrators 26,
+                    // CREATOR OWNER 3.
+                    let trusted = EqualSid(sid, token[0] as Ptr) != 0
+                        || IsWellKnownSid(sid, 22) != 0
+                        || IsWellKnownSid(sid, 26) != 0
+                        || IsWellKnownSid(sid, 3) != 0;
                     // Data, append, EA, delete-child, attributes, delete,
                     // WRITE_DAC, WRITE_OWNER and generic write/all rights.
-                    if mask & 0x500d_0156 != 0
-                        && EqualSid(header.add(8) as Ptr, token[0] as Ptr) == 0
-                    {
-                        return Err(Error::other("directory is writable by another principal"));
+                    if mask & 0x500d_0156 != 0 && !trusted {
+                        return Err(refuse("storage is writable by another principal"));
                     }
                 }
                 1 => {} // A deny ACE grants no access.
-                _ => return Err(Error::other("unsupported storage DACL ACE")),
+                _ => return Err(refuse("unsupported storage DACL ACE")),
             }
         }
     }
@@ -202,4 +243,144 @@ pub fn restrict(path: &Path) -> Result<()> {
         }
     }
     check(original)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("omgs-acl-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        crate::platform::create_private_dir(&path).unwrap();
+        path
+    }
+
+    fn set_acl(path: &Path, extra: &str) {
+        let token = user().unwrap();
+        let mut path = wide(path).unwrap();
+        // SAFETY: all descriptor and SID allocations outlive their uses and
+        // path and SDDL are NUL-terminated. Only this test's fixtures change.
+        unsafe {
+            let mut sid = null_mut();
+            assert_ne!(ConvertSidToStringSidW(token[0] as Ptr, &mut sid), 0);
+            let _sid = local(sid.cast()).unwrap();
+            let mut len = 0;
+            while *sid.add(len) != 0 {
+                len += 1;
+            }
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(sid, len));
+            let sddl: Vec<u16> = format!("D:P(A;OICI;FA;;;{sid}){extra}")
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let mut sd = null_mut();
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut sd,
+                    null_mut()
+                ),
+                0
+            );
+            let _sd = local(sd).unwrap();
+            let (mut present, mut acl, mut defaulted) = (0, null_mut(), 0);
+            assert_ne!(
+                GetSecurityDescriptorDacl(sd, &mut present, &mut acl, &mut defaulted),
+                0
+            );
+            assert_ne!(present, 0);
+            assert_eq!(
+                SetNamedSecurityInfoW(
+                    path.as_mut_ptr(),
+                    1,
+                    0x8000_0004,
+                    null_mut(),
+                    null_mut(),
+                    acl,
+                    null_mut()
+                ),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn files_only_inherit_write_grants_are_refused() {
+        let dir = scratch("inherit");
+        // Check every write-capable right, independent of whether it applies
+        // to the directory, files, subdirectories, or inheritance only.
+        for flags in ["", "OI", "CI", "OIIO", "CIIO", "OICIIO"] {
+            for mask in [
+                2, 4, 0x10, 0x40, 0x100, 0x10000, 0x40000, 0x80000, 0x40000000, 0x10000000,
+            ] {
+                set_acl(&dir, &format!("(A;{flags};0x{mask:x};;;BU)"));
+                let error = crate::platform::check_private_dir(&dir)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("writable by another principal"),
+                    "{flags} {mask:x}: {error}"
+                );
+            }
+        }
+        for principal in ["WD", "AU"] {
+            set_acl(&dir, &format!("(A;OIIO;FW;;;{principal})"));
+            assert!(check(&dir).is_err(), "admitted {principal}");
+        }
+        set_acl(&dir, "(A;OIIO;FW;;;BU)");
+        assert!(crate::platform::create_private_dir(&dir).is_err());
+        // Admission must not silently repair an existing ACL.
+        assert!(check(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicitly_writable_metadata_and_lock_files_are_refused() {
+        let dir = scratch("existing-files");
+        let run = dir.join("run");
+        crate::platform::create_private_dir(&run).unwrap();
+        let metadata = run.join(crate::runmeta::FILE);
+        std::fs::write(&metadata, "{}").unwrap();
+        set_acl(&metadata, "(A;;FW;;;BU)");
+        assert!(crate::platform::check_private_dir(&run).is_ok());
+        assert!(crate::budget::metadata(&run).is_err());
+        assert!(crate::runmeta::read(&run).is_err());
+        assert!(crate::runmeta::write_atomic(&metadata, "{\"changed\":true}").is_err());
+        assert_eq!(std::fs::read_to_string(&metadata).unwrap(), "{}");
+        let lock = run.join(".omgs-run.lock");
+        std::fs::write(&lock, "").unwrap();
+        set_acl(&lock, "(A;;FW;;;BU)");
+        assert!(
+            crate::runmeta::with_lock(&run, || -> std::result::Result<(), String> {
+                panic!("unsafe lock admitted")
+            })
+            .is_err()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn created_tree_and_trusted_system_principals_are_admitted() {
+        let dir = scratch("trusted");
+        let run = dir.join("run");
+        crate::platform::create_private_dir(&run).unwrap();
+        crate::runmeta::with_lock(&run, || {
+            crate::runmeta::write_atomic(&run.join(crate::runmeta::FILE), "{}")
+        })
+        .unwrap();
+        crate::budget::metadata(&run).unwrap();
+        crate::runmeta::read(&run).unwrap();
+        for extra in ["(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", "(A;OICIIO;FA;;;CO)"] {
+            set_acl(&run, extra);
+            crate::platform::check_private_dir(&run).unwrap();
+            crate::runmeta::with_lock(&run, || {
+                crate::runmeta::write_atomic(&run.join(crate::runmeta::FILE), "{}")
+            })
+            .unwrap();
+            crate::budget::metadata(&run).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

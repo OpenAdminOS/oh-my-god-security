@@ -1771,7 +1771,12 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             // Claim run-N with an exclusive create, so parallel inits (batch
             // mode) never share a run directory.
             let base = data_dir().join(&repo);
-            omgs::platform::create_private_tree(&base).map_err(|e| e.to_string())?;
+            omgs::platform::create_private_tree(&base).map_err(|e| {
+                format!(
+                    "default run storage {}: {e}; see README.md#storage-migration",
+                    base.display()
+                )
+            })?;
             let mut n = 1;
             loop {
                 let candidate = base.join(format!("run-{n}"));

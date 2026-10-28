@@ -23,9 +23,15 @@ pub fn now_ms() -> u64 {
 /// Write `bytes` to `path` through an exclusively created sibling temporary
 /// file and a rename. The rename replaces the directory entry itself, so an
 /// existing symlink or hardlink at `path` is replaced, never written through,
-/// and a pre-planted temporary name is never followed either.
+/// and a pre-planted temporary name is never followed either. Windows also
+/// refuses existing destinations that fail private, single-link admission.
 pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    #[cfg(windows)]
+    if let Some(file) = crate::platform::open_single_link(path)? {
+        crate::platform::check_private_file(&file)
+            .map_err(|e| std::io::Error::other(format!("storage {}: {e}", path.display())))?;
+    }
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -63,8 +69,13 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 
 pub fn read(dir: &Path) -> Result<Map<String, Value>, String> {
     let path = dir.join(FILE);
+    let file = crate::platform::open_single_link(&path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?
+        .ok_or_else(|| format!("read {}: file missing", path.display()))?;
+    crate::platform::check_private_file(&file)
+        .map_err(|e| format!("storage {}: {e}", path.display()))?;
     let text =
-        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        std::io::read_to_string(file).map_err(|e| format!("read {}: {e}", path.display()))?;
     match crate::shape::strict_json(&text) {
         Ok(Value::Object(m)) => {
             check_numeric_fields(&m)?;
@@ -101,6 +112,8 @@ pub fn with_lock_file<T>(
         .write(true)
         .open(lock_path)
         .map_err(|e| format!("open lock {}: {e}", lock_path.display()))?;
+    crate::platform::check_private_file(&file)
+        .map_err(|e| format!("storage {}: {e}", lock_path.display()))?;
     let start = std::time::Instant::now();
     loop {
         match file.try_lock() {

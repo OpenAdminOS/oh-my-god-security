@@ -1914,3 +1914,70 @@ fn audit_init_accepts_hunter_and_verifier_metadata() {
     assert_eq!(meta["verifier"], "verifier-1");
     std::fs::remove_dir_all(d).unwrap();
 }
+
+#[cfg(any(unix, windows))]
+#[test]
+fn default_storage_refusal_names_path_permissions_and_migration() {
+    let dir = scratch("default-storage-refusal");
+    let target = dir.join("app");
+    std::fs::create_dir(&target).unwrap();
+    let store = dir.join("store");
+    omgs::platform::create_private_dir(&store).unwrap();
+    let base = store.join("app");
+    omgs::platform::create_private_dir(&base).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        let result = std::process::Command::new("icacls")
+            .arg(&base)
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)(W)"])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", &store)
+        .args([
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--no-sensors",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains(base.to_str().unwrap()), "{error}");
+    assert!(error.contains("README.md#storage-migration"), "{error}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        assert!(
+            error.contains(&format!(
+                "owner uid {}",
+                std::fs::metadata(&base).unwrap().uid()
+            )),
+            "{error}"
+        );
+        assert!(error.contains("mode 0755"), "{error}");
+        assert_eq!(
+            std::fs::metadata(&base).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+    }
+    #[cfg(windows)]
+    {
+        assert!(error.contains("owner and DACL:"), "{error}");
+        assert!(omgs::platform::check_private_dir(&base).is_err());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -230,6 +230,26 @@ fn read_bounded_file(file: std::fs::File, limit: u64) -> std::io::Result<Vec<u8>
 /// Read an inventory file beneath a trusted target without traversing links.
 /// On Unix each component is opened relative to its pinned parent descriptor.
 pub fn read_bounded_in(target: &Path, relative: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    with_file_in(target, relative, |file| read_bounded_file(file, limit))
+}
+
+/// Read private metadata, checking the opened leaf's Windows owner and DACL.
+pub fn read_private_bounded_in(
+    target: &Path,
+    relative: &Path,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    with_file_in(target, relative, |file| {
+        check_private_file(&file)?;
+        read_bounded_file(file, limit)
+    })
+}
+
+fn with_file_in<T>(
+    target: &Path,
+    relative: &Path,
+    read: impl FnOnce(std::fs::File) -> std::io::Result<T>,
+) -> std::io::Result<T> {
     if !crate::paths::safe_relative(relative) {
         return Err(std::io::Error::other(
             "inventory path must be relative without parent traversal",
@@ -266,7 +286,7 @@ pub fn read_bounded_in(target: &Path, relative: &Path, limit: u64) -> std::io::R
                         "inventory content must be a single-link regular file",
                     ));
                 }
-                return read_bounded_file(file, limit);
+                return read(file);
             }
             dir = file;
         }
@@ -277,15 +297,17 @@ pub fn read_bounded_in(target: &Path, relative: &Path, limit: u64) -> std::io::R
         use std::os::windows::fs::OpenOptionsExt;
         // Keep every ancestor open without delete sharing, preventing rename
         // or replacement between checking an ancestor and opening its child.
-        let open = |path: &Path| {
+        // The leaf permits FILE_SHARE_DELETE so a lock holder can publish a
+        // replacement while this reader finishes reading its original handle.
+        let open = |path: &Path, leaf: bool| {
             std::fs::OpenOptions::new()
                 .read(true)
-                .share_mode(0x1 | 0x2)
+                .share_mode(0x1 | 0x2 | if leaf { 0x4 } else { 0 })
                 .custom_flags(0x0200_0000 | 0x0020_0000)
                 .open(path)
         };
         let mut path = std::fs::canonicalize(target)?;
-        let root = open(&path)?;
+        let root = open(&path, false)?;
         if is_link(&root.metadata()?) || !root.metadata()?.is_dir() {
             return Err(std::io::Error::other(
                 "inventory target must be a directory without links",
@@ -295,7 +317,7 @@ pub fn read_bounded_in(target: &Path, relative: &Path, limit: u64) -> std::io::R
         let mut components = relative.components().peekable();
         while let Some(component) = components.next() {
             path.push(component);
-            let file = open(&path)?;
+            let file = open(&path, components.peek().is_none())?;
             let meta = file.metadata()?;
             if is_link(&meta) {
                 return Err(std::io::Error::other("inventory links are excluded"));
@@ -306,7 +328,7 @@ pub fn read_bounded_in(target: &Path, relative: &Path, limit: u64) -> std::io::R
                         "inventory content must be a single-link regular file",
                     ));
                 }
-                return read_bounded_file(file, limit);
+                return read(file);
             }
             if !meta.is_dir() {
                 return Err(std::io::Error::other(
@@ -319,7 +341,7 @@ pub fn read_bounded_in(target: &Path, relative: &Path, limit: u64) -> std::io::R
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (target, limit);
+        let _ = (target, read);
         Err(std::io::Error::other(
             "contained inventory reads unavailable on this platform",
         ))
@@ -447,6 +469,55 @@ mod tests {
         assert!(which("omgs-definitely-not-a-tool-xyz").is_none());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn metadata_publication_child() {
+        let Some(dir) = std::env::var_os("OMGS_TEST_PUBLICATION_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        crate::runmeta::with_lock(&dir, || {
+            crate::runmeta::write_atomic(&dir.join(crate::runmeta::FILE), "new")
+        })
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_metadata_reader_allows_concurrent_atomic_publication() {
+        let dir = std::env::temp_dir().join(format!("omgs-share-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_private_dir(&dir).unwrap();
+        let run = dir.join("run");
+        create_private_dir(&run).unwrap();
+        crate::runmeta::write_atomic(&run.join(crate::runmeta::FILE), "old").unwrap();
+        with_file_in(&dir, &Path::new("run").join(crate::runmeta::FILE), |file| {
+            check_private_file(&file)?;
+            // Ancestors remain pinned while the validated metadata leaf is open.
+            assert!(std::fs::rename(&run, dir.join("moved")).is_err());
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::tests::metadata_publication_child",
+                    "--nocapture",
+                ])
+                .env("OMGS_TEST_PUBLICATION_DIR", &run)
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert_eq!(read_bounded_file(file, 100)?, b"old");
+            assert_eq!(std::fs::read(run.join(crate::runmeta::FILE))?, b"new");
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn single_link_open_refuses_hardlinks_and_accepts_plain_files() {
         let d = std::env::temp_dir().join(format!("omgs-link-{}", std::process::id()));
@@ -509,9 +580,10 @@ pub fn check_private_dir(path: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid has no arguments or memory preconditions.
         if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o7777 != 0o700 {
-            return Err(std::io::Error::other(
-                "storage must be owned by the current user with mode 0700",
-            ));
+            return Err(std::io::Error::other(format!(
+                "storage {} must be owned by the current user with mode 0700; observed owner uid {}, mode {:04o}; see README.md#storage-migration",
+                path.display(), meta.uid(), meta.mode() & 0o7777,
+            )));
         }
         Ok(())
     }
@@ -525,13 +597,33 @@ pub fn check_private_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Validate an opened metadata or lock file before using its contents or lock.
+/// Unix storage relies on its owner-private parent directory.
+pub fn check_private_file(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        windows_private::check_file(file)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
 /// Create owner-private storage or fail closed on an existing unsafe directory.
 /// Parent directories must already be trusted against concurrent replacement.
 pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
     match create_private_dir_new(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => check_private_dir(path),
-        Err(e) => Err(e),
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!(
+                "create storage {}: {e}; see README.md#storage-migration",
+                path.display()
+            ),
+        )),
     }
 }
 

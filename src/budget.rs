@@ -57,12 +57,13 @@ fn run_path(path: &Path) -> Result<PathBuf, String> {
 fn read_run(run: &Path) -> Result<Map<String, Value>, String> {
     let boundary = run.parent().ok_or("run path needs a parent")?;
     let relative = Path::new(run.file_name().ok_or("run path needs a name")?).join(runmeta::FILE);
-    let bytes = crate::platform::read_bounded_in(boundary, &relative, 16 << 20).map_err(|e| {
-        format!(
-            "linked run {}: no-follow metadata read failed: {e}",
-            run.display()
-        )
-    })?;
+    let bytes =
+        crate::platform::read_private_bounded_in(boundary, &relative, 16 << 20).map_err(|e| {
+            format!(
+                "linked run {}: no-follow metadata read failed: {e}",
+                run.display()
+            )
+        })?;
     let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
     let Value::Object(meta) = crate::shape::strict_json(text)? else {
         return Err("run metadata must be an object".into());
