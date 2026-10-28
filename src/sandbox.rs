@@ -123,9 +123,11 @@ pub fn locate_executor() -> Result<Located, String> {
         Err(e) => Err(format!("{} unreadable: {e}", platform::describe_path(path))),
     };
     // An explicit OMGS_MXC_EXEC is authoritative: if it is wrong, say so
-    // rather than quietly using some other executor.
+    // rather than quietly using some other executor. It is made absolute so
+    // the file that runs is the one hashed here, not a PATH search result.
     if let Some(p) = std::env::var_os("OMGS_MXC_EXEC").filter(|v| !v.is_empty()) {
-        let path = PathBuf::from(p);
+        let path = std::path::absolute(PathBuf::from(p))
+            .map_err(|e| format!("OMGS_MXC_EXEC is set but unusable, refusing to run: {e}"))?;
         return check(&path)
             .map(|_| Located {
                 path,

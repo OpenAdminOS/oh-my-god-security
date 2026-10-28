@@ -1144,6 +1144,24 @@ fn sensors_execute_resolved_paths_even_with_a_poisoned_current_directory() {
 }
 
 #[test]
+fn a_relative_executor_override_runs_the_verified_file() {
+    if !mxc_ready() {
+        return;
+    }
+    let executor = omgs::sandbox::locate_executor().unwrap().path;
+    let d = scratch("relative-executor");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["doctor", "--live"])
+        .current_dir(executor.parent().unwrap())
+        .env("OMGS_HOME", &d)
+        .env("OMGS_MXC_EXEC", executor.file_name().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
 fn doctor_discloses_planned_controls_and_gaps_without_an_executor() {
     let d = scratch("doctor-missing");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))

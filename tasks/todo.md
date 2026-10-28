@@ -69,6 +69,7 @@ parent-owned full-diff reviews and PR creation are separate from this implementa
 - [ ] `skill/agents/` briefs: red hunter, blue verifier, evaluator, green fixer
 - [ ] Proof by default with per-stack recipes
 - [ ] Windows toolchains reachable inside MXC: on the Windows 11 mini PC, `doctor --live` lists cargo, node and pwsh as on PATH but not reachable in the sandbox, although their roots are granted readable; the per-stack recipes need them
+- [ ] Supervisor drain flake: on macos-15 CI (run 40671536208, first attempt) `executor_text_errors_and_outer_exit_codes_cannot_substitute_for_markers` reported capture incomplete after the 2 s bounded drain for a one-line `sh` command with no descendants; the rerun passed. Find why EOF can arrive late and make capture completion deterministic
 - [ ] Shared path classifier; shell and browser-extension stacks; monorepo detection
 - [ ] Packs: identity binding, fail-closed semantics
 - [ ] Persona modes; host-provided accounting
