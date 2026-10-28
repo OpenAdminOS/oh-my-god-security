@@ -1581,7 +1581,7 @@ fn linked_proof_contract_requires_boundary_control_and_assertion_exit() {
 #[test]
 fn contract_deletions_nulls_and_downgrades_fail_validation_and_replay() {
     let dir = scratch("contract-tampering");
-    std::fs::write(dir.join(omgs::runmeta::FILE), "{}").unwrap();
+    write_private_fixture(dir.join(omgs::runmeta::FILE), "{}").unwrap();
     let (_, _, findings) = complete_run();
     let findings = attest(&dir, findings);
     let findings_path = dir.join("findings.json");
