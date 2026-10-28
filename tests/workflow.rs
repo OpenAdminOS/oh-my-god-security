@@ -320,8 +320,8 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             list_parents: false,
         })
         .to_string();
-        std::fs::write(proof_dir.join("mxc-config.json"), &config).unwrap();
-        std::fs::write(proof_dir.join("command.txt"), command).unwrap();
+        write_private_fixture(proof_dir.join("mxc-config.json"), &config).unwrap();
+        write_private_fixture(proof_dir.join("command.txt"), command).unwrap();
         let record = omgs::proof::ProofRecord {
             schema: omgs::proof::SCHEMA.into(),
             n,
