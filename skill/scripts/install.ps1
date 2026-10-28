@@ -94,6 +94,23 @@ function Signature([string]$Path, [string]$Subject) {
     if ($sig.Status -ne 'Valid' -or $null -eq $sig.SignerCertificate -or $sig.SignerCertificate.Subject -cne $Subject) { throw "publisher signature rejected: $Path" }
     Write-Output "Publisher signature verified: $Subject"
 }
+function Provenance([string]$Path) {
+    # Windows PowerShell 5.1 promotes native stderr under Stop, even when redirected.
+    # Keep this relaxation local to optional provenance, never integrity checks.
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+        if (Get-Command gh -ErrorAction SilentlyContinue) {
+            & gh auth status *> $null
+            if ($LASTEXITCODE -eq 0) {
+                & gh attestation verify $Path --repo OpenAdminOS/oh-my-god-security 2>&1 | Out-Host
+                return ($LASTEXITCODE -eq 0)
+            }
+        }
+    } catch { return $false }
+    return $false
+}
+
 try {
     Fetch 'SHA256SUMS' 1048576
     Fetch $asset 104857600
@@ -106,14 +123,7 @@ try {
     Fetch 'MXC-LICENSE.txt' 1048576
     Checksum 'MXC-LICENSE.txt'
     Write-Output "MXC 1.0.1 pin verified: $($pin[3])"
-    $verified = $false
-    if (Get-Command gh -ErrorAction SilentlyContinue) {
-        & gh auth status *> $null
-        if ($LASTEXITCODE -eq 0) {
-            & gh attestation verify (Join-Path $tmp $asset) --repo OpenAdminOS/oh-my-god-security
-            $verified = $LASTEXITCODE -eq 0
-        }
-    }
+    $verified = Provenance (Join-Path $tmp $asset)
     if ($verified) { Write-Output 'OMGS provenance: verified' }
     else { Write-Output 'OMGS provenance: unverified (unavailable or failed; this alone is not evidence of tampering)' }
     $actual = & (Join-Path $tmp $asset) --version

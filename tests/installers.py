@@ -126,6 +126,22 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
         self.assertIn('provenance: unverified', out.stdout + out.stderr)
         self.assertIn('Installed omgs 0.1.0:', out.stdout)
 
+    def test_unavailable_authentication_is_unverified(self):
+        self.fake_verifiers()
+        if self.windows:
+            self.script.write_text("function gh { Write-Error 'Authentication unavailable'; $global:LASTEXITCODE=1 }\n" + self.script.read_text())
+        else:
+            tools = self.root / 'tools'
+            tools.mkdir()
+            gh = tools / 'gh'
+            gh.write_text('#!/bin/sh\necho "Authentication unavailable" >&2\nexit 1\n')
+            gh.chmod(0o755)
+            self.env['PATH'] = str(tools) + os.pathsep + self.env['PATH']
+        out = self.run_install()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn('provenance: unverified', out.stdout + out.stderr)
+        self.assertIn('Installed omgs 0.1.0:', out.stdout)
+
     def test_tampered_binary_with_forged_checksums_fails_signature(self):
         self.fake_verifiers()
         with self.binary.open('ab') as stream:
