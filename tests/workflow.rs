@@ -576,7 +576,7 @@ fn cli_ledger_and_critic_end_to_end() {
     let mut ledger = ledger;
     ledger.units[0].status = "planned".into();
     ledger.units[0].evidence.clear();
-    let w = |name: &str, v: String| std::fs::write(dir.join(name), v).unwrap();
+    let w = |name: &str, v: String| write_private_fixture(dir.join(name), v).unwrap();
     w(
         "coverage-ledger.json",
         serde_json::to_string(&ledger).unwrap(),
