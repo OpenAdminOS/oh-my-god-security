@@ -75,13 +75,18 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
 
 pub fn read(dir: &Path) -> Result<Map<String, Value>, String> {
     let path = dir.join(FILE);
-    let file = crate::platform::open_single_link(&path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?
-        .ok_or_else(|| format!("read {}: file missing", path.display()))?;
-    crate::platform::check_private_file(&file)
-        .map_err(|e| format!("storage {}: {e}", path.display()))?;
+    #[cfg(windows)]
+    let text = {
+        let file = crate::platform::open_single_link(&path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?
+            .ok_or_else(|| format!("read {}: file missing", path.display()))?;
+        crate::platform::check_private_file(&file)
+            .map_err(|e| format!("storage {}: {e}", path.display()))?;
+        std::io::read_to_string(file).map_err(|e| format!("read {}: {e}", path.display()))?
+    };
+    #[cfg(not(windows))]
     let text =
-        std::io::read_to_string(file).map_err(|e| format!("read {}: {e}", path.display()))?;
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     match crate::shape::strict_json(&text) {
         Ok(Value::Object(m)) => {
             check_numeric_fields(&m)?;
