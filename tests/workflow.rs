@@ -2446,8 +2446,12 @@ fn report_handoff_and_sarif_golden_contract() {
         ..Default::default()
     };
     let h = omgs::handoff::build(&dir, &file, None).unwrap();
-    let normalize =
-        |text: String| text.replace(&omgs::handoff::path_text(&dir.to_string_lossy()), "RUN");
+    let normalize = |text: String| {
+        text.replace(
+            &omgs::handoff::path_text(&dir.canonicalize().unwrap().to_string_lossy()),
+            "RUN",
+        )
+    };
     let md = normalize(omgs::handoff::markdown(&h));
     let json = normalize(format!("{}\n", serde_json::to_string_pretty(&h).unwrap()));
     golden("HANDOFF.md", &md);
@@ -2776,6 +2780,11 @@ fn report_metadata_defaults_explicit_overrides_and_handoff_cli() {
 
 #[test]
 fn portable_rendering_and_handoff_schema_fields() {
+    assert_eq!(omgs::handoff::path_text(r"\\?\C:\runs\one"), "C:/runs/one");
+    assert_eq!(
+        omgs::handoff::path_text(r"\\?\UNC\server\runs\one"),
+        "//server/runs/one"
+    );
     let (dir, file) = report_fixture("portable-report");
     let mut alternate = file.clone();
     for f in &mut alternate.findings {
@@ -2826,5 +2835,26 @@ fn portable_rendering_and_handoff_schema_fields() {
             );
         }
     }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn stage_refuses_unknown_or_internal_targets_even_without_findings() {
+    let dir = scratch("stage-empty");
+    let empty = FindingsFile::default();
+    write_private_fixture(dir.join("findings.json"), "{\"findings\":[]}").unwrap();
+    assert!(omgs::handoff::stage(&dir, &empty)
+        .unwrap_err()
+        .contains("recorded target"));
+    write_private_fixture(dir.join("run-metadata.json"), "{bad json").unwrap();
+    assert!(omgs::handoff::stage(&dir, &empty).is_err());
+    write_private_fixture(
+        dir.join("run-metadata.json"),
+        serde_json::json!({"target":dir}).to_string(),
+    )
+    .unwrap();
+    let out = omgs(&["stage", "--run", dir.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(!dir.join("proposed-tests.patch").exists());
     std::fs::remove_dir_all(dir).unwrap();
 }

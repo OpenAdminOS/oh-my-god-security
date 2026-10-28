@@ -42,7 +42,12 @@ pub fn normalized(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
 }
 pub fn path_text(s: &str) -> String {
-    s.replace('\\', "/")
+    let path = s.replace('\\', "/");
+    if let Some(unc) = path.strip_prefix("//?/UNC/") {
+        format!("//{unc}")
+    } else {
+        path.strip_prefix("//?/").unwrap_or(&path).to_string()
+    }
 }
 fn location(l: &Location) -> Location {
     Location {
@@ -61,6 +66,8 @@ fn quote(s: &str) -> String {
 }
 
 pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Handoff, String> {
+    let canonical_run = std::fs::canonicalize(run).map_err(|e| format!("run directory: {e}"))?;
+    let run = canonical_run.as_path();
     let mut records = Vec::new();
     for (verdict, prefix) in [(Verdict::Confirmed, 'C'), (Verdict::NeedsValidation, 'V')] {
         for (i, f) in file
@@ -261,10 +268,17 @@ fn outside(run: &Path, target: &Path) -> Result<(), String> {
 /// New-file diffs for externally staged, confirmed proof tests only.
 /// Accepted target tests are already retained and need no patch.
 pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
-    if let Ok(m) = crate::runmeta::read(run) {
-        if let Some(t) = m.get("target").and_then(|v| v.as_str()) {
-            outside(run, Path::new(t))?;
+    let mut target_known = false;
+    match std::fs::symlink_metadata(run.join(crate::runmeta::FILE)) {
+        Ok(_) => {
+            let m = crate::runmeta::read(run)?;
+            if let Some(t) = m.get("target").and_then(|v| v.as_str()) {
+                outside(run, Path::new(t))?;
+                target_known = true;
+            }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("inspect run metadata: {e}")),
     }
     let mut tests: BTreeMap<String, (String, bool)> = BTreeMap::new();
     for f in file
@@ -281,6 +295,7 @@ pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
         let test = relative_test(p.test.as_deref().ok_or("proof has no test")?)?;
         let target = PathBuf::from(p.target.as_deref().ok_or("proof has no target")?);
         outside(run, &target)?;
+        target_known = true;
         let source = if p.test_from.is_some() {
             run.join("proofs").join(p.n.to_string()).join("test-draft")
         } else {
@@ -326,6 +341,9 @@ pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
             return Err(format!("conflicting proof tests for {test}"));
         }
         tests.insert(test, (text, executable));
+    }
+    if !target_known {
+        return Err("stage needs a recorded target to establish that the run is outside it".into());
     }
     let mut patch = String::new();
     for (path, (text, executable)) in tests {
