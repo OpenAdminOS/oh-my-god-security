@@ -1373,6 +1373,74 @@ fn doctor_and_proofs_list_memory_and_task_gap_once() {
     std::fs::remove_dir_all(d).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn concurrent_proofs_do_not_sweep_each_others_processes() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("concurrent-sweep");
+    let home = d.join("home");
+    let run = d.join("held");
+    omgs::platform::private_dir(&run).unwrap();
+    write_private_fixture(run.join(omgs::runmeta::FILE), "{}").unwrap();
+    let executor = omgs::sandbox::locate_executor().unwrap();
+
+    struct HeldProof {
+        child: Option<std::process::Child>,
+        release: PathBuf,
+    }
+    impl Drop for HeldProof {
+        fn drop(&mut self) {
+            // Release the workload on assertion failure as well, so its own
+            // supervisor can finish cleanup and reap the executor.
+            let _ = std::fs::write(&self.release, b"release");
+            if let Some(child) = &mut self.child {
+                let _ = child.wait();
+            }
+        }
+    }
+    let workspace = run.join("proofs/1/workspace");
+    let mut held = HeldProof {
+        release: workspace.join("release"),
+        child: Some(
+            std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .args([
+                    "prove",
+                    "--run",
+                    run.to_str().unwrap(),
+                    "--cmd",
+                    "echo ready > ready; while [ ! -f release ]; do /bin/sleep 0.02; done",
+                ])
+                .env("OMGS_HOME", &home)
+                .env("OMGS_MXC_EXEC", executor.path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        ),
+    };
+    let start = std::time::Instant::now();
+    while !workspace.join("ready").exists() {
+        assert!(held.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        assert!(start.elapsed().as_secs() < 20, "held proof did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for _ in 0..8 {
+        let out = omgs(&home, &["prove", "--cmd", "echo concurrent-proof"]);
+        assert!(out.status.success(), "{}", text(&out));
+        let record = record_from(&text(&out));
+        assert_eq!(record["survivors"], serde_json::json!([]));
+        assert!(held.child.as_mut().unwrap().try_wait().unwrap().is_none());
+    }
+    std::fs::write(&held.release, b"release").unwrap();
+    let out = held.child.take().unwrap().wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert!(record.clean() && record.survivors.is_empty(), "{record:?}");
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn narrowed_homebrew_roots_support_python_node_and_cargo() {

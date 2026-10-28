@@ -1133,24 +1133,43 @@ mod sweep {
         Ok(false)
     }
 
-    fn matches(pid: i32, allowed: &CString, denied: &CString) -> io::Result<bool> {
+    fn policy_check(pid: i32, path: Option<&CString>) -> io::Result<i32> {
         let operation = b"file-read-data\0";
-        // SAFETY: operation and path are NUL terminated and live through the call.
-        let check = |path: &CString| unsafe {
-            sandbox_check(pid, operation.as_ptr().cast(), 1, path.as_ptr())
+        // SAFETY: a null operation queries confinement without a path. Otherwise
+        // operation and path are NUL terminated and live through the call.
+        let result = unsafe {
+            match path {
+                None => sandbox_check(pid, std::ptr::null(), 0),
+                Some(path) => sandbox_check(pid, operation.as_ptr().cast(), 1, path.as_ptr()),
+            }
         };
-        let allow = check(allowed);
-        if allow < 0 {
+        if result < 0 {
             return Err(io::Error::last_os_error());
         }
-        if allow != 0 {
+        Ok(result)
+    }
+
+    fn policy_matches(
+        allowed: &CString,
+        denied: &CString,
+        mut check: impl FnMut(Option<&CString>) -> io::Result<i32>,
+    ) -> io::Result<bool> {
+        // Avoid expensive path resolution for unsandboxed same-uid processes.
+        // Descendants inherit Seatbelt confinement and cannot remove it.
+        if check(None)? == 0 {
             return Ok(false);
         }
-        let deny = check(denied);
-        if deny < 0 {
-            return Err(io::Error::last_os_error());
+        // sandbox_check returns a denial for a vanished pid, too. Query deny
+        // first: an unrestricted process exiting or entering another sandbox
+        // between calls must not combine an old allow with a new denial.
+        if check(Some(denied))? == 0 {
+            return Ok(false);
         }
-        Ok(deny != 0)
+        Ok(check(Some(allowed))? == 0)
+    }
+
+    fn matches(pid: i32, allowed: &CString, denied: &CString) -> io::Result<bool> {
+        policy_matches(allowed, denied, |path| policy_check(pid, path))
     }
 
     fn command(pid: i32) -> Option<String> {
@@ -1402,6 +1421,84 @@ mod sweep {
         const UID: libc::uid_t = 501;
         const A: i32 = 101;
         const B: i32 = 102;
+
+        #[test]
+        fn policy_fingerprint_filters_unconfined_and_other_runs_and_preserves_errors() {
+            let allowed = CString::new("/allowed").unwrap();
+            let denied = CString::new("/denied").unwrap();
+            for (answers, matched) in [
+                (vec![0], false),
+                (vec![1, 0], false),
+                (vec![1, 1, 1], false),
+                (vec![1, 1, 0], true),
+            ] {
+                let mut answers: VecDeque<_> = answers.into();
+                let mut paths = Vec::new();
+                let result = policy_matches(&allowed, &denied, |path| {
+                    paths.push(path.map(|p| p.to_bytes().to_vec()));
+                    Ok(answers.pop_front().unwrap())
+                });
+                assert_eq!(result.unwrap(), matched);
+                assert!(answers.is_empty());
+                let order = [None, Some(b"/denied".to_vec()), Some(b"/allowed".to_vec())];
+                assert_eq!(paths, order[..paths.len()]);
+            }
+            for failing_query in 0..3 {
+                let mut query = 0;
+                let error = policy_matches(&allowed, &denied, |_| {
+                    query += 1;
+                    if query == failing_query + 1 {
+                        Err(io::Error::from_raw_os_error(libc::EPERM))
+                    } else {
+                        Ok(1)
+                    }
+                })
+                .unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+                assert_eq!(query, failing_query + 1);
+            }
+        }
+
+        #[test]
+        fn process_exiting_between_path_queries_is_not_a_policy_match() {
+            use std::io::BufRead;
+
+            let mut child = Command::new("/usr/bin/sandbox-exec")
+                .env_clear()
+                .args([
+                    "-p",
+                    "(version 1)(allow default)(deny file-read-data (literal \"/usr/bin/true\"))",
+                    "/bin/sh",
+                    "-c",
+                    "printf 'ready\\n'; exec /bin/sleep 30",
+                ])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut ready = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            let allowed = CString::new("/bin/sh").unwrap();
+            let denied = CString::new("/usr/bin/true").unwrap();
+            let mut reaped = false;
+            let matched = policy_matches(&allowed, &denied, |path| {
+                let result = policy_check(child.id() as i32, path);
+                if path.is_some() && !reaped {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    reaped = true;
+                }
+                result
+            });
+            if !reaped {
+                let _ = child.kill();
+            }
+            child.wait().unwrap();
+            assert_eq!(ready, "ready\n");
+            assert!(reaped, "the positive control must be sandboxed");
+            assert!(!matched.unwrap());
+        }
 
         enum Step {
             Pids(Vec<i32>, Duration),

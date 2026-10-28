@@ -407,8 +407,39 @@ fn executor_does_not_inherit_another_spawns_pipe() {
         unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
         0
     );
+    let path = std::env::temp_dir().join(format!(
+        "omgs-inheritance-{}",
+        omgs::platform::random_nonce().unwrap()
+    ));
+    omgs::platform::private_dir(&path).unwrap();
+    let ready = path.join("ready");
+    let release = path.join("release");
+    struct Release<'a>(&'a std::path::Path);
+    impl Drop for Release<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0, b"release");
+        }
+    }
     std::thread::scope(|scope| {
-        let child = scope.spawn(|| run(shell("sleep 1"), &limits(), None));
+        let release_on_exit = Release(&release);
+        let child = scope.spawn(|| {
+            let mut command = shell(
+                "printf ready > \"$OMGS_TEST_READY\"; \
+                 while [ ! -f \"$OMGS_TEST_RELEASE\" ]; do sleep 0.02; done",
+            );
+            command
+                .env("OMGS_TEST_READY", &ready)
+                .env("OMGS_TEST_RELEASE", &release);
+            run(command, &limits(), None)
+        });
+        // CLOEXEC takes effect at exec, not at fork. The other thread may
+        // still be preparing its child when our short command finishes.
+        // Require an executed shell, held alive until after the EOF assertion.
+        let start = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(start.elapsed() < std::time::Duration::from_millis(limits().wall_ms));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         // Wait for a second child to inspect its own inherited writer. This
         // also checks the descriptor directly, independent of EOF scheduling.
         let result = run(
@@ -419,8 +450,10 @@ fn executor_does_not_inherit_another_spawns_pipe() {
         drop(write);
         assert!(result.success, "{result:?}");
         assert_eq!(read.read(&mut [0u8; 1]).unwrap(), 0);
+        drop(release_on_exit);
         assert!(child.join().unwrap().success);
     });
+    std::fs::remove_dir_all(path).unwrap();
 }
 
 #[cfg(unix)]
@@ -525,7 +558,13 @@ fn unsupervised_spawns_do_not_delay_capture() {
                         BufReader::new(child.0.stdout.take().unwrap())
                             .read_line(&mut line)
                             .unwrap();
-                        assert_eq!(line, "ready\n");
+                        assert_eq!(
+                            line,
+                            "ready\n",
+                            "unmanaged child {} status {:?}",
+                            child.0.id(),
+                            child.0.try_wait().unwrap()
+                        );
                         if tx.send(child).is_err() {
                             return;
                         }

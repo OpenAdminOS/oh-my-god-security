@@ -140,7 +140,16 @@ runtime, within the proof budget. The [per-stack recipes](skill/VALIDATION-AND-R
 cover PowerShell, Node, Python isolated mode, shell and Swift, including exact
 commands, invariant assertions and blockers. `doctor --live` launches each
 runtime's bounded version command (or `sh -c 'exit 0'`) inside MXC before
-calling it reachable. Missing tools print `<runtime> not on host PATH`.
+calling it reachable. On macOS, when `swiftc` or `clang` resolves to an Apple
+shim in `/usr/bin`, the probe reads the selected developer directory with
+`xcode-select -p` inside MXC and launches its toolchain binary directly. This
+avoids xcrun's SDK discovery and Xcode first-launch work within the unchanged
+three-second reach deadline. Other tools on the sandbox PATH keep their own
+version command. A missing developer directory or failing tool still fails
+the probe. `TMPDIR` already points to per-proof scratch; setting
+`DARWIN_USER_CACHE_DIR` does not repair Xcode's sandboxed `confstr(3)` lookup,
+so OMGS does not grant access to the host user cache for it.
+Missing tools print `<runtime> not on host PATH`.
 Installed tools whose probes fail print
 `<runtime> on host PATH but failed to launch inside MXC` and a reason.
 Retain those exact lines and the proof startup diagnostic with the pending finding. No installation or
@@ -149,6 +158,19 @@ scratch `CARGO_HOME`, the existing `RUSTUP_HOME` and `RUSTUP_AUTO_INSTALL=0`.
 Host credentials and broad home access stay outside the grants. Linux explicitly
 grants read-only `/usr/include` for local compiler headers; MXC does not mount
 that system directory by default.
+
+On macOS the survivor sweep identifies each run by its distinct allowed and
+denied marker paths. It skips unsandboxed processes before path-policy queries
+and checks the denied path before the allowed path. A process exiting or
+entering another sandbox during inspection cannot turn an earlier unrestricted
+read into evidence that it belongs to this run. Concurrent proofs retain their
+own process groups, workspaces, scratch directories and markers. Live doctor
+runs also use distinct temporary directories, including when they share
+`OMGS_HOME`.
+Older OMGS binaries still use the unsafe query order. Running an older binary
+alongside a fixed binary on the same Mac can still interrupt the fixed run.
+Upgrade every concurrently running OMGS installation before relying on this
+isolation guarantee.
 
 ## What a proof record does and does not prove
 

@@ -107,6 +107,59 @@ jobs:
             test "$status" -eq 0
           fi
 
+  macos-isolation:
+    name: macos isolation (${{ matrix.threads }})
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        threads: [default, "32"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # Use the runner's existing Rust toolchain. Never auto-install a toolchain.
+      - name: Verify existing toolchain
+        run: |
+          rustc --version
+          cargo --version
+      - name: Prepare pinned MXC executor
+        env:
+          MXC_ZIP_SHA256: 0e832239454ba7fcd338ff56218a287eef4c0a01c1484084b869f55feff8abe9
+          MXC_EXEC_SHA256: c54390e48a25187fdae10758c6a286bede49416cb610c88c6705fd8445e97f60
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ARCH" = ARM64
+          zip="$RUNNER_TEMP/mxc.zip"
+          curl -fsSL -o "$zip" https://github.com/microsoft/mxc/releases/download/v1.0.1/mxc-release-binaries.zip
+          echo "$MXC_ZIP_SHA256  $zip" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/mxc"
+          unzip -j "$zip" arm64/mxc-exec-mac -d "$RUNNER_TEMP/mxc"
+          rm "$zip"
+          exe="$RUNNER_TEMP/mxc/mxc-exec-mac"
+          echo "$MXC_EXEC_SHA256  $exe" | shasum -a 256 -c -
+          chmod +x "$exe"
+          echo "OMGS_MXC_EXEC=$exe" >> "$GITHUB_ENV"
+      - name: Repeat sandbox and supervisor isolation tests
+        env:
+          TEST_THREADS: ${{ matrix.threads }}
+        run: |
+          set -euo pipefail
+          cargo test --locked --test sandbox --test supervise --no-run
+          for iteration in $(seq 1 10); do
+            for suite in sandbox supervise; do
+              echo "::group::$suite repetition $iteration, threads=$TEST_THREADS"
+              if [[ "$TEST_THREADS" == default ]]; then
+                cargo test --locked --test "$suite"
+              else
+                cargo test --locked --test "$suite" -- --test-threads="$TEST_THREADS"
+              fi
+              echo "::endgroup::"
+              echo "Passed $suite repetition $iteration, threads=$TEST_THREADS" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
+
   msrv:
     name: rust (1.89)
     runs-on: ubuntu-24.04

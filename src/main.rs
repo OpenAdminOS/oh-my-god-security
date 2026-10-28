@@ -912,8 +912,16 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn doctor_probe_command(name: &str) -> String {
+fn doctor_probe_command(os: &str, name: &str) -> String {
     match name {
+        "swiftc" | "clang" if os == "macos" => format!(
+            "tool=$(command -v {name}) || exit; \
+             if [ \"$tool\" = /usr/bin/{name} ]; then \
+             developer=$(/usr/bin/xcode-select -p) || exit; \
+             tool=\"$developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/{name}\"; \
+             if [ ! -x \"$tool\" ]; then tool=\"$developer/usr/bin/{name}\"; fi; \
+             fi; \"$tool\" --version"
+        ),
         "sh" => "sh -c 'exit 0'".into(),
         "java" => "java -version".into(),
         "go" => "go version".into(),
@@ -1079,8 +1087,10 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         return Err("__EXIT1__".into());
     }
     if has(args, "--live") {
-        let probe = data_dir().join("doctor");
-        let _ = std::fs::remove_dir_all(&probe);
+        let probe = data_dir().join(format!(
+            "doctor-{}",
+            omgs::platform::random_nonce().map_err(|e| e.to_string())?
+        ));
         let target = probe.join("target");
         std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
         // Two fresh tokens: one inside the workspace that must be readable
@@ -1177,7 +1187,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             // Separate deadlines keep one hanging tool from hiding the rest.
             let reach = ProveRequest {
                 expect_marker: None,
-                command: doctor_probe_command(name),
+                command: doctor_probe_command(os, name),
                 test: None,
                 timeout_ms: 3_000,
                 target: None,
@@ -3259,7 +3269,20 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
 mod cli_tests {
     #[test]
     fn doctor_shell_probe_and_unreachable_reasons() {
-        assert_eq!(super::doctor_probe_command("sh"), "sh -c 'exit 0'");
+        assert_eq!(super::doctor_probe_command("macos", "sh"), "sh -c 'exit 0'");
+        for os in ["macos", "linux", "windows"] {
+            for name in ["swiftc", "clang"] {
+                let command = super::doctor_probe_command(os, name);
+                if os == "macos" {
+                    assert!(command.contains(&format!("tool=$(command -v {name}) || exit")));
+                    assert!(command.contains("developer=$(/usr/bin/xcode-select -p) || exit"));
+                    assert!(command.contains(&format!("XcodeDefault.xctoolchain/usr/bin/{name}")));
+                    assert!(command.ends_with("\"$tool\" --version"));
+                } else {
+                    assert_eq!(command, format!("{name} --version"));
+                }
+            }
+        }
         assert_eq!(
             super::doctor_tool_failure("node", "timeout=true"),
             "node on host PATH but failed to launch inside MXC\n  reason: timeout=true"
