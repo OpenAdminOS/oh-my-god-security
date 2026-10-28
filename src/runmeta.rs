@@ -39,14 +39,20 @@ pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut n = 0u32;
     let (tmp, mut file) = loop {
         let tmp = path.with_file_name(format!(".{name}.{}.{n}.tmp", std::process::id()));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&tmp) {
+        #[cfg(windows)]
+        let opened = crate::platform::open_private_write(&tmp, true);
+        #[cfg(not(windows))]
+        let opened = {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(&tmp)
+        };
+        match opened {
             Ok(f) => break (tmp, f),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => n += 1,
             Err(e) => return Err(e),
@@ -106,12 +112,15 @@ pub fn with_lock_file<T>(
     lock_path: &Path,
     f: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let file = std::fs::OpenOptions::new()
+    #[cfg(windows)]
+    let opened = crate::platform::open_private_write(lock_path, false);
+    #[cfg(not(windows))]
+    let opened = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(lock_path)
-        .map_err(|e| format!("open lock {}: {e}", lock_path.display()))?;
+        .open(lock_path);
+    let file = opened.map_err(|e| format!("open lock {}: {e}", lock_path.display()))?;
     crate::platform::check_private_file(&file)
         .map_err(|e| format!("storage {}: {e}", lock_path.display()))?;
     let start = std::time::Instant::now();

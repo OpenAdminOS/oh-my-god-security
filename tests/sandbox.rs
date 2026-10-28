@@ -5,6 +5,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+// Valid storage fixtures must have the same owner and ACL as runtime files,
+// including when the Windows test process has an elevated token.
+fn write_private_fixture(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    omgs::runmeta::write_atomic_bytes(path.as_ref(), bytes.as_ref())
+}
+
 fn scratch(name: &str) -> PathBuf {
     let base = std::env::temp_dir()
         .canonicalize()
@@ -1366,7 +1375,7 @@ fn interrupting_prove_cleans_the_executor_group_and_marks_the_record_unclean() {
         let d = scratch(&format!("signal-{number}"));
         let run = d.join("run");
         omgs::platform::private_dir(&run).unwrap();
-        std::fs::write(run.join(omgs::runmeta::FILE), "{}").unwrap();
+        write_private_fixture(run.join(omgs::runmeta::FILE), "{}").unwrap();
         // The detached child also exercises the macOS survivor sweep.
         let command = if cfg!(target_os = "macos") {
             "python3 -I -c 'import os,time\npid=os.fork()\nif pid==0:\n os.setsid()\n open(\"ready\",\"w\").write(str(os.getpid()))\n time.sleep(120)\n os._exit(0)\ntime.sleep(120)'"
@@ -1515,7 +1524,7 @@ fn linux_new_session_descendants_die_with_the_pid_namespace() {
         let d = scratch(&format!("linux-escape-{method}"));
         let run = d.join("run");
         omgs::platform::private_dir(&run).unwrap();
-        std::fs::write(run.join(omgs::runmeta::FILE), "{}").unwrap();
+        write_private_fixture(run.join(omgs::runmeta::FILE), "{}").unwrap();
         let marker = format!("omgs-r4-{method}-{}", std::process::id());
         let args = format!(
             "[\"{}\",\"-I\",\"-c\",\"import time; time.sleep(120)\",\"{marker}\"]",
@@ -1617,7 +1626,7 @@ fn executable_drafts_keep_their_mode_and_commands_are_redacted() {
     let run = d.join("run");
     std::fs::create_dir_all(&target).unwrap();
     omgs::platform::private_dir(&run).unwrap();
-    std::fs::write(
+    write_private_fixture(
         run.join(omgs::runmeta::FILE),
         serde_json::json!({"target": target}).to_string(),
     )
@@ -1685,7 +1694,7 @@ fn cli_rejects_unknown_and_duplicate_options_before_charging_budget() {
     omgs::platform::private_dir(&run).unwrap();
     let meta = serde_json::json!({"budget_agent_calls": 1, "proof_runs_used": 0});
     let bytes = serde_json::to_vec(&meta).unwrap();
-    std::fs::write(run.join(omgs::runmeta::FILE), &bytes).unwrap();
+    write_private_fixture(run.join(omgs::runmeta::FILE), &bytes).unwrap();
     for tail in [
         vec!["--cmd", "exit 0", "--timeot-ms", "1"],
         vec!["--cmd", "exit 0", "--cmd", "exit 1"],
@@ -1740,7 +1749,7 @@ fn symlinked_executor_and_proof_test_run_with_private_artifacts() {
     symlink("real.sh", target.join("proof.sh")).unwrap();
     let executor = d.join("executor-link");
     symlink(omgs::sandbox::locate_executor().unwrap().path, &executor).unwrap();
-    std::fs::write(
+    write_private_fixture(
         run.join(omgs::runmeta::FILE),
         serde_json::json!({"target": target}).to_string(),
     )
@@ -1810,7 +1819,7 @@ fn preparation_signals_release_the_reservation_and_remove_the_workspace() {
             .unwrap()
             .set_len(64 << 20)
             .unwrap();
-        std::fs::write(
+        write_private_fixture(
             run.join(omgs::runmeta::FILE),
             serde_json::json!({"target": target, "proof_runs_used": 0}).to_string(),
         )

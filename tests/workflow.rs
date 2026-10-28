@@ -3,6 +3,15 @@ use omgs::ledger::{add_unit, set_status, validate_ledger, Ledger, Unit};
 use omgs::model::{validate, Finding, FindingsFile, Location, ProofTier, Severity, Verdict};
 use omgs::report::{render_html, render_markdown, render_sarif, ReportMeta};
 
+// Valid storage fixtures must have the same owner and ACL as runtime files,
+// including when the Windows test process has an elevated token.
+fn write_private_fixture(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    omgs::runmeta::write_atomic_bytes(path.as_ref(), bytes.as_ref())
+}
+
 /// A valid confirmed record for `key`, hunted by red-1 and verified by blue-1.
 fn record(key: &str) -> Finding {
     let attack_class = format!("class_{key}");
@@ -660,7 +669,7 @@ fn critic_includes_findings_validation() {
 fn critic_rejects_a_misspelled_candidates_file() {
     let dir = scratch("misspelled");
     let (ledger, _cands, _findings) = complete_run();
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
     )
@@ -679,7 +688,7 @@ fn report_critic_describes_the_rendered_findings() {
     let dir = scratch("selected");
     let (ledger, cands, findings) = complete_run();
     let findings = attest(&dir, findings);
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
     )
@@ -741,7 +750,7 @@ fn ledger_requires_the_units_key() {
     let empty: Ledger = serde_json::from_str(r#"{"units": []}"#).unwrap();
     assert!(empty.units.is_empty());
     let dir = scratch("units-key");
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         r#"{"unit": [{"id": "sensitive-route", "status": "planned"}]}"#,
     )
@@ -766,7 +775,7 @@ fn findings_file_requires_the_findings_key() {
     let mut unit = Unit::new("u", ".", &[], "covered");
     unit.evidence = vec!["path/a.ts".into()];
     ledger.units.push(unit);
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
     )
@@ -907,7 +916,7 @@ fn critic_flags_blank_identity_inputs_on_merged_candidates() {
 fn critic_refuses_symlinked_candidate_files() {
     let dir = scratch("symlinked-candidates");
     let (ledger, cands, findings) = complete_run();
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
     )
@@ -959,7 +968,7 @@ fn array_shaped_and_null_inputs_are_errors() {
     // End to end: an otherwise complete run with a positional candidates file fails.
     let dir = scratch("array-shapes");
     let (ledger, _, findings) = complete_run();
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
     )
@@ -1043,9 +1052,9 @@ fn report_fails_on_malformed_companion_files() {
             dir.join("out").to_str().unwrap(),
         ])
     };
-    std::fs::write(dir.join("coverage-ledger.json"), "{").unwrap();
+    write_private_fixture(dir.join("coverage-ledger.json"), "{").unwrap();
     assert_eq!(report(&dir).status.code(), Some(2), "malformed ledger");
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_string(&ledger).unwrap(),
     )
@@ -1413,7 +1422,7 @@ fn saved_configs_are_checked_even_when_their_digest_matches() {
         "output_sha256"
     ));
     record.output.clear();
-    std::fs::write(
+    write_private_fixture(
         dir.join("run-metadata.json"),
         serde_json::json!({"target": dir.join("target")} ).to_string(),
     )
@@ -1817,7 +1826,7 @@ fn validation_and_replay_reject_special_tests_within_a_second() {
     let dir = scratch("special-proof-test");
     let (ledger, cands, findings) = complete_run();
     let findings = attest(&dir, findings);
-    std::fs::write(
+    write_private_fixture(
         dir.join("coverage-ledger.json"),
         serde_json::to_vec(&ledger).unwrap(),
     )
@@ -1838,7 +1847,7 @@ fn validation_and_replay_reject_special_tests_within_a_second() {
     let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
     record.target = Some(target.to_string_lossy().into());
     record.target_sha256 = Some("0".repeat(64));
-    std::fs::write(
+    write_private_fixture(
         dir.join(omgs::runmeta::FILE),
         serde_json::json!({"target": target}).to_string(),
     )
@@ -2123,7 +2132,7 @@ fn persona_never_changes_validation_critic_or_verdicts() {
                 serde_json::to_string(&proven).unwrap(),
             )
             .unwrap();
-            std::fs::write(
+            write_private_fixture(
                 run.join("coverage-ledger.json"),
                 serde_json::to_string(&ledger).unwrap(),
             )

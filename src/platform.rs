@@ -597,6 +597,12 @@ pub fn check_private_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Open a new private file or an existing lock without changing its ACL.
+#[cfg(windows)]
+pub fn open_private_write(path: &Path, create_new: bool) -> std::io::Result<std::fs::File> {
+    windows_private::open_write(path, create_new)
+}
+
 /// Validate an opened metadata or lock file before using its contents or lock.
 /// Unix storage relies on its owner-private parent directory.
 pub fn check_private_file(file: &std::fs::File) -> std::io::Result<()> {

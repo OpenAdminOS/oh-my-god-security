@@ -2,7 +2,7 @@
 use std::ffi::c_void;
 use std::io::{Error, Result};
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
 use std::ptr::{null_mut, NonNull};
 
@@ -59,7 +59,23 @@ extern "system" {
     fn GetCurrentProcess() -> Ptr;
     fn CloseHandle(handle: Ptr) -> i32;
     fn LocalFree(mem: Ptr) -> Ptr;
+    fn CreateFileW(
+        path: *const u16,
+        access: u32,
+        share: u32,
+        security: *const SecurityAttributes,
+        creation: u32,
+        flags: u32,
+        template: Ptr,
+    ) -> Ptr;
 }
+#[repr(C)]
+struct SecurityAttributes {
+    length: u32,
+    descriptor: Ptr,
+    inherit: i32,
+}
+
 struct Local(NonNull<c_void>);
 impl Drop for Local {
     fn drop(&mut self) {
@@ -98,6 +114,65 @@ fn wide(path: &Path) -> Result<Vec<u16>> {
     }
     text.push(0);
     Ok(text)
+}
+
+/// Supply the owner and protected DACL at creation, even for elevated tokens
+/// whose default owner is Administrators. OPEN_ALWAYS leaves existing ACLs alone.
+pub(super) fn open_write(path: &Path, create_new: bool) -> Result<std::fs::File> {
+    let path = wide(path)?;
+    let token = user()?;
+    // SAFETY: all Windows allocations and NUL-terminated strings remain live
+    // through CreateFileW. A successful handle is transferred to File once.
+    unsafe {
+        let mut sid = null_mut();
+        if ConvertSidToStringSidW(token[0] as Ptr, &mut sid) == 0 {
+            return Err(Error::last_os_error());
+        }
+        let _sid = local(sid.cast())?;
+        let mut len = 0;
+        while *sid.add(len) != 0 {
+            len += 1;
+        }
+        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(sid, len));
+        let sddl: Vec<u16> = format!("O:{sid}D:P(A;;FA;;;{sid})")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut sd = null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut sd,
+            null_mut(),
+        ) == 0
+        {
+            return Err(Error::last_os_error());
+        }
+        let _sd = local(sd)?;
+        let security = SecurityAttributes {
+            length: std::mem::size_of::<SecurityAttributes>() as u32,
+            descriptor: sd,
+            inherit: 0,
+        };
+        let handle = CreateFileW(
+            path.as_ptr(),
+            0x4000_0000,
+            0x1 | 0x2 | 0x4,
+            &security,
+            if create_new { 1 } else { 4 },
+            0x0020_0000,
+            null_mut(),
+        );
+        if handle as isize == -1 {
+            return Err(Error::last_os_error());
+        }
+        let file = std::fs::File::from_raw_handle(handle);
+        let meta = file.metadata()?;
+        if !meta.is_file() || super::is_link(&meta) {
+            return Err(Error::other("storage file must be regular without links"));
+        }
+        Ok(file)
+    }
 }
 
 pub fn check(path: &Path) -> Result<()> {
@@ -295,8 +370,8 @@ mod tests {
                 SetNamedSecurityInfoW(
                     path.as_mut_ptr(),
                     1,
-                    0x8000_0004,
-                    null_mut(),
+                    0x8000_0005,
+                    token[0] as Ptr,
                     null_mut(),
                     acl,
                     null_mut()
@@ -345,8 +420,12 @@ mod tests {
         std::fs::write(&metadata, "{}").unwrap();
         set_acl(&metadata, "(A;;FW;;;BU)");
         assert!(crate::platform::check_private_dir(&run).is_ok());
-        assert!(crate::budget::metadata(&run).is_err());
-        assert!(crate::runmeta::read(&run).is_err());
+        assert!(crate::budget::metadata(&run)
+            .unwrap_err()
+            .contains("writable by another principal"));
+        assert!(crate::runmeta::read(&run)
+            .unwrap_err()
+            .contains("writable by another principal"));
         assert!(crate::runmeta::write_atomic(&metadata, "{\"changed\":true}").is_err());
         assert_eq!(std::fs::read_to_string(&metadata).unwrap(), "{}");
         let lock = run.join(".omgs-run.lock");
