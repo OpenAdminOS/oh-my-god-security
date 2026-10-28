@@ -2063,3 +2063,121 @@ fn windows_unc_proof_directories_match_writer_and_validator() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn persona_never_changes_validation_critic_or_verdicts() {
+    let dir = scratch("persona-evidence");
+    let target = dir.join("repo");
+    std::fs::create_dir_all(target.join("tests/security")).unwrap();
+    std::fs::write(target.join("tests/security/x.test.ts"), "fixture").unwrap();
+    let mut outcomes = Vec::new();
+    for persona in ["builder", "inheritor", "team"] {
+        let run = dir.join(persona);
+        let out = omgs(&[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--persona",
+            persona,
+            "--no-sensors",
+        ]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (ledger, candidates, mut findings) = complete_run();
+        // Repeat identical accepted and broken proof inputs for all verdicts.
+        let mut results = Vec::new();
+        for verdict in [
+            Verdict::Confirmed,
+            Verdict::NeedsValidation,
+            Verdict::Rejected,
+        ] {
+            findings.findings[0].verdict = verdict;
+            findings.findings[0].severity = if verdict == Verdict::Confirmed {
+                Some(omgs::model::Severity::High)
+            } else {
+                None
+            };
+            let proven = attest(&run, findings.clone());
+            let saved_proof = run.join(proven.findings[0].proof_ref.as_ref().unwrap());
+            let mut record: omgs::proof::ProofRecord =
+                serde_json::from_str(&std::fs::read_to_string(&saved_proof).unwrap()).unwrap();
+            record.target = Some(target.canonicalize().unwrap().to_string_lossy().into());
+            record.target_sha256 = Some(omgs::proof::tree_digest(&target).unwrap());
+            record.test_sha256 = Some(omgs::sha256::digest(b"fixture"));
+            omgs::proof::write(&run, &record).unwrap();
+            std::fs::write(
+                run.join("findings.json"),
+                serde_json::to_string(&proven).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                run.join("coverage-ledger.json"),
+                serde_json::to_string(&ledger).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                run.join("candidates-red-1.json"),
+                serde_json::json!({"candidates":[candidate_json(&candidates[0].candidate)]})
+                    .to_string(),
+            )
+            .unwrap();
+            let validate = || {
+                omgs(&[
+                    "validate",
+                    "--findings",
+                    run.join("findings.json").to_str().unwrap(),
+                ])
+                .status
+                .code()
+            };
+            let critic = || {
+                omgs(&["critic", "--run", run.to_str().unwrap()])
+                    .status
+                    .code()
+            };
+            let check = omgs(&[
+                "validate",
+                "--findings",
+                run.join("findings.json").to_str().unwrap(),
+            ]);
+            assert_eq!(
+                check.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&check.stderr)
+            );
+            assert_eq!(critic(), Some(0));
+            let proof_path = run.join(proven.findings[0].proof_ref.as_ref().unwrap());
+            let mut proof: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&proof_path).unwrap()).unwrap();
+            proof["command_finished"] = false.into();
+            std::fs::write(&proof_path, proof.to_string()).unwrap();
+            results.push((validate(), critic(), proven.findings[0].verdict));
+            assert_eq!(results.last().unwrap().0, Some(1));
+            assert_eq!(results.last().unwrap().1, Some(1));
+            // Traced evidence cannot confirm, for any persona.
+            let mut traced = proven.clone();
+            traced.findings[0].proof_tier = ProofTier::Traced;
+            traced.findings[0].proof_ref = None;
+            std::fs::write(
+                run.join("findings.json"),
+                serde_json::to_string(&traced).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                validate(),
+                Some(if verdict == Verdict::Confirmed { 1 } else { 0 })
+            );
+        }
+        outcomes.push(results);
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
+    assert_eq!(outcomes[1], outcomes[2]);
+    std::fs::remove_dir_all(dir).unwrap();
+}

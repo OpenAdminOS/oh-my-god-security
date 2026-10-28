@@ -109,6 +109,9 @@ fn html_report_escapes_target_content() {
             critic: None,
             models: vec![],
             reroutes: vec![],
+            accounting: Default::default(),
+            persona: String::new(),
+            report_depth: String::new(),
             intent_answers: Default::default(),
         },
     );
@@ -246,6 +249,9 @@ fn markdown_report_shows_rejected_and_pending_evidence() {
             critic: None,
             models: vec![],
             reroutes: vec![],
+            accounting: Default::default(),
+            persona: String::new(),
+            report_depth: String::new(),
             intent_answers: Default::default(),
         },
     );
@@ -268,6 +274,9 @@ fn meta() -> ReportMeta {
         critic: None,
         models: vec![],
         reroutes: vec![],
+        accounting: Default::default(),
+        persona: String::new(),
+        report_depth: String::new(),
         intent_answers: Default::default(),
     }
 }
@@ -391,6 +400,9 @@ fn html_escapes_hostile_strings_end_to_end() {
         critic: None,
         models: vec![],
         reroutes: vec![],
+        accounting: Default::default(),
+        persona: String::new(),
+        report_depth: String::new(),
         intent_answers: Default::default(),
     };
     let html = render_html(&file, &hostile_meta);
@@ -561,6 +573,9 @@ fn report_shows_run_metadata_or_not_recorded() {
         critic: None,
         models: vec![],
         reroutes: vec![],
+        accounting: Default::default(),
+        persona: String::new(),
+        report_depth: String::new(),
         intent_answers: Default::default(),
     };
     let md2 = render_markdown(&file, &bare);

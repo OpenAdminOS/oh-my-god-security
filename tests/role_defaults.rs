@@ -158,3 +158,135 @@ fn monorepo_stacks_are_scoped_and_exclude_docs_tests_and_vendor() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn persona_defaults_and_explicit_overrides_are_recorded() {
+    let dir = scratch("personas");
+    let target = dir.join("repo");
+    std::fs::create_dir(&target).unwrap();
+    for (name, budget, depth) in [
+        ("builder", 24, "concise"),
+        ("inheritor", 64, "full"),
+        ("team", 96, "full"),
+    ] {
+        let meta = init(&target, &dir.join(name), &["--persona", name]);
+        assert_eq!(meta["persona"], name);
+        assert_eq!(meta["budget_agent_calls"], budget);
+        assert_eq!(meta["report_depth"], depth);
+        assert_eq!(meta["mode"], "advisory");
+        assert_eq!(meta["execution_policy"], "sandboxed-source-and-local-only");
+        let overridden = init(
+            &target,
+            &dir.join(format!("{name}-override")),
+            &["--persona", name, "--budget", "7", "--mode", "gate"],
+        );
+        assert_eq!(overridden["budget_agent_calls"], 7);
+        assert_eq!(overridden["mode"], "gate");
+    }
+    let bad = cli(&[
+        "audit",
+        "init",
+        "--target",
+        target.to_str().unwrap(),
+        "--out",
+        dir.join("bad").to_str().unwrap(),
+        "--persona",
+        "other",
+    ]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(!dir.join("bad").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn accounting_unknown_round_trips_through_status_and_report() {
+    let dir = scratch("accounting");
+    let target = dir.join("repo");
+    std::fs::create_dir(&target).unwrap();
+    let run = dir.join("run");
+    init(&target, &run, &["--persona", "builder"]);
+    let out = cli(&[
+        "status",
+        "--run",
+        run.to_str().unwrap(),
+        "--stage",
+        "hunt",
+        "--state",
+        "done",
+        "--accounting",
+        "red-hunter=100,unknown,",
+        "--accounting",
+        "blue-verifier=0,0,0",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("red-hunter: tokens 100, cost USD unknown, duration ms unknown"));
+    let meta = read(&run.join("run-metadata.json"));
+    assert!(meta["accounting"]["red-hunter"]["duration_ms"].is_null());
+    assert_eq!(meta["accounting"]["blue-verifier"]["tokens"], 0);
+    let out = cli(&[
+        "report",
+        "--findings",
+        run.join("findings.json").to_str().unwrap(),
+        "--out",
+        run.to_str().unwrap(),
+        "--accounting",
+        "evaluator=unknown,0.12,50",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for path in ["REPORT.md", "REPORT.html"] {
+        let text = std::fs::read_to_string(run.join(path)).unwrap();
+        assert!(text.contains("red-hunter: tokens 100, cost USD unknown, duration ms unknown"));
+        assert!(text.contains("evaluator: tokens unknown, cost USD 0.12, duration ms 50"));
+        assert!(text.contains("green-fixer: tokens unknown, cost USD unknown, duration ms unknown"));
+    }
+    let meta = omgs::runmeta::read(&run).unwrap();
+    assert_eq!(
+        omgs::accounting::read(&meta).unwrap()["red-hunter"].duration_ms,
+        None
+    );
+    for bad in [
+        "red-hunter=-1,0,0",
+        "red-hunter=0,NaN,0",
+        "red-hunter=0,-1,0",
+        "red-hunter=0,inf,0",
+        "unknown=0,0,0",
+        "red-hunter=1,2",
+    ] {
+        assert!(omgs::accounting::parse(&[bad.into()]).is_err(), "{bad}");
+    }
+    // Invalid input must not rewrite progress or accounting.
+    let before = std::fs::read(run.join("pipeline-status.json")).unwrap();
+    let out = cli(&[
+        "status",
+        "--run",
+        run.to_str().unwrap(),
+        "--stage",
+        "hunt",
+        "--state",
+        "active",
+        "--accounting",
+        "red-hunter=-1,0,0",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        std::fs::read(run.join("pipeline-status.json")).unwrap(),
+        before
+    );
+    for bad in [
+        json!({"accounting":[]}),
+        json!({"accounting":{"red-hunter":[null,null,null]}}),
+        json!({"accounting":{"red-hunter":{"tokens":-1}}}),
+    ] {
+        assert!(omgs::accounting::read(bad.as_object().unwrap()).is_err());
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

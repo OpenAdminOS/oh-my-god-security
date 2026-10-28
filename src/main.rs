@@ -57,7 +57,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--hunter <id>] [--verifier <id>]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -68,7 +68,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "setup" => ("--yes --from", false),
         "review" => ("--repo-url --mode --budget --no-sensors", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
-            "--target --out --mode --budget --no-sensors --hunter --verifier",
+            "--target --out --mode --budget --no-sensors --hunter --verifier --persona",
             true,
         ),
         "batch" if args.first().is_some_and(|a| a == "init") => {
@@ -83,7 +83,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         ),
         "approve" => ("--target", false),
         "report" => (
-            "--findings --out --repo --ref --mode --sandbox --hunters --verifier --agent-calls",
+            "--findings --out --repo --ref --mode --sandbox --hunters --verifier --agent-calls --accounting",
             false,
         ),
         "architecture" => ("--in --out", false),
@@ -96,7 +96,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         }
         "critic" => ("--run", false),
         "status" => (
-            "--run --stage --state --label --parent --detail --counter --log",
+            "--run --stage --state --label --parent --detail --counter --log --accounting",
             false,
         ),
         "watch" => ("--run --max-ms", false),
@@ -126,7 +126,8 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
             return Err(format!("unknown option '{option}' for {cmd}"));
         }
         let repeatable = (cmd == "ledger" && option == "--evidence")
-            || (cmd == "status" && option == "--counter");
+            || (cmd == "status" && option == "--counter")
+            || (["status", "report"].contains(&cmd) && option == "--accounting");
         if !seen.insert(option) && !repeatable {
             return Err(format!("duplicate option '{option}'"));
         }
@@ -1273,6 +1274,25 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         omgs::batch::check_meta_types(&m)
             .map_err(|e| format!("{}: {e}", dir.join(omgs::runmeta::FILE).display()))?;
     }
+    let supplied_usage = omgs::accounting::parse(&flags(args, "--accounting"))?;
+    let saved = findings_dir
+        .as_deref()
+        .filter(|d| d.join(omgs::runmeta::FILE).is_file())
+        .map(omgs::runmeta::read)
+        .transpose()?
+        .unwrap_or_default();
+    let mut accounting = omgs::accounting::read(&saved)?;
+    accounting.extend(supplied_usage.clone());
+    let persona = saved
+        .get("persona")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let report_depth = saved
+        .get("report_depth")
+        .and_then(|v| v.as_str())
+        .unwrap_or("full")
+        .to_string();
     let meta = ReportMeta {
         repo: flag(args, "--repo").unwrap_or_else(|| "target".into()),
         source_ref: flag(args, "--ref").unwrap_or_else(|| "working tree".into()),
@@ -1287,6 +1307,9 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         models: run_models(findings_dir.as_deref()),
         reroutes: run_reroutes(findings_dir.as_deref()),
         intent_answers: run_answers(findings_dir.as_deref())?,
+        accounting,
+        persona,
+        report_depth,
     };
     let dir = Path::new(&out);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -1316,6 +1339,12 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             if let Some(n) = meta.agent_calls {
                 m.insert("agent_calls_used".into(), serde_json::json!(n));
             }
+            let mut usage = omgs::accounting::read(m)?;
+            usage.extend(supplied_usage.clone());
+            m.insert(
+                "accounting".into(),
+                serde_json::to_value(&usage).map_err(|e| e.to_string())?,
+            );
             m.insert("run_status".into(), serde_json::json!("complete"));
             m.insert(
                 "completed_unix".into(),
@@ -1557,7 +1586,11 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     // Validate every input and read the answer store before claiming a run
     // directory, so a mistyped option or an untrusted store never leaves a
     // claimed, half-written run behind.
-    let mode = flag(rest, "--mode").unwrap_or_else(|| "advisory".into());
+    let persona = flag(rest, "--persona")
+        .map(|p| omgs::persona::defaults(&p))
+        .transpose()?;
+    let defaults = persona.unwrap_or(omgs::persona::defaults("builder")?);
+    let mode = flag(rest, "--mode").unwrap_or_else(|| defaults.mode.into());
     if mode != "gate" && mode != "advisory" {
         return Err("--mode must be gate or advisory".into());
     }
@@ -1566,7 +1599,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
             v.parse()
                 .map_err(|_| format!("--budget must be a whole number, got '{v}'"))?,
         ),
-        None => None,
+        None => persona.map(|p| p.budget),
     };
     let answers_src = trusted_store(&target)?;
     let answers = if answers_src.is_file() {
@@ -1746,6 +1779,9 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     let mut meta = serde_json::json!({
         "repo": repo, "target": target.to_string_lossy(), "source_ref": source_ref,
         "mode": mode, "budget_agent_calls": budget, "profile": "standard",
+        "persona": defaults.name, "report_depth": defaults.report_depth,
+        "budget_profile": if persona.is_some() { defaults.budget_profile } else { "standard" },
+        "accounting": omgs::accounting::read(&serde_json::Map::new())?,
         "execution_policy": "sandboxed-source-and-local-only", "run_status": "in_progress",
         "detected_stacks": stacks.clone(),
         "subprojects": projects,
@@ -2357,6 +2393,9 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     let run = flag(args, "--run").ok_or("status requires --run <run-dir>")?;
     let stage = flag(args, "--stage").ok_or("status requires --stage <id>")?;
     let state = flag(args, "--state").ok_or("status requires --state <state>")?;
+    let supplied_usage = omgs::accounting::parse(&flags(args, "--accounting"))?;
+    // Refuse malformed metadata before updating progress.
+    omgs::runmeta::read(Path::new(&run))?;
     let mut counters = Vec::new();
     for c in flags(args, "--counter") {
         let (k, v) = c
@@ -2383,7 +2422,19 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
             log: log.as_deref(),
         },
     )?;
+    let usage = omgs::runmeta::update(Path::new(&run), |m| {
+        let mut usage = omgs::accounting::read(m)?;
+        usage.extend(supplied_usage);
+        m.insert(
+            "accounting".into(),
+            serde_json::to_value(&usage).map_err(|e| e.to_string())?,
+        );
+        Ok(usage)
+    })?;
     println!("{stage}: {state}");
+    for line in omgs::accounting::lines(&usage) {
+        println!("{line}");
+    }
     Ok(())
 }
 

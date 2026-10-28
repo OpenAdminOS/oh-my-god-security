@@ -82,6 +82,7 @@ pub fn check_numeric_fields(meta: &Map<String, Value>) -> Result<(), String> {
             return Err(format!("{key} must be a non-negative integer or absent"));
         }
     }
+    crate::accounting::read(meta)?;
     Ok(())
 }
 

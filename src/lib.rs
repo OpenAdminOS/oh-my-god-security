@@ -1,3 +1,4 @@
+pub mod accounting;
 pub mod approval;
 pub mod architecture;
 pub mod batch;
@@ -6,6 +7,7 @@ pub mod intent;
 pub mod ledger;
 pub mod model;
 pub mod paths;
+pub mod persona;
 pub mod platform;
 pub mod proof;
 pub mod report;

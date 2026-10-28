@@ -503,6 +503,9 @@ fn intent_ids_validate_group_and_show_answers() {
     )
     .is_err());
     let meta = ReportMeta {
+        accounting: Default::default(),
+        persona: String::new(),
+        report_depth: String::new(),
         intent_answers: answers,
         ..ReportMeta::default()
     };
@@ -1834,6 +1837,9 @@ fn markdown_shows_intent_answers_for_every_verdict() {
         findings: vec![confirmed, rejected],
     };
     let meta = ReportMeta {
+        accounting: Default::default(),
+        persona: String::new(),
+        report_depth: String::new(),
         intent_answers: omgs::intent::Answers {
             target: "/x".into(),
             answers: vec![omgs::intent::Answer {
