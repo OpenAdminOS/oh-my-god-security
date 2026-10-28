@@ -1151,7 +1151,7 @@ mod sweep {
         Ok(deny != 0)
     }
 
-    fn command(pid: i32, notes: &mut Vec<String>) -> String {
+    fn command(pid: i32) -> Option<String> {
         let mut buffer = [0u8; 4096];
         // SAFETY: buffer is writable for the specified byte count.
         let mut count =
@@ -1162,15 +1162,14 @@ mod sweep {
                 unsafe { libc::proc_name(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
         }
         if count <= 0 {
-            notes.push(format!("could not read command for survivor {pid}"));
-            return "unknown".into();
+            return None;
         }
         let length = (count as usize).min(buffer.len());
         let end = buffer[..length]
             .iter()
             .position(|b| *b == 0)
             .unwrap_or(length);
-        String::from_utf8_lossy(&buffer[..end]).into_owned()
+        Some(String::from_utf8_lossy(&buffer[..end]).into_owned())
     }
 
     pub(super) fn run(markers: &SweepMarkers, result: &mut Supervised) -> bool {
@@ -1260,10 +1259,22 @@ mod sweep {
                 }
                 let identity = (pid, before.pbi_start_tvsec, before.pbi_start_tvusec);
                 if !seen.contains(&identity) {
-                    result.survivors.push(Survivor {
-                        pid,
-                        command: command(pid, &mut result.notes),
-                    });
+                    let command = match command(pid) {
+                        Some(command) => command,
+                        // A matched process that exits on its own before its
+                        // command can be read did not survive the run.
+                        None if matches!(info(pid), Err(ref e) if e.raw_os_error() == Some(libc::ESRCH)) =>
+                        {
+                            continue;
+                        }
+                        None => {
+                            result
+                                .notes
+                                .push(format!("could not read command for survivor {pid}"));
+                            "unknown".into()
+                        }
+                    };
+                    result.survivors.push(Survivor { pid, command });
                     seen.push(identity);
                 }
                 // Recheck identity after the policy calls, before signalling a pid.
