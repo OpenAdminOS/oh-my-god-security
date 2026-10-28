@@ -68,7 +68,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes | --dry-run] [--from <skill-dir>] [--install-skills] [--replace] [--verify-mxc] [--write-policy <repo> --mode gate|advisory]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--base <ref>] [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>]\n  omgs gate --target <checkout> --base <base-sha> --head <head-sha> [--run <dir>]\n  omgs stage --run <run-dir>\n  omgs intent propose --run <run-dir>\n  omgs budget --run <run-dir>\n  omgs bench score --cases <manifest> --runs <run-dir> [--runs <run-dir>]...\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nBoolean options: --replace, --yes, --dry-run, --install-skills, --verify-mxc, --no-sensors and --live. Every other option takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes | --dry-run] [--from <skill-dir>] [--install-skills] [--replace] [--verify-mxc] [--write-policy <repo> --mode gate|advisory]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--base <ref>] [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>]\n  omgs gate --target <checkout> --base <base-sha> --head <head-sha> [--run <dir>]\n  omgs stage --run <run-dir>\n    Only confirmed test_proven or higher with valid runner-attested proofs. Invalid proofs are excluded and reported; pending drafts stay in HANDOFF.md.\n  omgs handoff --run <run-dir> [--finding <id>]\n  omgs intent propose --run <run-dir>\n  omgs budget --run <run-dir>\n  omgs bench score --cases <manifest> --runs <run-dir> [--runs <run-dir>]...\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--persona builder|inheritor|team] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nBoolean options: --replace, --yes, --dry-run, --install-skills, --verify-mxc, --no-sensors and --live. Every other option takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -95,9 +95,11 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         ),
         "approve" => ("--target", false),
         "report" => (
-            "--findings --out --repo --ref --mode --sandbox --hunters --verifier --agent-calls --accounting",
+            "--findings --out --repo --ref --mode --sandbox --persona --hunters --verifier --agent-calls --accounting",
             false,
         ),
+        "handoff" => ("--run --finding", false),
+        "stage" => ("--run", false),
         "architecture" => ("--in --out", false),
         "ledger" if args.first().is_some_and(|a| a == "list") => ("--ledger", true),
         "ledger" if args.first().is_some_and(|a| a == "add") => {
@@ -107,7 +109,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
             ("--ledger --unit --status --evidence --note", true)
         }
         "gate" => ("--target --base --head --run", false),
-        "stage" | "critic" | "budget" => ("--run", false),
+        "critic" | "budget" => ("--run", false),
         "status" => (
             "--run --stage --state --label --parent --detail --counter --log --accounting",
             false,
@@ -219,6 +221,7 @@ fn main() -> ExitCode {
         "prove" => cmd_prove(rest),
         "approve" => cmd_approve(rest),
         "report" => cmd_report(rest),
+        "handoff" => cmd_handoff(rest),
         "architecture" => cmd_architecture(rest),
         "ledger" => cmd_ledger(rest),
         "critic" => cmd_critic(rest),
@@ -245,11 +248,6 @@ fn main() -> ExitCode {
             }
         }
     }
-}
-
-fn cmd_stage(args: &[String]) -> Result<(), String> {
-    let run = flag(args, "--run").ok_or("stage requires --run")?;
-    intent_propose(Path::new(&run))
 }
 
 fn cmd_gate(args: &[String]) -> Result<(), String> {
@@ -1236,6 +1234,61 @@ fn cmd_approve(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn write_handoff(
+    dir: &Path,
+    handoff: &omgs::handoff::Handoff,
+    artifact_base: &str,
+) -> Result<(), String> {
+    omgs::runmeta::write_atomic(
+        &dir.join("HANDOFF.md"),
+        &omgs::handoff::markdown_at(handoff, artifact_base),
+    )?;
+    omgs::runmeta::write_atomic(
+        &dir.join("handoff.json"),
+        &format!(
+            "{}\n",
+            serde_json::to_string_pretty(handoff).map_err(|e| e.to_string())?
+        ),
+    )
+}
+
+fn actionable_run(args: &[String]) -> Result<(PathBuf, FindingsFile), String> {
+    let run = PathBuf::from(flag(args, "--run").ok_or("command requires --run <dir>")?);
+    let path = run.join("findings.json");
+    let file = read_findings(&path.to_string_lossy())?;
+    let errors = validate_at(&file, &path.to_string_lossy());
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
+    Ok((run, file))
+}
+
+fn cmd_handoff(args: &[String]) -> Result<(), String> {
+    let (run, file) = actionable_run(args)?;
+    let only = flag(args, "--finding");
+    let h = omgs::handoff::build(&run, &file, only.as_deref())?;
+    write_handoff(&run, &h, "")?;
+    println!("wrote HANDOFF.md and handoff.json in {}", run.display());
+    Ok(())
+}
+
+fn cmd_stage(args: &[String]) -> Result<(), String> {
+    let run = PathBuf::from(flag(args, "--run").ok_or("stage requires --run <dir>")?);
+    let file = read_findings(&run.join("findings.json").to_string_lossy())?;
+    let staged = omgs::handoff::stage_validated(&run, &file)?;
+    for reason in &staged.excluded {
+        eprintln!("{reason}");
+    }
+    omgs::runmeta::write_atomic(&run.join("proposed-tests.patch"), &staged.patch)?;
+    println!("wrote {}", run.join("proposed-tests.patch").display());
+    // Legacy runs can still export retained tests. Policy-aware runs also
+    // produce the owner-reviewable registry and intent proposal.
+    if run.join(omgs::runmeta::FILE).exists() && omgs::runmeta::read(&run)?.contains_key("policy") {
+        intent_propose(&run)?;
+    }
+    Ok(())
+}
+
 fn cmd_report(args: &[String]) -> Result<(), String> {
     let path = flag(args, "--findings").ok_or("report requires --findings <path>")?;
     let out = flag(args, "--out").ok_or("report requires --out <dir>")?;
@@ -1331,27 +1384,14 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             }
         }
     }
-    // Verifier identities recorded on the findings stand in for an unpassed
-    // --verifier. The hunter count is not inferred: hunters that found nothing
-    // or were merged into another record would be missed.
+    // Explicit flags override saved metadata. Verifier identities on findings
+    // are a last resort. Never infer hunter counts from the surviving records:
+    // hunters that found nothing or were merged into another record would be missed.
     let verifier_ids: std::collections::BTreeSet<String> = file
         .findings
         .iter()
         .filter_map(|f| identity(&f.verified_by))
         .collect();
-    let hunters = flag(args, "--hunters").and_then(|s| s.parse::<u32>().ok());
-    let verifier = flag(args, "--verifier")
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            (!verifier_ids.is_empty())
-                .then(|| verifier_ids.into_iter().collect::<Vec<_>>().join(", "))
-        });
-    let agent_calls = flag(args, "--agent-calls").and_then(|s| s.parse::<u32>().ok());
-    if hunters.is_none() || verifier.is_none() || agent_calls.is_none() {
-        eprintln!(
-            "warning: run metadata incomplete; pass --hunters <n>, --verifier <id>, and --agent-calls <n>. Unrecorded values render as \"not recorded\"."
-        );
-    }
     if let Some(dir) = findings_dir
         .as_deref()
         .filter(|d| std::fs::symlink_metadata(d.join(omgs::runmeta::FILE)).is_ok())
@@ -1367,23 +1407,76 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         .map(omgs::runmeta::read)
         .transpose()?
         .unwrap_or_default();
+    let hunters = flag(args, "--hunters")
+        .and_then(|s| s.parse::<u32>().ok())
+        .or_else(|| {
+            saved
+                .get("hunters")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+        });
+    let verifier = flag(args, "--verifier")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            saved
+                .get("verifier")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            (!verifier_ids.is_empty())
+                .then(|| verifier_ids.into_iter().collect::<Vec<_>>().join(", "))
+        });
+    let agent_calls = flag(args, "--agent-calls")
+        .and_then(|s| s.parse::<u32>().ok())
+        .or_else(|| {
+            saved
+                .get("agent_calls_used")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+        });
+    if hunters.is_none() || verifier.is_none() || agent_calls.is_none() {
+        eprintln!(
+            "warning: run metadata incomplete; pass --hunters <n>, --verifier <id>, and --agent-calls <n>. Unrecorded values render as \"not recorded\"."
+        );
+    }
     let mut accounting = omgs::accounting::read(&saved)?;
     accounting.extend(supplied_usage.clone());
-    let persona = saved
-        .get("persona")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let report_depth = saved
-        .get("report_depth")
-        .and_then(|v| v.as_str())
-        .unwrap_or("full")
-        .to_string();
-    let meta = ReportMeta {
-        repo: flag(args, "--repo").unwrap_or_else(|| "target".into()),
-        source_ref: flag(args, "--ref").unwrap_or_else(|| "working tree".into()),
-        mode: flag(args, "--mode").unwrap_or_else(|| "advisory".into()),
-        sandbox: flag(args, "--sandbox").unwrap_or_else(|| "not recorded".into()),
+    let persona = flag(args, "--persona")
+        .or_else(|| {
+            saved
+                .get("persona")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    if !persona.is_empty() {
+        omgs::persona::defaults(&persona)?;
+    }
+    let report_depth = if persona == "builder" {
+        "concise"
+    } else {
+        "full"
+    }
+    .to_string();
+    let defaulted = |explicit: Option<String>, key: &str, fallback: &str| {
+        explicit
+            .or_else(|| saved.get(key).and_then(|v| v.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| fallback.into())
+    };
+    let timeline = findings_dir
+        .as_deref()
+        .map(omgs::report::timeline)
+        .transpose()?
+        .unwrap_or_default();
+    let mut meta = ReportMeta {
+        repo: defaulted(flag(args, "--repo"), "repo", "target"),
+        source_ref: defaulted(flag(args, "--ref"), "source_ref", "working tree"),
+        mode: defaulted(flag(args, "--mode"), "mode", "advisory"),
+        sandbox: defaulted(flag(args, "--sandbox"), "sandbox", "not recorded"),
+        artifact_base: String::new(),
+        timeline,
         coverage,
         sensors: sensors_summary,
         hunters,
@@ -1397,14 +1490,23 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         persona,
         report_depth,
     };
+    let handoff = omgs::handoff::build(
+        findings_dir.as_deref().unwrap_or(Path::new(".")),
+        &file,
+        None,
+    )?;
     let dir = Path::new(&out);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    if let Some(run) = &findings_dir {
+        meta.artifact_base = omgs::report::artifact_base(dir, run)?;
+    }
     write_out(dir.join("REPORT.md"), render_markdown(&file, &meta)).map_err(|e| e.to_string())?;
     write_out(dir.join("REPORT.html"), render_html(&file, &meta)).map_err(|e| e.to_string())?;
     write_out(dir.join("findings.sarif.json"), render_sarif(&file, &meta))
         .map_err(|e| e.to_string())?;
+    write_handoff(dir, &handoff, &meta.artifact_base)?;
     println!(
-        "wrote {}, {}, {}",
+        "wrote {}, {}, {}, HANDOFF.md, handoff.json",
         dir.join("REPORT.md").display(),
         dir.join("REPORT.html").display(),
         dir.join("findings.sarif.json").display()
@@ -3305,6 +3407,8 @@ mod cli_tests {
         ("prove", ""),
         ("approve", ""),
         ("report", ""),
+        ("handoff", ""),
+        ("stage", ""),
         ("architecture", ""),
         ("ledger", "list"),
         ("ledger", "add"),
@@ -3332,6 +3436,9 @@ mod cli_tests {
             let name = format!("cmd_{cmd}");
             let mut sections = vec![(name.as_str(), function(source, &name))];
             match (cmd, sub) {
+                ("handoff" | "stage", _) => {
+                    sections.push(("actionable_run", function(source, "actionable_run")));
+                }
                 ("audit", _) => {
                     sections.push(("audit_init", function(source, "audit_init")));
                     sections.push(("audit_init_limited", function(source, "audit_init_limited")));

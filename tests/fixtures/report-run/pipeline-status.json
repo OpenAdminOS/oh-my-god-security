@@ -1,0 +1,29 @@
+{
+  "stages": [
+    {
+      "id": "hunt",
+      "label": "Hunt",
+      "status": "done",
+      "started_ms": 1000,
+      "ended_ms": 3000,
+      "children": [
+        {
+          "id": "red-1",
+          "label": "Tenant boundary",
+          "status": "done",
+          "started_ms": 1100,
+          "ended_ms": 2900,
+          "detail": "One candidate"
+        }
+      ]
+    },
+    {
+      "id": "verify",
+      "label": "Verify",
+      "status": "done",
+      "started_ms": 3000,
+      "ended_ms": 5000,
+      "detail": "Proof retained"
+    }
+  ]
+}

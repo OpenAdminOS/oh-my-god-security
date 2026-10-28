@@ -74,7 +74,7 @@ pub fn apply(dir: &Path, u: &Update) -> Result<(), String> {
 
 /// Check an existing status document against the status schema before it is
 /// updated, so a malformed file is refused rather than carried forward.
-fn check_document(doc: &Map<String, Value>) -> Result<(), String> {
+pub fn check_document(doc: &Map<String, Value>) -> Result<(), String> {
     fn stage(v: &Value, at: &str, nested: bool) -> Result<(), String> {
         let o = v.as_object().ok_or(format!("{at} must be an object"))?;
         for key in ["id", "label"] {
