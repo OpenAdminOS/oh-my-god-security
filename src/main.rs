@@ -1392,7 +1392,13 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
 /// author "recorded" answers.
 fn trusted_store(target: &Path) -> Result<PathBuf, String> {
     let path = omgs::intent::answers_file(&data_dir(), target);
-    if resolve_existing_prefix(&path)?.starts_with(target) {
+    // Publishers replace the leaf atomically. Resolve its stable parent so
+    // canonicalization cannot race that replacement; the leaf is checked
+    // separately here and opened without following links by read_store.
+    let parent = path.parent().ok_or("intent answer store needs a parent")?;
+    let resolved = resolve_existing_prefix(parent)?
+        .join(path.file_name().ok_or("intent answer store needs a name")?);
+    if resolved.starts_with(target) {
         return Err(format!(
             "the intent answer store {} resolves inside the target {}; refusing to use it",
             path.display(),
