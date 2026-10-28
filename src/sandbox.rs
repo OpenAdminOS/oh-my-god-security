@@ -222,6 +222,7 @@ pub enum Tier {
 }
 
 pub struct ProveRequest {
+    pub expect_marker: Option<String>,
     pub command: String,
     pub test: Option<String>,
     pub timeout_ms: u64,
@@ -293,7 +294,8 @@ pub fn toolchain_roots(os: &str, home: Option<&Path>) -> Vec<PathBuf> {
             "/usr/local/lib".into(),
             "/usr/local/microsoft".into(),
         ],
-        "linux" => vec!["/opt".into(), "/usr/local".into()],
+        // MXC mounts system binaries/libraries, but not compiler headers.
+        "linux" => vec!["/opt".into(), "/usr/local".into(), "/usr/include".into()],
         "windows" => vec![
             r"C:\Program Files\PowerShell\7".into(),
             r"C:\Program Files\nodejs".into(),
@@ -418,6 +420,8 @@ fn link_dir(to: &Path, link: &Path) -> std::io::Result<()> {
 /// Everything that varies per run, kept separate from probing the host so
 /// the config is testable.
 pub struct ConfigInput<'a> {
+    /// Declaration and nonce bound to the saved config and command.
+    pub contract: Option<(&'a str, &'a str)>,
     pub os: &'a str,
     pub containment: &'a str,
     pub command: &'a str,
@@ -442,6 +446,7 @@ pub fn environment_keys(os: &str) -> Vec<&'static str> {
             "TEMP",
             "TMP",
             "PATH",
+            "PATHEXT",
         ]
     } else {
         vec![
@@ -456,7 +461,13 @@ pub fn environment_keys(os: &str) -> Vec<&'static str> {
     if os == "macos" {
         keys.push("OPENSSL_CONF");
     }
-    keys.extend(["CARGO_HOME", "CARGO_NET_OFFLINE", "RUSTUP_HOME"]);
+    keys.extend([
+        "CARGO_HOME",
+        "CARGO_NET_OFFLINE",
+        "RUSTUP_HOME",
+        "RUSTUP_AUTO_INSTALL",
+        "OMGS_PROOF_CONTRACT",
+    ]);
     keys
 }
 
@@ -473,7 +484,8 @@ pub fn environment(
             format!("LOCALAPPDATA={scratch}"),
             format!("TEMP={scratch}"),
             format!("TMP={scratch}"),
-            "PATH=C:\\Windows\\System32;C:\\Windows;C:\\Program Files\\PowerShell\\7;C:\\Program Files\\nodejs;C:\\Program Files\\Git\\cmd".into(),
+            format!("PATH={system_root}\\System32;{system_root};C:\\Program Files\\PowerShell\\7;C:\\Program Files\\nodejs;C:\\Program Files\\Git\\cmd"),
+            "PATHEXT=.COM;.EXE;.BAT;.CMD".into(),
         ]
     } else {
         let mut path = if os == "macos" {
@@ -508,6 +520,7 @@ pub fn environment(
             env.push(format!("RUSTUP_HOME={}", mxc_path(rh)));
         }
     }
+    env.push("RUSTUP_AUTO_INSTALL=0".into());
     env
 }
 
@@ -536,7 +549,14 @@ pub fn supervisor_timeout_ms(os: &str, timeout_ms: u64) -> u64 {
 
 pub fn mxc_config_at(input: &ConfigInput, system_root: &str) -> serde_json::Value {
     let scratch = mxc_path(input.scratch);
-    let env = environment(input.os, &scratch, input.rust.as_ref(), system_root);
+    let mut env = environment(input.os, &scratch, input.rust.as_ref(), system_root);
+    env.push(format!(
+        "OMGS_PROOF_CONTRACT={}",
+        input.contract.map(|(m, _)| m).unwrap_or("none")
+    ));
+    if let Some((_, nonce)) = input.contract {
+        env.push(format!("OMGS_PROOF_NONCE={nonce}"));
+    }
     let mut readonly: Vec<String> = input.readonly.iter().map(|p| mxc_path(p)).collect();
     if let Some(m) = input.allowed_marker {
         readonly.push(mxc_path(m));
@@ -1186,6 +1206,15 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         path: req.run_dir.clone(),
         armed: true,
     };
+    if req
+        .expect_marker
+        .as_ref()
+        .is_some_and(|m| !crate::proof::valid_expect_marker(m))
+    {
+        return ProveOutcome::Blocked {
+            reason: "invalid boundary marker contract".into(),
+        };
+    }
     if let Err(reason) = validate_input(&req.command, req.timeout_ms) {
         return ProveOutcome::Blocked { reason };
     }
@@ -1324,8 +1353,24 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         Ok(staged) => staged,
         Err(reason) => return blocked(reason),
     };
+    #[cfg(target_os = "macos")]
+    {
+        let safe = supervise::capture_root().and_then(|root| {
+            let grants: Vec<_> = [&workspace, &scratch]
+                .into_iter()
+                .chain(readonly.iter())
+                .cloned()
+                .chain(markers.iter().map(|m| m.allowed.clone()))
+                .collect();
+            supervise::validate_capture_grants(&root, &grants)
+        });
+        if let Err(e) = safe {
+            return blocked(format!("unsafe capture location: {e}"));
+        }
+    }
     extra_gaps.extend(windows_gaps);
     let mut input = ConfigInput {
+        contract: req.expect_marker.as_deref().map(|m| (m, nonce.as_str())),
         os,
         containment: located.executor.containment,
         command: &wrapped,
@@ -1401,7 +1446,13 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             return blocked(reason);
         }
         let cmd = preflight::workload_command(&executor, &config_path, &run_dir);
-        let run = supervise::run_marked(cmd, &limits, markers.as_ref(), &nonce);
+        let run = supervise::run_contracted(
+            cmd,
+            &limits,
+            markers.as_ref(),
+            &nonce,
+            req.expect_marker.as_deref(),
+        );
         #[cfg(windows)]
         let run = {
             let mut run = run;
@@ -1527,9 +1578,42 @@ mod tests {
     }
 
     #[test]
+    fn linux_system_headers_are_an_explicit_readonly_grant() {
+        assert!(toolchain_roots("linux", None).contains(&PathBuf::from("/usr/include")));
+        let input = ConfigInput {
+            contract: None,
+            os: "linux",
+            containment: "bubblewrap",
+            command: "exit 0",
+            timeout_ms: 1000,
+            workspace: Path::new("/tmp/workspace"),
+            scratch: Path::new("/tmp/scratch"),
+            allowed_marker: None,
+            readonly: vec![PathBuf::from("/usr/include")],
+            denied: vec![],
+            rust: None,
+            list_parents: false,
+        };
+        let config = mxc_config(&input);
+        let text = serde_json::to_string(&config).unwrap();
+        assert!(text.contains("/usr/include"));
+        assert!(config["filesystem"]["readwritePaths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p != "/usr/include"));
+        assert!(config["filesystem"]["readonlyPaths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p == "/usr/include"));
+    }
+
+    #[test]
     fn blocked_proofs_remove_their_staging_directory() {
         let d = std::env::temp_dir().join(format!("omgs-blocked-{}", std::process::id()));
         let req = |command: &str| ProveRequest {
+            expect_marker: None,
             command: command.into(),
             test: None,
             timeout_ms: 1000,
@@ -1570,33 +1654,39 @@ mod tests {
     #[test]
     fn environment_allowlist_matches_every_emitted_key() {
         for os in ["macos", "linux", "windows"] {
-            let config = mxc_config(&ConfigInput {
-                os,
-                containment: "test",
-                command: "echo test",
-                timeout_ms: 1000,
-                workspace: Path::new("/run/workspace"),
-                scratch: Path::new("/run/scratch"),
-                allowed_marker: None,
-                readonly: vec![],
-                denied: vec![],
-                rust: Some(RustHomes {
-                    bin: "/tools/bin".into(),
-                    cargo_home: "/run/scratch/cargo-home".into(),
-                    rustup_home: Some("/tools/rustup".into()),
-                }),
-                list_parents: false,
-            });
-            let mut keys: Vec<_> = config["process"]["env"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_str().unwrap().split_once('=').unwrap().0)
-                .collect();
-            let mut expected = environment_keys(os);
-            keys.sort_unstable();
-            expected.sort_unstable();
-            assert_eq!(keys, expected, "{os}");
+            for contract in [None, Some(("BOUNDARY", "nonce"))] {
+                let config = mxc_config(&ConfigInput {
+                    contract,
+                    os,
+                    containment: "test",
+                    command: "echo test",
+                    timeout_ms: 1000,
+                    workspace: Path::new("/run/workspace"),
+                    scratch: Path::new("/run/scratch"),
+                    allowed_marker: None,
+                    readonly: vec![],
+                    denied: vec![],
+                    rust: Some(RustHomes {
+                        bin: "/tools/bin".into(),
+                        cargo_home: "/run/scratch/cargo-home".into(),
+                        rustup_home: Some("/tools/rustup".into()),
+                    }),
+                    list_parents: false,
+                });
+                let mut keys: Vec<_> = config["process"]["env"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().split_once('=').unwrap().0)
+                    .collect();
+                let mut expected = environment_keys(os);
+                if contract.is_some() {
+                    expected.push("OMGS_PROOF_NONCE");
+                }
+                keys.sort_unstable();
+                expected.sort_unstable();
+                assert_eq!(keys, expected, "{os}");
+            }
         }
     }
 
@@ -1795,6 +1885,8 @@ mod tests {
             command_started: false,
             command_finished: false,
             test_reachable: None,
+            boundary_marker_seen: false,
+            authorized_control_seen: false,
             enumerate_rejected: true,
             executor_error: true,
             killed: false,
@@ -1839,6 +1931,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("omgs-refusal-no-config-{}", std::process::id()));
         let before = preflight::config_invocations();
         let request = ProveRequest {
+            expect_marker: None,
             command: "echo must-not-run".into(),
             test: None,
             timeout_ms: 1000,

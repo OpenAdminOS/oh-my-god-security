@@ -219,6 +219,13 @@ pub fn sensors(text: &str) -> Result<crate::sensors::SensorsReport, String> {
 pub fn proof(text: &str) -> Result<crate::proof::ProofRecord, String> {
     parse(text, "proof", |v| {
         let top = object(v, "document")?;
+        if top.get("schema").and_then(|s| s.as_str()) != Some(crate::proof::SCHEMA) {
+            return Err(format!("proof record predates the current policy or has an unsupported schema; rerun omgs prove to create a {} record", crate::proof::SCHEMA));
+        }
+        object(
+            top.get("contract").ok_or("contract is required")?,
+            "contract",
+        )?;
         objects(
             top.get("survivors").ok_or("survivors is required")?,
             "survivors",

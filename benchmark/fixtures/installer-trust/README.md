@@ -26,13 +26,15 @@ upholds all of them and the control, and exits zero.
 ## Run it through the sandbox (the expected path)
 
 ```
-omgs prove --target benchmark/fixtures/installer-trust \
-  --cmd 'swiftc main.swift vulnerable/Verifier.swift -o "$TMPDIR/probe" && "$TMPDIR/probe"'
+omgs prove --target benchmark/fixtures/installer-trust --test main.swift \
+  --expect-marker BOUNDARY_ASSERTION_FAILED \
+  --cmd 'swiftc main.swift vulnerable/Verifier.swift -o "$TMPDIR/probe" || exit 2; "$TMPDIR/probe"'
 ```
 
 The vulnerable snapshot makes the invariant harness fail, which is the tier 1 `test_proven` evidence
 of the defect. Swap `vulnerable` for `fixed` and the same command succeeds. The proof needs only a
-Swift toolchain and the OMGS sandbox backend; it never needs root, a real installer, Gatekeeper, or a
+Swift toolchain and the OMGS sandbox backend; the harness emits nonce-qualified
+control and boundary markers under the declared recipe contract; it never needs root, a real installer, Gatekeeper, or a
 dedicated host.
 
 Benign lines may appear in the output, such as `xcodebuild` reporting that it could not read

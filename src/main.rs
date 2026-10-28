@@ -57,7 +57,7 @@ fn has(args: &[String], name: &str) -> bool {
 
 fn usage() {
     eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--hunter <id>] [--verifier <id>]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
+        "omgs {}\n\nUsage:\n  omgs setup [--yes] [--from <skill-dir>]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--hunter <id>] [--verifier <id>]\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--hunters <n>] [--verifier <id>] [--agent-calls <n>]\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nEvery option except --yes, --no-sensors and --live takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -78,7 +78,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "validate" => ("--findings", false),
         "fingerprint" => ("--attack-class --entry-point --sink --boundary", false),
         "prove" => (
-            "--cmd --target --run --finding --test --test-from --replay --tier --timeout-ms",
+            "--cmd --target --run --finding --test --test-from --expect-marker --replay --tier --timeout-ms",
             false,
         ),
         "approve" => ("--target", false),
@@ -336,6 +336,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
                 .as_ref()
                 .ok_or("--replay needs --run <run-dir>, the run that holds the record")?;
             for conflicting in [
+                "--expect-marker",
                 "--cmd",
                 "--finding",
                 "--test",
@@ -360,6 +361,16 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         Some(r) => omgs::proof::recorded_command(run.as_ref().unwrap(), r)?,
         None => flag(args, "--cmd").ok_or("prove requires --cmd <command>")?,
     };
+    let expect_marker = match &replay {
+        Some(r) => r.contract.expect_marker().map(String::from),
+        None => flag(args, "--expect-marker"),
+    };
+    if expect_marker
+        .as_ref()
+        .is_some_and(|m| !omgs::proof::valid_expect_marker(m))
+    {
+        return Err("--expect-marker must be 1..=128 ASCII letters, digits or underscores, distinct from AUTHORIZED_CONTROL_OK and OMGS_ markers".into());
+    }
     let timeout_ms: u64 = match flag(args, "--timeout-ms") {
         Some(v) => v
             .parse()
@@ -629,6 +640,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         None => None,
     };
     let request = ProveRequest {
+        expect_marker: expect_marker.clone(),
         command: command.clone(),
         test: test.clone(),
         timeout_ms,
@@ -686,6 +698,14 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         started_at_ms,
         duration_ms: s.duration_ms,
         exit_code: s.exit_code,
+        contract: match expect_marker {
+            Some(expect_marker) => omgs::proof::Contract::Recipe {
+                expect_marker,
+                boundary_marker_seen: s.boundary_marker_seen,
+                authorized_control_seen: s.authorized_control_seen,
+            },
+            None => omgs::proof::Contract::None,
+        },
         timed_out: s.timed_out,
         capture_complete: s.capture_complete,
         cleanup_complete: s.cleanup_complete,
@@ -806,10 +826,8 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         if !record.clean() {
             reasons.push("run did not finish cleanly");
         }
-        if !matches!(record.exit_code, Some(0..=125)) {
-            reasons.push("exit 126, 127, a signal or an invalid exit cannot support a proof");
-        } else if !rejected && !record.assertion_failure() {
-            reasons.push("a non-rejected finding needs assertion failure exit 1..=125");
+        if !record.supports_verdict(rejected) {
+            reasons.push("proof requires assertion exit 1 or 3..=125; exit 2 is a harness or usage error; a declared contract requires exit 1, its nonce-qualified boundary and control markers from full-stream capture");
         }
         let tier_name = if record.tier == "test" {
             "test_proven"
@@ -827,7 +845,10 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     }
     if let Some(orig) = &replay {
         let code = |c: Option<i32>| c.map(|c| c.to_string()).unwrap_or_else(|| "none".into());
-        let same = record.exit_code == orig.exit_code && record.clean() && orig.clean();
+        let same = record.exit_code == orig.exit_code
+            && record.contract == orig.contract
+            && record.clean()
+            && orig.clean();
         eprintln!(
             "replay of {}: recorded exit {}, replayed exit {}: {}",
             omgs::proof::reference(orig.n),
@@ -846,6 +867,47 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     } else {
         Err("__EXIT1__".into())
     }
+}
+
+fn doctor_probe_command(name: &str) -> String {
+    match name {
+        "sh" => "sh -c 'exit 0'".into(),
+        "java" => "java -version".into(),
+        "go" => "go version".into(),
+        _ => format!("{name} --version"),
+    }
+}
+
+fn doctor_tool_failure(name: &str, reason: &str) -> String {
+    format!(
+        "{name} on host PATH but failed to launch inside MXC\n  reason: {}",
+        omgs::platform::escape_controls(reason)
+    )
+}
+
+fn doctor_probe_result(run: &omgs::supervise::Supervised) -> Result<(), String> {
+    if run.success
+        && run.command_started
+        && run.command_finished
+        && run.capture_complete
+        && run.cleanup_complete
+        && !run.executor_error
+        && !run.timed_out
+        && !run.killed
+        && !run.interrupted
+        && run.survivors.is_empty()
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "timeout={}, capture_complete={}, cleanup_complete={}, executor_error={}, exit={:?}; {}",
+        run.timed_out,
+        run.capture_complete,
+        run.cleanup_complete,
+        run.executor_error,
+        run.exit_code,
+        run.output
+    ))
 }
 
 /// What this machine can and cannot do for OMGS. Executes no target code;
@@ -930,8 +992,15 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             .collect()
     };
     let tools = found(&[
-        "swiftc", "cargo", "clang", "python3", "node", "npm", "pwsh", "go", "dotnet", "java",
+        "sh", "swiftc", "cargo", "clang", "python3", "node", "npm", "pwsh", "go", "dotnet", "java",
     ]);
+    for name in [
+        "sh", "swiftc", "cargo", "clang", "python3", "node", "npm", "pwsh", "go", "dotnet", "java",
+    ] {
+        if !tools.iter().any(|t| t == name) {
+            println!("{name} not on host PATH");
+        }
+    }
     println!(
         "toolchains on PATH: {}",
         if tools.is_empty() {
@@ -957,7 +1026,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         println!("hint: this kernel restricts unprivileged user namespaces (Ubuntu 24.04 and later). MXC needs them; see the README section on Linux for the AppArmor profile.");
     }
     if os == "windows" {
-        println!("note: PowerShell under MXC needs an interactive desktop session; over SSH (session 0) pwsh fails to start while cmd works.");
+        println!("note: upstream MXC issue https://github.com/microsoft/mxc/issues/1465 reports STATUS_DLL_INIT_FAILED for toolchains in Windows session 0; use an existing interactive desktop session when affected.");
     }
     if !ready {
         if has(args, "--live") {
@@ -994,6 +1063,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             format!("cat {inside_test}; cat '{}'", secret.display())
         };
         let request = ProveRequest {
+            expect_marker: None,
             command: cmd,
             test: Some(inside_test.into()),
             timeout_ms: 30_000,
@@ -1059,66 +1129,39 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         for g in &outcome.gaps {
             println!("  not enforced: {}", omgs::platform::escape_controls(g));
         }
-        // A toolchain on the host PATH may still be out of reach inside, for
-        // example under a version manager in the home directory.
-        let names: Vec<&str> = tools.iter().map(|t| t.as_str()).collect();
-        let cmd = if os == "windows" {
-            format!(
-                "cmd.exe /d /c for %t in ({}) do @where %t && echo omgs-reach %t",
-                names.join(" ")
-            )
-        } else {
-            format!(
-                "for t in {}; do command -v $t >/dev/null 2>&1 && echo omgs-reach $t; done; exit 0",
-                names.join(" ")
-            )
-        };
-        let reach = ProveRequest {
-            command: cmd,
-            test: None,
-            timeout_ms: 30_000,
-            target: None,
-            run_dir: probe.join("reach"),
-            tier: Tier::Test,
-            stage: None,
-            expected_tree_sha256: None,
-        };
-        let reach_outcome = match prove(&reach) {
-            ProveOutcome::Ran(r) => r,
-            ProveOutcome::Blocked { reason } => {
-                let _ = std::fs::remove_dir_all(&probe);
-                eprintln!(
-                    "needs_validation: target code was not executed. {}",
-                    omgs::platform::escape_controls(&reason)
-                );
-                return Err("__EXIT3__".into());
-            }
-        };
-        {
-            let r = reach_outcome;
-            let found = |n: &str| {
-                r.run
-                    .output
-                    .lines()
-                    .any(|l| l.trim() == format!("omgs-reach {n}"))
+        let mut inside = Vec::new();
+        for name in &tools {
+            // Separate deadlines keep one hanging tool from hiding the rest.
+            let reach = ProveRequest {
+                expect_marker: None,
+                command: doctor_probe_command(name),
+                test: None,
+                timeout_ms: 3_000,
+                target: None,
+                run_dir: probe.join(format!("reach-{name}")),
+                tier: Tier::Test,
+                stage: None,
+                expected_tree_sha256: None,
             };
-            let (inside, outside): (Vec<&str>, Vec<&str>) =
-                names.iter().copied().partition(|n| found(n));
-            println!(
-                "toolchains reachable inside the sandbox: {}",
-                if inside.is_empty() {
-                    "none".into()
-                } else {
-                    inside.join(", ")
+            let result = match prove(&reach) {
+                ProveOutcome::Ran(r) => doctor_probe_result(&r.run),
+                ProveOutcome::Blocked { reason } => Err(reason),
+            };
+            match result {
+                Ok(()) => inside.push(name.as_str()),
+                Err(reason) => {
+                    println!("{}", doctor_tool_failure(name, &reason));
                 }
-            );
-            if !outside.is_empty() {
-                println!(
-                    "on PATH here but NOT reachable inside the sandbox: {} (proofs that need them fail; install them system wide)",
-                    outside.join(", ")
-                );
             }
         }
+        println!(
+            "toolchains reachable inside the sandbox: {}",
+            if inside.is_empty() {
+                "none".into()
+            } else {
+                inside.join(", ")
+            }
+        );
         let _ = std::fs::remove_dir_all(&probe);
     }
     Ok(())
@@ -2570,6 +2613,45 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod cli_tests {
+    #[test]
+    fn doctor_shell_probe_and_unreachable_reasons() {
+        assert_eq!(super::doctor_probe_command("sh"), "sh -c 'exit 0'");
+        assert_eq!(
+            super::doctor_tool_failure("node", "timeout=true"),
+            "node on host PATH but failed to launch inside MXC\n  reason: timeout=true"
+        );
+        let limits = omgs::supervise::Limits {
+            wall_ms: 100,
+            cpu_secs: None,
+            file_size_bytes: None,
+            open_files: None,
+            memory_bytes: None,
+            tasks: None,
+            output_cap_bytes: 1024,
+        };
+        #[cfg(unix)]
+        let mut command = std::process::Command::new("/bin/sh");
+        #[cfg(unix)]
+        command.args(["-c", "sleep 10"]);
+        #[cfg(windows)]
+        let mut command = std::process::Command::new("cmd.exe");
+        #[cfg(windows)]
+        command.args(["/d", "/c", "for /l %i in (1,0,2) do @rem"]);
+        let mut run = omgs::supervise::run(command, &limits, None);
+        assert!(super::doctor_probe_result(&run)
+            .unwrap_err()
+            .contains("timeout=true"));
+        run.timed_out = false;
+        run.success = true;
+        run.command_started = true;
+        run.command_finished = true;
+        run.capture_complete = false;
+        assert!(super::doctor_probe_result(&run).is_err());
+        run.capture_complete = true;
+        run.executor_error = true;
+        assert!(super::doctor_probe_result(&run).is_err());
+    }
+
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
