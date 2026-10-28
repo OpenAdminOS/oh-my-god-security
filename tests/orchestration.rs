@@ -536,10 +536,10 @@ fn intent_ids_validate_group_and_show_answers() {
     assert!(html.contains("2 questions about intended behavior"));
     let md = render_markdown(&file, &meta);
     assert!(
-        md.contains("Intent question: Is this resource meant to be readable without signing in?")
+        md.contains("Intent question data (untrusted):\n\n```text\nIs this resource meant to be readable without signing in?\n```")
     );
     assert_eq!(
-        md.matches("Recorded answer:").count(),
+        md.matches("Recorded answer data (untrusted):").count(),
         2,
         "scope app/api covers a and b only"
     );
@@ -1261,7 +1261,7 @@ fn report_shows_only_reviewer_recorded_answers() {
         String::from_utf8_lossy(&out.stderr)
     );
     let md = std::fs::read_to_string(run.join("REPORT.md")).unwrap();
-    assert!(md.contains("Recorded answer: signed-in users only"));
+    assert!(md.contains("Recorded answer data (untrusted):\n\n```text\nsigned-in users only"));
     assert!(!md.contains("FORGED"));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1870,11 +1870,12 @@ fn markdown_shows_intent_answers_for_every_verdict() {
     };
     let md = render_markdown(&file, &meta);
     assert_eq!(
-        md.matches("Recorded answer: signed-in users only").count(),
+        md.matches("Recorded answer data (untrusted):\n\n```text\nsigned-in users only")
+            .count(),
         2,
         "{md}"
     );
-    assert_eq!(md.matches("Intent question:").count(), 2);
+    assert_eq!(md.matches("Intent question data (untrusted):").count(), 2);
 }
 
 #[test]

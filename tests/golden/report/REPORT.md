@@ -40,7 +40,11 @@ Proof record: [proofs/1.json](proofs/1.json)
 
 #### Fix brief
 
+Fix brief data (untrusted):
+
+```text
 Bind the order to the trusted caller before returning data. Keep the owner success control.
+```
 
 Entry point: GET /orders/:id
 
@@ -48,7 +52,7 @@ Sink: orders.load
 
 Boundary: tenant
 
-Class: tenant_isolation
+Class: tenant&#95;isolation
 
 Hunted by: red-1
 
@@ -56,20 +60,46 @@ Verified by: blue-1
 
 #### Evidence
 
+Evidence data (untrusted):
+
+```text
 A dummy caller reads another account order.
+```
 
 ##### Trace
 
+Evidence data (untrusted):
+
+```text
 request id reaches orders.load.
+```
 
 ##### Sandbox evidence
 
+Evidence data (untrusted):
+
+```text
 the invariant fails and the authorized control succeeds.
+```
 
 #### Trace steps
 
-1. src/orders.ts:12: Untrusted order id reaches the loader.
-2. src/store.ts:8: The lookup does not bind the order to the caller.
+1. src/orders.ts:12
+
+Trace note data (untrusted):
+
+```text
+Untrusted order id reaches the loader.
+```
+
+2. src/store.ts:8
+
+Trace note data (untrusted):
+
+```text
+The lookup does not bind the order to the caller.
+```
+
 
 
 ## Needs validation
@@ -92,7 +122,7 @@ Sink: orders.load
 
 Boundary: tenant
 
-Class: export_scope
+Class: export&#95;scope
 
 Hunted by: red-1
 
@@ -100,20 +130,46 @@ Verified by: blue-1
 
 #### Evidence
 
+Evidence data (untrusted):
+
+```text
 The export may be public.
+```
 
 ##### Missing fact
 
+Evidence data (untrusted):
+
+```text
 Should exports be restricted to their owner?
+```
 
 ##### Validation plan
 
+Evidence data (untrusted):
+
+```text
 establish intended access before proving the boundary.
+```
 
 #### Trace steps
 
-1. src/orders.ts:12: Untrusted order id reaches the loader.
-2. src/store.ts:8: The lookup does not bind the order to the caller.
+1. src/orders.ts:12
+
+Trace note data (untrusted):
+
+```text
+Untrusted order id reaches the loader.
+```
+
+2. src/store.ts:8
+
+Trace note data (untrusted):
+
+```text
+The lookup does not bind the order to the caller.
+```
+
 
 
 ## Rejected after verification
@@ -136,7 +192,7 @@ Sink: orders.load
 
 Boundary: tenant
 
-Class: search_control
+Class: search&#95;control
 
 Hunted by: red-1
 
@@ -146,12 +202,30 @@ Verified by: blue-1
 
 ##### Counterevidence
 
+Evidence data (untrusted):
+
+```text
 search parameters are escaped before the query.
+```
 
 #### Trace steps
 
-1. src/orders.ts:12: Untrusted order id reaches the loader.
-2. src/store.ts:8: The lookup does not bind the order to the caller.
+1. src/orders.ts:12
+
+Trace note data (untrusted):
+
+```text
+Untrusted order id reaches the loader.
+```
+
+2. src/store.ts:8
+
+Trace note data (untrusted):
+
+```text
+The lookup does not bind the order to the caller.
+```
+
 
 ## Pipeline timeline
 

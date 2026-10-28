@@ -1347,27 +1347,14 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             }
         }
     }
-    // Verifier identities recorded on the findings stand in for an unpassed
-    // --verifier. The hunter count is not inferred: hunters that found nothing
-    // or were merged into another record would be missed.
+    // Explicit flags override saved metadata. Verifier identities on findings
+    // are a last resort. Never infer hunter counts from the surviving records:
+    // hunters that found nothing or were merged into another record would be missed.
     let verifier_ids: std::collections::BTreeSet<String> = file
         .findings
         .iter()
         .filter_map(|f| identity(&f.verified_by))
         .collect();
-    let hunters = flag(args, "--hunters").and_then(|s| s.parse::<u32>().ok());
-    let verifier = flag(args, "--verifier")
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            (!verifier_ids.is_empty())
-                .then(|| verifier_ids.into_iter().collect::<Vec<_>>().join(", "))
-        });
-    let agent_calls = flag(args, "--agent-calls").and_then(|s| s.parse::<u32>().ok());
-    if hunters.is_none() || verifier.is_none() || agent_calls.is_none() {
-        eprintln!(
-            "warning: run metadata incomplete; pass --hunters <n>, --verifier <id>, and --agent-calls <n>. Unrecorded values render as \"not recorded\"."
-        );
-    }
     if let Some(dir) = findings_dir
         .as_deref()
         .filter(|d| std::fs::symlink_metadata(d.join(omgs::runmeta::FILE)).is_ok())
@@ -1383,6 +1370,40 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         .map(omgs::runmeta::read)
         .transpose()?
         .unwrap_or_default();
+    let hunters = flag(args, "--hunters")
+        .and_then(|s| s.parse::<u32>().ok())
+        .or_else(|| {
+            saved
+                .get("hunters")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+        });
+    let verifier = flag(args, "--verifier")
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            saved
+                .get("verifier")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            (!verifier_ids.is_empty())
+                .then(|| verifier_ids.into_iter().collect::<Vec<_>>().join(", "))
+        });
+    let agent_calls = flag(args, "--agent-calls")
+        .and_then(|s| s.parse::<u32>().ok())
+        .or_else(|| {
+            saved
+                .get("agent_calls_used")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok())
+        });
+    if hunters.is_none() || verifier.is_none() || agent_calls.is_none() {
+        eprintln!(
+            "warning: run metadata incomplete; pass --hunters <n>, --verifier <id>, and --agent-calls <n>. Unrecorded values render as \"not recorded\"."
+        );
+    }
     let mut accounting = omgs::accounting::read(&saved)?;
     accounting.extend(supplied_usage.clone());
     let persona = flag(args, "--persona")

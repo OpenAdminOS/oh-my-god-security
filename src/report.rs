@@ -1,4 +1,5 @@
 use crate::critic::CriticReport;
+use crate::handoff::{markdown_data, markdown_inline, markdown_link};
 use crate::html_escape;
 use crate::model::{Finding, FindingsFile, Location, Verdict};
 
@@ -65,10 +66,10 @@ fn answers_for(meta: &ReportMeta, f: &Finding) -> Vec<String> {
 /// matching what the HTML card shows.
 fn push_intent(out: &mut String, meta: &ReportMeta, f: &Finding) {
     if let Some(q) = question_of(f) {
-        out.push_str(&format!("Intent question: {q}\n\n"));
+        out.push_str(&markdown_data("Intent question", &q));
     }
     for a in answers_for(meta, f) {
-        out.push_str(&format!("Recorded answer: {a}\n\n"));
+        out.push_str(&markdown_data("Recorded answer", &a));
     }
 }
 
@@ -174,12 +175,12 @@ fn short(meta: &ReportMeta) -> bool {
     meta.persona == "builder"
 }
 fn md_cell(s: &str) -> String {
-    s.replace('|', "\\|").replace(['\r', '\n'], " ")
+    markdown_inline(s)
 }
 fn proof_link(f: &Finding, meta: &ReportMeta) -> String {
     f.proof_ref
         .as_ref()
-        .map(|p| format!("[{}]({}{})", p, meta.artifact_base, p))
+        .map(|p| markdown_link(p, &meta.artifact_base))
         .unwrap_or_else(|| "No executed proof record".into())
 }
 const GLOSSARY: &[(&str, &str)] = &[
@@ -212,17 +213,17 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
             plural(conf.len(), "confirmed finding", "confirmed findings")
         )
     };
-    let mut out = format!("# What this asks of you\n\n{fix}\n\nVerify {} before fixing. {} were rejected after verification and need no action. Answer the intent questions below where recorded.\n\nRepository: {} at {}\nMode: {}\nSandbox: {}\n\nConfirmed findings: {}\nNeeds validation: {pending}\nRejected after verification: {rejected}\n\n", plural(pending, "pending record", "pending records"), plural(rejected, "lead", "leads"), meta.repo, meta.source_ref, meta.mode, meta.sandbox, conf.len());
+    let mut out = format!("# What this asks of you\n\n{fix}\n\nVerify {} before fixing. {} were rejected after verification and need no action. Answer the intent questions below where recorded.\n\nRepository: {} at {}\nMode: {}\nSandbox: {}\n\nConfirmed findings: {}\nNeeds validation: {pending}\nRejected after verification: {rejected}\n\n", plural(pending, "pending record", "pending records"), plural(rejected, "lead", "leads"), markdown_inline(&meta.repo), markdown_inline(&meta.source_ref), markdown_inline(&meta.mode), markdown_inline(&meta.sandbox), conf.len());
     if let Some(sensors) = &meta.sensors {
-        out.push_str(&format!("Sensors: {sensors}\n\n"));
+        out.push_str(&format!("Sensors: {}\n\n", markdown_inline(sensors)));
     }
     out.push_str(&format!(
         "Run: {}\n\nCoverage critic: {}\n\n",
-        run_meta_text(meta),
-        critic_text(meta)
+        markdown_inline(&run_meta_text(meta)),
+        markdown_inline(&critic_text(meta))
     ));
     if let Some(models) = models_text(meta) {
-        out.push_str(&format!("Models: {models}\n\n"));
+        out.push_str(&format!("Models: {}\n\n", markdown_inline(&models)));
     }
     out.push_str("## Index of records\n\n| Ref | Record | Outcome | Proof tier | Proof record |\n| --- | --- | --- | --- | --- |\n");
     let ids = anchors(file);
@@ -250,10 +251,11 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         out.push_str(&format!("\n## {title}\n\n"));
         for r in list {
             let f = r.f;
-            out.push_str(&format!("<a id=\"{}\"></a>\n\n### {}: {}\n\n{}\n\nVerdict: {}. Tier: {}. Severity: {}.\n\nFingerprint: {}\n\nProof record: {}\n\n", r.anchor, r.reference, f.title, location_line(f), verdict_label(f.verdict).1, f.proof_tier.label(), f.severity.map(|s| s.label()).unwrap_or("none"), f.fingerprint, proof_link(f, meta)));
+            out.push_str(&format!("<a id=\"{}\"></a>\n\n### {}: {}\n\n{}\n\nVerdict: {}. Tier: {}. Severity: {}.\n\nFingerprint: {}\n\nProof record: {}\n\n", r.anchor, r.reference, markdown_inline(&f.title), markdown_inline(&location_line(f)), verdict_label(f.verdict).1, f.proof_tier.label(), f.severity.map(|s| s.label()).unwrap_or("none"), markdown_inline(&f.fingerprint), proof_link(f, meta)));
             push_intent(&mut out, meta, f);
             if let Some(brief) = &f.fix_brief {
-                out.push_str(&format!("#### Fix brief\n\n{brief}\n\n"));
+                out.push_str("#### Fix brief\n\n");
+                out.push_str(&markdown_data("Fix brief", brief));
             }
             if !short(meta) {
                 for (name, value) in [
@@ -267,21 +269,26 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
                     ("Verified by", f.verified_by.as_deref()),
                 ] {
                     if let Some(value) = value {
-                        out.push_str(&format!("{name}: {value}\n\n"));
+                        out.push_str(&format!("{name}: {}\n\n", markdown_inline(value)));
                     }
                 }
             }
             out.push_str("#### Evidence\n\n");
             for part in split_evidence(&f.evidence) {
                 if let Some(label) = part.label {
-                    out.push_str(&format!("##### {label}\n\n"));
+                    out.push_str(&format!("##### {}\n\n", markdown_inline(&label)));
                 }
-                out.push_str(&format!("{}\n\n", part.body));
+                out.push_str(&markdown_data("Evidence", &part.body));
             }
             if !f.trace.is_empty() {
                 out.push_str("#### Trace steps\n\n");
                 for (i, t) in f.trace.iter().enumerate() {
-                    out.push_str(&format!("{}. {}: {}\n", i + 1, place(&t.location), t.note));
+                    out.push_str(&format!(
+                        "{}. {}\n\n",
+                        i + 1,
+                        markdown_inline(&place(&t.location))
+                    ));
+                    out.push_str(&markdown_data("Trace note", &t.note));
                 }
                 out.push('\n');
             }
@@ -297,8 +304,8 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
                 "| {} | {} | {} | {} | {} |\n",
                 md_cell(&r.label),
                 md_cell(&r.state),
-                r.started,
-                r.ended,
+                md_cell(&r.started),
+                md_cell(&r.ended),
                 md_cell(&r.detail)
             ));
         }
@@ -309,14 +316,14 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         out.push_str("See findings.json and the full coverage ledger for details.\n\n");
     } else {
         for line in &meta.coverage {
-            out.push_str(&format!("- {line}\n"));
+            out.push_str(&format!("- {}\n", markdown_inline(line)));
         }
         out.push('\n');
     }
     if let Some(critic) = meta.critic.as_ref().filter(|c| !c.passed()) {
         out.push_str("### Coverage critic gaps\n\n");
         for gap in &critic.gaps {
-            out.push_str(&format!("- {gap}\n"));
+            out.push_str(&format!("- {}\n", markdown_inline(gap)));
         }
         out.push('\n');
     }
@@ -785,7 +792,7 @@ fn render_finding(r: &Record, meta: &ReportMeta) -> String {
         id = html_escape(&r.anchor),
         reference = html_escape(&r.reference),
         title = html_escape(&f.title),
-        loc = html_escape(&location(f)),
+        loc = std::iter::once(&f.location).chain(&f.locations).map(|l| html_escape(&place(l))).collect::<Vec<_>>().join("</code>, <code>"),
         tags = render_tags(f),
         facts = if short(meta) { String::new() } else { render_facts(f) },
     )
