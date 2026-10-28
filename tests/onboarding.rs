@@ -104,6 +104,15 @@ fn skill_version_and_executor_pins_match_the_binary() {
         include_str!("../skill/VERSION").trim(),
         env!("CARGO_PKG_VERSION")
     );
+    let embedded = omgs::setup::BUNDLED
+        .iter()
+        .find(|(name, _)| *name == "VERSION")
+        .expect("embedded skill VERSION")
+        .1;
+    assert_eq!(
+        std::str::from_utf8(embedded).unwrap().trim(),
+        env!("CARGO_PKG_VERSION")
+    );
     let rows: Vec<_> = include_str!("../skill/mxc-pins.txt")
         .lines()
         .filter(|line| !line.starts_with('#') && !line.is_empty())

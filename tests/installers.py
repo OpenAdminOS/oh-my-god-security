@@ -508,7 +508,7 @@ if ((Normalize-DirectoryArgument '\\server\share\') -cne '\\server\share') { thr
         shell = (ROOT / 'skill/scripts/install.sh').read_text()
         block = shell.split("cat <<'CONSENT'\n")[1].split('\nCONSENT')[0]
         self.assertIn(block, (ROOT / 'skill/scripts/install.ps1').read_text())
-        self.assertIn(block, (ROOT / 'skill/SKILL.md').read_text())
+        self.assertIn(block, (ROOT / 'skill/SETUP.md').read_text())
         for script in ['install.sh', 'install.ps1']:
             source = (ROOT / 'skill/scripts' / script).read_text()
             self.assertNotIn('OMGS_TEST_', source)

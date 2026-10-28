@@ -22,6 +22,10 @@ fn cli(args: &[&str]) -> std::process::Output {
         .output()
         .unwrap()
 }
+fn normalized(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn read(path: &Path) -> Value {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
@@ -171,13 +175,13 @@ fn monorepo_stacks_are_scoped_and_exclude_docs_tests_and_vendor() {
 #[test]
 fn briefs_and_pack_intents_are_complete() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("skill");
-    let skill = std::fs::read_to_string(root.join("SKILL.md")).unwrap();
+    let skill = normalized(&std::fs::read_to_string(root.join("SKILL.md")).unwrap());
     assert!(skill.contains("verbatim"));
     assert!(skill.contains("Do not paraphrase"));
     for role in ["red-hunter", "blue-verifier", "evaluator", "green-fixer"] {
         let path = format!("agents/{role}.md");
         assert!(skill.contains(&path));
-        let brief = std::fs::read_to_string(root.join(path)).unwrap();
+        let brief = normalized(&std::fs::read_to_string(root.join(path)).unwrap());
         for section in [
             "## Inputs",
             "## Allowed reads",
@@ -185,7 +189,7 @@ fn briefs_and_pack_intents_are_complete() {
             "## Exact commands",
             "## Never do",
         ] {
-            assert!(brief.contains(section), "{role}: {section}");
+            assert!(brief.contains(&normalized(section)), "{role}: {section}");
         }
         assert!(brief.contains("outside omgs prove"));
     }
@@ -718,7 +722,7 @@ fn initial_proof_belongs_to_verifier_and_replay_to_evaluator() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let hunter = std::fs::read_to_string(root.join("skill/agents/red-hunter.md")).unwrap();
     assert!(!hunter.lines().any(|l| l.starts_with("omgs prove")));
-    assert!(hunter.contains("Only the verifier runs the initial proof"));
+    assert!(normalized(&hunter).contains("Only the verifier runs the initial proof"));
     for (path, command) in [
         (
             "skill/agents/blue-verifier.md",
@@ -733,7 +737,11 @@ fn initial_proof_belongs_to_verifier_and_replay_to_evaluator() {
             .unwrap()
             .contains(command));
     }
-    let skill = std::fs::read_to_string(root.join("skill/SKILL.md")).unwrap();
+    let skill = std::fs::read_to_string(root.join("skill/PIPELINE.md"))
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(skill
         .contains("Hunters hand proof plans and drafts to the verifier and never execute proofs"));
     assert!(skill.contains("The independent verifier submits"));

@@ -612,6 +612,23 @@ fn setup_detects_only_existing_agents_and_writes_policy_only_on_request() {
             std::fs::read(source.join("SKILL.md")).unwrap()
         );
         assert!(installed.join("schemas/policy.schema.json").is_file());
+        for name in [
+            "PIPELINE.md",
+            "PROOF-CONTRACT.md",
+            "PROOF-RECIPES.md",
+            "POLICY-AND-GATE.md",
+            "BUDGETS-AND-ROUTING.md",
+            "EXECUTION-SAFETY.md",
+            "SETUP.md",
+            "HANDOFF-AND-PROGRESS.md",
+            "DECISION-RULES.md",
+        ] {
+            assert_eq!(
+                std::fs::read(installed.join(name)).unwrap(),
+                std::fs::read(source.join(name)).unwrap(),
+                "{name}"
+            );
+        }
     }
     assert!(!home.join(".agents").exists());
     assert!(!home.join(".cursor").exists());
@@ -1086,6 +1103,8 @@ fn default_setup_ignores_adjacent_and_checkout_sidecars() {
         .unwrap();
     assert!(result.status.success(), "{}", output(&result));
     let installed = home.join(".agents/skills").join(omgs::setup::SKILL_NAME);
+    assert!(installed.join("HANDOFF-AND-PROGRESS.md").is_file());
+    assert!(!installed.join("HANDOFF.md").exists());
     for (path, bytes) in omgs::setup::BUNDLED {
         assert_eq!(std::fs::read(installed.join(path)).unwrap(), *bytes);
     }
