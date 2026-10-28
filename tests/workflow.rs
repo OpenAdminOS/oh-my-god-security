@@ -1338,7 +1338,12 @@ fn saved_configs_are_checked_even_when_their_digest_matches() {
             serde_json::json!(["/"]),
             "readwritePaths",
         ),
-        ("/process/timeout", serde_json::json!(0), "timeout"),
+        // The other platform's timeout policy: Windows saves 0, Unix the budget.
+        (
+            "/process/timeout",
+            serde_json::json!(if cfg!(windows) { 1000 } else { 0 }),
+            "timeout",
+        ),
         ("/process/timeout", serde_json::json!(2000), "timeout"),
         (
             "/filesystem/readonlyPaths",
