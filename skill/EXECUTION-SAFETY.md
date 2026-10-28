@@ -50,3 +50,10 @@ unresolved links are disclosed as a counted proof gap and remain subject to sand
 Small trust files use bounded, single-link, no-follow reads. On macOS and Linux, SIGINT, SIGTERM and
 SIGHUP during preparation remove the proof directory and release a charged reservation; once
 execution begins, interrupted runs retain their charge and an unclean record.
+
+## Role-written artifacts
+
+On Unix set `umask 077` before writing role artifacts, create directories with mode 0700 and files
+with mode 0600, including candidates, dispositions and draft proofs. On Windows use owner-private
+ACLs consistent with the initialized run. The private outer directory protects nested artifacts,
+but it is not permission to export them into shared locations. Never copy secrets into tool notes.

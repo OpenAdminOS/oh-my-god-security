@@ -172,3 +172,8 @@ databases and unapplied resource limits, in the handoff.
    `OUTPUT_DIR`, alongside the `ARCHITECTURE.md` and `ARCHITECTURE.html` map from the Map phase.
    Report confirmed findings with tier and severity, pending questions, exact blockers, what was not
    examined, and mode/budget/model/sandbox metadata. Do not publish a score or coverage percentage.
+
+If budget or a provider block prevents resolving a late lead, record a blocked or deferred ledger
+unit and preserve the pending fact. Render a partial handoff with the critic gaps visible rather
+than losing completed evidence. A partial report is not a completed review or a critic pass;
+`run_status: partial` marks artifact delivery only. Resume in a follow-up run with explicit scope.

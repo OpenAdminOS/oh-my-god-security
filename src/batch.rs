@@ -120,6 +120,26 @@ pub fn parse_batch(text: &str) -> Result<BatchFile, String> {
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
+/// Refusals stay visible even when a configured fallback successfully routes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RefusalEvent {
+    pub role: String,
+    pub from: String,
+    pub to: Option<String>,
+    pub reason: Option<String>,
+}
+impl RefusalEvent {
+    fn description(&self) -> String {
+        format!(
+            "{}: {} refused; next {}; reason {}",
+            self.role,
+            self.from,
+            self.to.as_deref().unwrap_or("none"),
+            self.reason.as_deref().unwrap_or("not recorded")
+        )
+    }
+}
+
 /// What the index shows for one run, gathered from its run directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunSummary {
@@ -133,19 +153,9 @@ pub struct RunSummary {
     /// Critic gaps, blocked units, init errors, and exhausted model routes.
     pub blockers: Vec<String>,
     pub agent_calls: Option<u64>,
+    pub budget: Option<String>,
     pub reroutes: usize,
-}
-
-/// Contents of `path`, `None` only when no entry exists. Anything present
-/// but unreadable (a dangling link, a directory, bad permissions) is an error.
-fn read_present(path: &Path) -> Result<Option<String>, String> {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("inspect {}: {e}", path.display())),
-        Ok(_) => std::fs::read_to_string(path)
-            .map(Some)
-            .map_err(|e| format!("read {}: {e}", path.display())),
-    }
+    pub refusal_events: Vec<RefusalEvent>,
 }
 
 /// The run metadata fields the index reads must have their documented
@@ -209,7 +219,11 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
         return Ok(s);
     };
     let at = |name: &str, e: String| format!("{}: {name}: {e}", dir.display());
-    match read_present(&dir.join("findings.json"))? {
+    match crate::run_artifact::optional_text(
+        dir,
+        Path::new("findings.json"),
+        crate::run_artifact::FINDINGS_BYTES,
+    )? {
         Some(text) => {
             use crate::model::Verdict;
             let f = crate::shape::findings(&text).map_err(|e| at("findings.json", e))?;
@@ -223,23 +237,42 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
         }
         None => s.blockers.push("findings.json missing".into()),
     }
-    if read_present(&dir.join(crate::runmeta::FILE))?.is_some() {
+    if crate::run_artifact::optional_text(
+        dir,
+        Path::new(crate::runmeta::FILE),
+        crate::run_artifact::METADATA_BYTES,
+    )?
+    .is_some()
+    {
         let meta = crate::runmeta::read(dir)?;
         check_meta_types(&meta).map_err(|e| at(crate::runmeta::FILE, e))?;
         if let Some(st) = meta.get("run_status").and_then(|v| v.as_str()) {
             s.state = st.to_string();
         }
+        s.budget = Some(crate::budget::summary(dir)?);
         s.agent_calls = meta.get("agent_calls_used").and_then(|v| v.as_u64());
         s.reroutes = meta
             .get("reroutes")
             .and_then(|v| v.as_array())
             .map_or(0, |a| a.len());
+        if let Some(events) = meta.get("reroutes").and_then(|v| v.as_array()) {
+            s.refusal_events = events
+                .iter()
+                .cloned()
+                .map(serde_json::from_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("invalid refusal history: {e}"))?;
+        }
         if let Some(blocked) = meta.get("blockers").and_then(|v| v.as_array()) {
             s.blockers
                 .extend(blocked.iter().filter_map(|b| b.as_str()).map(String::from));
         }
     }
-    if let Some(text) = read_present(&dir.join("coverage-ledger.json"))? {
+    if let Some(text) = crate::run_artifact::optional_text(
+        dir,
+        Path::new("coverage-ledger.json"),
+        crate::run_artifact::LEDGER_BYTES,
+    )? {
         let ledger = crate::shape::ledger(&text).map_err(|e| at("coverage-ledger.json", e))?;
         for u in ledger.units.iter().filter(|u| u.status == "blocked") {
             s.blockers.push(format!("blocked unit {}", u.id));
@@ -271,10 +304,10 @@ pub fn render_index_markdown(runs: &[RunSummary]) -> String {
         total(|r| r.rejected),
         agent_total(runs)
     ));
-    out.push_str("| Repository | State | Confirmed | Needs validation | Rejected | Agent calls | Reroutes | Blockers |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    out.push_str("| Repository | State | Confirmed | Needs validation | Rejected | Agent calls | Cumulative budget | Reroutes | Refusals and provider blocks | Blockers |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
     for r in runs {
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
             md_cell(&r.url),
             md_cell(&r.state),
             r.confirmed,
@@ -282,7 +315,15 @@ pub fn render_index_markdown(runs: &[RunSummary]) -> String {
             r.rejected,
             r.agent_calls
                 .map_or("not recorded".into(), |n| n.to_string()),
+            md_cell(r.budget.as_deref().unwrap_or("not recorded")),
             r.reroutes,
+            md_cell(
+                &r.refusal_events
+                    .iter()
+                    .map(RefusalEvent::description)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
             if r.blockers.is_empty() {
                 "none".to_string()
             } else {
@@ -322,6 +363,16 @@ pub fn render_index_html(runs: &[RunSummary]) -> String {
             ),
             None => html_escape(&r.url),
         };
+        let refusals = r
+            .refusal_events
+            .iter()
+            .map(|event| format!("<li>{}</li>", html_escape(&event.description())))
+            .collect::<String>();
+        let refusals = if refusals.is_empty() {
+            "none".into()
+        } else {
+            format!("<ul>{refusals}</ul>")
+        };
         let blockers = if r.blockers.is_empty() {
             "none".to_string()
         } else {
@@ -333,19 +384,20 @@ pub fn render_index_html(runs: &[RunSummary]) -> String {
             format!("<ul>{items}</ul>")
         };
         rows.push_str(&format!(
-            "<tr><td>{repo}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{blockers}</td></tr>",
+            "<tr><td>{repo}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{refusals}</td><td>{blockers}</td></tr>",
             html_escape(&r.state),
             r.confirmed,
             r.needs_validation,
             r.rejected,
             r.agent_calls
                 .map_or("not recorded".into(), |n| n.to_string()),
+            html_escape(r.budget.as_deref().unwrap_or("not recorded")),
             r.reroutes,
         ));
     }
     let total = |f: fn(&RunSummary) -> usize| runs.iter().map(f).sum::<usize>();
     format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><title>OMGS batch index</title><style>{CSS}</style></head><body><main><h1>OMGS batch index</h1><p class=\"lede\">{} repositories: {} confirmed, {} needs validation, {} rejected. Agent calls: {}.</p><table><thead><tr><th scope=\"col\">Repository</th><th scope=\"col\">State</th><th scope=\"col\">Confirmed</th><th scope=\"col\">Needs validation</th><th scope=\"col\">Rejected</th><th scope=\"col\">Agent calls</th><th scope=\"col\">Reroutes</th><th scope=\"col\">Blockers</th></tr></thead><tbody>{rows}</tbody></table><p class=\"note\">Generated by omgs {} from each run directory. This page loads no external resources and runs no scripts.</p></main></body></html>\n",
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><title>OMGS batch index</title><style>{CSS}</style></head><body><main><h1>OMGS batch index</h1><p class=\"lede\">{} repositories: {} confirmed, {} needs validation, {} rejected. Agent calls: {}.</p><table><thead><tr><th scope=\"col\">Repository</th><th scope=\"col\">State</th><th scope=\"col\">Confirmed</th><th scope=\"col\">Needs validation</th><th scope=\"col\">Rejected</th><th scope=\"col\">Agent calls</th><th scope=\"col\">Cumulative budget</th><th scope=\"col\">Reroutes</th><th scope=\"col\">Refusals and provider blocks</th><th scope=\"col\">Blockers</th></tr></thead><tbody>{rows}</tbody></table><p class=\"note\">Generated by omgs {} from each run directory. This page loads no external resources and runs no scripts.</p></main></body></html>\n",
         runs.len(),
         total(|r| r.confirmed),
         total(|r| r.needs_validation),

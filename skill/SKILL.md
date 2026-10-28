@@ -37,7 +37,10 @@ any target execution, including imports, test discovery, builds and configuratio
 
 ## Setup
 
-Read [SETUP.md](SETUP.md) before initialization. Resolve `SKILL_DIR`, canonical `TARGET`, private
+Read [SETUP.md](SETUP.md) before initialization. Use `omgs review` or `batch init` for URL clones;
+see
+[BUDGETS-AND-ROUTING.md](BUDGETS-AND-ROUTING.md) for placement and persona. Resolve `SKILL_DIR`,
+canonical `TARGET`, private
 external `OUTPUT_DIR`, exact `SOURCE_REF` and `OMGS_BIN`. Keep reports, drafts, ledgers and retained
 artifacts outside the target, including after symlink resolution. Never silently mix revisions.
 
@@ -104,8 +107,7 @@ Before consuming any handoff artifacts, read
 
 ## Detail files and role briefs
 
-Each guide retains the full operating rules. Follow cross-links for the task at hand. All paths are
-relative to this installed directory; schemas and scripts ship in the same embedded bundle.
+Paths are relative to this installed directory; schemas and scripts ship in the same bundle.
 
 | File | Read for |
 | --- | --- |

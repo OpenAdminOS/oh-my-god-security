@@ -143,6 +143,8 @@ fn load_bearing_rules_survive_moves() {
         "A recipe contract requires exit 1 and both nonce-qualified marker flags",
         "No approval is implied by a general audit request.",
         "Hunters hand proof plans and drafts to the verifier and never execute proofs.",
+        "Never write step-by-step operational instructions, weaponized commands, credential harvesting",
+        "Do include the minimal synthetic input and the external test draft the verifier needs,",
         "It is never the author of a record it judges.",
         "the evaluator is independent of both hunt and verify.",
         "The evaluator in step 6 replays every proof it upholds with `omgs prove --run OUTPUT_DIR --replay <n>` instead of trusting the record file",

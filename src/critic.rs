@@ -48,6 +48,7 @@ pub struct CandidateLocation {
 /// fails to parse instead of reading as an empty handoff; a hunter that found
 /// nothing writes `{"candidates": []}`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CandidatesFile {
     pub candidates: Vec<Candidate>,
 }
@@ -75,7 +76,7 @@ impl CriticReport {
     /// One line summary, for example "pass (4 units, 6 candidates, 3 findings)".
     pub fn summary(&self) -> String {
         format!(
-            "{} ({} units, {} candidates, {} findings)",
+            "{} (inspected: {} units, {} candidates, {} findings)",
             if self.passed() {
                 "pass".to_string()
             } else {
@@ -86,6 +87,52 @@ impl CriticReport {
             self.findings
         )
     }
+}
+
+/// Validate candidate fields without filtering target-derived diagnostics.
+pub fn validate_candidate(c: &Candidate) -> Vec<String> {
+    let mut errors = Vec::new();
+    let expected = crate::fingerprint(&c.attack_class, &c.entry_point, &c.sink, &c.boundary);
+    for (name, value) in [
+        ("source_ref", &c.source_ref),
+        ("title", &c.title),
+        ("attack_class", &c.attack_class),
+        ("entry_point", &c.entry_point),
+        ("sink", &c.sink),
+        ("boundary", &c.boundary),
+        ("location.path", &c.location.path),
+        ("attacker_capability", &c.attacker_capability),
+        ("trace", &c.trace),
+        ("concrete_result", &c.concrete_result),
+        ("counterevidence", &c.counterevidence),
+        ("proof_plan", &c.proof_plan),
+    ] {
+        if value.trim().is_empty() {
+            errors.push(format!("{name} is empty"));
+        }
+    }
+    if c.location.line == Some(0) {
+        errors.push("location.line must be one-based".into());
+    }
+    if !is_fingerprint(&c.fingerprint) {
+        errors.push(format!(
+            "fingerprint '{}' is not an omgs fingerprint",
+            c.fingerprint
+        ));
+    }
+    if c.fingerprint != expected {
+        errors.push(format!(
+            "fingerprint {} does not match computed identity {expected}",
+            c.fingerprint
+        ));
+    }
+    if identity(&Some(c.hunter.clone())).is_none() {
+        errors.push("hunter is not recorded".into());
+    }
+    if c.unit_ids.is_empty() {
+        errors.push("names no ledger unit".into());
+    }
+    errors
 }
 
 /// Reconcile one run. `candidate_files` counts the candidates files found,
@@ -128,49 +175,15 @@ pub fn critique(
     for sc in candidates {
         let c = &sc.candidate;
         let at = format!("{} candidate '{}'", sc.file, c.title);
-        let expected = crate::fingerprint(&c.attack_class, &c.entry_point, &c.sink, &c.boundary);
-        for (name, value) in [
-            ("source_ref", &c.source_ref),
-            ("title", &c.title),
-            ("attack_class", &c.attack_class),
-            ("entry_point", &c.entry_point),
-            ("sink", &c.sink),
-            ("boundary", &c.boundary),
-            ("location.path", &c.location.path),
-            ("attacker_capability", &c.attacker_capability),
-            ("trace", &c.trace),
-            ("concrete_result", &c.concrete_result),
-            ("counterevidence", &c.counterevidence),
-            ("proof_plan", &c.proof_plan),
-        ] {
-            if value.trim().is_empty() {
-                gaps.push(format!("{at}: {name} is empty"));
-            }
-        }
-        if c.location.line == Some(0) {
-            gaps.push(format!("{at}: location.line must be one-based"));
-        }
-        if !is_fingerprint(&c.fingerprint) {
-            gaps.push(format!(
-                "{at}: fingerprint '{}' is not an omgs fingerprint",
-                c.fingerprint
-            ));
-            continue;
-        }
-        if c.fingerprint != expected {
-            gaps.push(format!(
-                "{at}: fingerprint {} does not match computed identity {expected}",
-                c.fingerprint
-            ));
-        }
-        match identity(&Some(c.hunter.clone())) {
-            Some(h) => {
+        gaps.extend(
+            validate_candidate(c)
+                .into_iter()
+                .map(|e| format!("{at}: {e}")),
+        );
+        if is_fingerprint(&c.fingerprint) {
+            if let Some(h) = identity(&Some(c.hunter.clone())) {
                 hunters.entry(c.fingerprint.as_str()).or_default().insert(h);
             }
-            None => gaps.push(format!("{at}: hunter is not recorded")),
-        }
-        if c.unit_ids.is_empty() {
-            gaps.push(format!("{at}: names no ledger unit"));
         }
         for id in &c.unit_ids {
             if !unit_ids.contains(id.as_str()) {
@@ -225,8 +238,15 @@ pub fn critique(
         }
         if !referenced.contains(f.fingerprint.as_str()) {
             gaps.push(format!(
-                "{at}: no ledger unit cites {} as evidence",
-                f.fingerprint
+                "{at}: no ledger unit cites {} as evidence; candidate unit_ids: {}",
+                f.fingerprint,
+                candidates
+                    .iter()
+                    .filter(|c| c.candidate.fingerprint == f.fingerprint
+                        || f.candidates.contains(&c.candidate.fingerprint))
+                    .flat_map(|c| c.candidate.unit_ids.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     }
@@ -250,16 +270,15 @@ pub fn critique(
     }
 }
 
-fn read_in(dir: &Path, name: &str) -> Result<String, String> {
-    let path = dir.join(name);
-    std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))
-}
-
 /// Load a run directory's `findings.json` and critique it together with the
 /// ledger and candidates beside it.
 pub fn critique_run(dir: &Path) -> Result<CriticReport, String> {
-    let findings = crate::shape::findings(&read_in(dir, "findings.json")?)
-        .map_err(|e| format!("parse findings.json: {e}"))?;
+    let findings = crate::shape::findings(&crate::run_artifact::text(
+        dir,
+        Path::new("findings.json"),
+        crate::run_artifact::FINDINGS_BYTES,
+    )?)
+    .map_err(|e| format!("parse findings.json: {e}"))?;
     critique_dir(dir, &findings)
 }
 
@@ -267,9 +286,25 @@ pub fn critique_run(dir: &Path) -> Result<CriticReport, String> {
 /// `candidates*.json` in `dir`. Used by `omgs report`, so the critic result
 /// always describes the exact findings being rendered.
 pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport, String> {
-    let read = |name: &str| read_in(dir, name);
-    let ledger: Ledger = crate::shape::ledger(&read("coverage-ledger.json")?)
-        .map_err(|e| format!("parse coverage-ledger.json: {e}"))?;
+    critique_dir_inner(
+        dir,
+        findings,
+        #[cfg(test)]
+        || {},
+    )
+}
+
+fn critique_dir_inner(
+    dir: &Path,
+    findings: &FindingsFile,
+    #[cfg(test)] before_read: impl FnOnce(),
+) -> Result<CriticReport, String> {
+    let ledger: Ledger = crate::shape::ledger(&crate::run_artifact::text(
+        dir,
+        Path::new("coverage-ledger.json"),
+        crate::run_artifact::LEDGER_BYTES,
+    )?)
+    .map_err(|e| format!("parse coverage-ledger.json: {e}"))?;
     // Every candidates*.json must be a readable regular file: a symlink, a
     // directory, or an unreadable entry is an error, never silently skipped,
     // so no hunter handoff can disappear from reconciliation.
@@ -286,21 +321,19 @@ pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport,
         if !(name.starts_with("candidates") && name.ends_with(".json")) {
             continue;
         }
-        let kind = entry
-            .file_type()
-            .map_err(|e| format!("inspect {name}: {e}"))?;
-        if !kind.is_file() {
-            return Err(format!(
-                "{name} is not a regular file (symlinks and directories are refused)"
-            ));
-        }
         names.push(name);
     }
     names.sort();
+    #[cfg(test)]
+    before_read();
     let mut candidates = Vec::new();
     for name in &names {
-        let file: CandidatesFile =
-            crate::shape::candidates(&read(name)?).map_err(|e| format!("parse {name}: {e}"))?;
+        let file: CandidatesFile = crate::shape::candidates(&crate::run_artifact::text(
+            dir,
+            Path::new(name),
+            crate::run_artifact::CANDIDATES_BYTES,
+        )?)
+        .map_err(|e| format!("parse {name}: {e}"))?;
         candidates.extend(
             file.candidates
                 .into_iter()
@@ -319,5 +352,54 @@ pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport,
     for e in crate::proof::validate_proofs(findings, dir) {
         report.gaps.push(format!("findings {e}"));
     }
+    report
+        .gaps
+        .extend(crate::adjudication::check(dir, findings)?);
+    if let Some(evaluation) = crate::adjudication::load(dir)? {
+        for decision in &evaluation.decisions {
+            if let Some(f) = findings
+                .findings
+                .iter()
+                .find(|f| f.fingerprint == decision.fingerprint)
+            {
+                for candidate in candidates.iter().filter(|c| {
+                    c.candidate.fingerprint == f.fingerprint
+                        || f.candidates.contains(&c.candidate.fingerprint)
+                }) {
+                    let id = |v: &str| crate::model::identity(&Some(v.to_string()));
+                    if id(&candidate.candidate.hunter).is_some()
+                        && id(&candidate.candidate.hunter) == id(&evaluation.evaluator)
+                    {
+                        report.gaps.push(format!("{}: evaluator hunted absorbed candidate {}; independent adjudication required", f.fingerprint, candidate.candidate.fingerprint));
+                    }
+                }
+            }
+        }
+    }
     Ok(report)
+}
+
+#[cfg(all(test, unix))]
+mod replacement_tests {
+    #[test]
+    fn candidate_replacement_after_enumeration_is_refused() {
+        let run = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-candidate-replace-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_tree(&run).unwrap();
+        crate::runmeta::write_atomic(&run.join("coverage-ledger.json"), r#"{"units":[]}"#).unwrap();
+        let candidate = run.join("candidates-1.json");
+        crate::runmeta::write_atomic(&candidate, r#"{"hunter":"one","candidates":[]}"#).unwrap();
+        let outside = run.join("outside.json");
+        crate::runmeta::write_atomic(&outside, r#"{"hunter":"one","candidates":[]}"#).unwrap();
+        let error = super::critique_dir_inner(&run, &Default::default(), || {
+            std::fs::remove_file(&candidate).unwrap();
+            std::os::unix::fs::symlink(&outside, &candidate).unwrap();
+        })
+        .expect_err("replacement must fail");
+        assert!(error.contains("candidates-1.json"), "{error}");
+        assert!(error.contains("run artifact"), "{error}");
+        std::fs::remove_dir_all(run).unwrap();
+    }
 }

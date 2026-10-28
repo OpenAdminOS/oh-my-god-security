@@ -117,9 +117,9 @@ jobs:
   macos-isolation:
     name: macos isolation (${{ matrix.threads }})
     runs-on: macos-15
-    # Ten clean default-thread repetitions take about 33 minutes on this runner.
-    # Keep every repetition and the individual test deadlines unchanged.
-    timeout-minutes: 45
+    # All ten default-thread repetitions take more than 40 minutes on this runner.
+    # Allow runner variance without changing repetitions or individual deadlines.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

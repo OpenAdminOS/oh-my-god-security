@@ -198,6 +198,31 @@ A failure after an earlier successful publication can leave a mix of complete,
 verified versions; retry completes the installation. Trusted owners must not
 rename or replace storage concurrently with a run or installation.
 
+## Run evidence and source content admission
+
+Run evidence is private, bounded data read relative to the trusted run directory
+through `run_artifact::read`. Descendant directories and leaves cannot be links
+or Windows reparse points. The opened leaf must be a regular file without
+hardlink aliases, and descriptor validation and byte limits apply before parsing
+or hashing. Only genuine absence is optional; linked, special, unreadable and
+oversized artifacts are errors. Named limits cover each artifact kind, including
+16 MiB run metadata and retained test drafts, 2 MiB proof records and configs,
+and 1 MiB saved commands. Concurrent atomic replacement may leave an already
+opened snapshot with zero links; it has no aliases and remains safe to read.
+
+Target checkout content has a separate policy. Proof validation and handoff
+validation deliberately follow the checkout's own source symlinks and accept
+hardlinked source content. They hash only opened regular files, reject special
+files without blocking, and stream SHA-256 through a fixed 64 KiB buffer rather
+than loading source files into memory. Snapshot hashing records symlinks as
+links. Source inventory and sensor input selection retain their existing
+contained, bounded policies. None of these source policies authorize following
+links in run evidence.
+
+Report publication charges initial usage under the run lock, renders outside
+the lock, then publishes completion against fresh metadata under the lock.
+Completion never writes a rendered usage snapshot back over concurrent charges.
+
 ## Disposable gate and sensor storage
 
 Gate and sensor scratch live directly under admitted OMGS data storage, using

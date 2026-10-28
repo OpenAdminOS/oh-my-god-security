@@ -523,7 +523,12 @@ pub fn committed_snapshot(
     if Path::new(&trusted.target) != target || Path::new(&trusted.run) != run {
         return Err("trusted policy record belongs to another target or run".into());
     }
-    let generation = crate::platform::read_bounded(&run.join(".omgs-claim"), 64).map_err(|e| {
+    let generation = crate::run_artifact::read(
+        &run,
+        Path::new(".omgs-claim"),
+        crate::run_artifact::CLAIM_BYTES,
+    )
+    .map_err(|e| {
         format!("run generation unavailable: {e}; re-initialize into a new output path")
     })?;
     if trusted.generation.len() != 64
@@ -829,8 +834,12 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
 }
 fn advisory_findings(run: &Path, p: &Policy) {
     let display = || -> Result<(), String> {
-        let bytes = crate::platform::read_bounded_in(run, Path::new("findings.json"), 16 << 20)
-            .map_err(|e| e.to_string())?;
+        let bytes = crate::run_artifact::read(
+            run,
+            Path::new("findings.json"),
+            crate::run_artifact::FINDINGS_BYTES,
+        )
+        .map_err(|e| e.to_string())?;
         let f = crate::shape::findings(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)?;
         for f in f
             .findings
@@ -864,13 +873,13 @@ pub fn propose(
     answers: &crate::intent::Answers,
     policy: &AuthenticatedPolicy,
 ) -> Result<std::path::PathBuf, String> {
-    let path = run.join("findings.json");
-    let file = if path.exists() {
-        let bytes = crate::platform::read_bounded_in(run, Path::new("findings.json"), 16 << 20)
-            .map_err(|e| e.to_string())?;
-        crate::shape::findings(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)?
-    } else {
-        crate::model::FindingsFile::default()
+    let file = match crate::run_artifact::optional_text(
+        run,
+        Path::new("findings.json"),
+        crate::run_artifact::FINDINGS_BYTES,
+    )? {
+        Some(text) => crate::shape::findings(&text)?,
+        None => crate::model::FindingsFile::default(),
     };
     let staged = crate::handoff::stage_validated(run, &file)?;
     for reason in &staged.excluded {

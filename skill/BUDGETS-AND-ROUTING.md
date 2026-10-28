@@ -48,3 +48,34 @@ blue-verifier, evaluator and green-fixer. Values are tokens, USD cost and durati
 Use `unknown` or an empty field for unavailable values. Omitted roles and values stay unknown, never
 zero; resubmission replaces that role's totals. Report reads saved status accounting. Never estimate
 missing usage from stage clocks.
+
+## Clone placement and live accounting
+
+Use `omgs review --repo-url https://github.com/example/project --persona inheritor
+--clone-root /private/campaign/clones --out /private/campaign/run` for one repository.
+Use `omgs batch init --list repos.txt --out /private/campaign/runs --persona inheritor
+--clone-root /private/campaign/clones` for a batch. Clone root contains host/owner/name paths;
+`--out` chooses run storage. Both must remain outside the reviewed target after symlink resolution.
+The persona is applied on initial creation, so no run deletion or recreation is needed.
+`OMGS_HOME` still relocates all state, including models, answers, scratch and offline database;
+prefer the explicit placement flags when isolating only clones and runs. `execution_profile`
+describes sandbox settings; `budget_profile` describes persona defaults and is independently named.
+
+Before every dispatch, charge its calls with `omgs budget --run OUTPUT_DIR --charge-calls 1`.
+Proofs charge themselves. Report `--agent-calls` is an absolute local cumulative count, never a
+delta;
+it cannot reduce recorded usage. Reports, indexes and handoffs show calls plus proofs and remaining
+family allowance. Do not charge the same calls again during reporting.
+
+`omgs route --run OUTPUT_DIR --role verifier --refused MODEL --reason "provider block: reason"`
+records the event even without models.json. Exit 1 means recorded with no route available, not lost
+metadata. Refusal history and blockers remain visible even if a later call succeeds. A provider
+block can leave complete or partial artifacts; validate them and obtain independent adjudication
+before using them. Record the exact reason without credentials. Retrying or switching still requires
+the host's existing authorization and consumes the same budget; no automatic provider retry occurs.
+
+Supply known identities with repeated `omgs report --model hunter=NAME --model verifier=NAME
+--model evaluator=NAME ...`. These labels disclose host facts and never authorize a model change.
+
+With no routing file and no refusal, `route` returns `host-default` to retain the host selection.
+After a refusal it stays blocked until an explicit configured fallback is available.

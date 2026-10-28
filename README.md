@@ -727,3 +727,28 @@ recovery step. Windows accounting includes named streams on files, directories
 and the traversal root. Polling permits overshoot and can miss files created and deleted
 between samples. Recovery removes eligible abandoned payloads on the next
 invocation; these limits do not cap aggregate storage across concurrent runs.
+
+## Field review controls
+
+`omgs review --repo-url https://github.com/example/project --persona inheritor
+--clone-root /private/campaign/clones --out /private/campaign/run` clones and initializes directly.
+Batch initialization accepts the same persona and clone root; its `--out` is the batch run root.
+Neither flag relocates intent answers, routing configuration, scratch or offline databases.
+Inspect `omgs <command> --help` for command-specific defaults and exit semantics.
+
+Charge host calls before dispatch with `omgs budget --run RUN --charge-calls N`. Proofs charge
+themselves; reports, handoffs and batch indexes include cumulative spend and remaining allowance.
+Record a refusal or provider block with `omgs route --run RUN --role verifier --refused NAME
+--reason "provider block: reason"`, even with no models.json. Exit 1 records a blocker without
+selecting a fallback. Known identities can be supplied using repeatable report `--model role=name`.
+
+Validate candidates, dispositions and evaluator handoffs through the corresponding `omgs validate`
+flags. `omgs ledger ingest --ledger RUN/coverage-ledger.json --dispositions FILE` applies a complete
+validated hunter handoff atomically. The critic checks independent evaluator verdicts for finalized
+records and attested reproduced replays for upheld proofs. Reports disclose evaluator decisions,
+gaps, blockers, architecture omissions and sensor limits. See the
+[proof contract](skill/PROOF-CONTRACT.md) for outer exit 0 (clean success), 1 (supported assertion),
+2 (harness/execution error), 3 (unavailable tier 2), and replay's separate 0 (reproduced) convention.
+A proof tier measures behavior, not confirmation; pending records can have proven behavior while
+intent remains unresolved. Zero sensor hits never establish safety. Gitleaks includes an Azure
+Functions URL-key rule; unknown formats can still be missed and no live credential is tested.

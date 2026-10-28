@@ -134,11 +134,13 @@ pub struct TimelineRow {
 }
 
 pub fn timeline(run: &std::path::Path) -> Result<Vec<TimelineRow>, String> {
-    let path = run.join(crate::status::FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    let Some(text) = crate::run_artifact::optional_text(
+        run,
+        std::path::Path::new(crate::status::FILE),
+        crate::run_artifact::STATUS_BYTES,
+    )?
+    else {
+        return Ok(Vec::new());
     };
     let doc = crate::shape::strict_json(&text)?;
     crate::status::check_document(doc.as_object().ok_or("pipeline status must be an object")?)?;
@@ -242,7 +244,7 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
             md_cell(&r.f.title),
             r.anchor,
             verdict_label(r.f.verdict).1,
-            r.f.proof_tier.label(),
+            tier_label(r.f),
             proof_link(r.f, meta)
         ));
     }
@@ -254,7 +256,7 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         out.push_str(&format!("\n## {title}\n\n"));
         for r in list {
             let f = r.f;
-            out.push_str(&format!("<a id=\"{}\"></a>\n\n### {}: {}\n\n{}\n\nVerdict: {}. Tier: {}. Severity: {}.\n\nFingerprint: {}\n\nProof record: {}\n\n", r.anchor, r.reference, markdown_inline(&f.title), location_line(f), verdict_label(f.verdict).1, f.proof_tier.label(), f.severity.map(|s| s.label()).unwrap_or("none"), markdown_inline(&f.fingerprint), proof_link(f, meta)));
+            out.push_str(&format!("<a id=\"{}\"></a>\n\n### {}: {}\n\n{}\n\nVerdict: {}. Tier: {}. Severity: {}.\n\nFingerprint: {}\n\nProof record: {}\n\n", r.anchor, r.reference, markdown_inline(&f.title), location_line(f), verdict_label(f.verdict).1, tier_label(f), f.severity.map(|s| s.label()).unwrap_or("none"), markdown_inline(&f.fingerprint), proof_link(f, meta)));
             push_intent(&mut out, meta, f);
             if let Some(brief) = &f.fix_brief {
                 out.push_str("#### Fix brief\n\n");
@@ -648,7 +650,7 @@ fn render_tags(f: &Finding) -> String {
     let (class, text) = verdict_label(f.verdict);
     let mut out = format!(
         "<ul class=\"tags\" aria-label=\"Classification\"><li class=\"tag tag-{class}\">{text}</li><li class=\"tag\">Proof: {}</li>",
-        html_escape(f.proof_tier.label())
+        html_escape(&tier_label(f))
     );
     if let Some(sev) = f.severity {
         out.push_str(&format!(
@@ -950,7 +952,7 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
             id = html_escape(&r.anchor),
             title = html_escape(&r.f.title),
             loc = html_escape(&location(r.f)),
-            tier = html_escape(r.f.proof_tier.label()),
+            tier = html_escape(&tier_label(r.f)),
         ));
     }
     let index_body = if rows.is_empty() {
@@ -1376,7 +1378,17 @@ pub fn sensor_section(report: Option<&crate::sensors::SensorsReport>, html: bool
     let Some(report) = report else {
         return String::new();
     };
-    let mut lines = Vec::new();
+    let mut lines = vec!["Zero hits means no matching rule fired in scanned input, never clean or proof of safety. Sensors do not establish credential validity, exploitability or runtime authorization.".into()];
+    for tool in &report.tools_run {
+        let coverage = match tool.as_str() {
+            "gitleaks" => "secret pattern matches in working-tree files; coverage depends on retained configuration (new runs add the OMGS Azure Functions URL rule); no history scan or live credential validation; unknown key shapes and encodings can be missed",
+            "semgrep" => "locally supplied static rules; misses semantics and languages not covered by those rules, runtime state and external controls",
+            "trufflehog" => "offline secret detectors with verification disabled; no live credential validation and no guarantee for unknown secret shapes",
+            "osv-scanner" => "lockfile packages against the local offline advisory database; stale or missing advisories, unlisted dependencies and application logic are outside coverage",
+            _ => "coverage not recorded; no inference of safety is supported",
+        };
+        lines.push(format!("{tool} coverage: {coverage}"));
+    }
     for hit in &report.hits {
         lines.push(format!(
             "{}: {} at {}{}{} (class {:?}, fingerprint {})",
@@ -1396,7 +1408,13 @@ pub fn sensor_section(report: Option<&crate::sensors::SensorsReport>, html: bool
         ));
     }
     for tool in &report.tools_unavailable {
-        lines.push(format!("{tool}: not present or unavailable"));
+        if !report
+            .gaps
+            .iter()
+            .any(|g| g.starts_with(&format!("{tool}:")))
+        {
+            lines.push(format!("{tool}: not present or unavailable"));
+        }
     }
     for gap in &report.gaps {
         lines.push(format!("Gap: {gap}"));
@@ -1422,5 +1440,126 @@ pub fn sensor_section(report: Option<&crate::sensors::SensorsReport>, html: bool
                 })
                 .collect::<String>()
         )
+    }
+}
+
+fn tier_label(f: &Finding) -> String {
+    if f.verdict == Verdict::NeedsValidation {
+        format!(
+            "{} (behavior only; pending validation)",
+            f.proof_tier.label()
+        )
+    } else {
+        f.proof_tier.label().into()
+    }
+}
+
+/// Values rendered by a completed report. Counter usage is deliberately not
+/// copied back from that snapshot: concurrent charges remain authoritative.
+pub struct Completion {
+    pub hunters: Option<u32>,
+    pub verifier: Option<String>,
+    pub accounting: crate::accounting::Accounting,
+    pub complete: bool,
+}
+
+/// Publish initial counters, render without holding the run lock, then publish
+/// completion against fresh metadata under the lock. Rendering may overlap a
+/// charge from another process and must never restore its earlier allowance.
+pub fn publish(
+    run: Option<&std::path::Path>,
+    calls: Option<u32>,
+    models: &std::collections::BTreeMap<String, String>,
+    render: impl FnOnce() -> Result<Completion, String>,
+) -> Result<(), String> {
+    if let Some(run) = run {
+        crate::runmeta::update(run, |m| {
+            if let Some(n) = calls {
+                let old = m
+                    .get("agent_calls_used")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if u64::from(n) < old {
+                    return Err("--agent-calls cannot decrease recorded usage".into());
+                }
+                m.insert("agent_calls_used".into(), serde_json::json!(n));
+            }
+            let saved = m
+                .entry("models")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or("models must be an object")?;
+            for (role, model) in models {
+                saved.insert(role.clone(), serde_json::json!(model));
+            }
+            Ok(())
+        })?;
+    }
+    let completion = render()?;
+    if let Some(run) = run {
+        crate::runmeta::update(run, |m| {
+            if let Some(n) = completion.hunters {
+                m.insert("hunters".into(), serde_json::json!(n));
+            }
+            if let Some(v) = &completion.verifier {
+                m.insert("verifier".into(), serde_json::json!(v));
+            }
+            let mut usage = crate::accounting::read(m)?;
+            usage.extend(completion.accounting);
+            m.insert(
+                "accounting".into(),
+                serde_json::to_value(usage).map_err(|e| e.to_string())?,
+            );
+            m.insert(
+                "run_status".into(),
+                serde_json::json!(if completion.complete {
+                    "complete"
+                } else {
+                    "partial"
+                }),
+            );
+            m.insert(
+                "completed_unix".into(),
+                serde_json::json!(crate::runmeta::now_unix()),
+            );
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod publication_tests {
+    #[test]
+    fn report_cannot_restore_allowance_after_concurrent_call_charge() {
+        let root = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-report-publication-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let run = root.join("run");
+        crate::platform::create_private_tree(&run).unwrap();
+        crate::runmeta::write_atomic(
+            &run.join(crate::runmeta::FILE),
+            r#"{"run_id":"publication-test","budget_agent_calls":12,"agent_calls_used":0}"#,
+        )
+        .unwrap();
+        super::publish(Some(&run), Some(5), &Default::default(), || {
+            assert_eq!(crate::runmeta::read(&run)?["agent_calls_used"], 5);
+            crate::budget::charge_calls(&run, 1)?;
+            Ok(super::Completion {
+                hunters: None,
+                verifier: None,
+                accounting: Default::default(),
+                complete: true,
+            })
+        })
+        .unwrap();
+        let meta = crate::runmeta::read(&run).unwrap();
+        assert_eq!(meta["run_status"], "complete");
+        assert_eq!(meta["agent_calls_used"], 6);
+        assert!(crate::budget::summary(&run)
+            .unwrap()
+            .contains("6 used of 12; 6 remaining"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
