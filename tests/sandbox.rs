@@ -1166,6 +1166,7 @@ fn sensors_execute_resolved_paths_even_with_a_poisoned_current_directory() {
             d.join("reports").to_str().unwrap(),
         ])
         .env("PATH", format!(".:{}:/usr/bin:/bin", safe.display()))
+        .env("OMGS_HOME", d.join("data"))
         .env("OMGS_SEMGREP_CONFIG", rules)
         .env(
             "OMGS_MXC_EXEC",

@@ -4,9 +4,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn scratch(name: &str) -> PathBuf {
-    let path = omgs::platform::temp_root()
-        .unwrap()
-        .join(format!("omgs-policy-{}-{name}", std::process::id()));
+    let parent = if cfg!(windows) {
+        PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
+    } else {
+        omgs::platform::temp_root().unwrap()
+    };
+    let path = parent.join(format!("omgs-policy-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
     omgs::platform::create_private_tree(&path).unwrap();
     std::fs::canonicalize(path).unwrap()
@@ -137,6 +140,14 @@ fn gate(root: &Path, repo: &Path, base: &str, head: &str, run: Option<&Path>, co
     }
     let o = cli(&root.join("home"), &args);
     assert_eq!(o.status.code(), Some(code), "{}", output(&o));
+    let data = root.join("home/omgs-data");
+    if data.exists() {
+        assert!(!std::fs::read_dir(data).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("omgs-gate-")));
+    }
     o
 }
 fn registered() -> policy::GateTest {
@@ -950,6 +961,11 @@ fn changed_registered_test_is_visible_before_sandbox_in_both_modes() {
                     "--head",
                     head,
                 ])
+                .env("OMGS_HOME", root.join("data"))
+                // Internal scratch must not consult ambient OS temp settings.
+                .env("TMPDIR", root.join("missing-temp"))
+                .env("TEMP", root.join("missing-temp"))
+                .env("TMP", root.join("missing-temp"))
                 .env("OMGS_MXC_EXEC", root.join("missing-executor"))
                 .output()
                 .unwrap()

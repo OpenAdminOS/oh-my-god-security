@@ -423,7 +423,25 @@ fn check_handle(file: &std::fs::File, ancestor: bool) -> Result<()> {
                     // that replace/redirect the checked chain are forbidden.
                     let forbidden = if ancestor { 0x500d_0140 } else { 0x500d_0156 };
                     if mask & forbidden != 0 && !trusted {
-                        return Err(refuse("storage is writable by another principal"));
+                        let mut text = null_mut();
+                        if ConvertSidToStringSidW(sid, &mut text) == 0 {
+                            return Err(Error::last_os_error());
+                        }
+                        let _text = local(text.cast())?;
+                        let mut len = 0;
+                        while *text.add(len) != 0 {
+                            len += 1;
+                        }
+                        let sid_text =
+                            String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+                        let origin = if *header.add(1) & 0x10 != 0 {
+                            "inherited"
+                        } else {
+                            "explicit"
+                        };
+                        return Err(refuse(&format!(
+                            "storage is writable by another principal; offending ACE: SID {sid_text}, rights mask 0x{mask:08x}, {origin}"
+                        )));
                     }
                 }
                 1 => {} // A deny ACE grants no access.

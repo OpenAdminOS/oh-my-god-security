@@ -98,6 +98,16 @@ pub fn temp_root() -> std::io::Result<PathBuf> {
     Ok(root)
 }
 
+/// Admit the internal scratch parent without consulting OS temporary storage.
+/// Callers must reserve each child exclusively with create_private_dir_new.
+pub fn scratch_root() -> std::io::Result<PathBuf> {
+    let root =
+        data_dir().ok_or_else(|| std::io::Error::other("OMGS data directory unavailable"))?;
+    create_private_tree(&root)?;
+    // Git for Windows cannot consume extended canonical path prefixes.
+    Ok(PathBuf::from(mxc_path(&std::fs::canonicalize(root)?)))
+}
+
 /// One retained staging directory. Sources are leaf names, never caller paths.
 pub struct StagingDir(std::fs::File);
 impl StagingDir {

@@ -180,10 +180,12 @@ refusal. Ambient temporary-directory settings cannot choose executable staging.
 The verified binary's hidden `install-self` retains one staging directory handle,
 opens only relative leaf names without following links, and checks every source
 against the SHA-256 supplied from the verified bundle before publishing any file.
-Internally selected OS temporary roots are resolved to physical paths for gate
-storage. Proof and sensor scratch stays under admitted run storage; macOS capture
-already resolves Darwin's private temporary root. Explicit storage and install
-destinations still reject symlink ancestors.
+Gate and sensor scratch use fresh private directories under the admitted OMGS
+data directory on every OS and are removed after each run. Proof workspaces
+also default to admitted data storage. Windows and Linux capture use pipes;
+macOS capture resolves Darwin's private temporary root independently of ambient
+temp settings to keep its FIFOs outside readable sandbox grants. Explicit
+storage and install destinations still reject symlink ancestors.
 
 Before either download, the skill and scripts show the identical consent text in
 [SKILL.md](skill/SKILL.md#setup), including source, maximum sizes, verification and

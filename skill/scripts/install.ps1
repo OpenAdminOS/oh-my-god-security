@@ -8,6 +8,14 @@ if ($Version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$') { throw 'I
 $Base = if ($env:OMGS_RELEASE_BASE) { $env:OMGS_RELEASE_BASE.TrimEnd('/') } else { "https://github.com/OpenAdminOS/oh-my-god-security/releases/download/v$Version" }
 $DestRoot = if ($env:OMGS_HOME) { $env:OMGS_HOME } else { Join-Path $env:USERPROFILE '.local\share\omgs' }
 if (-not ($DestRoot -match '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)')) { throw 'OMGS_HOME must be absolute' }
+# Windows PowerShell 5.1 misquotes spaced native arguments ending in a backslash.
+# Retain the separator only for a drive root, which cannot contain spaces.
+function Normalize-DirectoryArgument([string]$Path) {
+    $Path = $Path.TrimEnd([char[]]'\/')
+    if ($Path -match '^[A-Za-z]:$') { $Path += '\' }
+    return $Path
+}
+$DestRoot = Normalize-DirectoryArgument $DestRoot
 # Owner sets this exact public certificate subject before the first public release.
 $OmgsSubject = 'CN=OWNER_WINDOWS_SIGNER_SUBJECT'
 $MicrosoftSubject = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US'
@@ -74,7 +82,11 @@ $acl = [Security.AccessControl.DirectorySecurity]::new()
 $acl.SetOwner($StorageUser)
 $acl.SetAccessRuleProtection($true, $false)
 $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($StorageUser, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
-[IO.DirectoryInfo]::new($tmp).Create($acl)
+if ($PSVersionTable.PSEdition -eq 'Core') {
+    [IO.FileSystemAclExtensions]::Create([IO.DirectoryInfo]::new($tmp), $acl)
+} else {
+    [IO.DirectoryInfo]::new($tmp).Create($acl)
+}
 Admit-Staging $tmp
 function Fetch([string]$Name, [long]$Limit) {
     $to = Join-Path $tmp $Name
@@ -169,7 +181,7 @@ try {
     $actual = & (Join-Path $tmp $asset) --version
     if ($LASTEXITCODE -ne 0 -or $actual -cne "omgs $Version") { throw "version mismatch: skill expects omgs $Version; binary reports $actual" }
     # The verified executable owns admission and exact-path publication.
-    & (Join-Path $tmp $asset) install-self --to $DestRoot --staging $tmp --binary $asset --binary-sha256 $binaryHash --mxc $mxcAsset --mxc-sha256 $executorHash --license MXC-LICENSE.txt --license-sha256 $licenseHash
+    & (Join-Path $tmp $asset) install-self --to $DestRoot --staging (Normalize-DirectoryArgument $tmp) --binary $asset --binary-sha256 $binaryHash --mxc $mxcAsset --mxc-sha256 $executorHash --license MXC-LICENSE.txt --license-sha256 $licenseHash
     if ($LASTEXITCODE -ne 0) { throw 'Verified install-self failed' }
 } finally {
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue

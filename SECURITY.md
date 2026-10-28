@@ -111,9 +111,14 @@ none of those operations.
 
 ### Internal verified installer publication
 
-`omgs install-self --to <absolute-OMGS_HOME> [--mxc <verified-mirrored-asset>
---license <verified-license>]` is an internal command, omitted from normal help.
-It publishes its own running executable and the optional MXC files. The
+`omgs install-self --to <absolute-OMGS_HOME> --staging <private-directory>
+--binary <source-leaf-name> --binary-sha256 <sha256>
+[--mxc <source-leaf-name> --mxc-sha256 <sha256>]
+[--license <source-leaf-name> --license-sha256 <sha256>]` is an internal
+command, omitted from normal help. It publishes explicitly supplied source
+bytes from the retained staging directory, checking each source against its
+required SHA-256 before publication. The binary source is supplied separately
+from the running executable. The
 bootstrap must verify all source files in private staging before calling it;
 this command is not a replacement for publisher, checksum or pin verification.
 It admits the complete destination chain using the same Rust safe-path policy

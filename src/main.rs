@@ -1108,10 +1108,12 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         return Err("__EXIT1__".into());
     }
     if has(args, "--live") {
-        let probe = data_dir().join("doctor");
+        let probe = omgs::platform::scratch_root()
+            .map_err(|e| e.to_string())?
+            .join("doctor");
         let _ = std::fs::remove_dir_all(&probe);
         let target = probe.join("target");
-        std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
+        omgs::platform::create_private_tree(&target).map_err(|e| e.to_string())?;
         // Two fresh tokens: one inside the workspace that must be readable
         // (proves the command really ran), one outside that must not be.
         // Neither appears in a denial message, which echoes only the path.

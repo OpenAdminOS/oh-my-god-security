@@ -110,7 +110,7 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
 
     def run_install(self, answer='yes\n', real=False, extra=()):
         script = ROOT / 'skill/scripts' / self.script.name if real else self.script
-        command = ['powershell', '-NoProfile', '-File', str(script)] if self.windows else ['sh', str(script)]
+        command = [os.environ.get('OMGS_TEST_POWERSHELL', 'powershell'), '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script)] if self.windows else ['sh', str(script)]
         return subprocess.run(command + list(extra), input=answer, text=True, capture_output=True,
                               env=self.env, timeout=60)
 
@@ -380,6 +380,8 @@ Set-Acl -LiteralPath $p -AclObject $a
         self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn('storage is writable by another principal', out.stderr)
         self.assertIn(str(destination), out.stderr)
+        self.assertIn('offending ACE: SID S-1-5-32-545, rights mask 0x', out.stderr)
+        self.assertIn('explicit', out.stderr)
 
     @unittest.skipUnless(os.name == 'nt', 'Windows sharing violations')
     def test_locked_destinations_preserve_existing_files_and_clean_staging(self):
@@ -413,6 +415,22 @@ Set-Acl -LiteralPath $p -AclObject $a
                                 self.executor_hash if file.name == 'wxc-exec.exe' else
                                 sha(self.bundle / 'MXC-LICENSE.txt'))
                     self.assertEqual(sha(file), expected)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows native argument serialization')
+    def test_windows_spaced_destination_with_trailing_backslash(self):
+        self.fake_verifiers()
+        # Test the exact reported input and roots in each selected PowerShell.
+        marker = '$DestRoot = Normalize-DirectoryArgument $DestRoot'
+        assertions = r"""
+if ((Normalize-DirectoryArgument 'C:\Users\ugur\My Tools\') -cne 'C:\Users\ugur\My Tools') { throw 'spaced destination normalization failed' }
+if ((Normalize-DirectoryArgument 'C:\') -cne 'C:\') { throw 'drive root normalization failed' }
+if ((Normalize-DirectoryArgument '\\server\share\') -cne '\\server\share') { throw 'UNC root normalization failed' }
+"""
+        self.script.write_text(self.script.read_text().replace(marker, marker + assertions))
+        self.env['OMGS_HOME'] = str(self.root / 'My Tools') + "\\"
+        out = self.run_install()
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(sha(self.root / 'My Tools/bin/omgs.exe'), self.original)
 
     def test_authenticated_attestation_failure_is_unverified(self):
         self.fake_verifiers()
