@@ -83,7 +83,17 @@ jobs:
         run: cargo test --locked
       - name: Doctor
         shell: bash
-        run: cargo run --locked -q -- doctor --live
+        run: |
+          set +e
+          output=$(cargo run --locked -q -- doctor --live 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [[ "$RUNNER_OS" == Windows && "$status" == 3 && "$output" == *"MXC 1.0.1 leaves changed ACEs on granted folders"* ]]; then
+            echo "Augmentation tier refusal verified; Windows tiers without augmentation remain supported"
+          else
+            test "$status" -eq 0
+          fi
 
   msrv:
     name: rust (1.89)

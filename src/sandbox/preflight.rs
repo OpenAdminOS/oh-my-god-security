@@ -107,34 +107,35 @@ impl std::fmt::Display for ProbeFailure {
     }
 }
 
-pub const DACL_GAP: &str = "MXC temporarily adds host ACEs to granted paths, including toolchain roots, and restores them best effort during cleanup; cleanup can change inherited ACE flags, and an internal script timeout, interrupted run or forced termination can leave host ACL changes until MXC next starts and attempts best-effort recovery, which does not promise to restore inheritance flags; this is distinct from optional administrator wxc-host-prep.exe preparation, which OMGS never runs";
+pub fn windows_augmentation_refusal(tier: &str) -> String {
+    format!("Windows MXC tier {tier} requires DACL augmentation; OMGS refuses before any config-bearing MXC invocation: MXC 1.0.1 leaves changed ACEs on granted folders even after a successful run. OMGS never writes host ACLs. Windows 11 builds where the probe reports needsDaclAugmentation=false are supported.")
+}
 
 pub fn windows_policy(
     probe: Result<WindowsProbe, ProbeFailure>,
 ) -> Result<(bool, bool, Vec<String>, Vec<String>), String> {
-    match probe {
-        Ok(p) => {
-            let mut notes = p.notes();
-            if let Some(error) = &p.error {
-                notes.push(format!("Windows capability selection: detector error; guarded enumeration refusal/retry fallback: {error}"));
-                return Ok((true, true, notes, vec![DACL_GAP.into()]));
-            }
-            p.require_supported_tier()?;
-            let enumerate = p.probes.base_container_supports_enumerate_paths;
-            let mut gaps = Vec::new();
-            if p.needs_dacl_augmentation == Some(true) {
-                gaps.push(DACL_GAP.into());
-                notes.push("Optional administrator host preparation can improve metadata and NUL access; OMGS never runs wxc-host-prep.exe, which requires administrator rights".into());
-            }
-            notes.push("Windows capability selection: probe; enumeration retry disabled".into());
-            if !enumerate { gaps.push(enumeration_gap()); }
-            Ok((enumerate, false, notes, gaps))
-        }
-        Err(ProbeFailure::Invalid(e)) => Err(e),
-        Err(ProbeFailure::Unavailable(e)) => Ok((true, true, vec![format!(
-            "Windows capability selection: probe failed; guarded enumeration refusal/retry fallback: {e}"
-        )], vec![DACL_GAP.into()])),
+    let p = probe.map_err(|e| format!("Windows MXC probe could not establish a tier without DACL augmentation; refusing before any config-bearing invocation: {e}"))?;
+    if let Some(error) = &p.error {
+        return Err(format!("Windows MXC detector error; cannot establish a tier without DACL augmentation; refusing before any config-bearing invocation: {error}"));
     }
+    p.require_supported_tier()?;
+    if p.needs_dacl_augmentation != Some(false) {
+        return Err(windows_augmentation_refusal(
+            p.tier.as_deref().unwrap_or("unknown"),
+        ));
+    }
+    let enumerate = p.probes.base_container_supports_enumerate_paths;
+    let mut notes = p.notes();
+    notes.push(
+        "Windows capability selection: probe; no DACL augmentation; enumeration retry disabled"
+            .into(),
+    );
+    let gaps = if enumerate {
+        Vec::new()
+    } else {
+        vec![enumeration_gap()]
+    };
+    Ok((enumerate, false, notes, gaps))
 }
 
 pub fn enumeration_gap() -> String {
@@ -228,7 +229,17 @@ fn probe_result(run: &supervise::Supervised) -> Result<WindowsProbe, ProbeFailur
     Ok(probe)
 }
 
+#[cfg(test)]
+thread_local! { static CONFIG_INVOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+pub(super) fn config_invocations() -> usize {
+    CONFIG_INVOCATIONS.with(|n| n.get())
+}
+
 pub fn dry_run(executor: &Path, config: &Path, cwd: &Path) -> supervise::Supervised {
+    #[cfg(test)]
+    CONFIG_INVOCATIONS.with(|n| n.set(n.get() + 1));
     let mut cmd = executor_command(executor, Some(cwd));
     cmd.arg("--dry-run").arg("--config").arg(config);
     inspect(cmd)
@@ -251,6 +262,8 @@ pub fn dry_run_result(run: &supervise::Supervised) -> Result<(), String> {
 }
 
 pub fn workload_command(executor: &Path, config: &Path, cwd: &Path) -> Command {
+    #[cfg(test)]
+    CONFIG_INVOCATIONS.with(|n| n.set(n.get() + 1));
     let mut cmd = executor_command(executor, Some(cwd));
     cmd.arg("--config").arg(config);
     cmd
@@ -453,8 +466,22 @@ fn windows_version() -> Option<(u32, u32, u32, u32)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+    #[cfg(windows)]
+    pub(super) fn refuse_augmented_fixture(executor: &Path) -> bool {
+        let probe = windows_probe(executor).unwrap();
+        if probe.needs_dacl_augmentation != Some(true) {
+            return false;
+        }
+        let before = config_invocations();
+        let reason = windows_policy(Ok(probe)).unwrap_err();
+        assert!(reason.contains("MXC 1.0.1 leaves changed ACEs"));
+        assert!(reason.contains("Windows 11"));
+        assert_eq!(config_invocations(), before);
+        true
+    }
+
     fn probe() -> serde_json::Value {
         serde_json::json!({"tier":"base-container", "needsDaclAugmentation":false,
             "warnings":[], "probes": {"baseContainerApiPresent":true,
@@ -505,18 +532,17 @@ mod tests {
         let p = WindowsProbe::parse(minimal).unwrap();
         assert!(p.warnings.is_empty());
         assert!(!p.probes.base_container_api_present);
-        assert!(windows_policy(Ok(p)).unwrap().1);
+        assert!(windows_policy(Ok(p))
+            .unwrap_err()
+            .contains("detector error"));
         let mut v = probe();
         v.as_object_mut().unwrap().remove("tier");
         v.as_object_mut().unwrap().remove("needsDaclAugmentation");
         v["error"] = "WRITE_DAC unavailable on path C:\\scratch: detector detail".into();
-        let (_, retry, notes, _) =
+        let reason =
             windows_policy(WindowsProbe::parse(&v.to_string()).map_err(ProbeFailure::Invalid))
-                .unwrap();
-        assert!(retry);
-        assert!(notes
-            .iter()
-            .any(|n| n.contains(v["error"].as_str().unwrap())));
+                .unwrap_err();
+        assert!(reason.contains(v["error"].as_str().unwrap()));
         for (key, value) in [
             ("tier", serde_json::json!("base-container")),
             ("needsDaclAugmentation", serde_json::json!(false)),
@@ -533,16 +559,27 @@ mod tests {
         assert!(WindowsProbe::parse(&extended.to_string()).is_ok());
     }
 
-    #[cfg(unix)]
     #[test]
     fn stdout_probe_parsing_and_incomplete_dry_runs_fail_closed() {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.args([
-            "-c",
-            "printf '%s' \"$1\"; printf 'stray diagnostic' >&2",
-            "sh",
-            &probe().to_string(),
-        ]);
+        let cmd = if cfg!(windows) {
+            let mut cmd = Command::new("cmd.exe");
+            cmd.env("OMGS_TEST_PROBE_JSON", probe().to_string());
+            cmd.args([
+                "/d",
+                "/c",
+                "echo %OMGS_TEST_PROBE_JSON%& echo stray diagnostic 1>&2",
+            ]);
+            cmd
+        } else {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args([
+                "-c",
+                "printf '%s' \"$1\"; printf 'stray diagnostic' >&2",
+                "sh",
+                &probe().to_string(),
+            ]);
+            cmd
+        };
         let mut run = inspect(cmd);
         assert!(probe_result(&run).is_ok(), "{run:?}");
         let mut truncated = run.clone();
@@ -582,33 +619,24 @@ mod tests {
     }
 
     #[test]
-    fn observed_server_dacl_tier_runs_without_claiming_base_container_capabilities() {
-        let value = serde_json::json!({"tier":"appcontainer-dacl", "needsDaclAugmentation":true,
-            "warnings":["metadata and NUL preparation advised"], "probes": {
-            "baseContainerApiPresent":false, "baseContainerSupportsEnumeratePaths":false,
-            "baseContainerSupportsDenyPaths":false,
-            "baseContainerSupportsIngressHostLoopbackAllow":false, "nativeCaptureAvailable":false}});
-        let (enumerate, fallback, notes, gaps) =
+    fn observed_server_dacl_tier_is_refused_before_configuration() {
+        let mut value = probe();
+        value["tier"] = "appcontainer-dacl".into();
+        value["needsDaclAugmentation"] = true.into();
+        value["probes"]["baseContainerSupportsEnumeratePaths"] = false.into();
+        value["probes"]["baseContainerSupportsDenyPaths"] = false.into();
+        let before = config_invocations();
+        let reason =
             windows_policy(WindowsProbe::parse(&value.to_string()).map_err(ProbeFailure::Invalid))
-                .unwrap();
-        assert!(!enumerate && !fallback);
-        assert!(gaps.contains(&DACL_GAP.into()));
-        assert!(notes
-            .iter()
-            .any(|n| n.contains("metadata and NUL preparation advised")));
-        assert!(notes
-            .iter()
-            .any(|n| n.contains("never runs wxc-host-prep.exe")));
-        let mut inconsistent = value;
-        inconsistent["probes"]["baseContainerSupportsEnumeratePaths"] = true.into();
-        assert!(windows_policy(
-            WindowsProbe::parse(&inconsistent.to_string()).map_err(ProbeFailure::Invalid)
-        )
-        .is_err());
+                .unwrap_err();
+        assert!(reason.contains("appcontainer-dacl"));
+        assert!(reason.contains("MXC 1.0.1 leaves changed ACEs"));
+        assert!(reason.contains("Windows 11"));
+        assert_eq!(config_invocations(), before);
     }
 
     #[test]
-    fn probe_selects_enumeration_and_only_failures_enable_retry() {
+    fn probe_selects_enumeration_only_when_no_augmentation_is_established() {
         for enumerate in [false, true] {
             let mut v = probe();
             v["probes"]["baseContainerSupportsEnumeratePaths"] = enumerate.into();
@@ -620,10 +648,7 @@ mod tests {
             assert!(notes.iter().any(|n| n.contains("selection: probe;")));
             assert_eq!(gaps.contains(&enumeration_gap()), !enumerate);
         }
-        let (selected, fallback, notes, gaps) =
-            windows_policy(Err(ProbeFailure::Unavailable("could not start".into()))).unwrap();
-        assert!(selected && fallback && notes[0].contains("probe failed"));
-        assert!(gaps.contains(&DACL_GAP.into()));
+        assert!(windows_policy(Err(ProbeFailure::Unavailable("could not start".into()))).is_err());
         assert!(
             windows_policy(WindowsProbe::parse("bad JSON").map_err(ProbeFailure::Invalid)).is_err()
         );
@@ -640,6 +665,10 @@ mod tests {
         let Ok(located) = super::super::locate_executor() else {
             return;
         };
+        #[cfg(windows)]
+        if refuse_augmented_fixture(&located.path) {
+            return;
+        }
         let d = std::env::temp_dir().join(format!("omgs-dry-run-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let d = std::fs::canonicalize(d).unwrap();
@@ -701,6 +730,10 @@ mod tests {
         let Ok(located) = super::super::locate_executor() else {
             return;
         };
+        #[cfg(windows)]
+        if refuse_augmented_fixture(&located.path) {
+            return;
+        }
         let _console = supervise::interruption::Guard::install().unwrap();
         let d = std::env::temp_dir().join(format!("omgs-dacl-timeout-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
@@ -730,7 +763,7 @@ mod tests {
                     "cwd":platform_path(&granted), "timeout":2000},
                 "network":{"egress":{"default":"deny"}},
                 "filesystem":{"readwritePaths":[platform_path(&granted)]},
-                "processContainer":{"leastPrivilege":true}});
+                "processContainer":{}});
             if supervisor_timeout {
                 // Use the actual production config, including its timer policy.
                 config = super::super::mxc_config(&super::super::ConfigInput {
@@ -820,28 +853,30 @@ mod tests {
             .unwrap();
         assert!(status.success());
         if let Ok(located) = super::super::locate_executor() {
-            let scratch = d.join("scratch");
-            std::fs::create_dir(&scratch).unwrap();
-            let config = serde_json::json!({"version":"1.0.0", "containment":"process",
+            if !refuse_augmented_fixture(&located.path) {
+                let scratch = d.join("scratch");
+                std::fs::create_dir(&scratch).unwrap();
+                let config = serde_json::json!({"version":"1.0.0", "containment":"process",
                 "process":{"commandLine":"cmd.exe /d /c exit /b 0", "cwd":platform_path(&scratch)},
                 "network":{"egress":{"default":"deny"}},
                 "filesystem":{"readonlyPaths":[platform_path(&linked)],
                     "readwritePaths":[platform_path(&scratch)]}});
-            let config_path = d.join("config.json");
-            std::fs::write(&config_path, config.to_string()).unwrap();
-            let snapshot = WindowsAclSnapshot::capture([&linked]).unwrap();
-            assert_eq!(snapshot.0[0].path, std::fs::canonicalize(&target).unwrap());
-            let mut run = dry_run(&located.path, &config_path, &d);
-            assert!(dry_run_result(&run).is_ok(), "{run:?}");
-            let restored = windows_acl(&snapshot.0[0].path).unwrap() == snapshot.0[0].acl;
-            snapshot.verify(&mut run);
-            assert_eq!(run.cleanup_complete, restored, "{run:?}");
-            if !restored {
-                assert!(!run.success);
-                assert!(run
-                    .notes
-                    .iter()
-                    .any(|n| n.contains("granted root ACL changed")));
+                let config_path = d.join("config.json");
+                std::fs::write(&config_path, config.to_string()).unwrap();
+                let snapshot = WindowsAclSnapshot::capture([&linked]).unwrap();
+                assert_eq!(snapshot.0[0].path, std::fs::canonicalize(&target).unwrap());
+                let mut run = dry_run(&located.path, &config_path, &d);
+                assert!(dry_run_result(&run).is_ok(), "{run:?}");
+                let restored = windows_acl(&snapshot.0[0].path).unwrap() == snapshot.0[0].acl;
+                snapshot.verify(&mut run);
+                assert_eq!(run.cleanup_complete, restored, "{run:?}");
+                if !restored {
+                    assert!(!run.success);
+                    assert!(run
+                        .notes
+                        .iter()
+                        .any(|n| n.contains("granted root ACL changed")));
+                }
             }
         }
         let snapshot = WindowsAclSnapshot::capture([&linked]).unwrap();
@@ -963,8 +998,8 @@ mod tests {
             return;
         };
         let d = std::path::PathBuf::from(d);
-        let executor = super::super::locate_executor().unwrap();
-        let cmd = workload_command(&executor.path, &d.join("config.json"), &d);
+        let mut cmd = Command::new("cmd.exe");
+        cmd.current_dir(&d).args(["/d", "/c", "echo OMGS_START_owner& echo started>started& cmd.exe /d /c for /l %i in (1,0,2) do @rem"]);
         let limits = supervise::Limits {
             wall_ms: 120000,
             cpu_secs: None,
@@ -980,7 +1015,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn killing_owner_terminates_real_executor_and_infinite_workload() {
+    fn killing_owner_terminates_executor_and_infinite_workload() {
         use std::ffi::c_void;
         use std::os::windows::io::AsRawHandle;
         use std::os::windows::io::FromRawHandle;
@@ -989,18 +1024,8 @@ mod tests {
             fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
             fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
         }
-        let Ok(_) = super::super::locate_executor() else {
-            return;
-        };
         let d = std::env::temp_dir().join(format!("omgs-owner-death-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
-        let config = serde_json::json!({"version":"1.0.0", "containment":"process",
-            "process":{"commandLine":"cmd.exe /d /c echo OMGS_START_owner& echo started>started& for /l %i in (1,0,2) do @rem",
-                "cwd":platform_path(&d), "timeout":0},
-            "filesystem":{"readwritePaths":[platform_path(&d)]},
-            "network":{"egress":{"default":"deny"}},
-            "processContainer":{"leastPrivilege":true}});
-        std::fs::write(d.join("config.json"), config.to_string()).unwrap();
         let mut owner = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -1028,7 +1053,7 @@ mod tests {
             );
         }
         // Inspect before killing and retain process handles to avoid PID reuse.
-        let query = format!("$e=Get-CimInstance Win32_Process -Filter 'ParentProcessId = {}' | Where-Object Name -eq 'wxc-exec.exe'; $e.ProcessId; Get-CimInstance Win32_Process | Where-Object {{ $_.ParentProcessId -in $e.ProcessId -and $_.Name -eq 'cmd.exe' }} | ForEach-Object ProcessId", owner.id());
+        let query = format!("$e=Get-CimInstance Win32_Process -Filter 'ParentProcessId = {}' | Where-Object Name -eq 'cmd.exe'; $e.ProcessId; Get-CimInstance Win32_Process | Where-Object {{ $_.ParentProcessId -in $e.ProcessId -and $_.Name -eq 'cmd.exe' }} | ForEach-Object ProcessId", owner.id());
         let output = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &query])
             .output()
@@ -1060,10 +1085,6 @@ mod tests {
                 "pid {pid} survived owner death"
             );
         }
-        // Force termination can leave ACEs, so recovery is explicit after the
-        // lifetime assertion, before deleting the test's granted directory.
-        let executor = super::super::locate_executor().unwrap();
-        let _ = windows_probe(&executor.path);
         std::fs::remove_dir_all(d).unwrap();
     }
 

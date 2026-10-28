@@ -26,14 +26,129 @@ fn omgs(home: &Path, args: &[&str]) -> Output {
     c.output().unwrap()
 }
 
+#[track_caller]
 fn mxc_ready() -> bool {
     match omgs::sandbox::locate_executor() {
-        Ok(_) => true,
+        Ok(located) => {
+            #[cfg(windows)]
+            {
+                let probe = omgs::sandbox::windows_probe(&located.path).unwrap();
+                if probe.needs_dacl_augmentation == Some(true) {
+                    assert_augmented_tier_refusal(
+                        probe.tier.as_deref().unwrap(),
+                        std::panic::Location::caller().line(),
+                    );
+                    return false;
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = located;
+            true
+        }
         Err(e) => {
             eprintln!("skipping: {e}");
             false
         }
     }
+}
+
+// On augmentation hosts every real-proof test using mxc_ready executes this
+// refusal contract instead. Safe Windows tiers retain their real proof runs.
+#[cfg(windows)]
+fn assert_augmented_tier_refusal(tier: &str, caller: u32) {
+    use omgs::sandbox::{prove, ProveOutcome, ProveRequest, Tier};
+    use std::process::Command;
+    let d = scratch(&format!("augmentation-refusal-{caller}"));
+    let target = d.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("evidence.txt"), "untouched").unwrap();
+    let roots: Vec<_> = std::iter::once(target.clone())
+        .chain(
+            omgs::sandbox::toolchain_roots("windows", omgs::platform::home().as_deref())
+                .into_iter()
+                .filter(|p| p.exists()),
+        )
+        .map(|p| p.canonicalize().unwrap())
+        .collect();
+    let acls = || {
+        roots
+            .iter()
+            .map(|p| {
+                let output = Command::new("icacls.exe")
+                    .arg(p)
+                    .arg("/l")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                output.stdout
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = acls();
+    let check = |message: &str| {
+        assert!(message.contains(tier), "{message}");
+        assert!(
+            message.contains(
+                "MXC 1.0.1 leaves changed ACEs on granted folders even after a successful run"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("Windows 11") && message.contains("needsDaclAugmentation=false"),
+            "{message}"
+        );
+    };
+    let lib_dir = d.join("library-proof");
+    let request = ProveRequest {
+        command: "echo REFUSAL_WORKLOAD_RAN".into(),
+        test: None,
+        target: Some(target.clone()),
+        run_dir: lib_dir.clone(),
+        timeout_ms: 1000,
+        tier: Tier::Test,
+        stage: None,
+        expected_tree_sha256: None,
+    };
+    let ProveOutcome::Blocked { reason } = prove(&request) else {
+        panic!("augmentation tier executed");
+    };
+    check(&reason);
+    assert!(
+        !lib_dir.exists(),
+        "refusal must precede staging and config creation"
+    );
+    let home = d.join("home");
+    for args in [
+        vec![
+            "prove",
+            "--target",
+            target.to_str().unwrap(),
+            "--cmd",
+            "echo REFUSAL_WORKLOAD_RAN",
+        ],
+        vec!["doctor", "--live"],
+    ] {
+        let out = omgs(&home, &args);
+        assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+        check(&text(&out));
+        assert!(!text(&out).contains("REFUSAL_WORKLOAD_RAN"));
+    }
+    fn no_config(path: &Path) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            assert_ne!(entry.file_name(), "mxc-config.json");
+            if entry.file_type().unwrap().is_dir() {
+                no_config(&entry.path());
+            }
+        }
+    }
+    no_config(&d);
+    assert_eq!(acls(), before, "refusal changed granted folder ACLs");
+    assert_eq!(
+        std::fs::read_to_string(target.join("evidence.txt")).unwrap(),
+        "untouched"
+    );
+    std::fs::remove_dir_all(d).unwrap();
 }
 
 fn text(o: &Output) -> String {
@@ -1153,6 +1268,10 @@ fn proof_test_paths_are_counted_on_every_os() {
 
 #[test]
 fn doctor_and_proofs_list_memory_and_task_gap_once() {
+    #[cfg(windows)]
+    if !mxc_ready() {
+        return;
+    }
     let d = scratch("unique-gaps");
     let doctor = omgs(&d, &["doctor"]);
     let needle = if cfg!(target_os = "linux") {

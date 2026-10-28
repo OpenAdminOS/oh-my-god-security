@@ -1226,6 +1226,17 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     };
     let os = std::env::consts::OS;
     let blocked = |reason: String| ProveOutcome::Blocked { reason };
+    let (list_parents, probe_fallback, mut notes, windows_gaps) = if os == "windows" {
+        match preflight::windows_policy(windows_probe(&located.path)) {
+            Ok(policy) => policy,
+            Err(reason) => return blocked(reason),
+        }
+    } else {
+        (false, false, Vec::new(), Vec::new())
+    };
+    if os == "windows" {
+        notes.push(windows_build_report());
+    }
     if let Err(e) = platform::private_dir(&req.run_dir) {
         return blocked(format!("cannot create {}: {e}", req.run_dir.display()));
     }
@@ -1312,18 +1323,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         Ok(staged) => staged,
         Err(reason) => return blocked(reason),
     };
-    let (list_parents, probe_fallback, mut notes, windows_gaps) = if os == "windows" {
-        match preflight::windows_policy(windows_probe(&executor)) {
-            Ok(policy) => policy,
-            Err(reason) => return blocked(reason),
-        }
-    } else {
-        (false, false, Vec::new(), Vec::new())
-    };
     extra_gaps.extend(windows_gaps);
-    if os == "windows" {
-        notes.push(windows_build_report());
-    }
     let mut input = ConfigInput {
         os,
         containment: located.executor.containment,
@@ -1827,34 +1827,32 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn real_dry_run_enumeration_refusal_allows_guarded_retry() {
+    fn augmentation_refusal_never_constructs_a_config_invocation() {
         let Ok(located) = locate_executor() else {
             return;
         };
-        let d = std::env::temp_dir().join(format!("omgs-enumerate-dry-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let config_path = d.join("config.json");
-        // LPAC is incompatible with BaseContainer on every host, requiring fallback.
-        let mut config = serde_json::json!({"version":"1.0.0", "containment":"process",
-            "process":{"commandLine":"cmd.exe /d /c echo workload > marker", "cwd":mxc_path(&d)},
-            "network":{"egress":{"default":"deny"}},
-            "filesystem":{"readwritePaths":[mxc_path(&d)]},
-            "processContainer":{"leastPrivilege":true, "filesystem":{"enumeratePaths":[mxc_path(&d)]}}});
-        std::fs::write(&config_path, config.to_string()).unwrap();
-        let first = preflight::dry_run(&located.path, &config_path, &d);
-        assert!(retry_without_enumeration("windows", &first), "{first:?}");
-        assert!(preflight::dry_run_result(&first)
-            .unwrap_err()
-            .contains("configuration rejection"));
-        config["processContainer"]
-            .as_object_mut()
-            .unwrap()
-            .remove("filesystem");
-        std::fs::write(&config_path, config.to_string()).unwrap();
-        let second = preflight::dry_run(&located.path, &config_path, &d);
-        assert!(preflight::dry_run_result(&second).is_ok(), "{second:?}");
-        assert!(!d.join("marker").exists());
-        std::fs::remove_dir_all(d).unwrap();
+        let probe = windows_probe(&located.path).unwrap();
+        if probe.needs_dacl_augmentation != Some(true) {
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("omgs-refusal-no-config-{}", std::process::id()));
+        let before = preflight::config_invocations();
+        let request = ProveRequest {
+            command: "echo must-not-run".into(),
+            test: None,
+            timeout_ms: 1000,
+            target: None,
+            run_dir: d.clone(),
+            tier: Tier::Test,
+            stage: None,
+            expected_tree_sha256: None,
+        };
+        let ProveOutcome::Blocked { reason } = prove(&request) else {
+            panic!("augmented tier ran");
+        };
+        assert!(reason.contains("MXC 1.0.1 leaves changed ACEs"));
+        assert!(!d.exists());
+        assert_eq!(preflight::config_invocations(), before);
     }
 
     #[cfg(windows)]
