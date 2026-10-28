@@ -128,7 +128,7 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
             injection = {
                 'abort': "    throw 'simulated staging failure'",
                 'checksum': "    [IO.File]::WriteAllText($stagedLicense, 'corrupt staged bytes')",
-                'signature': "    $MicrosoftSubject = 'CN=wrong staged signer'",
+                'signature': "    function Test-AuthenticodeSignature { return [pscustomobject]@{ Status='HashMismatch'; SignerCertificate=$null } }",
             }[failure]
         else:
             marker = 'checksum "$asset" "$staged_omgs"'
