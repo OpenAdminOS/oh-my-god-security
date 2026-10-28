@@ -1,4 +1,5 @@
 pub mod accounting;
+pub mod adjudication;
 pub mod approval;
 pub mod architecture;
 pub mod batch;
@@ -6,6 +7,7 @@ pub mod bench;
 pub mod budget;
 pub mod critic;
 pub mod handoff;
+pub mod help;
 pub mod intent;
 pub mod ledger;
 pub mod model;

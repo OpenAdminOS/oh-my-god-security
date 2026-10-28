@@ -1,0 +1,496 @@
+//! Synthetic regression cases for field workflow failures. No campaign inputs.
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+struct Fixture {
+    root: PathBuf,
+    run: PathBuf,
+    target: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "omgs-pilot-{}",
+            omgs::platform::random_nonce().unwrap()
+        ));
+        omgs::platform::create_private_tree(&root).unwrap();
+        let target = root.join("target");
+        omgs::platform::create_private_dir(&target).unwrap();
+        std::fs::write(
+            target.join("sample.ps1"),
+            "function Get-Dummy { param($InputValue) $InputValue }",
+        )
+        .unwrap();
+        let run = root.join("run");
+        let f = Self { root, run, target };
+        let out = f.cli(&[
+            "audit",
+            "init",
+            "--target",
+            f.target.to_str().unwrap(),
+            "--out",
+            f.run.to_str().unwrap(),
+            "--persona",
+            "inheritor",
+            "--budget",
+            "12",
+            "--no-sensors",
+        ]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        f
+    }
+    fn cli(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .env("OMGS_HOME", self.root.join("state"))
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .args(args)
+            .output()
+            .unwrap()
+    }
+    fn put(&self, name: &str, v: Value) {
+        omgs::runmeta::write_atomic(&self.run.join(name), &v.to_string()).unwrap();
+    }
+    fn run_str(&self) -> &str {
+        self.run.to_str().unwrap()
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+fn read(path: impl AsRef<Path>) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+#[test]
+fn refusal_without_models_survives_report_metadata_and_index() {
+    let f = Fixture::new();
+    let out = f.cli(&[
+        "route",
+        "--run",
+        f.run_str(),
+        "--role",
+        "verifier",
+        "--refused",
+        "fixed-test-provider",
+        "--reason",
+        "provider eligibility block",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let m = read(f.run.join("run-metadata.json"));
+    assert_eq!(m["reroutes"][0]["from"], "fixed-test-provider");
+    assert!(m["blockers"][0]
+        .as_str()
+        .unwrap()
+        .contains("provider eligibility block"));
+    let out = f.cli(&[
+        "report",
+        "--findings",
+        f.run.join("findings.json").to_str().unwrap(),
+        "--out",
+        f.run_str(),
+        "--model",
+        "verifier=fixed-test-provider",
+        "--model",
+        "hunter=other-test-provider",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for name in ["REPORT.md", "REPORT.html"] {
+        let text = std::fs::read_to_string(f.run.join(name)).unwrap();
+        assert!(text.contains("provider eligibility block"));
+        assert!(text.contains("fixed-test-provider"));
+        assert!(text.contains("other-test-provider"));
+    }
+    assert_eq!(
+        read(f.run.join("run-metadata.json"))["run_status"],
+        "partial"
+    );
+    assert!(omgs::runmeta::is_complete(&f.run));
+    let summary = omgs::batch::summarize(
+        &omgs::batch::BatchRun {
+            url: "https://example.com/team/synthetic".into(),
+            run_dir: Some(f.run_str().into()),
+            ..Default::default()
+        },
+        &f.root,
+    )
+    .unwrap();
+    for text in [
+        omgs::batch::render_index_markdown(std::slice::from_ref(&summary)),
+        omgs::batch::render_index_html(&[summary]),
+    ] {
+        assert!(text.contains("provider eligibility block"));
+    }
+}
+#[test]
+fn call_charging_budget_handoff_and_status_are_consistent() {
+    let f = Fixture::new();
+    let out = f.cli(&["budget", "--run", f.run_str(), "--charge-calls", "5"]);
+    assert!(out.status.success());
+    let a: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(a["calls_and_proofs_used"], 5);
+    assert_eq!(a["remaining"], 7);
+    assert!(!f
+        .cli(&["budget", "--run", f.run_str(), "--charge-calls", "8"])
+        .status
+        .success());
+    let out = f.cli(&[
+        "status",
+        "--run",
+        f.run_str(),
+        "--stage",
+        "extra",
+        "--state",
+        "done",
+    ]);
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("unknown"));
+    let progress = read(f.run.join("pipeline-status.json"));
+    let stage = progress["stages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "extra")
+        .unwrap();
+    assert!(stage.get("started_ms").is_none());
+    let handoff = omgs::handoff::build(&f.run, &Default::default(), None).unwrap();
+    assert!(omgs::handoff::markdown(&handoff).contains("5 used of 12; 7 remaining"));
+    let out = f.cli(&[
+        "report",
+        "--findings",
+        f.run.join("findings.json").to_str().unwrap(),
+        "--out",
+        f.run_str(),
+        "--agent-calls",
+        "4",
+    ]);
+    assert!(!out.status.success());
+}
+#[test]
+fn strict_role_handoffs_and_atomic_disposition_ingest() {
+    let f = Fixture::new();
+    f.put("dispositions-test.json", json!({"hunter":"test-hunter", "units":[{"unit_id":"stack:powershell", "disposition":"candidate", "evidence":["synthetic-fingerprint"], "note":"handed to verification"}]}));
+    let input = f.run.join("dispositions-test.json");
+    assert!(f
+        .cli(&["validate", "--dispositions", input.to_str().unwrap()])
+        .status
+        .success());
+    assert!(f
+        .cli(&[
+            "ledger",
+            "ingest",
+            "--ledger",
+            f.run.join("coverage-ledger.json").to_str().unwrap(),
+            "--dispositions",
+            input.to_str().unwrap()
+        ])
+        .status
+        .success());
+    assert_eq!(
+        read(f.run.join("coverage-ledger.json"))["units"][0]["status"],
+        "covered"
+    );
+    assert!(
+        omgs::adjudication::dispositions(r#"{"hunter":"x","units":[["id","covered",[],""]]}"#)
+            .is_err()
+    );
+    assert!(omgs::adjudication::candidates(r#"{"candidates":[]}"#).is_ok());
+    assert!(omgs::adjudication::candidates(
+        r#"{"candidates":[{"fingerprint":"omgs-0000000000000000"}]}"#
+    )
+    .is_err());
+    assert!(omgs::adjudication::parse(
+        r#"{"evaluator":"x","source_ref":"a","decisions":[],"gaps":[],"gaps":[]}"#
+    )
+    .is_err());
+    assert!(omgs::adjudication::parse(
+        r#"{"evaluator":"x","source_ref":"a","decisions":[[]],"gaps":[]}"#
+    )
+    .is_err());
+}
+#[test]
+fn evaluator_missing_verdict_independence_and_report_limits() {
+    let f = Fixture::new();
+    let mut findings =
+        omgs::shape::findings(include_str!("fixtures/report-run/findings.json")).unwrap();
+    for (i, r) in findings.findings.iter_mut().enumerate() {
+        r.fingerprint = format!("omgs-{i:016x}");
+    }
+    assert!(omgs::adjudication::check(&f.run, &findings)
+        .unwrap()
+        .iter()
+        .any(|s| s.contains("missing")));
+    let source = read(f.run.join("run-metadata.json"))["source_ref"].clone();
+    f.put("evaluation.json", json!({"evaluator":"independent-test-context","source_ref":source,"decisions":[],"gaps":["synthetic transport not tested"]}));
+    let gaps = omgs::adjudication::check(&f.run, &findings).unwrap();
+    assert_eq!(
+        gaps.iter()
+            .filter(|g| g.contains("verdict missing"))
+            .count(),
+        findings.findings.len()
+    );
+    let decisions: Vec<_> = findings.findings.iter().map(|r| json!({"fingerprint":r.fingerprint,"decision":"uphold","reason":"independent trace","evidence":[],"required_changes":[]})).collect();
+    f.put("evaluation.json", json!({"evaluator":"red-1","source_ref":source,"decisions":decisions,"gaps":["synthetic transport not tested"]}));
+    assert!(omgs::adjudication::check(&f.run, &findings)
+        .unwrap()
+        .iter()
+        .any(|g| g.contains("independent")));
+    let mut a = read(f.run.join("architecture.json"));
+    a["unexamined"] = json!(["synthetic external boundary"]);
+    f.put("architecture.json", a);
+    let lines = omgs::adjudication::report_lines(&f.run, &findings).unwrap();
+    for html in [false, true] {
+        let text = omgs::adjudication::render_lines(&lines, html);
+        assert!(text.contains("synthetic transport not tested"));
+        assert!(text.contains("synthetic external boundary"));
+        assert!(text.contains("red-1"));
+    }
+}
+#[test]
+fn command_help_and_intent_aliases_are_actionable() {
+    let f = Fixture::new();
+    for cmd in [
+        "review", "batch", "prove", "critic", "validate", "route", "budget",
+    ] {
+        let o = f.cli(&[cmd, "--help"]);
+        assert!(o.status.success());
+        let text = String::from_utf8_lossy(&o.stdout);
+        assert!(text.contains(&format!("omgs {cmd}")));
+        assert!(!text.contains("omgs doctor"));
+    }
+    let one = f.cli(&["intent", "list", "--attack-class", "identity-binding"]);
+    let two = f.cli(&["intent", "list", "--attack-class", "identity_binding"]);
+    assert_eq!(one.stdout, two.stdout);
+    assert!(!one.stdout.is_empty());
+    assert_eq!(
+        f.cli(&["intent", "list", "--attack-class", "not-a-class"])
+            .status
+            .code(),
+        Some(2)
+    );
+}
+#[test]
+fn sensor_zero_hits_discloses_coverage_and_deduplicates_gaps() {
+    let sensors = omgs::shape::sensors(&json!({"tools_run":["gitleaks"],"tools_unavailable":["semgrep"],"hits":[],"gaps":["semgrep: not present on PATH"]}).to_string()).unwrap();
+    for html in [false, true] {
+        let text = omgs::report::sensor_section(Some(&sensors), html);
+        assert!(text.contains("Zero hits"));
+        assert!(text.contains("no history scan"));
+        assert_eq!(text.matches("semgrep:").count(), 1);
+    }
+    assert!(omgs::sensors::GITLEAKS_CONFIG.contains("omgs-azure-functions-url-key"));
+    assert!(omgs::sensors::GITLEAKS_CONFIG.contains("useDefault = true"));
+}
+
+fn repo(path: &Path, origin: Option<&str>) {
+    for args in [
+        vec!["init"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-m",
+            "Synthetic fixture",
+        ],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if let Some(origin) = origin {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["remote", "add", "origin", origin])
+            .status()
+            .unwrap()
+            .success());
+    }
+}
+#[test]
+fn review_and_batch_reuse_explicit_clone_root_with_persona_and_exact_commit() {
+    let f = Fixture::new();
+    let clones = f.root.join("clones");
+    let target = clones.join("example.com/team/synthetic");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("code.ps1"), "function Get-Dummy { 'fixture' }").unwrap();
+    repo(&target, Some("https://example.com/team/synthetic"));
+    let out_dir = f.root.join("explicit-run");
+    let out = f.cli(&[
+        "review",
+        "--repo-url",
+        "https://example.com/team/synthetic",
+        "--clone-root",
+        clones.to_str().unwrap(),
+        "--out",
+        out_dir.to_str().unwrap(),
+        "--persona",
+        "inheritor",
+        "--no-sensors",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let meta = read(out_dir.join("run-metadata.json"));
+    assert_eq!(meta["persona"], "inheritor");
+    assert_eq!(meta["budget_profile"], "deep");
+    assert!(meta.get("profile").is_none());
+    assert_eq!(meta["execution_profile"], "standard");
+    assert!(
+        read(out_dir.join("coverage-ledger.json"))["units"][0]["note"]
+            .as_str()
+            .unwrap()
+            .contains("Mapping placeholder")
+    );
+    assert_eq!(meta["source_ref"].as_str().unwrap().len(), 40);
+    assert_eq!(
+        read(out_dir.join("architecture.json"))["source_ref"],
+        meta["source_ref"]
+    );
+    let list = f.root.join("repos.txt");
+    std::fs::write(&list, "https://example.com/team/synthetic\n").unwrap();
+    let batch = f.root.join("batch");
+    let out = f.cli(&[
+        "batch",
+        "init",
+        "--list",
+        list.to_str().unwrap(),
+        "--out",
+        batch.to_str().unwrap(),
+        "--clone-root",
+        clones.to_str().unwrap(),
+        "--persona",
+        "builder",
+        "--no-sensors",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        read(batch.join("example.com/team/synthetic/run-metadata.json"))["persona"],
+        "builder"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(batch.join(".omgs-batch-claim"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(out_dir.join(".omgs-claim"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn gitleaks_rule_matches_synthetic_plain_and_encoded_url_keys_when_available() {
+    let Some(exe) = omgs::platform::which("gitleaks") else {
+        eprintln!("gitleaks not installed; rule configuration is checked separately");
+        return;
+    };
+    let f = Fixture::new();
+    let source = f.root.join("secret-fixtures");
+    std::fs::create_dir(&source).unwrap();
+    let dummy = "AbCd0123456789_test_dummy_key_never_issued_0123456789";
+    std::fs::write(
+        source.join("plain.ps1"),
+        format!("$u='https://synthetic.azurewebsites.net/api/test?code={dummy}=='\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("encoded.ps1"),
+        format!("$u='https://synthetic.azurewebsites.net/api/test?a=b&code={dummy}%3D%3D'\n"),
+    )
+    .unwrap();
+    let config = f.root.join("gitleaks.toml");
+    std::fs::write(&config, omgs::sensors::GITLEAKS_CONFIG).unwrap();
+    let report = f.root.join("gitleaks.json");
+    let out = Command::new(exe)
+        .args(["detect", "--no-git", "--source"])
+        .arg(&source)
+        .arg("--config")
+        .arg(&config)
+        .args(["--report-format", "json", "--report-path"])
+        .arg(&report)
+        .arg("--redact")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits = read(report);
+    let hits = hits.as_array().unwrap();
+    for name in ["plain.ps1", "encoded.ps1"] {
+        assert!(hits
+            .iter()
+            .any(|h| h["RuleID"] == "omgs-azure-functions-url-key"
+                && h["File"].as_str().unwrap().ends_with(name)));
+    }
+}
+
+#[test]
+fn guidance_preserves_probe_and_artifact_rules() {
+    for (guide, phrase) in [
+        (
+            include_str!("../skill/HUNTING.md"),
+            "Hunters must not execute any probe",
+        ),
+        (include_str!("../skill/EXECUTION-SAFETY.md"), "umask 077"),
+        (
+            include_str!("../skill/PROOF-CONTRACT.md"),
+            "record.exit_code: 1",
+        ),
+        (
+            include_str!("../skill/RECONNAISSANCE.md"),
+            "FunctionsToExport",
+        ),
+        (
+            include_str!("../skill/PROOF-RECIPES.md"),
+            "CertificateRequest.Create",
+        ),
+        (
+            include_str!("../skill/POLICY-AND-GATE.md"),
+            "owner-review `policy.patch`",
+        ),
+    ] {
+        assert!(guide.contains(phrase), "missing {phrase}");
+    }
+}

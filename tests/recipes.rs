@@ -1,5 +1,6 @@
 //! Tiny target pairs and invariant harnesses. No fixture is executed on the
 //! host: runtime checks, compilation and both variants go through the CLI.
+use serde_json::json;
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -77,11 +78,7 @@ fn ready(runtime: &str) -> bool {
 }
 fn record(out: &Output, expected: i32, test: bool) {
     let output = text(out);
-    assert_eq!(
-        out.status.code(),
-        Some(i32::from(expected != 0)),
-        "{output}"
-    );
+
     let path = output
         .lines()
         .find_map(|s| s.strip_prefix("proof record: "))
@@ -103,6 +100,12 @@ fn record(out: &Output, expected: i32, test: bool) {
     }
     assert_eq!(record["survivors"], serde_json::json!([]), "{record}");
     assert_eq!(record["exit_code"], expected, "{record}");
+    let parsed: omgs::proof::ProofRecord = serde_json::from_value(record.clone()).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(i32::from(omgs::proof::outer_exit(&parsed))),
+        "{output}"
+    );
     if test {
         assert_eq!(record["test_reachable"], true, "{record}");
     }
@@ -270,7 +273,16 @@ fn check(recipe: Recipe) -> bool {
         let output = text(&out);
         assert_eq!(
             out.status.code(),
-            Some(i32::from(exit != 0)),
+            Some(if exit == 0 {
+                0
+            } else if exit == 1
+                && !variant.ends_with("collision")
+                && !matches!(variant, "missing marker" | "missing control marker")
+            {
+                1
+            } else {
+                2
+            }),
             "{} {variant}: {output}",
             recipe.runtime
         );
@@ -371,6 +383,35 @@ fn check(recipe: Recipe) -> bool {
     assert!(replayed.clean() && replayed.contract.evidence().0 && replayed.contract.evidence().1);
     assert_eq!(replayed.exit_code, Some(1));
     let original = omgs::proof::load(&run, &format!("proofs/{n}.json")).unwrap();
+    assert!(omgs::proof::reproduces(&original, &replayed));
+    let final_findings =
+        omgs::shape::findings(&std::fs::read_to_string(&findings_path).unwrap()).unwrap();
+    let eval_path = run.join("evaluation.json");
+    let mut evaluation = json!({"evaluator":"independent-replay-context","source_ref":"synthetic",
+        "decisions":[{"fingerprint":fp,"decision":"uphold","reason":"reconstructed invariant",
+            "evidence":[],"required_changes":[]}],"gaps":["fixture-only reachability"]});
+    std::fs::write(&eval_path, evaluation.to_string()).unwrap();
+    assert!(omgs::adjudication::check(&run, &final_findings)
+        .unwrap()
+        .iter()
+        .any(|g| g.contains("no reproduced replay")));
+    evaluation["decisions"][0]["evidence"] = json!([format!("proofs/{}.json", n + 1)]);
+    std::fs::write(&eval_path, evaluation.to_string()).unwrap();
+    assert!(!omgs::adjudication::check(&run, &final_findings)
+        .unwrap()
+        .iter()
+        .any(|g| g.contains("no reproduced replay")));
+    let mut replay_as_original = final_findings.clone();
+    replay_as_original.findings[0].proof_ref = Some(format!("proofs/{}.json", n + 1));
+    assert!(omgs::proof::validate_proofs(&replay_as_original, &run)
+        .iter()
+        .any(|e| e.contains("not a replay")));
+    let mut mismatch = replayed.clone();
+    mismatch.command_sha256 = "f".repeat(64);
+    assert!(!omgs::proof::reproduces(&original, &mismatch));
+    mismatch = replayed.clone();
+    mismatch.exit_code = Some(2);
+    assert!(!omgs::proof::reproduces(&original, &mismatch));
     assert_ne!(replayed.marker_nonce, original.marker_nonce);
     assert!(text(&replay).contains("proof support for test_proven: yes"));
     assert!(text(&replay).contains(": reproduced"), "{}", text(&replay));

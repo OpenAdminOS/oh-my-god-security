@@ -15,6 +15,8 @@ pub struct Handoff {
     pub reading: &'static str,
     pub green_fixer_rules: &'static str,
     pub records: Vec<Item>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<String>,
 }
 #[derive(Serialize)]
 pub struct Trust {
@@ -177,6 +179,11 @@ pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Hand
         return Err("finding not found in actionable records (use C1, V1 or a fingerprint)".into());
     }
     Ok(Handoff {
+        budget: if run.join(crate::runmeta::FILE).is_file() {
+            Some(crate::budget::summary(run)?)
+        } else {
+            None
+        },
         schema: "omgs-handoff/1",
         trust: Trust {
             record_strings: RECORD_TRUST,
@@ -303,6 +310,9 @@ pub fn markdown_at(h: &Handoff, artifact_base: &str) -> String {
         "# How to read verdicts and proof tiers\n\n**Trust boundary:** {}\n\n{}\n\n## Green-fixer rules\n\n{}\n\n",
         h.trust.record_strings, h.reading, h.green_fixer_rules
     );
+    if let Some(budget) = &h.budget {
+        out.push_str(&markdown_data("Budget", budget));
+    }
     for r in &h.records {
         out.push_str(&format!(
             "## {}: {}\n\nFingerprint: {}\n\nVerdict: {}. Tier: {}.\n\n",

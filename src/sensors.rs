@@ -342,7 +342,7 @@ fn run_offline(tool: &str, target: &Path, artifacts: &Path, report: &mut Sensors
         limits: sensor_limits(),
         semgrep: tool == "semgrep",
         config: if tool == "gitleaks" {
-            "[extend]\nuseDefault = true\n"
+            GITLEAKS_CONFIG
         } else {
             ""
         },
@@ -531,6 +531,19 @@ pub fn read_report(dir: &Path) -> Result<Option<SensorsReport>, String> {
     }
     Ok(report)
 }
+
+/// Azure Functions keys need not carry the signatures recognized by default rules.
+/// Keep this URL-specific to avoid treating arbitrary base64 values as credentials.
+pub const GITLEAKS_CONFIG: &str = r#"[extend]
+useDefault = true
+
+[[rules]]
+id = "omgs-azure-functions-url-key"
+description = "Azure Functions URL code parameter"
+regex = '''(?i)https://[a-z0-9.-]+\.azurewebsites\.net/[^\s"'<>]*[?&]code=([a-z0-9_+/%=-]{32,})'''
+secretGroup = 1
+keywords = ["azurewebsites.net"]
+"#;
 
 #[cfg(test)]
 mod offline_tests {

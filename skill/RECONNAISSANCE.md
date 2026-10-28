@@ -102,3 +102,20 @@ Framework background: [Next.js route
 handlers](https://nextjs.org/docs/app/api-reference/file-conventions/route) and [authentication
 guidance](https://nextjs.org/docs/app/guides/authentication). Match the checked-in framework version
 before relying on routing behavior.
+
+## PowerShell, module libraries and other stacks
+
+The earlier HTTP examples are stack examples, not a prerequisite. For PowerShell, read manifests
+and `FunctionsToExport`, public/private functions, dot-sourcing and sample consumers as text.
+Map parameter binding, pipeline input, JSON conversion, certificate handling, filesystem writes,
+privileged cmdlets and external service calls. For Azure Functions, read bindings, authLevel,
+HTTP/query inputs, worker conversion and deployment configuration when present. Missing host
+configuration and real Graph or Storage semantics remain unexamined dependencies. Do not fetch or
+execute them to complete the map. For libraries, exported functions and callers replace routes;
+trace caller capabilities and validation before each sensitive return or side effect.
+
+Seeded stack units are mapping checklists, not hunter assignments. Before dispatch, create bounded
+surface/boundary/class units with `ledger add`, then close the checklist with evidence naming those
+units and a note describing the partition. Give each candidate one primary owner; additional units
+cite the same fingerprint rather than re-filing it. Never assign a whole-stack residual sweep over
+units another hunter already owns. The critic checks dispositions, not semantic non-overlap.

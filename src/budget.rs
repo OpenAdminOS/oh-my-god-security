@@ -367,6 +367,39 @@ pub fn with_family_lock<T>(
     })
 }
 
+/// Charge host-reported calls before dispatch, using the same family lock as proofs.
+pub fn charge_calls(run: &Path, calls: u64) -> Result<(), String> {
+    runmeta::update(run, |m| {
+        let root = original(run)?;
+        let total = allowance(&root)?;
+        if total.remaining.is_some_and(|remaining| calls > remaining) {
+            return Err("run budget exhausted: call charge exceeds remaining allowance".into());
+        }
+        let used = m
+            .get("agent_calls_used")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        m.insert(
+            "agent_calls_used".into(),
+            Value::from(used.checked_add(calls).ok_or("call count overflow")?),
+        );
+        Ok(())
+    })
+}
+
+pub fn summary(run: &Path) -> Result<String, String> {
+    let root = original(run)?;
+    let a = runmeta::with_lock(&root, || allowance(&root))?;
+    Ok(format!(
+        "Cumulative budget: {} used of {}; {} remaining across {} run(s)",
+        a.calls_and_proofs_used,
+        a.budget_agent_calls
+            .map_or("unlimited".into(), |n| n.to_string()),
+        a.remaining.map_or("unlimited".into(), |n| n.to_string()),
+        a.run_count
+    ))
+}
+
 #[cfg(test)]
 mod regressions {
     use super::*;

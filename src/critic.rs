@@ -48,6 +48,7 @@ pub struct CandidateLocation {
 /// fails to parse instead of reading as an empty handoff; a hunter that found
 /// nothing writes `{"candidates": []}`.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CandidatesFile {
     pub candidates: Vec<Candidate>,
 }
@@ -75,7 +76,7 @@ impl CriticReport {
     /// One line summary, for example "pass (4 units, 6 candidates, 3 findings)".
     pub fn summary(&self) -> String {
         format!(
-            "{} ({} units, {} candidates, {} findings)",
+            "{} (inspected: {} units, {} candidates, {} findings)",
             if self.passed() {
                 "pass".to_string()
             } else {
@@ -225,8 +226,15 @@ pub fn critique(
         }
         if !referenced.contains(f.fingerprint.as_str()) {
             gaps.push(format!(
-                "{at}: no ledger unit cites {} as evidence",
-                f.fingerprint
+                "{at}: no ledger unit cites {} as evidence; candidate unit_ids: {}",
+                f.fingerprint,
+                candidates
+                    .iter()
+                    .filter(|c| c.candidate.fingerprint == f.fingerprint
+                        || f.candidates.contains(&c.candidate.fingerprint))
+                    .flat_map(|c| c.candidate.unit_ids.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     }
@@ -319,5 +327,8 @@ pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport,
     for e in crate::proof::validate_proofs(findings, dir) {
         report.gaps.push(format!("findings {e}"));
     }
+    report
+        .gaps
+        .extend(crate::adjudication::check(dir, findings)?);
     Ok(report)
 }

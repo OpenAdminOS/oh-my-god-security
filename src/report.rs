@@ -242,7 +242,7 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
             md_cell(&r.f.title),
             r.anchor,
             verdict_label(r.f.verdict).1,
-            r.f.proof_tier.label(),
+            tier_label(r.f),
             proof_link(r.f, meta)
         ));
     }
@@ -254,7 +254,7 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         out.push_str(&format!("\n## {title}\n\n"));
         for r in list {
             let f = r.f;
-            out.push_str(&format!("<a id=\"{}\"></a>\n\n### {}: {}\n\n{}\n\nVerdict: {}. Tier: {}. Severity: {}.\n\nFingerprint: {}\n\nProof record: {}\n\n", r.anchor, r.reference, markdown_inline(&f.title), location_line(f), verdict_label(f.verdict).1, f.proof_tier.label(), f.severity.map(|s| s.label()).unwrap_or("none"), markdown_inline(&f.fingerprint), proof_link(f, meta)));
+            out.push_str(&format!("<a id=\"{}\"></a>\n\n### {}: {}\n\n{}\n\nVerdict: {}. Tier: {}. Severity: {}.\n\nFingerprint: {}\n\nProof record: {}\n\n", r.anchor, r.reference, markdown_inline(&f.title), location_line(f), verdict_label(f.verdict).1, tier_label(f), f.severity.map(|s| s.label()).unwrap_or("none"), markdown_inline(&f.fingerprint), proof_link(f, meta)));
             push_intent(&mut out, meta, f);
             if let Some(brief) = &f.fix_brief {
                 out.push_str("#### Fix brief\n\n");
@@ -648,7 +648,7 @@ fn render_tags(f: &Finding) -> String {
     let (class, text) = verdict_label(f.verdict);
     let mut out = format!(
         "<ul class=\"tags\" aria-label=\"Classification\"><li class=\"tag tag-{class}\">{text}</li><li class=\"tag\">Proof: {}</li>",
-        html_escape(f.proof_tier.label())
+        html_escape(&tier_label(f))
     );
     if let Some(sev) = f.severity {
         out.push_str(&format!(
@@ -950,7 +950,7 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
             id = html_escape(&r.anchor),
             title = html_escape(&r.f.title),
             loc = html_escape(&location(r.f)),
-            tier = html_escape(r.f.proof_tier.label()),
+            tier = html_escape(&tier_label(r.f)),
         ));
     }
     let index_body = if rows.is_empty() {
@@ -1376,7 +1376,17 @@ pub fn sensor_section(report: Option<&crate::sensors::SensorsReport>, html: bool
     let Some(report) = report else {
         return String::new();
     };
-    let mut lines = Vec::new();
+    let mut lines = vec!["Zero hits means no matching rule fired in scanned input, never clean or proof of safety. Sensors do not establish credential validity, exploitability or runtime authorization.".into()];
+    for tool in &report.tools_run {
+        let coverage = match tool.as_str() {
+            "gitleaks" => "secret pattern matches in working-tree files; coverage depends on retained configuration (new runs add the OMGS Azure Functions URL rule); no history scan or live credential validation; unknown key shapes and encodings can be missed",
+            "semgrep" => "locally supplied static rules; misses semantics and languages not covered by those rules, runtime state and external controls",
+            "trufflehog" => "offline secret detectors with verification disabled; no live credential validation and no guarantee for unknown secret shapes",
+            "osv-scanner" => "lockfile packages against the local offline advisory database; stale or missing advisories, unlisted dependencies and application logic are outside coverage",
+            _ => "coverage not recorded; no inference of safety is supported",
+        };
+        lines.push(format!("{tool} coverage: {coverage}"));
+    }
     for hit in &report.hits {
         lines.push(format!(
             "{}: {} at {}{}{} (class {:?}, fingerprint {})",
@@ -1396,7 +1406,13 @@ pub fn sensor_section(report: Option<&crate::sensors::SensorsReport>, html: bool
         ));
     }
     for tool in &report.tools_unavailable {
-        lines.push(format!("{tool}: not present or unavailable"));
+        if !report
+            .gaps
+            .iter()
+            .any(|g| g.starts_with(&format!("{tool}:")))
+        {
+            lines.push(format!("{tool}: not present or unavailable"));
+        }
     }
     for gap in &report.gaps {
         lines.push(format!("Gap: {gap}"));
@@ -1422,5 +1438,16 @@ pub fn sensor_section(report: Option<&crate::sensors::SensorsReport>, html: bool
                 })
                 .collect::<String>()
         )
+    }
+}
+
+fn tier_label(f: &Finding) -> String {
+    if f.verdict == Verdict::NeedsValidation {
+        format!(
+            "{} (behavior only; pending validation)",
+            f.proof_tier.label()
+        )
+    } else {
+        f.proof_tier.label().into()
     }
 }

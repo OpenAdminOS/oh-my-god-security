@@ -95,6 +95,7 @@ fn summary(url: &str, blockers: Vec<String>) -> RunSummary {
         rejected: 3,
         blockers,
         agent_calls: Some(40),
+        budget: None,
         reroutes: 1,
     }
 }
@@ -135,7 +136,7 @@ fn batch_index_is_deterministic_offline_and_escaped() {
 fn batch_summary_reads_a_run_directory() {
     let index = scratch("batch");
     let run = index.join("github.com__a__b");
-    std::fs::create_dir_all(&run).unwrap();
+    omgs::platform::create_private_dir(&run).unwrap();
     std::fs::write(run.join("findings.json"), r#"{"findings": []}"#).unwrap();
     write_private_fixture(
         run.join("run-metadata.json"),

@@ -317,6 +317,11 @@ pub fn validate_proofs(file: &FindingsFile, run: &Path) -> Vec<String> {
                 continue;
             }
         };
+        if record.replays.is_some() {
+            errors.push(format!(
+                "{at}: proof_ref must name the original proof, not a replay"
+            ));
+        }
         if record.finding.as_deref() != Some(f.fingerprint.as_str()) {
             errors.push(format!(
                 "{at}: {r} was recorded for finding {}, not {}",
@@ -1155,6 +1160,39 @@ impl QuoteCursor {
         self.pos = at;
         self.quote
     }
+}
+
+/// Stable CLI contract: success 0, supported assertion 1, harness/execution error 2.
+pub fn outer_exit(record: &ProofRecord) -> u8 {
+    if !record.clean() {
+        2
+    } else if record.assertion_failure() {
+        1
+    } else if record.exit_code == Some(0) {
+        0
+    } else {
+        2
+    }
+}
+/// Replays cannot replace originals or cross finding, command, snapshot or tier.
+pub fn reproduces(original: &ProofRecord, replay: &ProofRecord) -> bool {
+    original.replays.is_none()
+        && replay.replays == Some(original.n)
+        && original.finding == replay.finding
+        && original.finding.is_some()
+        && original.command_sha256 == replay.command_sha256
+        && original.command == replay.command
+        && original.target == replay.target
+        && original.test == replay.test
+        && original.timeout_ms == replay.timeout_ms
+        && original.target_head == replay.target_head
+        && original.target_sha256 == replay.target_sha256
+        && original.test_sha256 == replay.test_sha256
+        && original.tier == replay.tier
+        && original.exit_code == replay.exit_code
+        && original.contract == replay.contract
+        && original.clean()
+        && replay.clean()
 }
 
 #[cfg(test)]

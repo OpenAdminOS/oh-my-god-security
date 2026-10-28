@@ -58,7 +58,6 @@ fn set_state(entry: &mut Map<String, Value>, state: &str, detail: Option<&str>, 
         entry.remove("ended_ms");
     }
     if (state == "done" || state == "failed") && !entry.contains_key("ended_ms") {
-        entry.entry("started_ms").or_insert(json!(now));
         entry.insert("ended_ms".into(), json!(now));
     }
     if let Some(d) = detail {

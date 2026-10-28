@@ -177,7 +177,9 @@ reconciles the ledger, every `candidates*.json`, and `findings.json`, and exits 
 still `planned` or `candidate`, a `covered` unit without evidence, a candidate no finding accounts
 for, a finding whose verifier hunted one of its candidates, a finding no unit cites as evidence).
 Close each gap in the ledger with `omgs ledger set` (evidence or a note) or by verifying the missing
-candidate; do not report over open gaps. `omgs report` also runs the critic and prints its result in
+candidate; never present open gaps as a completed review. A budget or provider block may require
+a partial handoff with every gap visible, as described in [PIPELINE.md](PIPELINE.md). `omgs report`
+also runs the critic and prints its result in
 the report. Resolve schema errors, duplicate identity conflicts, missing evidence, invalid
 severity/verdict combinations, and inconsistent tiers before `omgs report`. A validator pass checks
 structure and deterministic consistency, not the truth of an agent's claim.
@@ -193,3 +195,28 @@ source trace, pending question, or uncommitted proof cannot gate, including a ti
 without a committed deterministic guard. Advisory mode blocks nothing. Propose accepted proof tests,
 intent rules, policy and suppressions for normal review; keep run output external and never silently
 change the gate mode or policy source.
+
+## Adjudication and sensor limits
+
+Validate `evaluation.json` with `omgs validate --evaluation OUTPUT_DIR/evaluation.json`, using
+`schemas/evaluation.schema.json`. Keep one cumulative evaluation of all finalized records per run.
+The evaluator identity must be independent of every hunter and verifier whose records it judges.
+The critic requires every finalized record to have an uphold decision with no outstanding changes;
+every upheld proof needs an attested reproduced replay named as an exact `proofs/N.json` evidence
+entry. Evaluator `gaps` describe evidence limits and are reported even when decisions are upheld.
+Structured `leads` contain `unit_id` and `reason`; each must have a ledger disposition. An in-scope
+lead returns through a fresh hunter and verifier. If budget or a provider block prevents that,
+record a deferred or blocked unit with the exact reason and report the gap. It cannot be silently
+dropped to pass the critic. Out-of-scope leads require an explicit scope reason and evidence.
+
+Proof tier describes demonstrated behavior, while verdict describes the vulnerability decision.
+A `needs_validation` record can have `test_proven` behavior when intent, deployment or production
+reachability remains unresolved. It stays pending with no severity. `covered` means examined with
+a disposition, including pending findings; it never means safe, fixed or fully demonstrated.
+
+Sensors list pattern and input coverage, unavailable tools and blind spots. Zero hits never means
+clean. Gitleaks uses defaults plus an OMGS rule for long Azure Functions URL `code` parameters,
+including URL-encoded padding. Arbitrary secret formats or encodings can still be missed; no
+credential is tested against a live endpoint. Inspect samples and configuration as text even after
+zero matches. Semgrep depends on local rule coverage, TruffleHog verification is disabled, and OSV
+depends on the supplied offline database. These tools cannot establish runtime authorization.

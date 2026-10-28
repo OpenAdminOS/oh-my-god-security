@@ -67,28 +67,33 @@ fn has(args: &[String], name: &str) -> bool {
 }
 
 fn usage() {
-    eprintln!(
-        "omgs {}\n\nUsage:\n  omgs setup [--yes | --dry-run] [--from <skill-dir>] [--install-skills] [--replace] [--verify-mxc] [--write-policy <repo> --mode gate|advisory]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--base <ref>] [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>]\n  omgs gate --target <checkout> --base <base-sha> --head <head-sha> [--run <dir>]\n  omgs stage --run <run-dir>\n    Only confirmed test_proven or higher with valid runner-attested proofs. Invalid proofs are excluded and reported; pending drafts stay in HANDOFF.md.\n  omgs handoff --run <run-dir> [--finding <id>]\n  omgs intent propose --run <run-dir>\n  omgs budget --run <run-dir>\n  omgs bench score --cases <manifest> --runs <run-dir> [--runs <run-dir>]...\n  omgs validate --findings <findings.json>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--persona builder|inheritor|team] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nBoolean options: --replace, --yes, --dry-run, --install-skills, --verify-mxc, --no-sensors and --live. Every other option takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n",
-        env!("CARGO_PKG_VERSION")
-    );
-    eprintln!("Sensors: trufflehog uses --no-verification --no-update; osv-scanner uses --offline-vulnerabilities and --offline with OMGS_OSV_DB (default: <OMGS data dir>/osv-db). No database download is automatic. See README for the explicit download step.");
+    omgs::help::usage();
 }
 
-/// Validate the complete option list before any command can mutate run state.
+fn clone_root(args: &[String]) -> PathBuf {
+    flag(args, "--clone-root")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir().join("targets"))
+}
+
+fn command_help(cmd: &str, args: &[String]) {
+    omgs::help::command(cmd, args);
+}
+
 fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
     let (allowed, positional): (&str, bool) = match cmd {
         "setup" => ("--yes --from --dry-run --install-skills --replace --verify-mxc --write-policy --mode", false),
-        "review" => ("--repo-url --mode --budget --no-sensors", false),
+        "review" => ("--repo-url --mode --budget --no-sensors --persona --out --clone-root", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
             "--target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of",
             true,
         ),
         "batch" if args.first().is_some_and(|a| a == "init") => {
-            ("--list --out --mode --budget --no-sensors", true)
+            ("--list --out --mode --budget --no-sensors --persona --clone-root", true)
         }
         "batch" if args.first().is_some_and(|a| a == "index") => ("--batch --out", true),
         "bench" if args.first().is_some_and(|a| a == "score") => ("--cases --runs", true),
-        "validate" => ("--findings", false),
+        "validate" => ("--findings --candidates --dispositions --evaluation", false),
         "fingerprint" => ("--attack-class --entry-point --sink --boundary", false),
         "prove" => (
             "--cmd --target --run --finding --test --test-from --expect-marker --replay --tier --timeout-ms",
@@ -96,12 +101,13 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         ),
         "approve" => ("--target", false),
         "report" => (
-            "--findings --out --repo --ref --mode --sandbox --persona --hunters --verifier --agent-calls --accounting",
+            "--findings --out --repo --ref --mode --sandbox --persona --hunters --verifier --agent-calls --accounting --model",
             false,
         ),
         "handoff" => ("--run --finding", false),
         "stage" => ("--run", false),
         "architecture" => ("--in --out", false),
+        "ledger" if args.first().is_some_and(|a| a == "ingest") => ("--ledger --dispositions", true),
         "ledger" if args.first().is_some_and(|a| a == "list") => ("--ledger", true),
         "ledger" if args.first().is_some_and(|a| a == "add") => {
             ("--ledger --unit --surface --classes --status --note", true)
@@ -110,7 +116,8 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
             ("--ledger --unit --status --evidence --note", true)
         }
         "gate" => ("--target --base --head --run", false),
-        "critic" | "budget" => ("--run", false),
+        "critic" => ("--run", false),
+        "budget" => ("--run --charge-calls", false),
         "status" => (
             "--run --stage --state --label --parent --detail --counter --log --accounting",
             false,
@@ -145,7 +152,8 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         let repeatable = (cmd == "ledger" && option == "--evidence")
             || (cmd == "status" && option == "--counter")
             || (cmd == "bench" && option == "--runs")
-            || (["status", "report"].contains(&cmd) && option == "--accounting");
+            || (["status", "report"].contains(&cmd) && option == "--accounting")
+            || (cmd == "report" && option == "--model");
         if !seen.insert(option) && !repeatable {
             return Err(format!("duplicate option '{option}'"));
         }
@@ -197,7 +205,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
         Ok(true) => {
-            usage();
+            command_help(cmd, rest);
             return ExitCode::SUCCESS;
         }
         Ok(false) => {}
@@ -271,6 +279,12 @@ fn cmd_gate(args: &[String]) -> Result<(), String> {
 
 fn cmd_budget(args: &[String]) -> Result<(), String> {
     let run = flag(args, "--run").ok_or("budget requires --run <run-dir>")?;
+    if let Some(n) = flag(args, "--charge-calls") {
+        let n = n
+            .parse::<u64>()
+            .map_err(|_| "--charge-calls needs a non-negative integer")?;
+        omgs::budget::charge_calls(Path::new(&run), n)?;
+    }
     let root = omgs::budget::original(Path::new(&run))?;
     let allowance = omgs::runmeta::with_lock(&root, || omgs::budget::allowance(&root))?;
     println!(
@@ -298,7 +312,34 @@ fn validate_at(file: &FindingsFile, path: &str) -> Vec<String> {
 }
 
 fn cmd_validate(args: &[String]) -> Result<(), String> {
-    let path = flag(args, "--findings").ok_or("validate requires --findings <path>")?;
+    let inputs = [
+        "--findings",
+        "--candidates",
+        "--dispositions",
+        "--evaluation",
+    ];
+    if inputs.iter().filter(|k| flag(args, k).is_some()).count() != 1 {
+        return Err("validate requires exactly one of --findings, --candidates, --dispositions, --evaluation".into());
+    }
+    for kind in &inputs[1..] {
+        if let Some(path) = flag(args, kind) {
+            let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+            match *kind {
+                "--candidates" => {
+                    omgs::adjudication::candidates(&text)?;
+                }
+                "--dispositions" => {
+                    omgs::adjudication::dispositions(&text)?;
+                }
+                _ => {
+                    omgs::adjudication::parse(&text)?;
+                }
+            }
+            println!("valid: {kind}");
+            return Ok(());
+        }
+    }
+    let path = flag(args, "--findings").unwrap();
     let file = read_findings(&path)?;
     let errors = validate_at(&file, &path);
     if errors.is_empty() {
@@ -905,10 +946,10 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             Err("__EXIT1__".into())
         };
     }
-    if s.success {
-        Ok(())
-    } else {
-        Err("__EXIT1__".into())
+    match omgs::proof::outer_exit(&record) {
+        0 => Ok(()),
+        1 => Err("__EXIT1__".into()),
+        _ => Err("proof harness or execution error; see retained record".into()),
     }
 }
 
@@ -1373,7 +1414,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                     .map_err(|e| format!("parse {}: {e}", path.display()))?;
                 let vendored = rep.hits.iter().filter(|h| h.vendored).count();
                 sensors_summary = Some(format!(
-                    "{} run, {} hit(s), {} vendored",
+                    "{} run, {} hit(s), {} vendored; pattern matches only, never a clean bill of health",
                     if rep.tools_run.is_empty() {
                         "no tools".into()
                     } else {
@@ -1442,6 +1483,33 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             "warning: run metadata incomplete; pass --hunters <n>, --verifier <id>, and --agent-calls <n>. Unrecorded values render as \"not recorded\"."
         );
     }
+    let supplied_models = omgs::route::parse_identities(&flags(args, "--model"))?;
+    if let Some(run) = findings_dir
+        .as_deref()
+        .filter(|d| d.join(omgs::runmeta::FILE).is_file())
+    {
+        omgs::runmeta::update(run, |m| {
+            if let Some(n) = agent_calls {
+                let old = m
+                    .get("agent_calls_used")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                if u64::from(n) < old {
+                    return Err("--agent-calls cannot decrease recorded usage".into());
+                }
+                m.insert("agent_calls_used".into(), serde_json::json!(n));
+            }
+            let models = m
+                .entry("models")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or("models must be an object")?;
+            for (role, model) in &supplied_models {
+                models.insert(role.clone(), serde_json::json!(model));
+            }
+            Ok(())
+        })?;
+    }
     let mut accounting = omgs::accounting::read(&saved)?;
     accounting.extend(supplied_usage.clone());
     let persona = flag(args, "--persona")
@@ -1471,6 +1539,12 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         .map(omgs::report::timeline)
         .transpose()?
         .unwrap_or_default();
+    let mut models = run_models(findings_dir.as_deref());
+    for (role, model) in &supplied_models {
+        models.retain(|line| !line.starts_with(&format!("{role}:")));
+        models.push(format!("{role}: {model}"));
+    }
+    models.sort();
     let mut meta = ReportMeta {
         repo: defaulted(flag(args, "--repo"), "repo", "target"),
         source_ref: defaulted(flag(args, "--ref"), "source_ref", "working tree"),
@@ -1484,7 +1558,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         verifier,
         agent_calls,
         critic,
-        models: run_models(findings_dir.as_deref()),
+        models,
         reroutes: run_reroutes(findings_dir.as_deref()),
         intent_answers: run_answers(findings_dir.as_deref())?,
         accounting,
@@ -1506,26 +1580,33 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         .map(omgs::sensors::read_report)
         .transpose()?
         .flatten();
+    let evidence =
+        omgs::adjudication::report_lines(findings_dir.as_deref().unwrap_or(Path::new(".")), &file)?;
+    let evidence_md = omgs::adjudication::render_lines(&evidence, false);
+    let evidence_html = omgs::adjudication::render_lines(&evidence, true);
     let sensor_md = omgs::report::sensor_section(sensors.as_ref(), false);
     let sensor_html = omgs::report::sensor_section(sensors.as_ref(), true);
     write_out(
         dir.join("REPORT.md"),
-        format!("{}{sensor_md}", render_markdown(&file, &meta)),
+        format!("{}{sensor_md}{evidence_md}", render_markdown(&file, &meta)),
     )
     .map_err(|e| e.to_string())?;
     write_out(
         dir.join("REPORT.html"),
-        render_html(&file, &meta).replace("</body>", &format!("{sensor_html}</body>")),
+        render_html(&file, &meta)
+            .replace("</body>", &format!("{sensor_html}{evidence_html}</body>")),
     )
     .map_err(|e| e.to_string())?;
     write_out(dir.join("findings.sarif.json"), render_sarif(&file, &meta))
         .map_err(|e| e.to_string())?;
     write_handoff(dir, &handoff, &meta.artifact_base)?;
     println!(
-        "wrote {}, {}, {}, HANDOFF.md, handoff.json",
+        "wrote {}, {}, {}, {}, {}",
         dir.join("REPORT.md").display(),
         dir.join("REPORT.html").display(),
-        dir.join("findings.sarif.json").display()
+        dir.join("findings.sarif.json").display(),
+        dir.join("HANDOFF.md").display(),
+        dir.join("handoff.json").display()
     );
     // Record what this report rendered in the run metadata and mark the run
     // complete, which also lets a running omgs watch shut itself down.
@@ -1549,13 +1630,54 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 "accounting".into(),
                 serde_json::to_value(&usage).map_err(|e| e.to_string())?,
             );
-            m.insert("run_status".into(), serde_json::json!("complete"));
+            m.insert(
+                "run_status".into(),
+                serde_json::json!(if meta.critic.as_ref().is_none_or(|c| c.passed()) {
+                    "complete"
+                } else {
+                    "partial"
+                }),
+            );
             m.insert(
                 "completed_unix".into(),
                 serde_json::json!(omgs::runmeta::now_unix()),
             );
             Ok(())
         })?;
+    }
+    if let Some(run) = findings_dir
+        .as_deref()
+        .filter(|d| d.join(omgs::status::FILE).is_file())
+    {
+        omgs::status::apply(
+            run,
+            &omgs::status::Update {
+                stage: "report",
+                label: None,
+                parent: None,
+                state: "done",
+                detail: None,
+                counters: &[],
+                log: None,
+            },
+        )?;
+    }
+    if let Some(run) = findings_dir
+        .as_deref()
+        .filter(|d| d.join(omgs::status::FILE).is_file())
+    {
+        meta.timeline = omgs::report::timeline(run)?;
+        write_out(
+            dir.join("REPORT.md"),
+            format!("{}{sensor_md}{evidence_md}", render_markdown(&file, &meta)),
+        )
+        .map_err(|e| e.to_string())?;
+        write_out(
+            dir.join("REPORT.html"),
+            render_html(&file, &meta)
+                .replace("</body>", &format!("{sensor_html}{evidence_html}</body>")),
+        )
+        .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -2178,9 +2300,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
         eprintln!("warning: run output is under a shared temp directory and describes vulnerabilities. Prefer the default runs directory under your home.");
     }
     save_trusted_policy(&target, &out_abs, &generation, &policy)?;
-    let source_ref = omgs::proof::git_head(&target)
-        .map(|h| h[..7].to_string())
-        .unwrap_or_else(|| "working tree".into());
+    let source_ref = omgs::proof::git_head(&target).unwrap_or_else(|| "working tree".into());
     let mut files = Vec::new();
     let mut omissions = InventoryGaps::default();
     walk_limited(
@@ -2245,12 +2365,14 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             } else {
                 format!("stack:{}:{stack}", project.root)
             };
-            units.push(Unit::new(
+            let mut unit = Unit::new(
                 &id,
                 &project.root,
                 &omgs::stack_attack_classes(stack),
                 "planned",
-            ));
+            );
+            unit.note = Some("Mapping placeholder: split into bounded surface/boundary/class units before hunter dispatch; cite those unit ids when closing this checklist. Never use it to duplicate candidate ownership.".into());
+            units.push(unit);
         }
     }
     for project in projects.iter().filter(|p| p.stacks.is_empty()) {
@@ -2388,7 +2510,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
     let mut meta = serde_json::json!({
         "repo": repo, "target": target.to_string_lossy(), "source_ref": source_ref,
         "run_id": omgs::platform::random_nonce().map_err(|e| e.to_string())?,
-        "mode": mode, "budget_agent_calls": budget, "profile": "standard",
+        "mode": mode, "budget_agent_calls": budget, "execution_profile": "standard",
         "policy": policy,
         "persona": persona.map(|p| p.name), "report_depth": persona.map_or("full", |p| p.report_depth),
         "budget_profile": persona.map_or("standard", |p| p.budget_profile),
@@ -2673,6 +2795,23 @@ fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
     let path = path.to_string();
     let mut ledger = read_ledger(&path)?;
     match sub {
+        "ingest" => {
+            let input =
+                flag(rest, "--dispositions").ok_or("ledger ingest requires --dispositions")?;
+            let text = std::fs::read_to_string(input).map_err(|e| e.to_string())?;
+            let dispositions = omgs::adjudication::dispositions(&text)?;
+            for d in dispositions.units {
+                let status = if d.disposition == "candidate" {
+                    "covered"
+                } else {
+                    &d.disposition
+                };
+                set_status(&mut ledger, &d.unit_id, status, &d.evidence, Some(&d.note))?;
+            }
+            write_ledger(&path, &ledger)?;
+            println!("ingested dispositions");
+            Ok(())
+        }
         "list" => {
             for line in coverage_lines(&ledger) {
                 println!("{line}");
@@ -2701,7 +2840,7 @@ fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
             new.note = flag(rest, "--note").filter(|n| !n.trim().is_empty());
             add_unit(&mut ledger, new)?;
             write_ledger(&path, &ledger)?;
-            println!("{unit}: {status}");
+            println!("{status}: {unit}");
             Ok(())
         }
         "set" => {
@@ -2714,7 +2853,7 @@ fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
             let note = flag(rest, "--note");
             set_status(&mut ledger, &unit, &status, &evidence, note.as_deref())?;
             write_ledger(&path, &ledger)?;
-            println!("{unit}: {status}");
+            println!("{status}: {unit}");
             Ok(())
         }
         _ => Err(usage.into()),
@@ -2738,9 +2877,9 @@ fn cmd_critic(args: &[String]) -> Result<(), String> {
 /// Clone (or reuse) a repository for review. Only validated https URLs reach
 /// git, as a positional argument after `--`, with every other transport
 /// disabled and no prompts; a reused clone must have the same origin.
-fn clone_target(raw_url: &str) -> Result<PathBuf, String> {
+fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
     let repo = omgs::batch::parse_repo_url(raw_url)?;
-    let targets = data_dir().join("targets");
+    let targets = clone_root(args);
     let dest = targets.join(&repo.host).join(&repo.owner).join(&repo.name);
     let git_path = omgs::platform::which("git").ok_or("git not found on an absolute PATH entry")?;
     let git = || {
@@ -2808,7 +2947,7 @@ fn clone_target(raw_url: &str) -> Result<PathBuf, String> {
 
 fn init_args(dest: &Path, args: &[String], out: Option<&Path>) -> Vec<String> {
     let mut v = vec!["--target".to_string(), dest.to_string_lossy().to_string()];
-    for name in ["--mode", "--budget"] {
+    for name in ["--mode", "--budget", "--persona"] {
         if let Some(value) = flag(args, name) {
             v.push(name.into());
             v.push(value);
@@ -2830,8 +2969,12 @@ fn brief(dest: &Path, run: &Path) -> String {
 
 fn cmd_review(args: &[String]) -> Result<(), String> {
     let url = flag(args, "--repo-url").ok_or("review requires --repo-url <url>")?;
-    let dest = clone_target(&url)?;
-    let run = audit_init(&init_args(&dest, args, None))?;
+    if let Some(p) = flag(args, "--persona") {
+        omgs::persona::defaults(&p)?;
+    }
+    let dest = clone_target(&url, args)?;
+    let out = flag(args, "--out").map(PathBuf::from);
+    let run = audit_init(&init_args(&dest, args, out.as_deref()))?;
     println!("{}", run.display());
     println!("{}", brief(&dest, &run));
     Ok(())
@@ -2849,6 +2992,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             if urls.is_empty() {
                 return Err(format!("{list} lists no repository URLs"));
             }
+            if let Some(p) = flag(rest, "--persona") { omgs::persona::defaults(&p)?; }
             // Reject bad shared options before cloning or claiming anything.
             if let Some(m) = flag(rest, "--mode") {
                 if m != "gate" && m != "advisory" {
@@ -2861,7 +3005,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             }
             // The batch output must sit outside the targets area and every
             // target in the list, including ones that later fail to clone.
-            let targets_root = data_dir().join("targets");
+            let targets_root = clone_root(rest);
             let dests: Vec<PathBuf> = urls
                 .iter()
                 .filter_map(|u| omgs::batch::parse_repo_url(u).ok())
@@ -2922,10 +3066,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                     out.display()
                 ));
             }
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(out.join(".omgs-batch-claim"))
+            omgs::platform::write_private_new(&out.join(".omgs-batch-claim"), b"")
                 .map_err(|e| {
                     format!(
                         "{} is already claimed by another batch ({e}); choose a new --out",
@@ -2944,7 +3085,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                     // Every run path is checked against every listed target,
                     // before the run is created and again after.
                     contained(&run_dir)?;
-                    let dest = clone_target(&url)?;
+                    let dest = clone_target(&url, rest)?;
                     contained(&run_dir)?;
                     let run = audit_init(&init_args(&dest, rest, Some(&run_dir)))?;
                     contained(&run)?;
@@ -3095,8 +3236,10 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         Ok(usage)
     })?;
     println!("{stage}: {state}");
-    for line in omgs::accounting::lines(&usage) {
-        println!("{line}");
+    if !flags(args, "--accounting").is_empty() {
+        for line in omgs::accounting::lines(&usage) {
+            println!("{line}");
+        }
     }
     Ok(())
 }
@@ -3140,12 +3283,18 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
             omgs::route::ROLES.join(", ")
         ));
     }
-    let models = omgs::route::load_models(&models_path(args))?;
     let newly = flag(args, "--refused");
     let reason = flag(args, "--reason").unwrap_or_default();
     if newly.is_some() && reason.trim().is_empty() {
         return Err("--refused requires --reason <text>".into());
     }
+    let model_path = models_path(args);
+    // A missing routing file cannot erase a refusal in a fixed-model run.
+    let models = if newly.is_some() && !model_path.exists() {
+        omgs::route::Models::default()
+    } else {
+        omgs::route::load_models(&model_path)?
+    };
     // Read the refusal history, pick the next model, and record the result in
     // one locked transaction, so concurrent reroutes never lose an entry.
     let next = omgs::runmeta::update(&run, |m| {
@@ -3219,7 +3368,10 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
                     .or_insert_with(|| serde_json::json!([]))
                     .as_array_mut()
                 {
-                    let e = serde_json::json!(e);
+                    let e = serde_json::json!(format!(
+                        "{role}: {}: {reason}: {e}",
+                        newly.as_deref().unwrap_or("unconfigured")
+                    ));
                     if !list.contains(&e) {
                         list.push(e);
                     }
@@ -3277,7 +3429,12 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
     match sub {
         Some("list") => {
             let stack = flag(rest, "--stack");
-            let class = flag(rest, "--attack-class");
+            let class = flag(rest, "--attack-class").map(|c| c.replace('-', "_"));
+            let class = class.map(|c| if c == "fail_closed" { "fail_closed_semantics".into() } else { c });
+            if let Some(c) = &class {
+                let valid: std::collections::BTreeSet<_> = omgs::intent::list(None, None).iter().flat_map(|q| q.attack_classes.iter().cloned()).collect();
+                if !valid.contains(c) { return Err(format!("unknown attack class {c}; expected {}", valid.into_iter().collect::<Vec<_>>().join(", "))); }
+            }
             for q in omgs::intent::list(stack.as_deref(), class.as_deref()) {
                 println!("{}: {}", q.id, q.question);
                 if !q.answers.is_empty() {
@@ -3490,6 +3647,12 @@ mod cli_tests {
                             .skip(1)
                             .map(|s| s.split('"').next().unwrap())
                             .collect::<Vec<_>>(),
+                        "k" | "kind" => vec![
+                            "--findings",
+                            "--candidates",
+                            "--dispositions",
+                            "--evaluation",
+                        ],
                         "name" | "conflicting" => {
                             let array = body
                                 .split_once(&format!("for {variable} in ["))
@@ -3539,6 +3702,7 @@ mod cli_tests {
         ("handoff", ""),
         ("stage", ""),
         ("architecture", ""),
+        ("ledger", "ingest"),
         ("ledger", "list"),
         ("ledger", "add"),
         ("ledger", "set"),
@@ -3593,6 +3757,7 @@ mod cli_tests {
             }
             if cmd == "review" || (cmd == "batch" && sub == "init") {
                 sections.push(("init_args", function(source, "init_args")));
+                sections.push(("clone_root", function(source, "clone_root")));
             }
             for (name, body) in sections {
                 let names = read_options(body);

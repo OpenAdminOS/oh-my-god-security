@@ -409,12 +409,91 @@ fn complete_run() -> (Ledger, Vec<SourcedCandidate>, FindingsFile) {
     (ledger, vec![sc], file(vec![f]))
 }
 
+fn adjudicate_fixture(dir: &std::path::Path, findings: &FindingsFile) {
+    let mut decisions = Vec::new();
+    for f in &findings.findings {
+        let mut evidence = Vec::new();
+        if let Some(reference) = &f.proof_ref {
+            let mut replay = omgs::proof::load(dir, reference).unwrap();
+            replay.replays = Some(replay.n);
+            replay.n += 1000;
+            let artifacts = dir.join("proofs").join(replay.n.to_string());
+            omgs::platform::create_private_dir(&artifacts).unwrap();
+            let original_dir = replay.proof_dir.clone();
+            replay.proof_dir = artifacts.to_string_lossy().into();
+            let config_path = artifacts.join("mxc-config.json");
+            let mut config: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    dir.join("proofs")
+                        .join(replay.replays.unwrap().to_string())
+                        .join("mxc-config.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            fn relocate(v: &mut serde_json::Value, old: &str, new: &str) {
+                match v {
+                    serde_json::Value::String(s) => {
+                        *s = s
+                            .replace(old, new)
+                            .replace(&old.replace('\\', "/"), &new.replace('\\', "/"));
+                    }
+                    serde_json::Value::Array(a) => {
+                        for v in a {
+                            relocate(v, old, new);
+                        }
+                    }
+                    serde_json::Value::Object(o) => {
+                        for v in o.values_mut() {
+                            relocate(v, old, new);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            relocate(&mut config, &original_dir, &replay.proof_dir);
+            let config = config.to_string();
+            replay.config_sha256 = omgs::sha256::digest(config.as_bytes());
+            write_private_fixture(config_path, config).unwrap();
+            write_private_fixture(
+                artifacts.join("command.txt"),
+                std::fs::read(
+                    dir.join("proofs")
+                        .join(replay.replays.unwrap().to_string())
+                        .join("command.txt"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                omgs::proof::runner_evidence(dir, &replay).is_empty(),
+                "{:?}",
+                omgs::proof::runner_evidence(dir, &replay)
+            );
+            evidence.push(omgs::proof::reference(replay.n));
+            omgs::proof::write(dir, &replay).unwrap();
+        }
+        decisions.push(serde_json::json!({"fingerprint":f.fingerprint,"decision":"uphold",
+            "reason":"Synthetic independent evaluation", "evidence":evidence,"required_changes":[]}));
+    }
+    write_private_fixture(
+        dir.join("evaluation.json"),
+        serde_json::json!({"evaluator":"eval-fixture",
+        "source_ref": if dir.join("run-metadata.json").is_file() { omgs::runmeta::read(dir).unwrap().get("source_ref").cloned().unwrap_or(serde_json::json!("synthetic")) } else { serde_json::json!("synthetic") },"decisions":decisions,"gaps":[]})
+        .to_string(),
+    )
+    .unwrap();
+}
+
 #[test]
 fn critic_passes_a_complete_run() {
     let (ledger, cands, findings) = complete_run();
     let report = critique(&ledger, 1, &cands, &findings);
     assert!(report.passed(), "{:?}", report.gaps);
-    assert_eq!(report.summary(), "pass (1 units, 1 candidates, 1 findings)");
+    assert_eq!(
+        report.summary(),
+        "pass (inspected: 1 units, 1 candidates, 1 findings)"
+    );
 }
 
 #[test]
@@ -536,7 +615,7 @@ fn report_renders_critic_result() {
         ..ReportMeta::default()
     };
     let html = render_html(&findings, &meta);
-    assert!(html.contains("Coverage critic: pass (1 units, 1 candidates, 1 findings)"));
+    assert!(html.contains("Coverage critic: pass (inspected: 1 units, 1 candidates, 1 findings)"));
     assert!(render_markdown(&findings, &meta).contains("Coverage critic: pass"));
 
     meta.critic = Some(critique(&ledger, 0, &[], &findings));
@@ -593,6 +672,9 @@ fn cli_ledger_and_critic_end_to_end() {
     let ledger_path = dir.join("coverage-ledger.json");
     let lp = ledger_path.to_str().unwrap();
 
+    let fs = omgs::shape::findings(&std::fs::read_to_string(dir.join("findings.json")).unwrap())
+        .unwrap();
+    adjudicate_fixture(&dir, &fs);
     let out = omgs(&["critic", "--run", run]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("still planned"));
@@ -708,6 +790,7 @@ fn report_critic_describes_the_rendered_findings() {
         serde_json::to_string(&findings).unwrap(),
     )
     .unwrap();
+    adjudicate_fixture(&dir, &findings);
     let out_dir = dir.join("out");
     let out = omgs(&[
         "report",
@@ -722,7 +805,7 @@ fn report_critic_describes_the_rendered_findings() {
         String::from_utf8_lossy(&out.stderr)
     );
     let md = std::fs::read_to_string(out_dir.join("REPORT.md")).unwrap();
-    assert!(md.contains("Coverage critic: pass (1 units, 1 candidates, 1 findings)"));
+    assert!(md.contains("Coverage critic: pass (inspected: 1 units, 1 candidates, 1 findings)"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2341,6 +2424,7 @@ fn persona_never_changes_validation_critic_or_verdicts() {
                 .status
                 .code()
             };
+            adjudicate_fixture(&run, &proven);
             let critic = || {
                 omgs(&["critic", "--run", run.to_str().unwrap()])
                     .status
@@ -3223,7 +3307,7 @@ fn report_metadata_defaults_explicit_overrides_and_handoff_cli() {
         "--hunters",
         "2",
         "--agent-calls",
-        "9",
+        "49",
         "--verifier",
         "explicit-reviewer",
         "--ref",
@@ -3237,7 +3321,7 @@ fn report_metadata_defaults_explicit_overrides_and_handoff_cli() {
     ]);
     for text in [
         "override/repo at override-ref",
-        "Run: hunters 2, verifier explicit-reviewer, agent calls 9",
+        "Run: hunters 2, verifier explicit-reviewer, agent calls 49",
         "Mode: advisory",
         "Sandbox: override-sandbox",
         "Persona inheritor, report depth full",
@@ -3245,7 +3329,7 @@ fn report_metadata_defaults_explicit_overrides_and_handoff_cli() {
     ] {
         assert!(md.contains(text), "{md}");
     }
-    assert!(render(&[]).contains("Run: hunters 2, verifier explicit-reviewer, agent calls 9"));
+    assert!(render(&[]).contains("Run: hunters 2, verifier explicit-reviewer, agent calls 49"));
     let mut meta = meta;
     meta["persona"] = serde_json::Value::Null;
     meta["report_depth"] = "concise".into();

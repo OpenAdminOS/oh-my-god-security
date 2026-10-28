@@ -327,7 +327,7 @@ fn timeout_kills_the_tree_and_fails_the_run() {
             "sleep 120 & sleep 120",
         ],
     );
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
     assert!(started.elapsed().as_secs() < 60);
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -349,7 +349,7 @@ fn setsid_escape_is_killed_reported_and_fails_the_run() {
     );
     let out = omgs(&d, &["prove", "--cmd", &cmd]);
     let t = text(&out);
-    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert_eq!(out.status.code(), Some(2), "{t}");
     assert!(t.contains("survivor killed"), "{t}");
     let record = record_from(&t);
     assert!(
@@ -728,7 +728,7 @@ fn posix_spawn_setsid_escape_is_killed_and_fails_the_run() {
     );
     let out = omgs(&d, &["prove", "--cmd", &cmd]);
     let t = text(&out);
-    assert_eq!(out.status.code(), Some(1), "{t}");
+    assert_eq!(out.status.code(), Some(2), "{t}");
     assert!(t.contains("survivor killed"), "{t}");
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -909,7 +909,7 @@ fn an_mxc_timeout_is_never_a_proof() {
             cmd,
         ],
     );
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
     let record: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(run.join("proofs/1.json")).unwrap()).unwrap();
     assert_eq!(record["timed_out"], true, "{record}");
@@ -1443,7 +1443,7 @@ fn interrupting_prove_cleans_the_executor_group_and_marks_the_record_unclean() {
         };
         assert_eq!(unsafe { libc::kill(child.id() as i32, number) }, 0);
         let out = child.wait_with_output().unwrap();
-        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out));
         let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
         assert!(
             record.interrupted && record.killed && !record.clean(),
@@ -1539,7 +1539,7 @@ fn a_test_readable_only_on_the_host_is_not_a_clean_record() {
             "echo tests/proof.txt COMMAND_SHOULD_NOT_RUN",
         ],
     );
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
     let record = record_from(&text(&out));
     assert_eq!(record["test_reachable"], false, "{record}");
     assert_eq!(record["exit_code"], 126, "{record}");

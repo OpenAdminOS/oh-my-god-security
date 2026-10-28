@@ -209,7 +209,7 @@ pub fn is_complete(dir: &Path) -> bool {
         .and_then(|m| {
             m.get("run_status")
                 .and_then(|s| s.as_str())
-                .map(|s| s == "complete")
+                .map(|s| s == "complete" || s == "partial")
         })
         .unwrap_or(false)
 }
