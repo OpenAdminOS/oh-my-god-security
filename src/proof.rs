@@ -1197,6 +1197,13 @@ mod tests {
         assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
         assert!(!masked.contains("hidden") && !masked.contains("secret"));
         assert_eq!(redact(&masked), masked);
+        // Exact output, so over-redaction cannot make this pass quickly.
+        let unit = redact("tool \"--password=hidden value\" Bearer secret ");
+        assert!(
+            unit.starts_with("tool \"--password=") && unit.contains("Bearer"),
+            "{unit}"
+        );
+        assert_eq!(masked, unit.repeat(30_000));
     }
 
     #[test]
@@ -1260,6 +1267,22 @@ mod tests {
             assert_eq!(redact(&masked), masked);
         }
         let elapsed = started.elapsed();
+        // Exact outputs, so over-redaction cannot make the timing pass.
+        let url = redact("https://user:URL_VALUE@host/path ");
+        assert!(url.contains("@host/path "), "{url}");
+        assert_eq!(
+            redact(&"https://user:URL_VALUE@host/path ".repeat(10_000)),
+            url.repeat(10_000)
+        );
+        for unit in ["Bearer BEARER_VALUE ", "--token=FLAG_VALUE "] {
+            let one = redact(unit);
+            assert!(one.starts_with(&unit[..6]), "{one}");
+            let line = format!("{}{}", unit.repeat(10_000), "\r".repeat(100_000));
+            assert_eq!(
+                redact(&line),
+                format!("{}{}", one.repeat(10_000), "\r".repeat(100_000))
+            );
+        }
         eprintln!("redact hostile URLs and trailing CR runs: {elapsed:?}");
         assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
     }
