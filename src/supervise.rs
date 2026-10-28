@@ -31,6 +31,8 @@ pub struct Survivor {
 #[derive(Debug, Clone)]
 pub struct Supervised {
     pub exit_code: Option<i32>,
+    /// Executor status is independent of the wrapper-reported workload status.
+    pub executor_exit_code: Option<i32>,
     pub command_started: bool,
     pub command_finished: bool,
     pub test_reachable: Option<bool>,
@@ -42,6 +44,7 @@ pub struct Supervised {
     pub interrupted: bool,
     pub duration_ms: u64,
     pub output: String,
+    pub stdout: String,
     pub output_bytes_total: u64,
     pub capture_complete: bool,
     /// Every group signal, reap and survivor scan succeeded. False means the
@@ -125,9 +128,176 @@ pub mod interruption {
     }
 }
 
+#[cfg(windows)]
+pub mod interruption {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+    static SIGNAL: AtomicBool = AtomicBool::new(false);
+    static LOCK: Mutex<()> = Mutex::new(());
+    thread_local! { static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+            add: i32,
+        ) -> i32;
+        fn GetConsoleCP() -> u32;
+        fn AllocConsole() -> i32;
+        fn FreeConsole() -> i32;
+        fn GenerateConsoleCtrlEvent(event: u32, group: u32) -> i32;
+    }
+    unsafe extern "system" fn handler(event: u32) -> i32 {
+        if matches!(event, 0 | 1 | 2 | 5 | 6) {
+            SIGNAL.store(true, Ordering::Relaxed);
+            1
+        } else {
+            0
+        }
+    }
+    pub fn pending() -> bool {
+        DEPTH.with(|d| d.get() != 0) && SIGNAL.load(Ordering::Relaxed)
+    }
+    pub struct Guard {
+        _lock: Option<MutexGuard<'static, ()>>,
+        allocated: bool,
+    }
+    impl Guard {
+        pub fn install() -> io::Result<Self> {
+            if DEPTH.with(|d| d.get() != 0) {
+                DEPTH.with(|d| d.set(d.get() + 1));
+                return Ok(Self {
+                    _lock: None,
+                    allocated: false,
+                });
+            }
+            let lock = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            // SSH and CI can lack a console; the executor must share one for Ctrl+Break.
+            let allocated = unsafe { GetConsoleCP() == 0 };
+            if allocated && unsafe { AllocConsole() } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
+                let error = io::Error::last_os_error();
+                if allocated {
+                    unsafe { FreeConsole() };
+                }
+                return Err(error);
+            }
+            SIGNAL.store(false, Ordering::Relaxed);
+            DEPTH.with(|d| d.set(1));
+            Ok(Self {
+                _lock: Some(lock),
+                allocated,
+            })
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get() - 1));
+            if self._lock.is_some() {
+                unsafe { SetConsoleCtrlHandler(Some(handler), 0) };
+                if self.allocated {
+                    unsafe { FreeConsole() };
+                }
+            }
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn request_for_test() {
+        SIGNAL.store(true, Ordering::Relaxed);
+    }
+
+    pub fn stop(group: u32) -> io::Result<()> {
+        if unsafe { GenerateConsoleCtrlEvent(1, group) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// Assign the owner itself before spawning, so children inherit lifetime ownership
+// from creation, including descendants in MXC's nested job. The unnamed handle is
+// non-inheritable and retained until process teardown, never closed during a run.
+#[cfg(windows)]
+mod owner_job {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicLimits {
+        process_time: i64,
+        job_time: i64,
+        flags: u32,
+        minimum_working_set: usize,
+        maximum_working_set: usize,
+        active_processes: u32,
+        affinity: usize,
+        priority: u32,
+        scheduling: u32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimits {
+        basic: BasicLimits,
+        io_counters: [u64; 6],
+        process_memory: usize,
+        job_memory: usize,
+        peak_process_memory: usize,
+        peak_job_memory: usize,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> *mut c_void;
+        fn SetInformationJobObject(
+            job: *mut c_void,
+            class: i32,
+            info: *const c_void,
+            size: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    pub fn ensure() -> Result<(), String> {
+        static OWNER: OnceLock<Result<(), String>> = OnceLock::new();
+        OWNER
+            .get_or_init(|| {
+                // Null security attributes make the sole job handle non-inheritable.
+                let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+                if job.is_null() {
+                    return Err(std::io::Error::last_os_error().to_string());
+                }
+                let mut limits = ExtendedLimits::default();
+                limits.basic.flags = 0x2000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                let configured = unsafe {
+                    SetInformationJobObject(
+                        job,
+                        9,
+                        (&limits as *const ExtendedLimits).cast(),
+                        std::mem::size_of::<ExtendedLimits>() as u32,
+                    )
+                };
+                if configured == 0
+                    || unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) } == 0
+                {
+                    let error = std::io::Error::last_os_error().to_string();
+                    unsafe { CloseHandle(job) };
+                    return Err(error);
+                }
+                // Closing this handle would also kill OMGS. Process teardown closes
+                // it even after TerminateProcess, killing all remaining descendants.
+                Ok(())
+            })
+            .clone()
+    }
+}
+
 /// Preparation loops cooperate with the same guard as executor supervision.
 pub fn check_interrupted() -> io::Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if interruption::pending() {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -454,7 +624,7 @@ fn wait(
     capture: &mut Capture,
     notes: &mut Vec<String>,
 ) -> Waited {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = check_signals;
     let start = Instant::now();
     let mut waited = Waited {
@@ -467,12 +637,10 @@ fn wait(
     let mut owns_leader = true;
     loop {
         capture.drain(rx, notes);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if check_signals && interruption::pending() {
             waited.interrupted = true;
-            notes.push(
-                "proof interrupted by SIGINT, SIGTERM or SIGHUP; executor cleanup required".into(),
-            );
+            notes.push("proof interrupted; executor cleanup required".into());
             break;
         }
         #[cfg(unix)]
@@ -514,6 +682,36 @@ fn wait(
         } else {
             notes.push("executor pid does not fit a process group id".into());
             waited.healthy = false;
+        }
+    }
+    #[cfg(windows)]
+    if waited.status.is_none() {
+        match interruption::stop(child.id()) {
+            Ok(()) => notes.push("Windows executor shutdown: Ctrl+Break requested; allowing 5000ms for MXC cleanup".into()),
+            Err(e) => notes.push(format!("Windows executor shutdown: Ctrl+Break request failed: {e}; allowing 5000ms before forced termination")),
+        }
+        let grace = Instant::now();
+        while grace.elapsed() < Duration::from_secs(5) {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    waited.status = Some(status);
+                    break;
+                }
+                Ok(None) => pause(rx, capture, notes, POLL),
+                Err(e) => {
+                    notes.push(format!("Windows executor shutdown: grace wait failed: {e}"));
+                    break;
+                }
+            }
+        }
+        if waited.status.is_some() {
+            notes.push(
+                "Windows executor shutdown: exited during cleanup grace; no forced termination"
+                    .into(),
+            );
+        } else {
+            waited.healthy = false;
+            notes.push("Windows executor shutdown: forced termination after cleanup grace; MXC DACL restoration not assured until next startup".into());
         }
     }
     #[cfg(not(unix))]
@@ -977,7 +1175,7 @@ mod sweep {
 /// does not expose whether it inherits the host environment; Linux scope wrapping
 /// reconstructs only get_envs and clears bus credentials before the executor.
 pub fn run(cmd: Command, limits: &Limits, markers: Option<&SweepMarkers>) -> Supervised {
-    run_inner(cmd, limits, markers, None)
+    run_inner(cmd, limits, markers, None, true)
 }
 
 pub fn run_marked(
@@ -986,7 +1184,13 @@ pub fn run_marked(
     markers: Option<&SweepMarkers>,
     nonce: &str,
 ) -> Supervised {
-    run_inner(cmd, limits, markers, Some(nonce))
+    run_inner(cmd, limits, markers, Some(nonce), true)
+}
+
+/// Bounded cleanup inspection must still work after the user requested a stop.
+#[cfg(windows)]
+pub(crate) fn run_cleanup(cmd: Command, limits: &Limits) -> Supervised {
+    run_inner(cmd, limits, None, None, false)
 }
 
 fn run_inner(
@@ -994,10 +1198,12 @@ fn run_inner(
     limits: &Limits,
     markers: Option<&SweepMarkers>,
     nonce: Option<&str>,
+    check_signals: bool,
 ) -> Supervised {
     let start = Instant::now();
     let mut result = Supervised {
         exit_code: None,
+        executor_exit_code: None,
         command_started: false,
         command_finished: false,
         test_reachable: None,
@@ -1009,6 +1215,7 @@ fn run_inner(
         interrupted: false,
         duration_ms: 0,
         output: String::new(),
+        stdout: String::new(),
         output_bytes_total: 0,
         capture_complete: false,
         cleanup_complete: false,
@@ -1046,8 +1253,8 @@ fn run_inner(
             .notes
             .push("survivor sweep not applied: only available on macOS".into());
     }
-    #[cfg(unix)]
-    let _signals = if nonce.is_some() {
+    #[cfg(any(unix, windows))]
+    let _signals = if cfg!(windows) || nonce.is_some() {
         match interruption::Guard::install() {
             Ok(guard) => Some(guard),
             Err(error) => {
@@ -1071,6 +1278,17 @@ fn run_inner(
             return result;
         }
     };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        if let Err(error) = owner_job::ensure() {
+            result.executor_error = true;
+            result.output = format!("failed to establish Windows lifetime job: {error}");
+            result.notes.push(result.output.clone());
+            return result;
+        }
+        cmd.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1084,6 +1302,10 @@ fn run_inner(
             return result;
         }
     };
+    #[cfg(windows)]
+    result
+        .enforced
+        .push("Windows owner kill-on-close job".into());
     result.enforced.extend([
         format!("wall_clock={}ms", limits.wall_ms),
         format!("output_cap={}B", limits.output_cap_bytes),
@@ -1131,7 +1353,7 @@ fn run_inner(
     let waited = wait(
         &mut child,
         limits.wall_ms,
-        nonce.is_some(),
+        check_signals,
         &rx,
         &mut capture,
         &mut result.notes,
@@ -1143,6 +1365,7 @@ fn run_inner(
     if !result.timed_out {
         result.exit_code = waited.status.and_then(|status| status.code());
     }
+    result.executor_exit_code = waited.status.and_then(|status| status.code());
     let cleanup_complete = waited.healthy;
     #[cfg(target_os = "macos")]
     let cleanup_complete = match markers {
@@ -1180,14 +1403,15 @@ fn run_inner(
         result.exit_code = capture.evidence.exit_code;
         result.executor_error = !result.command_started && !result.interrupted && !result.killed;
     }
-    #[cfg(unix)]
-    if nonce.is_some() && interruption::pending() {
+    #[cfg(any(unix, windows))]
+    if check_signals && interruption::pending() {
         result.interrupted = true;
         result.killed = true;
         result.executor_error = false;
         result.timed_out = false;
     }
     result.output_bytes_total = capture.total;
+    result.stdout = String::from_utf8_lossy(&capture.streams[0]).into_owned();
     result.output = capture.text();
     #[cfg(target_os = "linux")]
     if !pending_cgroups.is_empty() {
@@ -1201,7 +1425,15 @@ fn run_inner(
             result.enforced.extend(pending_cgroups);
         }
     }
-    result.cleanup_complete = cleanup_complete;
+    let executor_failed =
+        nonce.is_some() && result.command_finished && result.executor_exit_code != result.exit_code;
+    if executor_failed {
+        result.notes.push(format!(
+            "executor termination disagrees with completed workload: executor={:?}, workload={:?}",
+            result.executor_exit_code, result.exit_code
+        ));
+    }
+    result.cleanup_complete = cleanup_complete && !executor_failed;
     result.success = result.exit_code == Some(0)
         && !result.timed_out
         && !result.interrupted
@@ -1209,7 +1441,7 @@ fn run_inner(
         && !result.executor_error
         && result.capture_complete
         && result.survivors.is_empty()
-        && cleanup_complete;
+        && result.cleanup_complete;
     result.duration_ms = elapsed_ms(start);
     result
 }
@@ -1221,6 +1453,30 @@ fn elapsed_ms(start: Instant) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn executor_failure_after_end_marker_keeps_workload_status_but_fails_cleanup() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "printf 'OMGS_START_test\\nOMGS_END_test:0\\n'; exit 99",
+        ]);
+        let limits = Limits {
+            wall_ms: 5000,
+            cpu_secs: None,
+            file_size_bytes: None,
+            open_files: None,
+            memory_bytes: None,
+            tasks: None,
+            output_cap_bytes: 65536,
+        };
+        let run = run_marked(cmd, &limits, None, "test");
+        assert!(run.command_finished, "{run:?}");
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(run.executor_exit_code, Some(99));
+        assert!(!run.cleanup_complete && !run.success, "{run:?}");
+    }
 
     #[test]
     fn markers_survive_output_flood_and_chunk_boundaries() {

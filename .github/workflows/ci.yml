@@ -68,15 +68,32 @@ jobs:
           chmod +x "$exe"
           # omgs checks the executor's own SHA-256 against its pin before use.
           echo "OMGS_MXC_EXEC=$exe" >> "$GITHUB_ENV"
-      - name: Doctor
+      - name: MXC CLI capabilities
         shell: bash
-        run: cargo run --locked -q -- doctor --live
+        run: |
+          "$OMGS_MXC_EXEC" --help
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            "$OMGS_MXC_EXEC" --probe || echo "MXC probe returned nonzero; doctor and tests validate the response"
+          fi
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Doctor
+        shell: bash
+        run: |
+          set +e
+          output=$(cargo run --locked -q -- doctor --live 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [[ "$RUNNER_OS" == Windows && "$status" == 3 && "$output" == *"MXC 1.0.1 leaves changed ACEs on granted folders"* ]]; then
+            echo "Augmentation tier refusal verified; Windows tiers without augmentation remain supported"
+          else
+            test "$status" -eq 0
+          fi
 
   msrv:
     name: rust (1.89)

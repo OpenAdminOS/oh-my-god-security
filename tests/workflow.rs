@@ -356,8 +356,13 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             executor: executor.file.into(),
             executor_sha256: executor.sha256.into(),
             config_sha256: omgs::sha256::digest(config.as_bytes()),
-            enforced: omgs::sandbox::declared_controls(os, tier).0,
+            enforced: {
+                let mut controls = omgs::sandbox::declared_controls(os, tier).0;
+                controls.push("wall_clock=1000ms".into());
+                controls
+            },
             gaps: omgs::sandbox::declared_controls(os, tier).1,
+            notes: vec![],
             output_sha256: omgs::sha256::digest(b""),
             output_bytes_total: 0,
             output: String::new(),
@@ -1333,7 +1338,12 @@ fn saved_configs_are_checked_even_when_their_digest_matches() {
             serde_json::json!(["/"]),
             "readwritePaths",
         ),
-        ("/process/timeout", serde_json::json!(0), "timeout"),
+        // The other platform's timeout policy: Windows saves 0, Unix the budget.
+        (
+            "/process/timeout",
+            serde_json::json!(if cfg!(windows) { 1000 } else { 0 }),
+            "timeout",
+        ),
         ("/process/timeout", serde_json::json!(2000), "timeout"),
         (
             "/filesystem/readonlyPaths",
@@ -1577,6 +1587,53 @@ fn proof_validation_checks_target_test_and_declared_gaps() {
     omgs::proof::write(&dir, &record).unwrap();
     assert!(omgs::proof::validate_proofs(&findings, &dir).is_empty());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn multiline_records_validate_and_dry_run_evidence_is_required() {
+    for sep in ["\n", "\r\n"] {
+        let dir = scratch(if sep == "\n" {
+            "multiline-proof"
+        } else {
+            "crlf-proof"
+        });
+        let (_, _, findings) = complete_run();
+        let findings = attest(&dir, findings);
+        let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+        let command = format!("npm test -- tests/security/x.test.ts{sep}exit 1");
+        record.command = command.clone();
+        record.command_sha256 = omgs::sha256::digest(command.as_bytes());
+        let wrapped = omgs::sandbox::wrapped_command(
+            std::env::consts::OS,
+            &command,
+            &record.marker_nonce,
+            record.test.as_deref(),
+        );
+        record.wrapped_command_sha256 = omgs::sha256::digest(wrapped.as_bytes());
+        let config_path = dir.join("proofs/1/mxc-config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["process"]["commandLine"] = wrapped.into();
+        let text = config.to_string();
+        record.config_sha256 = omgs::sha256::digest(text.as_bytes());
+        std::fs::write(config_path, text).unwrap();
+        std::fs::write(dir.join("proofs/1/command.txt"), command).unwrap();
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(omgs::proof::validate_proofs(&findings, &dir).is_empty());
+        let mut old = serde_json::to_value(&record).unwrap();
+        old.as_object_mut().unwrap().remove("notes");
+        assert!(omgs::shape::proof(&old.to_string())
+            .unwrap()
+            .notes
+            .is_empty());
+        record.enforced.retain(|c| !c.contains("--dry-run"));
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "required control"
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[test]
@@ -1931,6 +1988,9 @@ fn windows_unc_proof_directories_match_writer_and_validator() {
     record.containment = executor.containment.into();
     record.executor_sha256 = executor.sha256.into();
     record.enforced = omgs::sandbox::declared_controls("windows", omgs::sandbox::Tier::Test).0;
+    record
+        .enforced
+        .push(format!("wall_clock={}ms", record.timeout_ms));
     record.gaps = omgs::sandbox::declared_controls("windows", omgs::sandbox::Tier::Test).1;
     record.system_root = Some(r"C:\Windows".into());
     let command = omgs::proof::recorded_command(&dir, &record).unwrap();
@@ -1976,6 +2036,30 @@ fn windows_unc_proof_directories_match_writer_and_validator() {
         omgs::proof::write(&dir, &record).unwrap();
         let errors = omgs::proof::validate_proofs(&findings, &dir);
         assert!(errors.is_empty(), "{prefix}: {errors:?}");
+
+        let mut internal_timer = config.clone();
+        internal_timer["process"]["timeout"] = record.timeout_ms.into();
+        let bytes = serde_json::to_vec(&internal_timer).unwrap();
+        record.config_sha256 = omgs::sha256::digest(&bytes);
+        std::fs::write(dir.join("proofs/1/mxc-config.json"), bytes).unwrap();
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "platform timeout policy"
+        ));
+
+        let bytes = serde_json::to_vec(&config).unwrap();
+        record.config_sha256 = omgs::sha256::digest(&bytes);
+        std::fs::write(dir.join("proofs/1/mxc-config.json"), bytes).unwrap();
+        record.enforced.retain(|c| !c.starts_with("wall_clock="));
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "finite supervisor wall clock"
+        ));
+        record
+            .enforced
+            .push(format!("wall_clock={}ms", record.timeout_ms));
     }
     std::fs::remove_dir_all(dir).unwrap();
 }

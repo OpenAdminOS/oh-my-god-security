@@ -26,14 +26,132 @@ fn omgs(home: &Path, args: &[&str]) -> Output {
     c.output().unwrap()
 }
 
+#[track_caller]
 fn mxc_ready() -> bool {
     match omgs::sandbox::locate_executor() {
-        Ok(_) => true,
+        Ok(located) => {
+            #[cfg(windows)]
+            {
+                let probe = omgs::sandbox::windows_probe(&located.path).unwrap();
+                if probe.needs_dacl_augmentation == Some(true) {
+                    assert_augmented_tier_refusal(
+                        probe.tier.as_deref().unwrap(),
+                        std::panic::Location::caller().line(),
+                    );
+                    return false;
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = located;
+            true
+        }
         Err(e) => {
             eprintln!("skipping: {e}");
             false
         }
     }
+}
+
+// On augmentation hosts every real-proof test using mxc_ready executes this
+// refusal contract instead. Safe Windows tiers retain their real proof runs.
+#[cfg(windows)]
+fn assert_augmented_tier_refusal(tier: &str, caller: u32) {
+    use omgs::sandbox::{prove, ProveOutcome, ProveRequest, Tier};
+    use std::process::Command;
+    let d = scratch(&format!("augmentation-refusal-{caller}"));
+    let target = d.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("evidence.txt"), "untouched").unwrap();
+    let roots: Vec<_> = std::iter::once(target.clone())
+        .chain(
+            omgs::sandbox::toolchain_roots("windows", omgs::platform::home().as_deref())
+                .into_iter()
+                .filter(|p| p.exists()),
+        )
+        .map(|p| p.canonicalize().unwrap())
+        .collect();
+    let acls = || {
+        roots
+            .iter()
+            .map(|p| {
+                let output = Command::new("icacls.exe")
+                    .arg(p)
+                    .arg("/l")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                output.stdout
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = acls();
+    let check = |message: &str| {
+        assert!(message.contains(tier), "{message}");
+        assert!(
+            message.contains(
+                "MXC 1.0.1 leaves changed ACEs on granted folders even after a successful run"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("Windows 11") && message.contains("needsDaclAugmentation=false"),
+            "{message}"
+        );
+    };
+    let lib_dir = d.join("library-proof");
+    let request = ProveRequest {
+        command: "echo REFUSAL_WORKLOAD_RAN".into(),
+        test: None,
+        target: Some(target.clone()),
+        run_dir: lib_dir.clone(),
+        timeout_ms: 1000,
+        tier: Tier::Test,
+        stage: None,
+        expected_tree_sha256: None,
+    };
+    let ProveOutcome::Blocked { reason } = prove(&request) else {
+        panic!("augmentation tier executed");
+    };
+    check(&reason);
+    assert!(
+        !lib_dir.exists(),
+        "refusal must precede staging and config creation"
+    );
+    let home = d.join("home");
+    for args in [
+        vec![
+            "prove",
+            "--target",
+            target.to_str().unwrap(),
+            "--cmd",
+            "echo REFUSAL_WORKLOAD_RAN",
+        ],
+        vec!["doctor", "--live"],
+    ] {
+        let out = omgs(&home, &args);
+        assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+        check(&text(&out));
+        assert!(!text(&out).contains("REFUSAL_WORKLOAD_RAN"));
+    }
+    fn no_config(path: &Path) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            assert_ne!(entry.file_name(), "mxc-config.json");
+            if entry.file_type().unwrap().is_dir() {
+                no_config(&entry.path());
+            }
+        }
+    }
+    // Blocked cleanup removes run directories, so the absence of configs is
+    // only a sanity check. The evidence that no config reached MXC is the
+    // unchanged ACLs on toolchain roots MXC would have augmented.
+    no_config(&d);
+    assert_eq!(acls(), before, "refusal changed granted folder ACLs");
+    assert_eq!(
+        std::fs::read_to_string(target.join("evidence.txt")).unwrap(),
+        "untouched"
+    );
+    std::fs::remove_dir_all(d).unwrap();
 }
 
 fn text(o: &Output) -> String {
@@ -66,6 +184,31 @@ fn prove_refuses_an_executor_that_does_not_match_the_pin() {
     assert!(t.contains("target code was not executed"), "{t}");
     assert!(!t.lines().any(|l| l.trim() == "ran"), "{t}");
     let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(unix)]
+#[test]
+fn blocked_reason_escapes_terminal_controls() {
+    let d = scratch("blocked-controls");
+    let fake = d.join("fake\x1b[31m\r\nexecutor");
+    std::fs::write(&fake, b"not a pinned executor").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["prove", "--cmd", "echo hi"])
+        .env("OMGS_HOME", d.join("home"))
+        .env("OMGS_MXC_EXEC", &fake)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains('\x1b') && !stderr.contains('\r'),
+        "{stderr:?}"
+    );
+    assert!(
+        stderr.contains("fake\\u{1b}[31m\\r\\nexecutor"),
+        "{stderr:?}"
+    );
+    std::fs::remove_dir_all(d).unwrap();
 }
 
 #[cfg(unix)]
@@ -413,7 +556,10 @@ fn proof_records_back_confirmed_findings() {
         &std::fs::read_to_string(run.join("proofs/3/mxc-config.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(config["process"]["timeout"], 17000);
+    assert_eq!(
+        config["process"]["timeout"],
+        omgs::sandbox::executor_timeout_ms(std::env::consts::OS, 17000)
+    );
 
     // A replay never takes a host path from an edited record.
     let original = std::fs::read_to_string(run.join("proofs/1.json")).unwrap();
@@ -743,6 +889,28 @@ fn an_mxc_timeout_is_never_a_proof() {
     let record: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(run.join("proofs/1.json")).unwrap()).unwrap();
     assert_eq!(record["timed_out"], true, "{record}");
+    if cfg!(windows) {
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(run.join("proofs/1/mxc-config.json")).unwrap())
+                .unwrap();
+        assert_eq!(config["process"]["timeout"], 0);
+        assert!(record["enforced"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("wall_clock=2000ms")));
+        assert!(!record["output"]
+            .as_str()
+            .unwrap()
+            .contains("script timed out"));
+        if record["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap.as_str().unwrap().starts_with("Windows ACL cleanup:"))
+        {
+            assert_eq!(record["cleanup_complete"], false);
+        }
+    }
     let findings = run.join("findings.json");
     std::fs::write(
         &findings,
@@ -976,6 +1144,24 @@ fn sensors_execute_resolved_paths_even_with_a_poisoned_current_directory() {
 }
 
 #[test]
+fn a_relative_executor_override_runs_the_verified_file() {
+    if !mxc_ready() {
+        return;
+    }
+    let executor = omgs::sandbox::locate_executor().unwrap().path;
+    let d = scratch("relative-executor");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["doctor", "--live"])
+        .current_dir(executor.parent().unwrap())
+        .env("OMGS_HOME", &d)
+        .env("OMGS_MXC_EXEC", executor.file_name().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
 fn doctor_discloses_planned_controls_and_gaps_without_an_executor() {
     let d = scratch("doctor-missing");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
@@ -1103,6 +1289,10 @@ fn proof_test_paths_are_counted_on_every_os() {
 
 #[test]
 fn doctor_and_proofs_list_memory_and_task_gap_once() {
+    #[cfg(windows)]
+    if !mxc_ready() {
+        return;
+    }
     let d = scratch("unique-gaps");
     let doctor = omgs(&d, &["doctor"]);
     let needle = if cfg!(target_os = "linux") {
@@ -1668,7 +1858,8 @@ fn missing_executor_is_explicit_in_live_doctor_and_free_text_prove() {
             .unwrap()
     };
     let out = run(&["doctor", "--live"]);
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+    assert!(!text(&out).contains("run omgs --help"));
     assert!(text(&out).contains("live check: not run, no verified executor"));
     for args in [
         vec!["prove", "--cmd", "--version"],
@@ -1844,5 +2035,94 @@ fn symlink_proofs_replay_when_sockets_appear_or_disappear() {
             std::fs::remove_file(target.join("socket")).unwrap();
         }
     }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn gap_paths_escape_terminal_controls_but_records_keep_the_path() {
+    use std::os::unix::ffi::OsStrExt;
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("gap-controls");
+    let target = d.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let name = "pipe\nforged\r\t\u{1b}[31m";
+    let fifo = std::ffi::CString::new(target.join(name).as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let out = omgs(
+        &d.join("home"),
+        &[
+            "prove",
+            "--target",
+            target.to_str().unwrap(),
+            "--cmd",
+            "echo ran",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains(name));
+    assert!(
+        stderr.contains("pipe\\nforged\\r\\t\\u{1b}[31m"),
+        "{stderr}"
+    );
+    let record = record_from(&text(&out));
+    assert!(record["gaps"].as_array().unwrap().iter().any(|g| {
+        g.as_str() == Some(format!("skipped target socket or FIFO: {name}").as_str())
+    }));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_records_bind_probe_selection_to_the_saved_config() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("windows-probe-config");
+    let out = omgs(&d.join("home"), &["prove", "--cmd", "echo ran"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let record = record_from(&text(&out));
+    let notes: Vec<_> = record["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    let gaps: Vec<_> = record["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    assert!(notes.iter().any(|n| n.starts_with("Windows OS build")));
+    assert!(!gaps
+        .iter()
+        .any(|n| n.starts_with("Windows OS build") || n.starts_with("Windows MXC probe:")));
+    let probe =
+        omgs::sandbox::windows_probe(&omgs::sandbox::locate_executor().unwrap().path).unwrap();
+    assert!(notes
+        .iter()
+        .any(|n| n.contains("Windows capability selection: probe;")));
+    assert!(notes
+        .iter()
+        .any(|n| n.contains(&format!("tier={}", probe.tier.as_deref().unwrap()))));
+    assert_eq!(probe.needs_dacl_augmentation, Some(false));
+    let config: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(Path::new(record["proof_dir"].as_str().unwrap()).join("mxc-config.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        !config["processContainer"]["filesystem"]["enumeratePaths"].is_null(),
+        probe.probes.base_container_supports_enumerate_paths
+    );
+    assert!(record["enforced"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e.as_str().unwrap().contains("--dry-run")));
     std::fs::remove_dir_all(d).unwrap();
 }

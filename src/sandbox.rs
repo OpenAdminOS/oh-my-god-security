@@ -4,6 +4,9 @@
 //! Target code never runs anywhere else: without a verified executor OMGS
 //! refuses and the finding stays at the tier it already earned.
 
+mod preflight;
+pub use preflight::{windows_build_report, windows_policy, windows_probe};
+
 use crate::platform::mxc_path;
 use crate::{platform, sha256, supervise};
 use std::path::{Path, PathBuf};
@@ -120,9 +123,11 @@ pub fn locate_executor() -> Result<Located, String> {
         Err(e) => Err(format!("{} unreadable: {e}", platform::describe_path(path))),
     };
     // An explicit OMGS_MXC_EXEC is authoritative: if it is wrong, say so
-    // rather than quietly using some other executor.
+    // rather than quietly using some other executor. It is made absolute so
+    // the file that runs is the one hashed here, not a PATH search result.
     if let Some(p) = std::env::var_os("OMGS_MXC_EXEC").filter(|v| !v.is_empty()) {
-        let path = PathBuf::from(p);
+        let path = std::path::absolute(PathBuf::from(p))
+            .map_err(|e| format!("OMGS_MXC_EXEC is set but unusable, refusing to run: {e}"))?;
         return check(&path)
             .map(|_| Located {
                 path,
@@ -244,6 +249,7 @@ pub struct ProveResult {
     pub target_sha256: Option<String>,
     pub enforced: Vec<String>,
     pub gaps: Vec<String>,
+    pub notes: Vec<String>,
     pub run: supervise::Supervised,
 }
 
@@ -423,8 +429,7 @@ pub struct ConfigInput<'a> {
     pub denied: Vec<PathBuf>,
     pub rust: Option<RustHomes>,
     /// Windows only: let the container list the parent directories of the
-    /// granted paths. Older ProcessContainer builds (Windows Server 2025)
-    /// reject the setting, so it can be turned off.
+    /// granted paths when the MXC probe reports support for it.
     pub list_parents: bool,
 }
 
@@ -511,6 +516,24 @@ pub fn mxc_config(input: &ConfigInput) -> serde_json::Value {
     mxc_config_at(input, &system_root)
 }
 
+// Windows timeout cleanup must pass through the supervisor's Ctrl+Break path.
+// MXC 1.0.1 treats zero as infinite; the finite budget is enforced by OMGS.
+pub fn executor_timeout_ms(os: &str, timeout_ms: u64) -> u64 {
+    if os == "windows" {
+        0
+    } else {
+        timeout_ms
+    }
+}
+
+pub fn supervisor_timeout_ms(os: &str, timeout_ms: u64) -> u64 {
+    if os == "windows" {
+        timeout_ms
+    } else {
+        timeout_ms.saturating_add(15_000)
+    }
+}
+
 pub fn mxc_config_at(input: &ConfigInput, system_root: &str) -> serde_json::Value {
     let scratch = mxc_path(input.scratch);
     let env = environment(input.os, &scratch, input.rust.as_ref(), system_root);
@@ -524,7 +547,7 @@ pub fn mxc_config_at(input: &ConfigInput, system_root: &str) -> serde_json::Valu
         "process": {
             "commandLine": input.command,
             "cwd": mxc_path(input.workspace),
-            "timeout": input.timeout_ms,
+            "timeout": executor_timeout_ms(input.os, input.timeout_ms),
             "env": env
         },
         "network": {
@@ -582,6 +605,7 @@ pub fn declared_controls(os: &str, tier: Tier) -> (Vec<String>, Vec<String>) {
         format!("mxc {MXC_VERSION} deny-by-default filesystem"),
         "target copied to a per-run workspace; the original is not mounted".to_string(),
         "external network egress denied".to_string(),
+        "MXC configuration accepted by executor --dry-run before workload execution".into(),
         "environment cleared to an allowlist with scratch home, temp and cache".to_string(),
     ];
     let mut gaps = vec![
@@ -609,7 +633,7 @@ pub fn declared_controls(os: &str, tier: Tier) -> (Vec<String>, Vec<String>) {
             .push("MXC PID namespace teardown kills descendants, including new sessions".into());
     }
     if os == "windows" {
-        gaps.push("supervisor wall clock expiry kills only the executor; descendant cleanup depends on MXC ProcessContainer teardown".into());
+        gaps.push("Windows expiry or interruption requests executor Ctrl+Break, waits up to 5000ms for MXC cleanup, then forces termination if needed; an owned kill-on-close job terminates descendants if OMGS dies; forced death can skip MXC ACL restoration".into());
         gaps.push("process tree owned by the MXC ProcessContainer; no per-process CPU, file size or open file limits on Windows".into());
     }
     (enforced, gaps)
@@ -701,6 +725,8 @@ fn retry_without_enumeration(os: &str, run: &supervise::Supervised) -> bool {
         && !run.command_started
         && run.enumerate_rejected
         && !run.timed_out
+        && !run.interrupted
+        && !run.killed
         && run.capture_complete
         && run.cleanup_complete
         && run.survivors.is_empty()
@@ -710,7 +736,7 @@ fn retry_without_enumeration(os: &str, run: &supervise::Supervised) -> bool {
 /// proof record lists what was actually applied on that run.
 pub fn declared_limits(os: &str) -> Vec<String> {
     let mut v = if os == "windows" {
-        vec!["supervisor wall clock expiry kills only the executor; descendant cleanup depends on MXC ProcessContainer teardown".to_string()]
+        vec!["Windows expiry or interruption requests executor Ctrl+Break, waits up to 5000ms for MXC cleanup, then forces termination if needed; an owned kill-on-close job terminates descendants if OMGS dies; forced death can skip MXC ACL restoration".to_string()]
     } else {
         vec!["wall clock limit; the process group is killed on expiry".to_string()]
     };
@@ -734,10 +760,25 @@ const MAX_SPECIAL_PATHS: usize = 20;
 
 fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
     let mut gaps = Vec::new();
-    let mut specials = 0;
+    let mut special_paths = Vec::new();
+    let mut links = Vec::new();
     let mut outside_links = 0;
     let root = std::fs::canonicalize(src).map_err(|e| e.to_string())?;
-    inspect_target(&root, &root, &mut gaps, &mut specials, &mut outside_links)?;
+    inspect_target(
+        &root,
+        &root,
+        &mut special_paths,
+        &mut links,
+        &mut outside_links,
+    )?;
+    special_paths.sort();
+    let specials = special_paths.len();
+    gaps.extend(
+        special_paths
+            .iter()
+            .take(MAX_SPECIAL_PATHS)
+            .map(|path| format!("skipped target socket or FIFO: {}", path.display())),
+    );
     if specials > MAX_SPECIAL_PATHS {
         gaps.push(format!(
             "skipped {} additional target sockets or FIFOs",
@@ -790,6 +831,7 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
             Err(_) => false,
         };
         if ok {
+            record_live_links(&root, dst, &links, &mut gaps);
             return Ok(gaps);
         }
         // A partial clone must not be mixed with the next attempt.
@@ -798,14 +840,15 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
     }
     let roots = (root, dst.to_path_buf());
     copy_recursive(src, dst, &roots)?;
+    record_live_links(&roots.0, dst, &links, &mut gaps);
     Ok(gaps)
 }
 
 fn inspect_target(
     root: &Path,
     dir: &Path,
-    gaps: &mut Vec<String>,
-    specials: &mut usize,
+    specials: &mut Vec<PathBuf>,
+    links: &mut Vec<PathBuf>,
     outside_links: &mut usize,
 ) -> Result<(), String> {
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
@@ -813,25 +856,28 @@ fn inspect_target(
         let entry = entry.map_err(|e| e.to_string())?;
         let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
         if platform::is_link(&meta) {
+            links.push(
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|e| e.to_string())?
+                    .to_path_buf(),
+            );
             if !std::fs::canonicalize(entry.path()).is_ok_and(|p| p.starts_with(root)) {
                 *outside_links += 1;
             }
             continue;
         }
         if meta.is_dir() {
-            inspect_target(root, &entry.path(), gaps, specials, outside_links)?;
+            inspect_target(root, &entry.path(), specials, links, outside_links)?;
         } else if platform::contentless(&meta) {
-            *specials += 1;
-            if *specials <= MAX_SPECIAL_PATHS {
-                gaps.push(format!(
-                    "skipped target socket or FIFO: {}",
-                    entry
-                        .path()
-                        .strip_prefix(root)
-                        .map_err(|e| e.to_string())?
-                        .display()
-                ));
-            }
+            specials.push(
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(|e| e.to_string())?
+                    .to_path_buf(),
+            );
         } else if !meta.is_file() {
             return Err(format!(
                 "unsupported target file type at {}; devices are refused",
@@ -840,6 +886,28 @@ fn inspect_target(
         }
     }
     Ok(())
+}
+
+fn record_live_links(root: &Path, dst: &Path, links: &[PathBuf], gaps: &mut Vec<String>) {
+    if cfg!(unix) {
+        let mut live: Vec<_> = links
+            .iter()
+            .filter(|rel| std::fs::canonicalize(dst.join(rel)).is_ok_and(|p| p.starts_with(root)))
+            .collect();
+        live.sort();
+        for rel in live.iter().take(MAX_SPECIAL_PATHS) {
+            gaps.push(format!(
+                "target link reaches live target from workspace: {}",
+                rel.display()
+            ));
+        }
+        if live.len() > MAX_SPECIAL_PATHS {
+            gaps.push(format!(
+                "{} additional target links reach live target from workspace",
+                live.len() - MAX_SPECIAL_PATHS
+            ));
+        }
+    }
 }
 
 /// `roots` is (canonical source root, destination root) of the whole copy.
@@ -1097,7 +1165,7 @@ fn stage_workspace(
 }
 
 pub fn prove(req: &ProveRequest) -> ProveOutcome {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let _signals = match supervise::interruption::Guard::install() {
         Ok(guard) => guard,
         Err(e) => {
@@ -1159,6 +1227,17 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     };
     let os = std::env::consts::OS;
     let blocked = |reason: String| ProveOutcome::Blocked { reason };
+    let (list_parents, probe_fallback, mut notes, windows_gaps) = if os == "windows" {
+        match preflight::windows_policy(windows_probe(&located.path)) {
+            Ok(policy) => policy,
+            Err(reason) => return blocked(reason),
+        }
+    } else {
+        (false, false, Vec::new(), Vec::new())
+    };
+    if os == "windows" {
+        notes.push(windows_build_report());
+    }
     if let Err(e) = platform::private_dir(&req.run_dir) {
         return blocked(format!("cannot create {}: {e}", req.run_dir.display()));
     }
@@ -1245,6 +1324,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         Ok(staged) => staged,
         Err(reason) => return blocked(reason),
     };
+    extra_gaps.extend(windows_gaps);
     let mut input = ConfigInput {
         os,
         containment: located.executor.containment,
@@ -1256,15 +1336,15 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         readonly,
         denied,
         rust,
-        list_parents: true,
+        list_parents,
     };
     if let Err(e) = supervise::check_interrupted() {
         return blocked(e.to_string());
     }
     let limits = supervise::Limits {
-        // The executor enforces the config timeout itself; the supervisor
-        // allows a short margin for teardown before killing it.
-        wall_ms: req.timeout_ms.saturating_add(15_000),
+        // Windows uses only our timer so MXC's internal timeout cannot race
+        // its console-control cleanup. Unix allows MXC a teardown margin.
+        wall_ms: supervisor_timeout_ms(os, req.timeout_ms),
         cpu_secs: Some(req.timeout_ms.div_ceil(1000).saturating_mul(2).max(10)),
         file_size_bytes: Some(1 << 30),
         open_files: Some(1024),
@@ -1288,28 +1368,49 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         if let Err(e) = crate::runmeta::write_atomic_bytes(&config_path, config_text.as_bytes()) {
             return blocked(format!("failed to write MXC config: {e}"));
         }
-        let mut cmd = Command::new(&executor);
-        cmd.arg("--config").arg(&config_path);
-        cmd.env_clear();
-        if os == "windows" {
-            for k in [
-                "SYSTEMROOT",
-                "WINDIR",
-                "TEMP",
-                "TMP",
-                "USERPROFILE",
-                "LOCALAPPDATA",
-            ] {
-                if let Some(v) = std::env::var_os(k) {
-                    cmd.env(k, v);
-                }
-            }
+        #[cfg(windows)]
+        let acl = match preflight::WindowsAclSnapshot::capture(
+            [&workspace, &scratch]
+                .into_iter()
+                .chain(input.readonly.iter()),
+        ) {
+            Ok(acl) => acl,
+            Err(reason) => return blocked(reason),
+        };
+        let validation = preflight::dry_run(&executor, &config_path, &run_dir);
+        #[cfg(windows)]
+        let validation = {
+            let mut validation = validation;
+            acl.verify(&mut validation);
+            validation
+        };
+        if probe_fallback
+            && !validation.success
+            && input.list_parents
+            && retry_without_enumeration(os, &validation)
+        {
+            input.list_parents = false;
+            notes.push(
+                "Windows enumeration fallback: dry-run refusal; retry without enumeratePaths"
+                    .into(),
+            );
+            extra_gaps.push(preflight::enumeration_gap());
+            continue;
         }
-        cmd.current_dir(&run_dir);
+        if let Err(reason) = preflight::dry_run_result(&validation) {
+            return blocked(reason);
+        }
+        let cmd = preflight::workload_command(&executor, &config_path, &run_dir);
         let run = supervise::run_marked(cmd, &limits, markers.as_ref(), &nonce);
+        #[cfg(windows)]
+        let run = {
+            let mut run = run;
+            acl.verify(&mut run);
+            run
+        };
         // MXC rejects the policy before starting anything, so nothing ran and
         // retrying without the setting is safe.
-        if input.list_parents && retry_without_enumeration(os, &run) {
+        if probe_fallback && input.list_parents && retry_without_enumeration(os, &run) {
             for dir in [&workspace, &scratch] {
                 if let Err(e) = std::fs::remove_dir_all(dir) {
                     return blocked(format!("cannot reset retry workspace: {e}"));
@@ -1326,10 +1427,18 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             if digest != target_sha256 {
                 return blocked("target changed before MXC retry".into());
             }
-            extra_gaps.extend(retry_gaps);
+            for gap in retry_gaps {
+                if !extra_gaps.contains(&gap) {
+                    extra_gaps.push(gap);
+                }
+            }
             input.rust = rust;
             input.list_parents = false;
-            extra_gaps.push("this Windows version refuses parent directory enumeration; relative nested file access is supported, but directory listing, absolute path resolution and NUL device redirection may fail; denied CMD redirection can retain exit 0".to_string());
+            notes.push(
+                "Windows enumeration fallback: executor refusal; retry without enumeratePaths"
+                    .into(),
+            );
+            extra_gaps.push(preflight::enumeration_gap());
             continue;
         }
         break (config_text, run);
@@ -1357,7 +1466,9 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     enforced.extend(run.enforced.iter().cloned());
     gaps.extend(extra_gaps);
     for note in &run.notes {
-        if !gaps.contains(note) {
+        if note.starts_with("Windows executor shutdown:") {
+            notes.push(note.clone());
+        } else if !gaps.contains(note) {
             gaps.push(note.clone());
         }
     }
@@ -1385,6 +1496,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         target_sha256,
         enforced,
         gaps,
+        notes,
         run,
     }))
 }
@@ -1440,6 +1552,18 @@ mod tests {
             request.expected_tree_sha256 = Some("a".repeat(64));
             assert!(matches!(prove(&request), ProveOutcome::Blocked { .. }));
             assert!(!d.exists());
+        }
+    }
+
+    #[test]
+    fn windows_timeout_is_owned_by_supervisor_without_an_internal_timer() {
+        for timeout in [1, 2000, u64::from(u32::MAX)] {
+            assert_eq!(executor_timeout_ms("windows", timeout), 0);
+            assert_eq!(supervisor_timeout_ms("windows", timeout), timeout);
+            for os in ["linux", "macos"] {
+                assert_eq!(executor_timeout_ms(os, timeout), timeout);
+                assert_eq!(supervisor_timeout_ms(os, timeout), timeout + 15_000);
+            }
         }
     }
 
@@ -1519,7 +1643,7 @@ mod tests {
         let socket = std::os::unix::net::UnixListener::bind(src.join("socket")).unwrap();
         let special_copy = d.join("special-copy");
         let gaps = copy_tree_with_gaps(&src, &special_copy).unwrap();
-        assert_eq!(gaps.len(), 3);
+        assert_eq!(gaps.len(), 4);
         assert!(
             gaps.iter().any(|g| g.starts_with("2 target link(s)")),
             "{gaps:?}"
@@ -1558,12 +1682,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn copied_absolute_reentering_and_chained_links_disclose_live_target_access() {
+        use std::os::unix::fs::symlink;
+        let d = std::env::temp_dir().join(format!("omgs-live-links-{}", std::process::id()));
+        let src = d.join("target");
+        std::fs::create_dir_all(&src).unwrap();
+        let src = std::fs::canonicalize(src).unwrap();
+        std::fs::write(src.join("file"), "original").unwrap();
+        symlink(src.join("file"), src.join("absolute")).unwrap();
+        symlink("../target/file", src.join("reenter")).unwrap();
+        symlink("absolute", src.join("chain")).unwrap();
+        symlink("file", src.join("internal")).unwrap();
+        for fallback in [false, true] {
+            if fallback {
+                use std::os::unix::ffi::OsStrExt;
+                let name = std::ffi::CString::new(src.join("pipe").as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            let dst = d.join(format!("copy-{fallback}"));
+            let gaps = copy_tree_with_gaps(&src, &dst).unwrap();
+            for link in ["absolute", "reenter", "chain"] {
+                assert!(
+                    gaps.contains(&format!(
+                        "target link reaches live target from workspace: {link}"
+                    )),
+                    "{gaps:?}"
+                );
+                assert_eq!(
+                    std::fs::canonicalize(dst.join(link)).unwrap(),
+                    src.join("file")
+                );
+            }
+            assert!(!gaps.iter().any(|g| g.ends_with(": internal")));
+        }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn special_file_gaps_list_twenty_paths_then_the_remaining_count() {
         use std::os::unix::ffi::OsStrExt;
         let d = std::env::temp_dir().join(format!("omgs-gap-cap-{}", std::process::id()));
         let src = d.join("target");
         std::fs::create_dir_all(&src).unwrap();
-        for n in 0..27 {
+        for n in (0..27).rev() {
             let path = src.join(format!("pipe-{n}"));
             let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
             assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
@@ -1573,8 +1735,42 @@ mod tests {
         assert!(gaps[..20]
             .iter()
             .all(|g| g.starts_with("skipped target socket or FIFO: pipe-")));
+        let mut expected: Vec<_> = (0..27)
+            .map(|n| format!("skipped target socket or FIFO: pipe-{n}"))
+            .collect();
+        expected.sort();
+        assert_eq!(gaps[..20], expected[..20]);
         assert_eq!(gaps[20], "skipped 7 additional target sockets or FIFOs");
         assert_eq!(std::fs::read_dir(d.join("copy")).unwrap().count(), 0);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_target_link_gaps_are_sorted_and_capped() {
+        let d = std::env::temp_dir().join(format!("omgs-live-link-cap-{}", std::process::id()));
+        let root = d.join("target");
+        let copy = d.join("copy");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(root.join("file"), "data").unwrap();
+        let links: Vec<_> = (0..27)
+            .rev()
+            .map(|i| PathBuf::from(format!("link-{i:02}")))
+            .collect();
+        for link in &links {
+            std::os::unix::fs::symlink(root.join("file"), copy.join(link)).unwrap();
+        }
+        let mut gaps = Vec::new();
+        record_live_links(&root, &copy, &links, &mut gaps);
+        assert_eq!(gaps.len(), 21);
+        assert!(gaps[0].ends_with("link-00"));
+        assert!(gaps[19].ends_with("link-19"));
+        assert_eq!(
+            gaps[20],
+            "7 additional target links reach live target from workspace"
+        );
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -1595,6 +1791,7 @@ mod tests {
     fn enumeration_retry_requires_a_clean_windows_executor_refusal() {
         let mut run = supervise::Supervised {
             exit_code: None,
+            executor_exit_code: None,
             command_started: false,
             command_finished: false,
             test_reachable: None,
@@ -1606,6 +1803,7 @@ mod tests {
             timed_out: false,
             duration_ms: 1,
             output: String::new(),
+            stdout: String::new(),
             output_bytes_total: 0,
             capture_complete: true,
             cleanup_complete: true,
@@ -1626,6 +1824,36 @@ mod tests {
         run.capture_complete = true;
         run.timed_out = true;
         assert!(!retry_without_enumeration("windows", &run));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn augmentation_refusal_never_constructs_a_config_invocation() {
+        let Ok(located) = locate_executor() else {
+            return;
+        };
+        let probe = windows_probe(&located.path).unwrap();
+        if probe.needs_dacl_augmentation != Some(true) {
+            return;
+        }
+        let d = std::env::temp_dir().join(format!("omgs-refusal-no-config-{}", std::process::id()));
+        let before = preflight::config_invocations();
+        let request = ProveRequest {
+            command: "echo must-not-run".into(),
+            test: None,
+            timeout_ms: 1000,
+            target: None,
+            run_dir: d.clone(),
+            tier: Tier::Test,
+            stage: None,
+            expected_tree_sha256: None,
+        };
+        let ProveOutcome::Blocked { reason } = prove(&request) else {
+            panic!("augmented tier ran");
+        };
+        assert!(reason.contains("MXC 1.0.1 leaves changed ACEs"));
+        assert!(!d.exists());
+        assert_eq!(preflight::config_invocations(), before);
     }
 
     #[cfg(windows)]
