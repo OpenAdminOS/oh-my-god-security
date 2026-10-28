@@ -67,6 +67,44 @@ fn read_run(run: &Path) -> Result<Map<String, Value>, String> {
     Ok(meta)
 }
 
+/// Proof setup must use the same no-follow reads as budget accounting.
+pub fn metadata(run: &Path) -> Result<Map<String, Value>, String> {
+    read_run(&run_path(run)?)
+}
+
+/// Refund only a validated family member. Broken links never redirect a
+/// refund to external metadata or silently alter the remaining allowance.
+pub fn release_proof(run: &Path) -> Result<(), String> {
+    let run = run_path(run)?;
+    let root = original(&run)?;
+    runmeta::with_lock(&root, || {
+        let update = || {
+            allowance(&root)?;
+            let mut meta = read_run(&run)?;
+            if original(&run)? != root {
+                return Err("linked run identity changed before refund".into());
+            }
+            let used = meta
+                .get("proof_runs_used")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            meta.insert(
+                "proof_runs_used".into(),
+                Value::from(used.saturating_sub(1)),
+            );
+            runmeta::write_atomic(
+                &run.join(runmeta::FILE),
+                &serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
+            )
+        };
+        if run == root {
+            update()
+        } else {
+            runmeta::with_lock(&run, update)
+        }
+    })
+}
+
 fn run_id(meta: &Map<String, Value>) -> Result<&str, String> {
     meta.get("run_id")
         .and_then(Value::as_str)
@@ -260,16 +298,20 @@ pub fn init_fix(
             return Err("fix run must be a distinct sibling in the trusted runs directory".into());
         }
         let child_id = run_id(&read_run(&child)?)?.to_string();
-        runmeta::update(&child, |m| {
+        runmeta::with_lock(&child, || {
+            let mut m = read_run(&child)?;
             m.insert(
                 "budget_parent".into(),
                 Value::from(root.to_string_lossy().as_ref()),
             );
             m.insert("budget_parent_id".into(), Value::from(run_id(&meta)?));
-            if run_id(m)? != child_id {
+            if run_id(&m)? != child_id {
                 return Err("linked run identity changed during registration".into());
             }
-            Ok(())
+            runmeta::write_atomic(
+                &child.join(runmeta::FILE),
+                &serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?,
+            )
         })?;
         let mut runs = fix_runs(&meta, root.parent().unwrap())?;
         runs.push(RegisteredRun {

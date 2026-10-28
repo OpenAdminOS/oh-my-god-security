@@ -323,18 +323,7 @@ fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
 }
 
 fn release_proof_charge(run: &Path) -> Result<(), String> {
-    omgs::runmeta::update(run, |m| {
-        let used = m
-            .get("proof_runs_used")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1);
-        m.insert(
-            "proof_runs_used".into(),
-            serde_json::json!(used.saturating_sub(1)),
-        );
-        Ok(())
-    })
-    .map(|_| ())
+    omgs::budget::release_proof(run)
 }
 
 fn cmd_prove(args: &[String]) -> Result<(), String> {
@@ -422,7 +411,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         }
     }
     let meta = match &run {
-        Some(r) => Some(omgs::runmeta::read(r)?),
+        Some(r) => Some(omgs::budget::metadata(r)?),
         None => None,
     };
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());

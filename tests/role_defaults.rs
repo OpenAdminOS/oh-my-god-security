@@ -1237,6 +1237,10 @@ fn assert_linked_budget_refused(root: &Path, fix: &Path, error: &str) {
         let message = String::from_utf8_lossy(&out.stderr);
         assert!(message.contains(error), "{message}");
         assert!(omgs::budget::charge_proof(run).is_err());
+        assert!(omgs::budget::release_proof(run).is_err());
+        let proof = cli(&["prove", "--run", run.to_str().unwrap(), "--cmd", "exit 0"]);
+        assert!(!proof.status.success());
+        assert!(String::from_utf8_lossy(&proof.stderr).contains(error));
     }
     assert_eq!(
         std::fs::read(root.join("run-metadata.json")).unwrap(),
@@ -1372,5 +1376,31 @@ fn legacy_standalone_budget_works_but_unidentified_links_fail_closed() {
     .unwrap();
     omgs::budget::charge_proof(&root).unwrap();
     assert_eq!(allowance(&root)["remaining"], 9);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn proof_setup_rejects_metadata_links_before_parsing_external_content() {
+    let (dir, root, fix) = linked_budget_fixture("proof-setup-no-follow");
+    let external = dir.join("external.json");
+    std::fs::write(&external, "not metadata").unwrap();
+    std::fs::remove_file(fix.join("run-metadata.json")).unwrap();
+    std::os::unix::fs::symlink(&external, fix.join("run-metadata.json")).unwrap();
+    assert_linked_budget_refused(&root, &fix, "no-follow metadata read failed");
+    assert_eq!(std::fs::read_to_string(&external).unwrap(), "not metadata");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn validated_refunds_restore_only_the_charged_family_allowance() {
+    let (dir, root, fix) = linked_budget_fixture("validated-family-refund");
+    omgs::budget::charge_proof(&fix).unwrap();
+    assert_eq!(allowance(&root)["remaining"], 3);
+    omgs::budget::release_proof(&fix).unwrap();
+    assert_eq!(allowance(&root)["remaining"], 4);
+    omgs::budget::charge_proof(&root).unwrap();
+    omgs::budget::release_proof(&root).unwrap();
+    assert_eq!(allowance(&root)["remaining"], 4);
     std::fs::remove_dir_all(dir).unwrap();
 }
