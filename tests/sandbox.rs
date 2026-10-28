@@ -1213,7 +1213,7 @@ fn target_mismatch_and_invalid_metadata_never_charge_budget() {
     }
     let meta = serde_json::json!({"target": target, "budget_agent_calls": 1});
     let meta_path = run.join(omgs::runmeta::FILE);
-    std::fs::write(&meta_path, meta.to_string()).unwrap();
+    write_private_fixture(&meta_path, meta.to_string()).unwrap();
     let mismatch = omgs(
         &d.join("home"),
         &[
@@ -1244,7 +1244,7 @@ fn target_mismatch_and_invalid_metadata_never_charge_budget() {
             let mut invalid = meta.clone();
             invalid[key] = value;
             let saved = invalid.to_string();
-            std::fs::write(&meta_path, &saved).unwrap();
+            write_private_fixture(&meta_path, &saved).unwrap();
             let out = omgs(
                 &d.join("home"),
                 &["prove", "--run", run.to_str().unwrap(), "--cmd", "echo ran"],
