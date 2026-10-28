@@ -227,7 +227,7 @@ fn link_count(file: &std::fs::File) -> std::io::Result<u64> {
 }
 
 #[cfg(windows)]
-fn link_count(file: &std::fs::File) -> std::io::Result<u64> {
+fn windows_file_information(file: &std::fs::File) -> std::io::Result<(u64, u32, u64)> {
     use std::os::windows::io::AsRawHandle;
     #[repr(C)]
     #[allow(non_snake_case)]
@@ -257,7 +257,22 @@ fn link_count(file: &std::fs::File) -> std::io::Result<u64> {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: a successful call filled the whole structure.
-    Ok(u64::from(unsafe { info.assume_init() }.nNumberOfLinks))
+    let info = unsafe { info.assume_init() };
+    Ok((
+        u64::from(info.nNumberOfLinks),
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+#[cfg(windows)]
+fn link_count(file: &std::fs::File) -> std::io::Result<u64> {
+    windows_file_information(file).map(|info| info.0)
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_file_identity(file: &std::fs::File) -> std::io::Result<(u32, u64)> {
+    windows_file_information(file).map(|(_, volume, index)| (volume, index))
 }
 
 #[cfg(not(any(unix, windows)))]

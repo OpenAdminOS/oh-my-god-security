@@ -75,15 +75,15 @@ jobs:
           if [[ "$RUNNER_OS" == Windows ]]; then
             "$OMGS_MXC_EXEC" --probe || echo "MXC probe returned nonzero; doctor and tests validate the response"
           fi
-      - name: Doctor
-        shell: bash
-        run: cargo run --locked -q -- doctor --live
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --locked
+      - name: Doctor
+        shell: bash
+        run: cargo run --locked -q -- doctor --live
 
   msrv:
     name: rust (1.89)

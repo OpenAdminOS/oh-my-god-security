@@ -274,44 +274,15 @@ struct WindowsAclRoot {
 #[cfg(windows)]
 fn open_acl_root(path: &Path) -> Result<(std::fs::File, (u32, u64)), String> {
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-    #[repr(C)]
-    #[derive(Default)]
-    struct FileInfo {
-        attributes: u32,
-        times: [u32; 6],
-        volume: u32,
-        size_high: u32,
-        size_low: u32,
-        links: u32,
-        index_high: u32,
-        index_low: u32,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandle(handle: *mut std::ffi::c_void, info: *mut FileInfo) -> i32;
-    }
     let file = std::fs::OpenOptions::new()
         .access_mode(0x0002_0000) // READ_CONTROL
         .share_mode(7) // FILE_SHARE_READ | WRITE | DELETE
         .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS permits directories
         .open(path)
         .map_err(|e| format!("cannot open granted ACL root {}: {e}", path.display()))?;
-    let mut info = FileInfo::default();
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
-        return Err(format!(
-            "cannot identify granted ACL root {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok((
-        file,
-        (
-            info.volume,
-            (u64::from(info.index_high) << 32) | u64::from(info.index_low),
-        ),
-    ))
+    let identity = crate::platform::windows_file_identity(&file)
+        .map_err(|e| format!("cannot identify granted ACL root {}: {e}", path.display()))?;
+    Ok((file, identity))
 }
 
 #[cfg(windows)]
