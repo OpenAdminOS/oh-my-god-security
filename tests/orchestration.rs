@@ -810,7 +810,7 @@ fn batch_index_refuses_output_inside_a_target() {
 #[test]
 fn answers_files_are_strict_and_bound_to_the_run_target() {
     let dir = scratch("answers");
-    std::fs::write(
+    write_private_fixture(
         dir.join("intent-answers.json"),
         r#"{"target":"/x","answer":[]}"#,
     )
@@ -820,7 +820,7 @@ fn answers_files_are_strict_and_bound_to_the_run_target() {
         .unwrap()
         .answers
         .is_empty());
-    std::fs::write(
+    write_private_fixture(
         dir.join("intent-answers.json"),
         r#"{"target":"/somewhere/else","answers":[{"id":"web.public-resource","answer":"public","scope":"repo","source":"o","recorded_unix":1}]}"#,
     )
@@ -863,7 +863,7 @@ fn answer_store_writes_enforce_the_limit_without_replacing_valid_answers() {
     std::fs::create_dir_all(&target).unwrap();
     let canonical = std::fs::canonicalize(&target).unwrap();
     let path = omgs::intent::answers_file(&home, &canonical);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    omgs::platform::create_private_tree(path.parent().unwrap()).unwrap();
     let mut answers = omgs::intent::Answers {
         target: canonical.to_string_lossy().to_string(),
         answers: vec![omgs::intent::Answer {
@@ -917,7 +917,8 @@ fn answer_store_writes_enforce_the_limit_without_replacing_valid_answers() {
 fn run_local_answer_snapshots_require_bounded_single_link_files() {
     let dir = scratch("run-answer-reader");
     let path = dir.join("intent-answers.json");
-    let file = std::fs::File::create(&path).unwrap();
+    omgs::platform::write_private_new(&path, b"").unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
     file.set_len((1 << 20) + 1).unwrap();
     assert!(omgs::intent::load_answers(&path)
         .unwrap_err()
@@ -1247,7 +1248,7 @@ fn report_shows_only_reviewer_recorded_answers() {
     snap["answers"].as_array_mut().unwrap().push(serde_json::json!({
         "id": "web.public-resource", "answer": "FORGED", "scope": "app", "source": "x", "recorded_unix": 1
     }));
-    std::fs::write(run.join("intent-answers.json"), snap.to_string()).unwrap();
+    write_private_fixture(run.join("intent-answers.json"), snap.to_string()).unwrap();
     let out = run_cmd(&[
         "report",
         "--findings",
