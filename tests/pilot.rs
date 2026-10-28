@@ -600,8 +600,16 @@ fn report_cannot_restore_allowance_after_concurrent_call_charge() {
         .status
         .success());
     std::fs::remove_file(f.run.join("coverage-ledger.json")).unwrap();
-    let evaluation = f.run.join("evaluation.json");
-    let name = std::ffi::CString::new(evaluation.as_os_str().as_encoded_bytes()).unwrap();
+    let source = read(f.run.join("run-metadata.json"))["source_ref"].clone();
+    f.put(
+        "evaluation.json",
+        json!({"evaluator":"independent","source_ref":source,"decisions":[],"gaps":[]}),
+    );
+    let status = f.run.join(omgs::status::FILE);
+    let data = json!({"stages":[],"counters":{},"log":[]});
+    f.put(omgs::status::FILE, data.clone());
+    std::fs::remove_file(&status).unwrap();
+    let name = std::ffi::CString::new(status.as_os_str().as_encoded_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
     let mut child = Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("OMGS_HOME", f.root.join("state"))
@@ -618,14 +626,15 @@ fn report_cannot_restore_allowance_after_concurrent_call_charge() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    // The report opens evaluation after publishing its initial counters.
+    // The report reads its timeline after publishing its initial counters,
+    // before the final metadata update that must preserve concurrent charges.
     // A nonblocking writer can connect only once the reader reaches that point.
     let start = std::time::Instant::now();
     let mut writer = loop {
         match std::fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
-            .open(&evaluation)
+            .open(&status)
         {
             Ok(writer) => break writer,
             Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
@@ -642,12 +651,11 @@ fn report_cannot_restore_allowance_after_concurrent_call_charge() {
             Err(error) => panic!("{error}"),
         }
     };
+    assert_eq!(read(f.run.join("run-metadata.json"))["agent_calls_used"], 5);
     omgs::budget::charge_calls(&f.run, 1).unwrap();
-    let source = read(f.run.join("run-metadata.json"))["source_ref"].clone();
-    let data = json!({"evaluator":"independent","source_ref":source,"decisions":[],"gaps":[]});
     // Replace the pathname while the report holds its original FIFO reader.
-    // Its later consistency read sees a regular file with identical contents.
-    f.put("evaluation.json", data.clone());
+    // Later status updates see a regular file with identical contents.
+    f.put(omgs::status::FILE, data.clone());
     writer.write_all(data.to_string().as_bytes()).unwrap();
     drop(writer);
     let out = child.wait_with_output().unwrap();
@@ -656,7 +664,10 @@ fn report_cannot_restore_allowance_after_concurrent_call_charge() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(read(f.run.join("run-metadata.json"))["agent_calls_used"], 6);
+    assert!(f.run.join("REPORT.md").is_file());
+    let meta = read(f.run.join("run-metadata.json"));
+    assert_eq!(meta["run_status"], "complete");
+    assert_eq!(meta["agent_calls_used"], 6);
     assert!(omgs::budget::summary(&f.run)
         .unwrap()
         .contains("6 used of 12; 6 remaining"));
