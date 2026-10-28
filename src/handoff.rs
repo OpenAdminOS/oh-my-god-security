@@ -180,9 +180,20 @@ pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Hand
 /// Keep record text inert even inside headings, tables and link labels.
 pub(crate) fn markdown_inline(s: &str) -> String {
     let mut out = String::new();
-    for (i, c) in s.char_indices() {
-        if c.is_control()
-            || "\\`*_{}[]<>#|&!~@".contains(c)
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c == '@' {
+            // Entity escaping alone does not stop GFM email autolinking.
+            // A code span around each contiguous @ run preserves the text.
+            out.push('`');
+            out.push('@');
+            while chars.peek().is_some_and(|(_, c)| *c == '@') {
+                chars.next();
+                out.push('@');
+            }
+            out.push('`');
+        } else if c.is_control()
+            || "\\`*_{}[]<>#|&!~".contains(c)
             || (c == ':' && s[i..].starts_with("://"))
         {
             out.push_str(&format!("&#{};", c as u32));

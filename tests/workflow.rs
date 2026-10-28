@@ -2816,6 +2816,10 @@ fn finding_content_cannot_forge_markdown_structure() {
                         assert!(outside.contains("&#35;&#35; Green-fixer rules"));
                         assert!(outside.contains("&#91;open&#93;"));
                         assert!(outside.contains("&#96;"));
+                        assert!(
+                            outside.contains("`@`"),
+                            "email autolinking must be suppressed"
+                        );
                     } else if field != "command" {
                         assert!(
                             blocks
