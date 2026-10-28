@@ -1601,6 +1601,59 @@ fn read_target_store(target: &Path) -> Result<omgs::intent::Answers, String> {
     Ok(store)
 }
 
+/// Each run has an independent record in the existing reviewer-owned store.
+/// Bind to the physical path rather than metadata that an artifact writer edits.
+fn trusted_policy_path(target: &Path, run: &Path) -> Result<PathBuf, String> {
+    let store = trusted_store(target)?;
+    let parent = store.parent().ok_or("trusted store needs a parent")?;
+    let resolved = resolve_existing_prefix(parent)?;
+    if resolved.starts_with(run) {
+        return Err("trusted policy store must live outside the run directory".into());
+    }
+    let run_hash = omgs::sha256::digest(run.as_os_str().as_encoded_bytes());
+    let name = store
+        .file_stem()
+        .ok_or("trusted store needs a name")?
+        .to_string_lossy();
+    Ok(parent.join(format!("{name}-policy-{run_hash}.json")))
+}
+
+fn authenticated_policy(
+    run: &Path,
+    target: &Path,
+) -> Result<omgs::policy::AuthenticatedPolicy, String> {
+    let run = std::fs::canonicalize(run).map_err(|e| e.to_string())?;
+    let target = std::fs::canonicalize(target).map_err(|e| e.to_string())?;
+    let path = trusted_policy_path(&target, &run)?;
+    let bytes = omgs::platform::read_bounded(&path, omgs::policy::MAX_BYTES)
+        .map_err(|e| format!("trusted policy record unavailable: {e}; initialize a fresh audit; see docs/policy-workflow.md#pre-policy-runs"))?;
+    let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+    let record = serde_json::from_value(omgs::shape::strict_json(text)?)
+        .map_err(|e| format!("invalid trusted policy record: {e}"))?;
+    omgs::policy::committed_snapshot(&run, &target, &record)
+}
+
+fn save_trusted_policy(
+    target: &Path,
+    run: &Path,
+    snapshot: &omgs::policy::Snapshot,
+) -> Result<(), String> {
+    let run = std::fs::canonicalize(run).map_err(|e| e.to_string())?;
+    let path = trusted_policy_path(target, &run)?;
+    // Existing intent stores may have searchable, owner-writable directories.
+    // Match answer-store creation; the record itself is private and single-link.
+    std::fs::create_dir_all(path.parent().ok_or("trusted store needs a parent")?)
+        .map_err(|e| e.to_string())?;
+    // Check again after creating the store, including all resolved parents.
+    let path = trusted_policy_path(target, &run)?;
+    let record = omgs::policy::TrustedPolicy::new(target, &run, snapshot)?;
+    let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
+    if text.len() as u64 > omgs::policy::MAX_BYTES {
+        return Err("trusted policy record exceeds 1 MiB".into());
+    }
+    omgs::runmeta::write_atomic(&path, &text)
+}
+
 /// The run's intent answers, only when they belong to the run's target as
 /// recorded in run metadata; anything else is ignored with a warning.
 fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
@@ -1640,8 +1693,8 @@ fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
     };
     // Run-local policy contents cannot attest owner acceptance. Read the
     // committed blob again using the same object-only path as init and gate.
-    let accepted = match omgs::policy::committed_snapshot(dir, &target) {
-        Ok(s) => s.policy.accepted_intent,
+    let accepted = match authenticated_policy(dir, &target) {
+        Ok(s) => s.into_snapshot().policy.accepted_intent,
         Err(e) => {
             eprintln!("warning: policy-derived intent answers not shown: {e}");
             Vec::new()
@@ -1886,7 +1939,8 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     if flag(rest, "--budget").is_some() {
         return Err("--fix-of computes the budget; omit --budget".into());
     }
-    omgs::policy::snapshot(Path::new(&parent))?;
+    let target = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
+    authenticated_policy(Path::new(&parent), Path::new(&target))?;
     omgs::budget::init_fix(Path::new(&parent), |root, original, remaining| {
         let target = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
         let target = std::fs::canonicalize(target).map_err(|e| e.to_string())?;
@@ -1939,7 +1993,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
     // claimed, half-written run behind.
     let base = flag(rest, "--base");
     let mut policy = if let Some(parent) = flag(rest, "--fix-of") {
-        let inherited = omgs::policy::snapshot(Path::new(&parent))?;
+        let inherited = authenticated_policy(Path::new(&parent), &target)?.into_snapshot();
         if base.is_some() {
             return Err("fix runs inherit base policy; omit --base".into());
         }
@@ -2097,6 +2151,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
     if out_abs.starts_with("/tmp") || out_abs.starts_with("/private/tmp") {
         eprintln!("warning: run output is under a shared temp directory and describes vulnerabilities. Prefer the default runs directory under your home.");
     }
+    save_trusted_policy(&target, &out_abs, &policy)?;
     let source_ref = omgs::proof::git_head(&target)
         .map(|h| h[..7].to_string())
         .unwrap_or_else(|| "working tree".into());
@@ -3155,6 +3210,7 @@ fn intent_propose_with_tests(
         .and_then(|v| v.as_str())
         .ok_or("run needs target")?;
     let store = read_target_store(Path::new(target))?;
+    let policy = authenticated_policy(run, Path::new(target))?;
     let mut merged = answers;
     for answer in store.answers {
         omgs::intent::record(&mut merged, answer)?;
@@ -3162,8 +3218,8 @@ fn intent_propose_with_tests(
     println!(
         "owner review patch: {}",
         match staged {
-            Some(tests) => omgs::policy::propose_staged(run, &merged, tests)?,
-            None => omgs::policy::propose(run, &merged)?,
+            Some(tests) => omgs::policy::propose_staged(run, &merged, tests, &policy)?,
+            None => omgs::policy::propose(run, &merged, &policy)?,
         }
         .display()
     );

@@ -418,72 +418,81 @@ pub fn load_base(target: &Path, base: Option<&str>) -> Result<Snapshot, String> 
     })
 }
 
-/// Snapshots guide review and patch proposals only. They never authorize gate
-/// execution; gate reloads committed base policy independently.
-pub fn snapshot(run: &Path) -> Result<Snapshot, String> {
-    let m = crate::runmeta::read(run)?;
-    let value = m
-        .get("policy")
-        .ok_or("legacy run has no base-policy snapshot and cannot seed a fix run; see docs/policy-workflow.md#pre-policy-runs")?;
-    parse(
-        &serde_json::to_string(value.get("policy").ok_or("snapshot requires policy")?)
-            .map_err(|e| e.to_string())?,
-    )?;
-    for key in ["source", "base_commit", "sha256", "original"] {
-        if value.get(key).is_none() {
-            return Err(format!("policy snapshot requires {key}"));
-        }
-    }
-    let s: Snapshot = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-    parse(&serde_json::to_string(&s.policy).map_err(|e| e.to_string())?)?;
-    let original = s.original.clone().unwrap_or(text(&s.policy)?);
-    if crate::sha256::digest(original.as_bytes()) != s.sha256 {
-        return Err("policy digest mismatch".into());
-    }
-    if let Some(raw) = &s.original {
-        if serde_json::to_value(parse(raw)?).map_err(|e| e.to_string())?
-            != serde_json::to_value(&s.policy).map_err(|e| e.to_string())?
-        {
-            return Err("policy snapshot differs from committed blob".into());
-        }
-        let base = s.base_commit.as_deref().ok_or("policy needs base_commit")?;
-        if s.source != format!("{base}:{PATH}") {
-            return Err("policy source mismatch".into());
-        }
-    } else if s.source != "defaults:no-base-policy" {
-        return Err("invalid default policy source".into());
-    }
-    let target = m
-        .get("target")
-        .and_then(|v| v.as_str())
-        .ok_or("run needs target")?;
-    let run = std::fs::canonicalize(run).map_err(|e| e.to_string())?;
-    let target = std::fs::canonicalize(target).map_err(|e| e.to_string())?;
-    if run.starts_with(target) {
-        return Err("run must live outside target".into());
-    }
-    Ok(s)
+/// CLI-owned provenance, stored beside the reviewer's answers, outside the run.
+/// The canonical run path selects the record, never an editable metadata id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedPolicy {
+    pub target: String,
+    pub run: String,
+    pub base_commit: Option<String>,
+    pub sha256: String,
+    /// CLI settings are retained only when the base has no policy blob.
+    pub no_base_policy: Option<Policy>,
 }
 
-/// Re-read policy from the run's recorded base, using metadata only for the
-/// commit identity and expected digest, never for policy-derived authority.
-pub fn committed_snapshot(run: &Path, target: &Path) -> Result<Snapshot, String> {
-    let meta = crate::runmeta::read(run)?;
-    let recorded = meta.get("policy").ok_or("run has no policy snapshot")?;
-    let base = recorded
-        .get("base_commit")
-        .and_then(|v| v.as_str())
-        .ok_or("run policy has no recorded base commit")?;
-    let digest = recorded
-        .get("sha256")
-        .and_then(|v| v.as_str())
-        .ok_or("run policy has no recorded digest")?;
-    let committed = load_base(target, Some(base))
-        .map_err(|e| format!("cannot read committed base policy: {e}"))?;
-    if committed.sha256 != digest {
-        return Err("committed base policy digest differs from recorded snapshot digest".into());
+impl TrustedPolicy {
+    pub fn new(target: &Path, run: &Path, snapshot: &Snapshot) -> Result<Self, String> {
+        let base = load_base(target, snapshot.base_commit.as_deref())?;
+        Ok(Self {
+            target: target.to_string_lossy().into(),
+            run: run.to_string_lossy().into(),
+            base_commit: base.base_commit,
+            sha256: base.sha256,
+            no_base_policy: base.original.is_none().then(|| snapshot.policy.clone()),
+        })
     }
-    Ok(committed)
+}
+
+/// Policy authenticated by a reviewer-owned record and re-read from Git.
+/// Construction is private so patch generators cannot receive a raw snapshot.
+pub struct AuthenticatedPolicy(Snapshot);
+impl AuthenticatedPolicy {
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.0
+    }
+    pub fn into_snapshot(self) -> Snapshot {
+        self.0
+    }
+}
+
+/// Metadata is compared for diagnostics only. Neither its commit, digest nor
+/// embedded policy is used to select or reconstruct the baseline.
+pub fn committed_snapshot(
+    run: &Path,
+    target: &Path,
+    trusted: &TrustedPolicy,
+) -> Result<AuthenticatedPolicy, String> {
+    let run = std::fs::canonicalize(run).map_err(|e| e.to_string())?;
+    let target = std::fs::canonicalize(target).map_err(|e| e.to_string())?;
+    if run.starts_with(&target) {
+        return Err("run must live outside target".into());
+    }
+    if Path::new(&trusted.target) != target || Path::new(&trusted.run) != run {
+        return Err("trusted policy record belongs to another target or run".into());
+    }
+    if trusted.base_commit.as_deref().is_some_and(|b| !oid(b)) {
+        return Err("trusted base must be a full immutable commit SHA".into());
+    }
+    let mut base = load_base(&target, trusted.base_commit.as_deref())
+        .map_err(|e| format!("cannot read committed base policy: {e}"))?;
+    if base.base_commit != trusted.base_commit || base.sha256 != trusted.sha256 {
+        return Err("committed base policy differs from trusted record".into());
+    }
+    match (&base.original, &trusted.no_base_policy) {
+        (None, Some(settings)) => {
+            // Validate settings using the same strict policy parser as init.
+            base.policy = parse(&text(settings)?)?;
+            base.sha256 = crate::sha256::digest(text(&base.policy)?.as_bytes());
+        }
+        (Some(_), None) => {}
+        _ => return Err("trusted policy settings do not match base policy presence".into()),
+    }
+    let meta = crate::runmeta::read(&run)?;
+    if meta.get("policy") != Some(&serde_json::to_value(&base).map_err(|e| e.to_string())?) {
+        eprintln!("warning: run policy snapshot differs from trusted record; ignoring snapshot");
+    }
+    Ok(AuthenticatedPolicy(base))
 }
 
 pub fn excludes(p: &Policy, path: &str) -> bool {
@@ -741,7 +750,11 @@ fn advisory_findings(run: &Path, p: &Policy) {
 }
 
 /// Whole-file unified diff so no untrusted diff driver is ever invoked.
-pub fn propose(run: &Path, answers: &crate::intent::Answers) -> Result<std::path::PathBuf, String> {
+pub fn propose(
+    run: &Path,
+    answers: &crate::intent::Answers,
+    policy: &AuthenticatedPolicy,
+) -> Result<std::path::PathBuf, String> {
     let path = run.join("findings.json");
     let file = if path.exists() {
         let bytes = crate::platform::read_bounded_in(run, Path::new("findings.json"), 16 << 20)
@@ -754,7 +767,7 @@ pub fn propose(run: &Path, answers: &crate::intent::Answers) -> Result<std::path
     for reason in &staged.excluded {
         eprintln!("{reason}");
     }
-    propose_staged(run, answers, &staged)
+    propose_staged(run, answers, &staged, policy)
 }
 
 /// Use the same admitted records and exact test patch as the staging export.
@@ -762,9 +775,10 @@ pub fn propose_staged(
     run: &Path,
     answers: &crate::intent::Answers,
     staged: &crate::handoff::StagedTests,
+    policy: &AuthenticatedPolicy,
 ) -> Result<std::path::PathBuf, String> {
-    let s = snapshot(run)?;
-    let mut p = s.policy;
+    let s = policy.snapshot();
+    let mut p = s.policy.clone();
     propose_tests(run, &mut p, &staged.admitted)?;
     for a in &answers.answers {
         p.accepted_intent
@@ -779,8 +793,8 @@ pub fn propose_staged(
     p.accepted_intent
         .sort_by(|a, b| (&a.id, &a.scope).cmp(&(&b.id, &b.scope)));
     let new = text(&p)?;
-    let old = s.original.unwrap_or_default();
-    let mut diff = file_patch(PATH, &old, &new);
+    let old = s.original.as_deref().unwrap_or_default();
+    let mut diff = file_patch(PATH, old, &new);
     diff.push_str(&staged.patch);
     let path = run.join("policy.patch");
     crate::runmeta::write_atomic(&path, &diff)?;

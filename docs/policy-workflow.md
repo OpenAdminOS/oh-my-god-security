@@ -103,15 +103,42 @@ enabling the gate. Proofs never install dependencies or fetch packages.
 
 ## Pre-policy runs
 
-Runs created before base-policy snapshots were introduced cannot seed
-`audit init --fix-of`. OMGS rejects them before creating a child run. Keep the
-old run for evidence, then initialize a fresh audit with `omgs audit init
---target /path/to/repo --base <full-base-sha> --out /private/runs/new-audit`.
-Complete that audit before using its path with `--fix-of`. This is a new budget
-family, not a continuation or refund of the legacy allowance. Set the reviewed
-budget in base policy and account for any earlier spending separately. Do not
-fabricate a snapshot in old metadata. Existing target and cumulative budget
-constraints continue to apply to supported fix runs.
+Runs created before reviewer-owned policy provenance was introduced cannot seed
+`audit init --fix-of` or generate policy proposals, even if they contain a policy
+snapshot. OMGS rejects them when no trusted record exists. Reports can still show
+answers recorded independently in the reviewer's intent store, but omit
+policy-derived answers with a warning. Keep the old run for evidence, then
+initialize a fresh audit with `omgs audit init --target /path/to/repo
+--base <full-base-sha> --out /private/runs/new-audit`. Complete that audit before
+using its path with `--fix-of`. This is a new budget family, not a continuation
+or refund of the legacy allowance. Set the reviewed budget in base policy and
+account for any earlier spending separately. Do not fabricate a snapshot in old
+metadata. Existing target and cumulative budget constraints continue to apply
+to supported fix runs.
+
+## Reviewer-owned policy provenance
+
+At initialization, the CLI resolves `--base` and records the full commit SHA and
+exact policy blob digest beside the target's reviewer-owned intent store. Each
+record binds the canonical target and run paths. The record lives outside both
+the target and the run directory. A later init for the same target creates a
+separate record and does not retarget earlier runs.
+
+Reports, fix initialization and policy proposals obtain the base only from this
+record. They require a full immutable SHA, re-read the policy through the safe
+object-only Git reader, and verify its digest against the trusted record.
+Run-local policy snapshots are diagnostic copies: disagreements warn and are
+ignored, including edits to the base SHA and matching digest. Missing or invalid
+trusted provenance never falls back to metadata. Gate continues to read its
+explicit caller-supplied base independently.
+
+When no committed policy exists, the trusted record retains the CLI-selected
+mode, persona and budget. Fix runs inherit those settings, subject to existing
+explicit override rules and cumulative budget limits. When a policy blob exists,
+fix runs inherit its authenticated mode, persona, excluded paths, suppressions
+and test registrations. Policy patches use the exact authenticated base blob as
+their baseline. Moving a run to another path or machine requires a fresh audit;
+copying its snapshot alone cannot establish provenance.
 
 ## Building the embedded skill
 
