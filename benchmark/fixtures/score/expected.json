@@ -1,0 +1,175 @@
+{
+  "recalls": [
+    {
+      "numerator": 1,
+      "denominator": 4,
+      "value": 0.25
+    },
+    {
+      "numerator": 2,
+      "denominator": 4,
+      "value": 0.5
+    }
+  ],
+  "union": {
+    "numerator": 3,
+    "denominator": 4,
+    "value": 0.75
+  },
+  "recall_variance": {
+    "distribution": [
+      0.25,
+      0.5
+    ],
+    "numerator": 2,
+    "denominator": 2,
+    "mean": 0.375,
+    "min": 0.25,
+    "max": 0.5,
+    "range": 0.25,
+    "standard_deviation": 0.125
+  },
+  "false_positives": [
+    {
+      "numerator": 1,
+      "denominator": 1,
+      "value": 1.0
+    },
+    {
+      "numerator": 0,
+      "denominator": 1,
+      "value": 0.0
+    }
+  ],
+  "fdr": [
+    {
+      "numerator": 1,
+      "denominator": 2,
+      "value": 0.5
+    },
+    {
+      "numerator": 0,
+      "denominator": 2,
+      "value": 0.0
+    }
+  ],
+  "negative_unit_rate": [
+    {
+      "numerator": 1,
+      "denominator": 1,
+      "value": 1.0
+    },
+    {
+      "numerator": 0,
+      "denominator": 1,
+      "value": 0.0
+    }
+  ],
+  "rejection": [
+    {
+      "numerator": 1,
+      "denominator": 3,
+      "value": 0.3333333333333333
+    },
+    {
+      "numerator": 0,
+      "denominator": 2,
+      "value": 0.0
+    }
+  ],
+  "pending": [
+    {
+      "numerator": 1,
+      "denominator": 3,
+      "value": 0.3333333333333333
+    },
+    {
+      "numerator": 0,
+      "denominator": 2,
+      "value": 0.0
+    }
+  ],
+  "fp_variance": {
+    "distribution": [
+      1.0,
+      0.0
+    ],
+    "numerator": 2,
+    "denominator": 2,
+    "mean": 0.5,
+    "min": 0.0,
+    "max": 1.0,
+    "range": 1.0,
+    "standard_deviation": 0.5
+  },
+  "frequency": [
+    {
+      "defect": "fixture:a",
+      "frequency": {
+        "numerator": 1,
+        "denominator": 2,
+        "value": 0.5
+      }
+    },
+    {
+      "defect": "fixture:b",
+      "frequency": {
+        "numerator": 1,
+        "denominator": 2,
+        "value": 0.5
+      }
+    },
+    {
+      "defect": "fixture:c",
+      "frequency": {
+        "numerator": 1,
+        "denominator": 2,
+        "value": 0.5
+      }
+    },
+    {
+      "defect": "fixture:d",
+      "frequency": {
+        "numerator": 0,
+        "denominator": 2,
+        "value": 0.0
+      }
+    }
+  ],
+  "cost_variance": {
+    "distribution": [
+      2.0,
+      null
+    ],
+    "numerator": 1,
+    "denominator": 2,
+    "mean": null,
+    "min": null,
+    "max": null,
+    "range": null,
+    "standard_deviation": null
+  },
+  "time_variance": {
+    "distribution": [
+      10.0,
+      14.0
+    ],
+    "numerator": 2,
+    "denominator": 2,
+    "mean": 12.0,
+    "min": 10.0,
+    "max": 14.0,
+    "range": 4.0,
+    "standard_deviation": 2.0
+  },
+  "costs": [
+    2.0,
+    null
+  ],
+  "total_cost": {
+    "numerator": null,
+    "denominator": 2,
+    "cohort": "entire_campaign"
+  },
+  "cli_calls": 0
+}

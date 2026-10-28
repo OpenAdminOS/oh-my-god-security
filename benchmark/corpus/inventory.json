@@ -1,0 +1,168 @@
+{
+  "format_version": "omgs-corpus-inventory/1",
+  "research_date": "2026-10-28",
+  "scorable": false,
+  "eligible_post_cutoff_count": 0,
+  "required_post_cutoff_count": 5,
+  "cases": [
+    {
+      "id": "cve-2026-105090",
+      "description": "Survey custom head script permission bypass",
+      "kind": "real_fix_pair",
+      "repository_url": "https://github.com/formbricks/formbricks",
+      "license": {
+        "spdx_id": "AGPL-3.0-only",
+        "scope": "Core only; enterprise paths and third-party dependencies have separate terms.",
+        "source_url": "https://github.com/formbricks/formbricks/blob/6fb5ce9c8443a9d1cda5c3f3e1b48748a0cc8e3a/LICENSE",
+        "redistribution_status": "metadata_only"
+      },
+      "stack": {
+        "language": "typescript",
+        "nextjs_version": "16.3.3",
+        "database": "postgres",
+        "app_router_evidence_url": "https://github.com/formbricks/formbricks/tree/6fb5ce9c8443a9d1cda5c3f3e1b48748a0cc8e3a/apps/web/app",
+        "package_evidence_url": "https://github.com/formbricks/formbricks/blob/6fb5ce9c8443a9d1cda5c3f3e1b48748a0cc8e3a/apps/web/package.json",
+        "database_evidence_url": "https://github.com/formbricks/formbricks/blob/6fb5ce9c8443a9d1cda5c3f3e1b48748a0cc8e3a/packages/database/schema/main.prisma"
+      },
+      "vulnerable_commit": "6fb5ce9c8443a9d1cda5c3f3e1b48748a0cc8e3a",
+      "fixed_commit": "ba56cfc322fb408689deabc25a3490344d6351bf",
+      "sha_verification": {
+        "checked_at": "2026-10-28",
+        "vulnerable_api_url": "https://api.github.com/repos/formbricks/formbricks/commits/6fb5ce9c8443a9d1cda5c3f3e1b48748a0cc8e3a",
+        "fixed_api_url": "https://api.github.com/repos/formbricks/formbricks/commits/ba56cfc322fb408689deabc25a3490344d6351bf",
+        "relationship": "Both APIs returned exact full SHAs; vulnerable commit is fixed commit first parent."
+      },
+      "advisory": {
+        "id": "CVE-2026-105090",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-105090",
+        "osv_url": "https://osv.dev/vulnerability/CVE-2026-105090"
+      },
+      "timeline": {
+        "earliest_known_public_disclosure_at": "2026-09-29T08:40:27Z",
+        "public_fix_available_by": "2026-09-29T09:50:08Z",
+        "disclosure_source_url": "https://github.com/formbricks/formbricks/pull/9432",
+        "fix_source_url": "https://github.com/formbricks/formbricks/pull/9432",
+        "precision": "Earliest located public security-fix PR. Merge timestamp establishes availability by this time, not original push time. Commit timestamps alone are not publication evidence.",
+        "later_advisory_publication_date": "2026-10-03"
+      },
+      "cutoff": {
+        "latest_known_cutoff": "2026-06-30",
+        "configuration_cutoff": null,
+        "eligibility": "unknown",
+        "reason": "One participating cutoff is unpublished. Located disclosure and fix are after latest known cutoff."
+      },
+      "cohort": "cutoff_unknown",
+      "split": {
+        "cohort_id": "formbricks-family",
+        "partition": "development",
+        "rotation_id": "research-2026-10-28"
+      },
+      "admission_status": "not_admitted",
+      "fingerprint": null,
+      "expected_findings": null,
+      "human_confirmation": null,
+      "fixtures": null,
+      "pending": [
+        "Independent complete-fix and regression review. Public PR claims are not benchmark ground truth.",
+        "Prepare authorized offline snapshots, synthetic fixtures, dependencies, policy and proof tests at campaign time.",
+        "Confirm paired sandbox assertions independently with human review.",
+        "Compute four-part finding identity at campaign time."
+      ]
+    },
+    {
+      "id": "cve-2026-14792",
+      "description": "Survey response oracle and PIN rate limits",
+      "kind": "real_fix_pair",
+      "repository_url": "https://github.com/formbricks/formbricks",
+      "license": {
+        "spdx_id": "AGPL-3.0-only",
+        "scope": "Core only; enterprise paths and third-party dependencies have separate terms.",
+        "source_url": "https://github.com/formbricks/formbricks/blob/33b041a5ae8155d06357424ce1db2b1d01107951/LICENSE",
+        "redistribution_status": "metadata_only"
+      },
+      "stack": {
+        "language": "typescript",
+        "nextjs_version": "16.2.6",
+        "database": "postgres",
+        "app_router_evidence_url": "https://github.com/formbricks/formbricks/tree/33b041a5ae8155d06357424ce1db2b1d01107951/apps/web/app",
+        "package_evidence_url": "https://github.com/formbricks/formbricks/blob/33b041a5ae8155d06357424ce1db2b1d01107951/apps/web/package.json",
+        "database_evidence_url": "https://github.com/formbricks/formbricks/blob/33b041a5ae8155d06357424ce1db2b1d01107951/packages/database/schema.prisma"
+      },
+      "vulnerable_commit": "33b041a5ae8155d06357424ce1db2b1d01107951",
+      "fixed_commit": "af6023b5ac3b030ffcea24fac799f76f3e3512c6",
+      "sha_verification": {
+        "checked_at": "2026-10-28",
+        "vulnerable_api_url": "https://api.github.com/repos/formbricks/formbricks/commits/33b041a5ae8155d06357424ce1db2b1d01107951",
+        "fixed_api_url": "https://api.github.com/repos/formbricks/formbricks/commits/af6023b5ac3b030ffcea24fac799f76f3e3512c6",
+        "relationship": "Both APIs returned exact full SHAs; vulnerable commit is fixed commit first parent."
+      },
+      "advisory": {
+        "id": "CVE-2026-14792",
+        "url": "https://nvd.nist.gov/vuln/detail/CVE-2026-14792",
+        "osv_url": "https://osv.dev/vulnerability/CVE-2026-14792"
+      },
+      "timeline": {
+        "earliest_known_public_disclosure_at": "2026-05-21T08:46:06Z",
+        "public_fix_available_by": "2026-05-27T14:26:39Z",
+        "disclosure_source_url": "https://github.com/formbricks/formbricks/pull/8094",
+        "fix_source_url": "https://github.com/formbricks/formbricks/pull/8094",
+        "precision": "Earliest located public security-fix PR. Merge timestamp establishes availability by this time, not original push time. Commit timestamps alone are not publication evidence.",
+        "later_advisory_publication_date": "2026-07-06"
+      },
+      "cutoff": {
+        "latest_known_cutoff": "2026-06-30",
+        "configuration_cutoff": null,
+        "eligibility": "ineligible",
+        "reason": "One participating cutoff is unpublished. Public PR and fix also predate the latest known cutoff."
+      },
+      "cohort": "earlier_public_fix",
+      "split": {
+        "cohort_id": "formbricks-family",
+        "partition": "development",
+        "rotation_id": "research-2026-10-28"
+      },
+      "admission_status": "not_admitted",
+      "fingerprint": null,
+      "expected_findings": null,
+      "human_confirmation": null,
+      "fixtures": null,
+      "pending": [
+        "Independent complete-fix and regression review. Public PR claims are not benchmark ground truth.",
+        "Prepare authorized offline snapshots, synthetic fixtures, dependencies, policy and proof tests at campaign time.",
+        "Confirm paired sandbox assertions independently with human review.",
+        "Compute four-part finding identity at campaign time."
+      ]
+    }
+  ],
+  "cutoff_configuration": {
+    "latest_known_cutoff": "2026-06-30",
+    "complete_configuration_cutoff": null,
+    "roles": [
+      "hunting",
+      "criticism",
+      "verification"
+    ],
+    "participants": [
+      {
+        "name": "Claude Opus 5.5",
+        "published_cutoff": "2026-06",
+        "conservative_date": "2026-06-30",
+        "source_url": "https://platform.claude.com/docs/en/models/overview"
+      },
+      {
+        "name": "GPT-6.1-Sol",
+        "published_cutoff": "2026-04-30",
+        "conservative_date": "2026-04-30",
+        "source_url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol"
+      },
+      {
+        "name": "Muse Wonder 1.0",
+        "published_cutoff": null,
+        "conservative_date": null,
+        "source_url": "https://ai.meta.com/tools/muse/",
+        "additional_source_url": "https://ai.meta.com/llama",
+        "reason": "No cutoff found in available publisher material. Direct overview retrieval redirected to login. Release date is not a training cutoff."
+      }
+    ]
+  }
+}

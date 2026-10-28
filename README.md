@@ -160,6 +160,8 @@ cargo build --release
 ./target/release/omgs check --target /path/to/your/repo
 ```
 
+Offline benchmark scoring: `omgs bench score --cases <manifest> --runs <run-dir>` reads saved artifacts and emits JSON plus Markdown. See the [benchmark guide](benchmark/README.md#score-saved-runs-offline) and [corpus research inventory](benchmark/corpus/README.md).
+
 ## Repository layout
 
 - `src/`: the deterministic Rust CLI (findings schema, finding identity across runs, stack detection, coverage ledger, redacted sensor execution, sandbox proof execution, report rendering to Markdown, a self contained HTML one pager, and SARIF, and the architecture map renderer).

@@ -95,6 +95,7 @@ parent-owned full-diff reviews and PR creation are separate from this implementa
 ## PR 6: benchmark runner, corpus, screenshots, self-audit (`feat/benchmark`)
 
 - [ ] `omgs bench score`; at least 5 post-cutoff CVE pairs
+  - Offline scorer and arithmetic fixtures implemented. Corpus research found two unadmitted metadata pairs and zero eligible post-cutoff cases for the requested configuration. See `benchmark/corpus/README.md` for the unknown-cutoff and preparation gap.
 - [ ] Opt-in screenshots; self-audit; fix round trip on the fixture
 
 ## Phase 7: Awesome Intune campaign

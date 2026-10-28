@@ -74,3 +74,99 @@ Paths are relative to an authorized local fixture bundle outside evaluated targe
 ## Licensing: open decision
 
 Benchmark corpus licensing is explicitly deferred in [DECISIONS.md](../DECISIONS.md). This design does not choose a corpus license or authorize copying upstream source, advisories, patches, or generated app dependencies. Track rights per case; retain required notices. Until the decision and rights are resolved, keep restricted material in authorized local fixtures and publish only metadata whose redistribution is permitted. Example license identifiers are illustrative, not a licensing decision.
+
+## Score saved runs offline
+
+```sh
+omgs bench score --cases benchmark/fixtures/score/cases.json \
+  --runs benchmark/fixtures/score/run-1 \
+  --runs benchmark/fixtures/score/run-2 > score.json 2> score.md
+```
+
+JSON goes to stdout and a short Markdown table to stderr. Errors return exit 2
+without partial results. The command reads JSON only. It performs no fetches,
+proof replays, builds or target execution. Validate proof records and complete
+independent adjudication before freezing the evaluator's scoring exports. A
+claimed tier in an export is not new proof attestation by the scorer.
+
+Each `--runs` directory is **one complete independent repetition** across every
+case snapshot, including blocked and budget-exhausted snapshots. Save a
+`benchmark-run.json` object with these required fields (no defaults):
+
+| Field | Shape |
+| --- | --- |
+| `format_version` | `1` |
+| `run_id`, `campaign_id`, `configuration` | Nonempty strings; run IDs unique, campaign/configuration identical across repetitions. Configuration identifies the frozen settings, versions, tools, sampling and seeds |
+| `manifest_sha256` | SHA-256 of compact, key-sorted parsed manifest JSON, binding the truth set to the frozen repetition |
+| `repetitions` | Predeclared positive integer `k`, equal to the number of supplied run directories |
+| `observations` | Exactly one object per manifest case/snapshot pair |
+| `resource_usage` | Object with required `proof_tool_cost_usd` and `wall_seconds`, each finite nonnegative number or explicit null |
+
+Every observation requires `case_id`, `snapshot_id`, `status` (`complete`,
+`blocked`, `budget_exhausted`), string arrays `blockers`, `examined_units`,
+`unexamined_units`, and arrays `candidates`, `findings`, `adjudications`.
+Incomplete observations must name blockers. They may retain partial findings.
+An empty findings array never removes a case from the primary denominator.
+
+- Each candidate has required `attack_class`, `entry_point`, `sink`, `boundary`
+  and `verifier` (`accepted`, `rejected`, `pending`). Export the pre-verifier
+  candidates, including lost or deferred candidates. Identities must be unique
+  within a snapshot; reviewed semantic aliases collapse to a defect within each
+  repetition. Rejection and pending numerators count groups with an explicit
+  rejection or pending candidate respectively; they can overlap for a group
+  with multiple submitted identities. They are not inferred from final verdicts.
+- Each finding has required `fingerprint`, the four identity inputs, `verdict`
+  (`confirmed`, `rejected`, `needs_validation`) and `proof_tier` (`traced`,
+  `test_proven`, `sandbox_exploited`). Fingerprints must match `omgs fingerprint`.
+  Recovery requires the expected minimum tier, never below `test_proven`.
+- Each adjudication has required `fingerprint`, `outcome` (`false_positive`,
+  `pending`), `negative_unit` and `review`. A false positive names the zero-based
+  index of an independently adjudicated `known_clean_units` entry covering that
+  snapshot. Pending uses null. `review` has `reviewer`, ISO UTC `reviewed_at`,
+  and evaluator-only `evidence_path`. Only independently refuted proven
+  confirmations count as FP. Unexpected confirmations, including unreviewed
+  fixed-snapshot findings, stay listed for adjudication.
+
+Required manifest fields from the format above are validated recursively,
+including explicit nullable fields. Unknown keys, duplicates, missing fields,
+invalid enums, malformed dates/hashes, example flags and dangling snapshot
+references fail closed. Snapshot refs are full 40-digit commit IDs. Location
+`line` is a positive integer or explicit null when not known. An expected finding
+may additionally have optional `aliases`: an array of the four identity inputs
+plus required `review` as above. The scorer computes every canonical and alias
+fingerprint itself. Aliases must be unique within a case and may not cross
+expected defects. No advisory-name or line-number matching is used.
+
+Results are separated by cutoff eligibility, partition and rotation, with frozen case
+context (family cohort, stack, budgets, split, provenance and minimum tiers) alongside metrics.
+Every ratio contains numerator, denominator and value. Parent cohort/context
+applies to all its nested metrics. FP and needs-validation counts use denominator
+1 repetition; negative-unit denominators count frozen adjudicated
+unit/snapshot pairs per repetition. TP counts distinct matched defect/snapshot
+pairs, FP counts distinct independently refuted findings per snapshot. Repeated
+FP detections on fixed snapshots remain in each run's result. The union recall
+uses distinct positive defects and the same denominator as every single run.
+
+Mean recall and variance objects contain the distribution, known-sample
+numerator and total-repetition denominator. Standard deviation is the population
+standard deviation (divide by `k`). Zero denominators and unavailable values
+produce null. Any unknown sample makes complete-distribution mean, range and
+standard deviation null, rather than silently selecting a cheaper executable
+subset. Per-defect frequency uses recovered repetitions divided by `k`.
+
+Optional `run-metadata.json` provides cumulative host accounting. The existing
+`agent_calls_used` field supplies calls. `accounting` maps `red-hunter`,
+`blue-verifier`, `evaluator`, `green-fixer` to optional nullable `tokens`,
+`cost_usd`, `duration_ms`, and optional `input_tokens`/`output_tokens` splits.
+Accounting must include retries across the complete repetition. A total is known
+only if every role supplies that dimension; explicit measured zero is preserved,
+missing billing is never zero. No token pricing is inferred. Raw role accounting
+is retained. Cost, proof/tool cost and wall time are campaign-wide, each labeled
+with cohort and sample count, and are not allocated to individual families.
+The `k`-run currency total is null if any repetition has unknown billing.
+CLI model-call count is always zero.
+
+The [golden fixture](fixtures/score/README.md) demonstrates the export format and
+hand arithmetic. The [corpus inventory](corpus/README.md) records researched real
+pairs, cutoff sources, SHA verification and the remaining admission gap. It is
+metadata awaiting campaign preparation, not a scorable case manifest.
