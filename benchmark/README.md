@@ -92,8 +92,11 @@ source run's `findings.json`, including the identity, verdict, tier and
 `proof_ref`. Source findings must pass the evidence rules used by `omgs validate`.
 Each matching finding then passes the same offline proof validator, including
 runner config, command and draft digests, clean execution and `omgs-proof/2`
-recipe contract rules. Missing, mismatched or invalid evidence is excluded from
-TP, recovery and FP counts and listed in `invalid_evidence` with diagnostics.
+recipe contract rules. Its proof record must have a `target_head` exactly equal
+to the observation's frozen manifest snapshot `source_ref`. Missing or mismatched
+revisions cannot support TP, recovery or FP counts. Missing, mismatched or
+invalid evidence is excluded from TP, recovery and FP counts and listed in
+`invalid_evidence` with diagnostics.
 These are offline consistency checks, not fresh execution or attestation.
 
 Each `--runs` directory is **one complete independent repetition** across every
@@ -120,6 +123,14 @@ Absolute paths, parent traversal and directories escaping the repetition are
 rejected as evidence. Incomplete observations must name blockers. They may
 retain partial findings.
 An empty findings array never removes a case from the primary denominator.
+Whenever `source_run` is supplied, its complete source findings file is validated,
+even for an empty export. Every archived `confirmed` and `needs_validation`
+finding must appear in the export. An invalid source archive or an omitted
+finding rejects the entire score command with exit 2 and a diagnostic naming
+the run, case, snapshot and source archive. Omissions also list the missing
+fingerprints. No partial metrics are emitted. This applies to complete, blocked
+and budget-exhausted observations, so clearing findings and adjudications on a
+fixed snapshot cannot silently turn an archived false positive into FP 0 or FDR 0.
 
 - Each candidate has required `attack_class`, `entry_point`, `sink`, `boundary`
   and `verifier` (`accepted`, `rejected`, `pending`). Export the pre-verifier

@@ -5,6 +5,7 @@
   "test": "tests/security/x.test.ts",
   "test_sha256": "14ac43916b9e8315f7efc58a85e6943d2217a0cfc0245e3f966ed8e532ab5982",
   "test_from": "fixture-draft",
+  "target_head": "2222222222222222222222222222222222222222",
   "tier": "test",
   "command": "npm test -- tests/security/x.test.ts",
   "command_sha256": "b660016cdbcc393e9aafe8a7a916b11126649944eb06fbe1b07ea5f8dea6f5db",

@@ -596,13 +596,54 @@ fn source_findings(
 fn evidence_errors(
     dir: &Path,
     r: &Value,
+    manifest: &Value,
 ) -> Result<BTreeMap<(String, String, String), Vec<String>>> {
     let mut errors = BTreeMap::new();
     for o in list(&r["observations"])? {
-        if list(&o["findings"])?.is_empty() {
-            continue;
-        }
-        let source = source_findings(dir, o);
+        let case = list(&manifest["cases"])?
+            .iter()
+            .find(|c| c["id"] == o["case_id"])
+            .ok_or("unknown run case")?;
+        let snapshot = list(&case["snapshots"])?
+            .iter()
+            .find(|s| s["id"] == o["snapshot_id"])
+            .ok_or("unknown run snapshot")?;
+        let context = || {
+            format!(
+                "run {} case {} snapshot {} source_run {}",
+                r["run_id"], o["case_id"], o["snapshot_id"], o["source_run"]
+            )
+        };
+        let source = if o["source_run"].is_null() {
+            Err("missing source_run".to_owned())
+        } else {
+            // Reject incomplete exports before producing any metrics, even if
+            // the observation is blocked or exports no findings at all.
+            let source = source_findings(dir, o).map_err(|e| format!("{}: {e}", context()))?;
+            let exported: BTreeSet<_> = list(&o["findings"])?
+                .iter()
+                .map(|f| text(&f["fingerprint"]))
+                .collect::<Result<_>>()?;
+            let omitted: Vec<_> = source
+                .0
+                .findings
+                .iter()
+                .filter(|f| {
+                    matches!(
+                        f.verdict,
+                        crate::model::Verdict::Confirmed | crate::model::Verdict::NeedsValidation
+                    ) && !exported.contains(f.fingerprint.as_str())
+                })
+                .map(|f| f.fingerprint.as_str())
+                .collect();
+            if !omitted.is_empty() {
+                return Err(format!(
+                    "{}: incomplete observation: export omits confirmed or needs_validation source findings: {}",
+                    context(), omitted.join(", ")
+                ));
+            }
+            Ok(source)
+        };
         for f in list(&o["findings"])? {
             let result = match &source {
                 Err(e) => vec![e.clone()],
@@ -631,12 +672,25 @@ fn evidence_errors(
                         } else {
                             // The same offline proof validator used by `omgs validate`, including
                             // runner artifacts and omgs-proof/2 contract rules. No replay.
-                            crate::proof::validate_proofs(
+                            let mut proof_errors = crate::proof::validate_proofs(
                                 &crate::model::FindingsFile {
                                     findings: vec![finding.clone()],
                                 },
                                 source,
-                            )
+                            );
+                            if let Some(proof_ref) = finding.proof_ref.as_deref() {
+                                // Load errors are already reported by validate_proofs.
+                                if let Ok(record) = crate::proof::load(source, proof_ref) {
+                                    let expected = text(&snapshot["source_ref"])?;
+                                    if record.target_head.as_deref() != Some(expected) {
+                                        proof_errors.push(format!(
+                                            "{proof_ref}: target_head {} does not match frozen snapshot source_ref {expected}",
+                                            record.target_head.as_deref().unwrap_or("<missing>")
+                                        ));
+                                    }
+                                }
+                            }
+                            proof_errors
                         }
                     }
                 },
@@ -785,7 +839,7 @@ pub fn score(cases: &Path, dirs: &[PathBuf]) -> Result<Value> {
             }
         }
         runs.push(ScoringRun {
-            evidence_errors: evidence_errors(dir, &r)?,
+            evidence_errors: evidence_errors(dir, &r, &m)?,
             export: r,
             accounting: accounting(dir)?,
         });
@@ -1073,6 +1127,7 @@ mod tests {
                     &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                         .join("benchmark/fixtures/score/run-1"),
                     &run,
+                    &json!({"cases": [&first, &second]}),
                 )
                 .unwrap(),
                 export: run,

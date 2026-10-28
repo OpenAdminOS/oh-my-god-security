@@ -219,11 +219,13 @@ impl SavedRuns {
         std::fs::write(path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
     }
     fn score(&self) -> Value {
+        self.try_score().unwrap()
+    }
+    fn try_score(&self) -> Result<Value, String> {
         omgs::bench::score(
             &self.0.join("cases.json"),
             &[self.0.join("run-1"), self.0.join("run-2")],
         )
-        .unwrap()
     }
 }
 impl Drop for SavedRuns {
@@ -285,6 +287,154 @@ fn mismatched_proof_references_are_reported_and_not_recovered() {
         r["findings"][0]["proof_ref"] = json!("proofs/2.json")
     });
     assert_invalid_positive(&saved, "was recorded for finding");
+}
+
+#[test]
+fn wrong_proof_revisions_cannot_count_as_tp_recovery_or_fp() {
+    let saved = SavedRuns::new();
+    saved.edit("run-1/positive/proofs/1.json", |r| {
+        r["target_head"] = json!("2".repeat(40))
+    });
+    assert_invalid_positive(&saved, "target_head 2222222222222222222222222222222222222222 does not match frozen snapshot source_ref 1111111111111111111111111111111111111111");
+    saved.edit("run-1/fixed/proofs/1.json", |r| {
+        r["target_head"] = json!("1".repeat(40))
+    });
+    assert_invalid_fixed(&saved, "target_head 1111111111111111111111111111111111111111 does not match frozen snapshot source_ref 2222222222222222222222222222222222222222");
+}
+
+#[test]
+fn missing_proof_revisions_cannot_count_as_tp_recovery_or_fp() {
+    // Both absent and explicit null revisions must fail closed.
+    for absent in [true, false] {
+        let saved = SavedRuns::new();
+        for snapshot in ["positive", "fixed"] {
+            saved.edit(&format!("run-1/{snapshot}/proofs/1.json"), |r| {
+                if absent {
+                    r.as_object_mut().unwrap().remove("target_head");
+                } else {
+                    r["target_head"] = Value::Null;
+                }
+            });
+        }
+        assert_invalid_positive(&saved, "target_head <missing>");
+        assert_invalid_fixed(&saved, "target_head <missing>");
+    }
+}
+
+fn assert_invalid_fixed(saved: &SavedRuns, message: &str) {
+    let s = saved.score();
+    let r = &s["cohorts"][0]["runs"][0];
+    assert_eq!(r["false_positives"]["numerator"], 0);
+    assert_eq!(r["false_discovery_fraction"]["numerator"], 0);
+    assert_eq!(r["negative_unit_rate"]["numerator"], 0);
+    let report = r["invalid_evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["snapshot_id"] == "fixed" && e["fingerprint"] == "omgs-d7c7756a1f68ec92")
+        .unwrap();
+    assert!(report["errors"].to_string().contains(message), "{report}");
+}
+
+#[test]
+fn source_archive_assigned_to_another_snapshot_cannot_count_as_tp_recovery_or_fp() {
+    let saved = SavedRuns::new();
+    saved.edit("run-1/benchmark-run.json", |r| {
+        // Export the entire archive to isolate snapshot binding from omissions.
+        r["observations"][1]["source_run"] = json!("positive");
+        r["observations"][1]["findings"] = r["observations"][0]["findings"].clone();
+    });
+    assert_invalid_fixed(&saved, "does not match frozen snapshot source_ref");
+    let s = saved.score();
+    assert_eq!(s["cohorts"][0]["runs"][0]["recall"]["numerator"], 1);
+    assert_eq!(
+        s["cohorts"][0]["runs"][0]["true_positive_detections"]["numerator"],
+        1
+    );
+    let saved = SavedRuns::new();
+    saved.edit("run-1/benchmark-run.json", |r| {
+        r["observations"][0]["source_run"] = json!("fixed");
+        r["observations"][0]["findings"] = r["observations"][1]["findings"].clone();
+    });
+    assert_invalid_positive(&saved, "does not match frozen snapshot source_ref");
+}
+
+#[test]
+fn clearing_fixed_findings_and_adjudications_rejects_export_without_metrics() {
+    let saved = SavedRuns::new();
+    saved.edit("run-1/benchmark-run.json", |r| {
+        r["observations"][1]["findings"] = json!([]);
+        r["observations"][1]["adjudications"] = json!([]);
+    });
+    let error = saved.try_score().unwrap_err();
+    assert!(
+        error.contains("run \"r1\" case \"fixture\" snapshot \"fixed\""),
+        "{error}"
+    );
+    assert!(error.contains("incomplete observation"), "{error}");
+    assert!(error.contains("omgs-d7c7756a1f68ec92"), "{error}");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["bench", "score", "--cases"])
+        .arg(saved.0.join("cases.json"))
+        .arg("--runs")
+        .arg(saved.0.join("run-1"))
+        .arg("--runs")
+        .arg(saved.0.join("run-2"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty(), "partial metrics were emitted");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("incomplete observation"));
+}
+
+#[test]
+fn partial_exports_cannot_omit_confirmed_or_needs_validation_findings() {
+    for index in [0, 2, 3] {
+        for status in ["complete", "blocked", "budget_exhausted"] {
+            let saved = SavedRuns::new();
+            let mut omitted = Value::Null;
+            saved.edit("run-1/benchmark-run.json", |r| {
+                let o = &mut r["observations"][0];
+                omitted =
+                    o["findings"].as_array_mut().unwrap().remove(index)["fingerprint"].clone();
+                o["status"] = json!(status);
+                if status != "complete" {
+                    o["blockers"] = json!(["fixture incomplete"]);
+                }
+            });
+            let error = saved.try_score().unwrap_err();
+            assert!(error.contains("incomplete observation"), "{error}");
+            assert!(error.contains(omitted.as_str().unwrap()), "{error}");
+        }
+    }
+}
+
+#[test]
+fn empty_exports_still_validate_supplied_source_archives() {
+    for invalid in [false, true] {
+        let saved = SavedRuns::new();
+        saved.edit("run-1/benchmark-run.json", |r| {
+            r["observations"][1]["findings"] = json!([]);
+            r["observations"][1]["adjudications"] = json!([]);
+        });
+        if invalid {
+            saved.edit("run-1/fixed/findings.json", |r| {
+                r["findings"][0]["evidence"] = json!("");
+            });
+        } else {
+            std::fs::remove_file(saved.0.join("run-1/fixed/findings.json")).unwrap();
+        }
+        let error = saved.try_score().unwrap_err();
+        assert!(error.contains("source_run \"fixed\""), "{error}");
+        assert!(
+            error.contains(if invalid {
+                "confirmed findings require evidence"
+            } else {
+                "findings.json"
+            }),
+            "{error}"
+        );
+    }
 }
 
 #[test]
@@ -397,7 +547,7 @@ fn archived_golden_sources_pass_validate_offline() {
 fn missing_or_invalid_source_findings_are_reported() {
     let saved = SavedRuns::new();
     std::fs::remove_file(saved.0.join("run-1/positive/findings.json")).unwrap();
-    assert_invalid_positive(&saved, "findings.json");
+    assert!(saved.try_score().unwrap_err().contains("findings.json"));
     let saved = SavedRuns::new();
     saved.edit("run-1/positive/findings.json", |r| {
         r["findings"].as_array_mut().unwrap().remove(0);
@@ -407,7 +557,10 @@ fn missing_or_invalid_source_findings_are_reported() {
     saved.edit("run-1/positive/findings.json", |r| {
         r["findings"][0]["evidence"] = json!("")
     });
-    assert_invalid_positive(&saved, "confirmed findings require evidence");
+    assert!(saved
+        .try_score()
+        .unwrap_err()
+        .contains("confirmed findings require evidence"));
     let saved = SavedRuns::new();
     saved.edit("run-1/benchmark-run.json", |r| {
         r["observations"][0]["findings"][0]["verdict"] = json!("needs_validation")
