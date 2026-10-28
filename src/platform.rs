@@ -89,7 +89,8 @@ pub fn which(name: &str) -> Option<PathBuf> {
 
 /// Open `path` for reading without following a final symlink (or reparse
 /// point on Windows) and without blocking on a FIFO, and accept it only when
-/// it is a regular file with exactly one link. `Ok(None)` when it is missing.
+/// it is a regular file without hardlink aliases. An opened file may have
+/// zero links after a concurrent atomic replacement. `Ok(None)` when missing.
 /// Used for files whose content decides trust, so a planted symlink or
 /// hardlink cannot substitute another file.
 pub fn open_single_link(path: &Path) -> std::io::Result<Option<std::fs::File>> {
@@ -112,8 +113,7 @@ pub fn open_single_link(path: &Path) -> std::io::Result<Option<std::fs::File>> {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let meta = file.metadata()?;
-    if !meta.is_file() || is_link(&meta) || link_count(&file)? != 1 {
+    if !is_single_link_file(&file)? {
         return Err(Error::other(format!(
             "{} must be a regular file with a single link",
             path.display()
@@ -281,7 +281,7 @@ fn with_file_in<T>(
             // SAFETY: successful openat returns a new descriptor owned here.
             let file = unsafe { std::fs::File::from_raw_fd(fd) };
             if last {
-                if !file.metadata()?.is_file() || link_count(&file)? != 1 {
+                if !is_single_link_file(&file)? {
                     return Err(std::io::Error::other(
                         "inventory content must be a single-link regular file",
                     ));
@@ -323,7 +323,7 @@ fn with_file_in<T>(
                 return Err(std::io::Error::other("inventory links are excluded"));
             }
             if components.peek().is_none() {
-                if !meta.is_file() || link_count(&file)? != 1 {
+                if !is_single_link_file(&file)? {
                     return Err(std::io::Error::other(
                         "inventory content must be a single-link regular file",
                     ));
@@ -346,6 +346,13 @@ fn with_file_in<T>(
             "contained inventory reads unavailable on this platform",
         ))
     }
+}
+
+// A retired snapshot with zero directory links is safe to read through its
+// already-open handle. Two or more links can alias attacker-controlled storage.
+fn is_single_link_file(file: &std::fs::File) -> std::io::Result<bool> {
+    let meta = file.metadata()?;
+    Ok(meta.is_file() && !is_link(&meta) && link_count(file)? <= 1)
 }
 
 #[cfg(unix)]
@@ -510,6 +517,10 @@ mod tests {
                 String::from_utf8_lossy(&child.stdout),
                 String::from_utf8_lossy(&child.stderr)
             );
+            // Revalidate after publication too: replacement may have reduced
+            // the old handle's link count to zero, but it has no aliases.
+            assert!(is_single_link_file(&file)?);
+            check_private_file(&file)?;
             assert_eq!(read_bounded_file(file, 100)?, b"old");
             assert_eq!(std::fs::read(run.join(crate::runmeta::FILE))?, b"new");
             Ok(())
@@ -525,10 +536,15 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let a = d.join("a");
         std::fs::write(&a, b"x").unwrap();
-        assert!(open_single_link(&a).unwrap().is_some());
+        let held = open_single_link(&a).unwrap().unwrap();
         assert!(open_single_link(&d.join("missing")).unwrap().is_none());
         std::fs::hard_link(&a, d.join("b")).unwrap();
         assert!(open_single_link(&a).is_err());
+        assert!(!is_single_link_file(&held).unwrap());
+        std::fs::remove_file(d.join("b")).unwrap();
+        std::fs::remove_file(&a).unwrap();
+        assert!(is_single_link_file(&held).unwrap());
+        assert_eq!(read_bounded_file(held, 100).unwrap(), b"x");
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(d.join("c-target"), d.join("c")).unwrap();
