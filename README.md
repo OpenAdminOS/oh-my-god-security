@@ -253,7 +253,12 @@ grants read-only `/usr/include` for local compiler headers; MXC does not mount
 that system directory by default.
 
 On macOS the survivor sweep identifies each run by its distinct allowed and
-denied marker paths. It skips unsandboxed processes before path-policy queries
+denied marker paths. Kernel process creation counters exclude services that
+predate the executor, even if their policy happens to match those paths.
+The identity query includes retained zombies; their first observation requires
+another scan before cleanup can be complete. If the executor's creation identity
+cannot be established, cleanup fails closed. It skips unsandboxed processes
+before path-policy queries
 and checks the denied path before the allowed path. A process exiting or
 entering another sandbox during inspection cannot turn an earlier unrestricted
 read into evidence that it belongs to this run. Concurrent proofs retain their
