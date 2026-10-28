@@ -3,9 +3,11 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 fn scratch(name: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("omgs-roles-{}-{name}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("omgs-private-fixtures-{}", std::process::id()));
+    omgs::platform::create_private_tree(&base).unwrap();
+    let path = base.join(format!("omgs-roles-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).unwrap();
+    omgs::platform::private_dir(&path).unwrap();
     path
 }
 fn cli(args: &[&str]) -> std::process::Output {
@@ -1107,6 +1109,7 @@ fn every_excluded_class_requires_review_and_reports_the_reason() {
     ] {
         let target = dir.join(class).join("repo");
         let run = dir.join(class).join("run");
+        omgs::platform::private_dir(target.parent().unwrap()).unwrap();
         std::fs::create_dir_all(&target).unwrap();
         for path in &paths {
             let file = target.join(path);
@@ -1171,7 +1174,26 @@ fn every_excluded_class_requires_review_and_reports_the_reason() {
         // the unit. This tests the mechanism, not the truth of the decision.
         let reason =
             "reviewed, not security relevant: sampled local fixtures; no production consumer";
-        assert!(set("out_of_scope", reason).status.success());
+        assert!(!set("out_of_scope", reason).status.success());
+        let resolved = cli(&[
+            "ledger",
+            "set",
+            "--ledger",
+            ledger_path.to_str().unwrap(),
+            "--unit",
+            unit_id,
+            "--status",
+            "out_of_scope",
+            "--note",
+            reason,
+            "--evidence",
+            &sorted[0],
+        ]);
+        assert!(
+            resolved.status.success(),
+            "{}",
+            String::from_utf8_lossy(&resolved.stderr)
+        );
         assert!(cli(&["critic", "--run", run.to_str().unwrap()])
             .status
             .success());
@@ -1254,7 +1276,11 @@ fn linked_run_directory_links_cannot_restore_allowance() {
     let (dir, root, fix) = linked_budget_fixture("linked-directory-refusal");
     let external = dir.join("external");
     std::fs::rename(&fix, &external).unwrap();
-    set_spending(&external, 0, 0);
+    // Deliberately forge the moved metadata without the guarded publication API.
+    let mut forged = read(&external.join("run-metadata.json"));
+    forged["agent_calls_used"] = json!(0);
+    forged["proof_runs_used"] = json!(0);
+    std::fs::write(external.join("run-metadata.json"), forged.to_string()).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(&external, &fix).unwrap();
     #[cfg(windows)]
@@ -1376,6 +1402,21 @@ fn legacy_standalone_budget_works_but_unidentified_links_fail_closed() {
     .unwrap();
     omgs::budget::charge_proof(&root).unwrap();
     assert_eq!(allowance(&root)["remaining"], 9);
+    let new_fix = root.parent().unwrap().join("legacy-fix");
+    let out = cli(&[
+        "audit",
+        "init",
+        "--target",
+        dir.join("repo").to_str().unwrap(),
+        "--out",
+        new_fix.to_str().unwrap(),
+        "--fix-of",
+        root.to_str().unwrap(),
+        "--no-sensors",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("run_id is required"));
+    assert!(!new_fix.exists());
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1402,5 +1443,117 @@ fn validated_refunds_restore_only_the_charged_family_allowance() {
     omgs::budget::charge_proof(&root).unwrap();
     omgs::budget::release_proof(&root).unwrap();
     assert_eq!(allowance(&root)["remaining"], 4);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn all_unresolved_inventory_units_fail_the_critic() {
+    use omgs::ledger::{Ledger, Unit};
+    for id in [
+        "inventory:limit",
+        "inventory:depth",
+        "inventory:symlink",
+        "inventory:read",
+        "inventory:future",
+    ] {
+        for status in [
+            "planned",
+            "candidate",
+            "blocked",
+            "deferred",
+            "covered",
+            "out_of_scope",
+        ] {
+            let mut unit = Unit::new(id, ".", &[], status);
+            unit.note = Some("explicit scope review".into());
+            unit.evidence = vec!["scope-review.txt".into()];
+            let report = omgs::critic::critique(
+                &Ledger {
+                    units: vec![unit],
+                    ..Ledger::default()
+                },
+                1,
+                &[],
+                &omgs::model::FindingsFile::default(),
+            );
+            assert_eq!(
+                report.passed(),
+                ["covered", "out_of_scope"].contains(&status),
+                "{id} {status}: {:?}",
+                report.gaps
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_vendor_notes_require_rereview_and_sampled_evidence() {
+    use omgs::ledger::{Ledger, Unit};
+    let mut unit = Unit::new("vendored:excluded", "vendor", &[], "out_of_scope");
+    unit.note = Some("automatically excluded vendored files".into());
+    unit.extra
+        .insert("excluded_paths".into(), json!(["vendor/lib.js"]));
+    unit.evidence = vec!["vendor/lib.js".into()];
+    let mut ledger = Ledger {
+        units: vec![unit],
+        ..Ledger::default()
+    };
+    assert!(!omgs::critic::critique(&ledger, 1, &[], &Default::default()).passed());
+    let reason =
+        "reviewed, not security relevant: sampled vendored example with no production consumer";
+    assert!(omgs::ledger::set_status(
+        &mut ledger,
+        "vendored:excluded",
+        "out_of_scope",
+        &[],
+        Some(reason)
+    )
+    .is_ok());
+    assert!(omgs::critic::critique(&ledger, 1, &[], &Default::default()).passed());
+    let readme = include_str!("../README.md");
+    assert!(readme.contains("older runs with automatic vendor exclusions now fail the critic"));
+    assert!(readme.contains("Never prepend"));
+    assert!(readme.contains("cannot start a linked fix family"));
+}
+
+#[cfg(unix)]
+#[test]
+fn budget_refuses_nonprivate_runs_and_parent_storage() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, root, fix) = linked_budget_fixture("private-storage");
+    for unsafe_dir in [&root, &fix, root.parent().unwrap()] {
+        for mode in [0o755, 0o770, 0o777] {
+            std::fs::set_permissions(unsafe_dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_linked_budget_refused(&root, &fix, "owner-private run storage");
+            std::fs::set_permissions(unsafe_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+    // The checker also rejects a directory owned by another uid when chown is available.
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(fix.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::chown(name.as_ptr(), 1, u32::MAX) }, 0);
+        assert!(omgs::budget::charge_proof(&fix).is_err());
+        assert_eq!(unsafe { libc::chown(name.as_ptr(), 0, u32::MAX) }, 0);
+    }
+    assert!(omgs::budget::charge_proof(&fix).is_ok());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn budget_refuses_storage_writable_by_other_principals() {
+    let (dir, root, fix) = linked_budget_fixture("private-storage-dacl");
+    for unsafe_dir in [&root, &fix, root.parent().unwrap()] {
+        let status = std::process::Command::new("icacls.exe")
+            .arg(unsafe_dir)
+            .args(["/grant", "*S-1-1-0:(W)"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_linked_budget_refused(&root, &fix, "writable by another principal");
+        omgs::platform::private_dir(unsafe_dir).unwrap();
+    }
+    assert!(omgs::budget::charge_proof(&fix).is_ok());
     std::fs::remove_dir_all(dir).unwrap();
 }

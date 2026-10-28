@@ -14,7 +14,7 @@ Write OUTPUT_DIR/evaluation.json with this inline schema: {"evaluator": string, 
 
 ## Excluded file accountability
 
-Check every `tests:excluded`, `docs:excluded`, `data:excluded` and `vendored:excluded` unit. Classification is a heuristic for priority, stack detection and size statistics, never proof that files are inert. Confirm that hunters skimmed or sampled the group and recorded either hunting evidence (`covered`) or `out_of_scope` with `reviewed, not security relevant: <reason>`. Challenge reasons that rely only on suffixes, size, directory names or the first 20 displayed paths. Interpreted policy and renamed scripts can appear in any class. Unresolved, blocked and deferred exclusions fail the critic and must remain explicit gaps.
+Check every `tests:excluded`, `docs:excluded`, `data:excluded` and `vendored:excluded` unit. Classification is a heuristic for priority, stack detection and size statistics, never proof that files are inert. Confirm that hunters skimmed or sampled the group and recorded either hunting evidence (`covered`) or `out_of_scope` with `reviewed, not security relevant: <reason>`. Challenge reasons that rely only on suffixes, size, directory names or the first 20 displayed paths. An out_of_scope disposition must cite at least one sampled path in its evidence. Record inadequate sampling as a gap, even when the critic passes the path citation check. Interpreted policy and renamed scripts can appear in any class. Unresolved, blocked and deferred exclusions fail the critic and must remain explicit gaps.
 
 ## Exact commands
 

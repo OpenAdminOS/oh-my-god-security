@@ -58,6 +58,11 @@ pub fn is_exclusion(u: &Unit) -> bool {
         || u.extra.contains_key("excluded_count")
 }
 
+/// Inventory omissions must be explicitly resolved just like exclusions.
+pub fn is_inventory_gap(u: &Unit) -> bool {
+    u.id.starts_with("inventory:") || u.extra.contains_key("inventory_gap_reason")
+}
+
 impl Unit {
     pub fn new(id: &str, surface: &str, attack_classes: &[&str], status: &str) -> Unit {
         Unit {
@@ -100,6 +105,18 @@ fn unit_errors(u: &Unit) -> Vec<String> {
         if !reason.is_some_and(|r| !r.trim().is_empty()) {
             errors
                 .push("excluded files require 'reviewed, not security relevant: <reason>'".into());
+        }
+        let sampled = u.extra.get("excluded_paths").and_then(|v| v.as_array());
+        if !sampled.is_some_and(|paths| {
+            paths
+                .iter()
+                .filter_map(|v| v.as_str())
+                .any(|path| !path.trim().is_empty() && u.evidence.iter().any(|e| e.trim() == path))
+        }) {
+            errors.push(
+                "excluded files require evidence citing at least one sampled excluded_paths path"
+                    .into(),
+            );
         }
     }
     if NEEDS_NOTE.contains(&u.status.as_str()) && !u.has_note() {

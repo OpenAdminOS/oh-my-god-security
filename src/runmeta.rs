@@ -134,7 +134,7 @@ pub fn update<T>(
     dir: &Path,
     change: impl FnOnce(&mut Map<String, Value>) -> Result<T, String>,
 ) -> Result<T, String> {
-    with_lock(dir, || {
+    crate::budget::with_family_lock(dir, || {
         let mut meta = read(dir)?;
         let out = change(&mut meta)?;
         check_numeric_fields(&meta)?;

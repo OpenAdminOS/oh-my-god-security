@@ -9,9 +9,11 @@ fn scratch(name: &str) -> PathBuf {
     let base = std::env::temp_dir()
         .canonicalize()
         .unwrap_or_else(|_| std::env::temp_dir());
+    let base = base.join(format!("omgs-private-fixtures-{}", std::process::id()));
+    omgs::platform::create_private_tree(&base).unwrap();
     let d = base.join(format!("omgs-sbx-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
+    omgs::platform::private_dir(&d).unwrap();
     d
 }
 
@@ -1194,7 +1196,7 @@ fn target_mismatch_and_invalid_metadata_never_charge_budget() {
     let other = d.join("other");
     let run = d.join("run");
     for path in [&target, &other, &run] {
-        std::fs::create_dir_all(path).unwrap();
+        omgs::platform::private_dir(path).unwrap();
     }
     let meta = serde_json::json!({"target": target, "budget_agent_calls": 1});
     let meta_path = run.join(omgs::runmeta::FILE);

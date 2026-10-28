@@ -44,6 +44,10 @@ fn run_path(path: &Path) -> Result<PathBuf, String> {
             run.display()
         ));
     }
+    for dir in [&parent, &run] {
+        crate::platform::check_private_dir(dir)
+            .map_err(|e| format!("owner-private run storage {}: {e}", dir.display()))?;
+    }
     Ok(run)
 }
 
@@ -232,6 +236,10 @@ pub fn allowance(root: &Path) -> Result<Allowance, String> {
 
 /// Serialize proof charging with fix registration and all other family proofs.
 pub fn charge_proof(run: &Path) -> Result<(), String> {
+    charge_proof_checked(run, || {})
+}
+
+fn charge_proof_checked(run: &Path, after_check: impl FnOnce()) -> Result<(), String> {
     let run = run_path(run)?;
     let root = original(&run)?;
     runmeta::with_lock(&root, || {
@@ -241,6 +249,7 @@ pub fn charge_proof(run: &Path) -> Result<(), String> {
                 "run budget exhausted: cumulative original and fix allowance consumed".into(),
             );
         }
+        after_check();
         let charge = |m: &mut Map<String, Value>| -> Result<(), String> {
             let calls = m
                 .get("agent_calls_used")
@@ -267,7 +276,11 @@ pub fn charge_proof(run: &Path) -> Result<(), String> {
                 return Err("linked run identity changed before charging".into());
             }
             // Revalidate the whole family immediately before charging.
-            allowance(&root)?;
+            if allowance(&root)?.remaining == Some(0) {
+                return Err(
+                    "run budget exhausted: cumulative original and fix allowance consumed".into(),
+                );
+            }
             charge(&mut meta)?;
             runmeta::write_atomic(
                 &run.join(runmeta::FILE),
@@ -328,4 +341,121 @@ pub fn init_fix(
         )?;
         Ok(child)
     })
+}
+
+/// Serialize metadata publications, including reported call counters, with
+/// every proof and fix registration. Never acquire a parent after its child.
+pub fn with_family_lock<T>(
+    run: &Path,
+    update: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let run = run_path(run)?;
+    let root = original(&run)?;
+    runmeta::with_lock(&root, || {
+        if original(&run)? != root {
+            return Err("linked run identity changed before publication".into());
+        }
+        if run == root {
+            update()
+        } else {
+            runmeta::with_lock(&run, update)
+        }
+    })
+}
+
+#[cfg(test)]
+mod regressions {
+    use super::*;
+    use serde_json::json;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn family(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("omgs-budget-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::platform::create_private_dir(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let root = dir.join("original");
+        let child = dir.join("child");
+        for run in [&root, &child] {
+            crate::platform::create_private_dir(run).unwrap();
+        }
+        runmeta::write_atomic(
+            &root.join(runmeta::FILE),
+            &json!({
+                "run_id": "original", "budget_agent_calls": 2, "agent_calls_used": 1,
+                "fix_runs": [{"path": child, "run_id": "child"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        runmeta::write_atomic(
+            &child.join(runmeta::FILE),
+            &json!({
+                "run_id": "child", "budget_parent": root, "budget_parent_id": "original",
+                "budget_agent_calls": 2, "agent_calls_used": 0
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (dir, root, child)
+    }
+
+    #[test]
+    fn charge_rechecks_remaining_after_waiting_for_child_lock() {
+        let (dir, root, child) = family("final-allowance");
+        let (checked, observed) = mpsc::channel();
+        let charging = runmeta::with_lock(&child, || {
+            let run = child.clone();
+            let charging = std::thread::spawn(move || {
+                charge_proof_checked(&run, || {
+                    checked.send(()).unwrap();
+                })
+            });
+            // The first allowance check saw original usage 1 against cap 2.
+            // Publish child usage 1 while charging waits for this child lock.
+            observed.recv_timeout(Duration::from_secs(10)).unwrap();
+            let mut meta = read_run(&child).unwrap();
+            meta.insert("agent_calls_used".into(), json!(1));
+            runmeta::write_atomic(
+                &child.join(runmeta::FILE),
+                &serde_json::to_string(&meta).unwrap(),
+            )?;
+            Ok(charging)
+        })
+        .unwrap();
+        assert!(charging
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .contains("budget exhausted"));
+        assert_eq!(allowance(&root).unwrap().calls_and_proofs_used, 2);
+        assert!(!read_run(&child).unwrap().contains_key("proof_runs_used"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn counter_publication_waits_for_root_before_child() {
+        let (dir, root, child) = family("counter-lock-order");
+        let (entered, observed) = mpsc::channel();
+        let publishing = runmeta::with_lock(&root, || {
+            let run = child.clone();
+            let publishing = std::thread::spawn(move || {
+                runmeta::update(&run, |m| {
+                    entered.send(()).unwrap();
+                    m.insert("agent_calls_used".into(), json!(1));
+                    Ok(())
+                })
+            });
+            assert!(observed.recv_timeout(Duration::from_millis(100)).is_err());
+            // No child lock can be held while waiting for the root.
+            runmeta::with_lock(&child, || Ok(()))?;
+            Ok(publishing)
+        })
+        .unwrap();
+        publishing.join().unwrap().unwrap();
+        observed.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(allowance(&root).unwrap().calls_and_proofs_used, 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -189,6 +189,8 @@ pub fn private_dir(path: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(windows)]
+    windows_private::restrict(path)?;
     Ok(())
 }
 
@@ -488,4 +490,73 @@ mod diagnostic_tests {
             "a\\nb\\r\\t\\u{1b}[31m café"
         );
     }
+}
+
+#[cfg(windows)]
+#[path = "windows_private.rs"]
+mod windows_private;
+
+/// Run storage is trusted only while the owner prevents concurrent replacement.
+pub fn check_private_dir(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if is_link(&meta) || !meta.is_dir() {
+        return Err(std::io::Error::other(
+            "storage must be a directory without links",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no arguments or memory preconditions.
+        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o7777 != 0o700 {
+            return Err(std::io::Error::other(
+                "storage must be owned by the current user with mode 0700",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        windows_private::check(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::other("private storage checks unavailable"))
+    }
+}
+
+/// Create owner-private storage or fail closed on an existing unsafe directory.
+/// Parent directories must already be trusted against concurrent replacement.
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    match create_private_dir_new(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => check_private_dir(path),
+        Err(e) => Err(e),
+    }
+}
+
+/// Reserve a new directory exclusively with owner-private permissions.
+pub fn create_private_dir_new(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+    #[cfg(windows)]
+    windows_private::restrict(path)?;
+    check_private_dir(path)
+}
+
+/// Create missing storage ancestors privately, checking the requested directory.
+pub fn create_private_tree(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if !parent.exists() {
+                create_private_tree(parent)?;
+            }
+        }
+    }
+    create_private_dir(path)
 }

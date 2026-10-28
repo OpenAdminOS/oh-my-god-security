@@ -1494,39 +1494,108 @@ fn data_dir() -> PathBuf {
     omgs::platform::data_dir().unwrap_or_else(|| home().join(".local").join("share").join("omgs"))
 }
 
-fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> bool {
-    walk_limited(dir, depth, out, omgs::stacks::INVENTORY_LIMIT)
+/// Counts describe omitted entries or subtrees, never guessed file totals.
+#[derive(Default)]
+struct InventoryGap {
+    count: usize,
+    samples: std::collections::BTreeSet<String>,
 }
 
-fn walk_limited(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, limit: usize) -> bool {
+#[derive(Default)]
+struct InventoryGaps(std::collections::BTreeMap<&'static str, InventoryGap>);
+impl InventoryGaps {
+    fn record(&mut self, reason: &'static str, path: &Path, root: &Path) {
+        let gap = self.0.entry(reason).or_default();
+        gap.count += 1;
+        gap.samples
+            .insert(omgs::platform::escape_controls(&omgs::paths::display(
+                path.strip_prefix(root).unwrap_or(path),
+            )));
+        if gap.samples.len() > 20 {
+            gap.samples.pop_last();
+        }
+    }
+
+    fn description(reason: &str, gap: &InventoryGap, limit: usize) -> String {
+        let reason = match reason {
+            "depth" => "depth limit of 12 exceeded; subtrees not traversed".into(),
+            "symlink" => "symlinks or reparse points skipped; targets not traversed".into(),
+            "read" => "directory or entry read failed; content not inventoried".into(),
+            _ => format!(
+                "inventory size limit of {limit} files reached; remaining paths not inventoried"
+            ),
+        };
+        format!(
+            "{reason}; {} omitted entry/subtree event(s); first {} sorted samples: {}",
+            gap.count,
+            gap.samples.len(),
+            gap.samples.iter().cloned().collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
+fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    walk_limited(
+        dir,
+        dir,
+        depth,
+        out,
+        omgs::stacks::INVENTORY_LIMIT,
+        &mut InventoryGaps::default(),
+    );
+}
+
+fn walk_limited(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+    limit: usize,
+    gaps: &mut InventoryGaps,
+) -> bool {
     if depth > 12 {
+        gaps.record("depth", dir, root);
         return false;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            gaps.record("read", dir, root);
+            return false;
+        }
     };
-    for entry in entries.flatten() {
-        if out.len() >= limit {
-            return true;
-        }
-        // Use the directory entry's own type so a symlink is never followed out
-        // of the target tree (is_dir() would resolve the link target).
-        let Ok(ftype) = entry.file_type() else {
-            continue;
-        };
-        if ftype.is_symlink() {
-            continue;
-        }
-        let path = entry.path();
-        if ftype.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == ".git" {
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                gaps.record("read", dir, root);
                 continue;
             }
-            if walk_limited(&path, depth + 1, out, limit) {
+        };
+        let path = entry.path();
+        if out.len() >= limit {
+            gaps.record("limit", &path, root);
+            return true;
+        }
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => {
+                gaps.record("read", &path, root);
+                continue;
+            }
+        };
+        if omgs::platform::is_link(&meta) {
+            gaps.record("symlink", &path, root);
+            continue;
+        }
+        if meta.is_dir() {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if walk_limited(root, &path, depth + 1, out, limit, gaps) {
                 return true;
             }
-        } else if ftype.is_file() {
+        } else if meta.is_file() {
             out.push(path);
         }
     }
@@ -1690,19 +1759,24 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
                     out_abs.display()
                 ));
             }
-            std::fs::create_dir_all(&out_abs).map_err(|e| e.to_string())?;
+            let parent = out_abs
+                .parent()
+                .ok_or("run output needs a runs directory")?;
+            omgs::platform::create_private_tree(parent)
+                .map_err(|e| format!("owner-private runs directory {}: {e}", parent.display()))?;
+            omgs::platform::create_private_dir(&out_abs).map_err(|e| e.to_string())?;
             out_abs
         }
         None => {
             // Claim run-N with an exclusive create, so parallel inits (batch
             // mode) never share a run directory.
             let base = data_dir().join(&repo);
-            std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+            omgs::platform::create_private_tree(&base).map_err(|e| e.to_string())?;
             let mut n = 1;
             loop {
                 let candidate = base.join(format!("run-{n}"));
                 outside(&candidate)?;
-                match std::fs::create_dir(&candidate) {
+                match omgs::platform::create_private_dir_new(&candidate) {
                     Ok(()) => break candidate,
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
                     Err(e) => return Err(format!("create {}: {e}", candidate.display())),
@@ -1725,11 +1799,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
                 out_abs.display()
             )
         })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&out_abs, std::fs::Permissions::from_mode(0o700));
-    }
+    omgs::platform::check_private_dir(&out_abs).map_err(|e| e.to_string())?;
     if out_abs.starts_with("/tmp") || out_abs.starts_with("/private/tmp") {
         eprintln!("warning: run output is under a shared temp directory and describes vulnerabilities. Prefer the default runs directory under your home.");
     }
@@ -1737,7 +1807,15 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
         .map(|h| h[..7].to_string())
         .unwrap_or_else(|| "working tree".into());
     let mut files = Vec::new();
-    let inventory_limited = walk_limited(&target, 0, &mut files, inventory_limit);
+    let mut omissions = InventoryGaps::default();
+    walk_limited(
+        &target,
+        &target,
+        0,
+        &mut files,
+        inventory_limit,
+        &mut omissions,
+    );
     let native_paths: Vec<PathBuf> = files
         .iter()
         .filter_map(|f| f.strip_prefix(&target).ok().map(Path::to_path_buf))
@@ -1867,17 +1945,22 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             units.push(unit);
         }
     }
-    let inventory_gaps: Vec<String> = if inventory_limited {
-        vec![format!(
-            "inventory size limit of {} files reached; remaining paths were not inventoried",
-            inventory_limit
-        )]
-    } else {
-        Vec::new()
-    };
-    for gap in &inventory_gaps {
-        let mut unit = Unit::new("inventory:limit", ".", &[], "blocked");
-        unit.note = Some(gap.clone());
+    let inventory_gaps: Vec<String> = omissions
+        .0
+        .iter()
+        .map(|(reason, gap)| InventoryGaps::description(reason, gap, inventory_limit))
+        .collect();
+    for (reason, gap) in &omissions.0 {
+        let mut unit = Unit::new(&format!("inventory:{reason}"), ".", &[], "blocked");
+        unit.note = Some(InventoryGaps::description(reason, gap, inventory_limit));
+        unit.extra
+            .insert("inventory_gap_reason".into(), serde_json::json!(reason));
+        unit.extra
+            .insert("inventory_gap_count".into(), serde_json::json!(gap.count));
+        unit.extra.insert(
+            "inventory_gap_samples".into(),
+            serde_json::json!(gap.samples),
+        );
         units.push(unit);
     }
     if units.is_empty() {
@@ -3091,6 +3174,7 @@ mod inventory_regressions {
         let _ = std::fs::remove_dir_all(&dir);
         let target = dir.join("repo");
         let run = dir.join("run");
+        omgs::platform::create_private_dir(&dir).unwrap();
         std::fs::create_dir_all(&target).unwrap();
         for i in 0..4 {
             std::fs::write(target.join(format!("{i}.rs")), "").unwrap();
@@ -3126,6 +3210,102 @@ mod inventory_regressions {
             read("architecture.json")["unexamined"],
             meta["inventory_gaps"]
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn omissions_are_bounded_sorted_and_directory_read_failures_are_recorded() {
+        let root = std::env::temp_dir().join("omgs-nonexistent-inventory-root");
+        let mut gaps = super::InventoryGaps::default();
+        let mut files = Vec::new();
+        super::walk_limited(&root, &root.join("missing"), 0, &mut files, 100, &mut gaps);
+        assert_eq!(gaps.0["read"].count, 1);
+        for n in (0..30).rev() {
+            gaps.record("symlink", &root.join(format!("link{n:02}")), &root);
+        }
+        assert_eq!(gaps.0["symlink"].count, 30);
+        assert_eq!(gaps.0["symlink"].samples.len(), 20);
+        assert_eq!(gaps.0["symlink"].samples.first().unwrap(), "link00");
+        assert_eq!(gaps.0["symlink"].samples.last().unwrap(), "link19");
+    }
+
+    #[test]
+    fn linked_javascript_and_deep_python_remain_explicit_report_gaps() {
+        let dir =
+            std::env::temp_dir().join(format!("omgs-inventory-omissions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        omgs::platform::create_private_dir(&dir).unwrap();
+        let target = dir.join("repo");
+        let external = dir.join("external");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(target.join("visible.rs"), "fn main() {} ").unwrap();
+        std::fs::write(external.join("hidden.js"), "eval(input)").unwrap();
+        let mut deep = target.clone();
+        for _ in 0..13 {
+            deep.push("nested");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("hidden.py"), "eval(input)").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, target.join("linked")).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(target.join("linked"))
+            .arg(&external)
+            .status()
+            .unwrap()
+            .success());
+        let run = dir.join("run");
+        let args = vec![
+            "--target".into(),
+            target.to_str().unwrap().into(),
+            "--out".into(),
+            run.to_str().unwrap().into(),
+            "--no-sensors".into(),
+        ];
+        super::audit_init_limited(&args, 100).unwrap();
+        let read = |name| {
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(run.join(name)).unwrap(),
+            )
+            .unwrap()
+        };
+        let meta = read("run-metadata.json");
+        assert_eq!(meta["files_total"], 1);
+        assert_eq!(meta["detected_stacks"], serde_json::json!(["rust"]));
+        assert_eq!(meta["inventory_gaps"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            read("architecture.json")["unexamined"],
+            meta["inventory_gaps"]
+        );
+        let ledger = read("coverage-ledger.json");
+        for reason in ["depth", "symlink"] {
+            let unit = ledger["units"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|u| u["id"] == format!("inventory:{reason}"))
+                .unwrap();
+            assert_eq!(unit["status"], "blocked");
+            assert_eq!(unit["inventory_gap_count"], 1);
+            assert_eq!(unit["inventory_gap_samples"].as_array().unwrap().len(), 1);
+        }
+        std::fs::write(run.join("candidates-red.json"), "{\"candidates\":[]}").unwrap();
+        let args = vec![
+            "--findings".into(),
+            run.join("findings.json").to_str().unwrap().into(),
+            "--out".into(),
+            run.to_str().unwrap().into(),
+        ];
+        super::cmd_report(&args).unwrap();
+        for name in ["REPORT.md", "REPORT.html"] {
+            let report = std::fs::read_to_string(run.join(name)).unwrap();
+            assert!(report.contains("inventory:depth"));
+            assert!(report.contains("inventory:symlink"));
+            assert!(report.contains("linked"));
+            assert!(report.contains("nested/nested"));
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

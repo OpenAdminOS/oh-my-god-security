@@ -539,9 +539,11 @@ fn report_renders_critic_result() {
 }
 
 fn scratch(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("omgs-wf-{}-{name}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("omgs-private-fixtures-{}", std::process::id()));
+    omgs::platform::create_private_tree(&base).unwrap();
+    let dir = base.join(format!("omgs-wf-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    omgs::platform::private_dir(&dir).unwrap();
     dir
 }
 

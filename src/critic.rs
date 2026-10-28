@@ -106,7 +106,7 @@ pub fn critique(
     for u in &ledger.units {
         if u.status == "planned"
             || u.status == "candidate"
-            || (crate::ledger::is_exclusion(u)
+            || ((crate::ledger::is_exclusion(u) || crate::ledger::is_inventory_gap(u))
                 && !["covered", "out_of_scope"].contains(&u.status.as_str()))
         {
             gaps.push(format!(
