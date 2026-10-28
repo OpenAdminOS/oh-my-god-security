@@ -47,6 +47,36 @@ fn git(repo: &Path, args: &[&str]) -> String {
     assert!(out.status.success(), "{}", output(&out));
     String::from_utf8(out.stdout).unwrap().trim().into()
 }
+fn check_patch(repo: &Path, patch: &Path) {
+    use std::io::Write;
+    use std::process::Stdio;
+    // Git for Windows does not accept Rust's extended canonical paths as
+    // patch arguments. Feed exact bytes through stdin on every platform.
+    let mut child = Command::new("git")
+        .current_dir(repo)
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "apply",
+            "--check",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&std::fs::read(patch).unwrap())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", output(&out));
+}
 fn read(path: &Path) -> Value {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
@@ -519,14 +549,7 @@ fn intent_proposal_is_reviewable_and_exclusions_remain_accountable() {
     assert_eq!(before, std::fs::read(repo.join(policy::PATH)).unwrap());
     let patch = std::fs::read_to_string(run.join("policy.patch")).unwrap();
     assert!(patch.contains("Owner confirmed") && patch.contains("--- a/.omgs/policy.json"));
-    git(
-        &repo,
-        &[
-            "apply",
-            "--check",
-            run.join("policy.patch").to_str().unwrap(),
-        ],
-    );
+    check_patch(&repo, &run.join("policy.patch"));
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -565,13 +588,6 @@ fn accepted_base_intent_seeds_answers_and_missing_policy_proposes_a_new_file() {
     let patch = std::fs::read_to_string(empty.join("policy.patch")).unwrap();
     assert!(patch.contains("--- /dev/null") && patch.contains("@@ -0,0 +1,"));
     std::fs::remove_file(repo.join(policy::PATH)).unwrap();
-    git(
-        &repo,
-        &[
-            "apply",
-            "--check",
-            empty.join("policy.patch").to_str().unwrap(),
-        ],
-    );
+    check_patch(&repo, &empty.join("policy.patch"));
     std::fs::remove_dir_all(root).unwrap();
 }
