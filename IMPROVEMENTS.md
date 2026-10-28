@@ -44,11 +44,29 @@ Pattern across all six: the dominant risk shape in this ecosystem is not web aut
 19. Local run accounting. Record model identity, agent calls, wall time and cost per run in run metadata by default. The benchmark design needs these numbers and hunters currently ignore budget fields they are not forced to update.
 20. Intent question library per ecosystem. Recurring questions from this test (may a feed lower a security minimum, who may supply a manifest, which URL schemes may reach managed browsers) should ship as reusable intent prompts that resolve into policy once.
 
-## Implementation status after the 2026-10-16 rerun
+## Current status, 2026-10-28
+
+Multi-location findings, verifier provenance, batch initialization/indexing,
+routing with recorded refusals, the intent library and the offline benchmark
+scorer exist in the current source and have regression coverage. Proof drafts are
+staged into per-run workspace copies; integrating accepted tests into a target
+suite still requires an approved change. MXC 1.0.1 is the sole backend, with
+macOS survivor cleanup, Linux PID namespace teardown and Windows augmentation
+refusal. Earlier profile and supervision limitations below are historical and
+superseded by the sandbox hardening section.
+
+PR 5 adds consent, version pinning, publisher checks, provenance, mirrored
+executors and package metadata generation. Public signed distribution and
+fresh-machine OS prompts remain unverified until the owner publishes and tests
+the release. Base-branch policy, gates and setup remain the separate policy
+change. The corpus has five eligible post-cutoff pairs as metadata; paired proofs,
+full benchmark runs and published metrics are still required.
+
+## Historical implementation status after the 2026-10-16 rerun
 
 Implemented and re-verified on the same six targets: item 1 (stack detection seeded the right primary stack on six of six, with a minor Python false positive on the Swift target), item 2 (472 of 636 Deployment Editor files classified vendored and both gitleaks hits flagged vendored), item 3 (sensors execute during init and check, with secret values redacted out of retained output), item 4 (reports grew from under 1 KB to 3 to 15 KB with rejected evidence, pending evidence, coverage, and sensor lines), item 5 in report form (family field plus family counts; the three copied rollback records group into one family), item 6 (OS native Seatbelt backend verified: scratch write allowed, outside write denied, network denied, timeout enforced; bubblewrap path exists for Linux but is untested on this machine), item 7 (run directories are owner-only with a shared-temp warning), items 8 to 11 (four new packs: generated script safety, feed to policy, privileged local operations, PowerShell), item 13 in basic form (`omgs ledger set`), item 14 (`prerequisites` and `verified_by` fields), item 15 (`omgs review` clones and initializes in one command), item 17 as documented case candidates in benchmark/field-cases.md, and item 19 in basic form (run metadata now records stacks, file counts, start time, hunter and verifier fields).
 
-Still open: item 5 as a full multi-location finding model, item 12 enforced verifier workflow in the CLI, item 16 batch mode, item 18 automatic model rerouting, item 20 as a shipped prompt library, signed release distribution, native MXC SDK integration, proof test staging into target test suites, base-branch policy loading with CI gate enforcement, and a benchmark runner with real corpus cases. No field finding was upgraded to confirmed in the rerun: a sandbox harness built from the drive mapping template line demonstrated the apostrophe breakout mechanically, but a generator-level proof through the real application remains the bar for confirmation.
+Open at that date, superseded by current status above: item 5 as a full multi-location finding model, item 12 enforced verifier workflow in the CLI, item 16 batch mode, item 18 automatic model rerouting, item 20 as a shipped prompt library, signed release distribution, native MXC SDK integration, proof test staging into target test suites, base-branch policy loading with CI gate enforcement, and a benchmark runner with real corpus cases. No field finding was upgraded to confirmed in the rerun: a sandbox harness built from the drive mapping template line demonstrated the apostrophe breakout mechanically, but a generator-level proof through the real application remains the bar for confirmation.
 
 ## Field run 2026-10-23: third party macOS updater with a root helper (Swift)
 
@@ -84,10 +102,10 @@ Decisions taken from this:
 1. The phase flow in SKILL.md is now stated as a multi-agent pipeline by default: red hunts in isolation, blue verifies independently, a separate evaluator adjudicates, green proposes fixes, each in its own fresh context. A single combined pass that hunts, verifies, and reports in one context is explicitly not an OMGS review. The separate evaluator (previously item 12, "still manual") is now a first-class phase (Adjudicate), because it is where overclaimed confirmations and mislabelled proofs are caught.
 2. An optional live-progress view ships as a reference under `skill/progress/` (a self-contained offline `dashboard.html` plus a `status.schema.json` the orchestrator writes at each milestone). It never changes a verdict; the deterministic `findings.json`/`REPORT.html` remain the record. If served it binds loopback only and shuts down at the end; it never auto-opens a browser and never binds a non-loopback interface, because it describes vulnerabilities.
 
-Still planned (tracked, not yet done):
-- Fold a pipeline and coverage timeline into `REPORT.html` so the methodology (which agents ran, timings, what was examined) is preserved in the deterministic artifact, not only in the ephemeral progress view.
-- Populate the benchmark corpus with real post-cutoff CVE pairs and publish recall, false positives, cost, and variance, so "best in class" rests on numbers rather than description.
-- Consider a `--watch` convenience in the skill that stands up the loopback progress server and tears it down with the run.
+Historical plan, with current status:
+- Reporting timeline remains part of the reporting change. Original goal: fold a pipeline and coverage timeline into `REPORT.html` so the methodology (which agents ran, timings, what was examined) is preserved in the deterministic artifact, not only in the ephemeral progress view.
+- The corpus now has five eligible post-cutoff pairs as metadata. Paired sandbox fixtures and published recall, false positives, cost and variance remain uncompleted.
+- `omgs watch` exists with loopback-only service and completion shutdown; it remains optional in the skill.
 
 ## Pre 0.1 workflow gaps (2026-10-24)
 

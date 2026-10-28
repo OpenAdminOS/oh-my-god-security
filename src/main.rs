@@ -2756,7 +2756,19 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
             omgs::route::ROLES.join(", ")
         ));
     }
-    let models = omgs::route::load_models(&models_path(args))?;
+    let path = models_path(args);
+    let models =
+        if flag(args, "--models").is_none() && !path.try_exists().map_err(|e| e.to_string())? {
+            // Without a routing file the host keeps its current selection.
+            omgs::route::Models {
+                roles: omgs::route::ROLES
+                    .into_iter()
+                    .map(|role| (role.to_string(), vec!["host-default".to_string()]))
+                    .collect(),
+            }
+        } else {
+            omgs::route::load_models(&path)?
+        };
     let newly = flag(args, "--refused");
     let reason = flag(args, "--reason").unwrap_or_default();
     if newly.is_some() && reason.trim().is_empty() {

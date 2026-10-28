@@ -1,0 +1,57 @@
+# Generated from signed release assets. Owner publishes this to the tap.
+class Omgs < Formula
+  desc "Deterministic defensive security review runner"
+  homepage "https://github.com/OpenAdminOS/oh-my-god-security"
+  version "@VERSION@"
+  license "Apache-2.0"
+
+  on_macos do
+    on_arm do
+      url "@BASE@/omgs-aarch64-apple-darwin"
+      sha256 "@SHA_omgs-aarch64-apple-darwin@"
+      resource "mxc" do
+        url "@BASE@/mxc-1.0.1-macos-arm64"
+        sha256 "@SHA_mxc-1.0.1-macos-arm64@"
+      end
+    end
+    on_intel do
+      url "@BASE@/omgs-x86_64-apple-darwin"
+      sha256 "@SHA_omgs-x86_64-apple-darwin@"
+    end
+  end
+  on_linux do
+    depends_on "bubblewrap"
+    on_arm do
+      url "@BASE@/omgs-aarch64-unknown-linux-gnu"
+      sha256 "@SHA_omgs-aarch64-unknown-linux-gnu@"
+      resource "mxc" do
+        url "@BASE@/mxc-1.0.1-linux-arm64"
+        sha256 "@SHA_mxc-1.0.1-linux-arm64@"
+      end
+    end
+    on_intel do
+      url "@BASE@/omgs-x86_64-unknown-linux-gnu"
+      sha256 "@SHA_omgs-x86_64-unknown-linux-gnu@"
+      resource "mxc" do
+        url "@BASE@/mxc-1.0.1-linux-x64"
+        sha256 "@SHA_mxc-1.0.1-linux-x64@"
+      end
+    end
+  end
+
+  def install
+    bin.install Dir["omgs-*"][0] => "omgs"
+    unless OS.mac? && Hardware::CPU.intel?
+      resource("mxc").stage { libexec.install Dir["mxc-*"][0] => (OS.mac? ? "mxc-exec-mac" : "lxc-exec") }
+      bin.install_symlink libexec/(OS.mac? ? "mxc-exec-mac" : "lxc-exec")
+    end
+  end
+
+  def caveats
+    "Intel Macs cannot run proofs. Run omgs doctor to check MXC readiness."
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/omgs --version")
+  end
+end

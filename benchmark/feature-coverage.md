@@ -23,7 +23,7 @@ Status after rounds on 2026-10-16: the first six projects, the next twenty proje
 | route | Unit tested | Fallback order, persisted refusals, exhaustion recorded as a blocker. |
 | intent list, intent answer | Unit tested | Library well formed, unknown ids rejected, grouping, path-scoped answers keyed by target. |
 | critic | Unit tested | Every gap class covered by tests and one end-to-end CLI run; report embeds the result. No field run yet. |
-| check | Partial | Sensor execution and proof-test counting verified. Trufflehog, osv-scanner, and semgrep paths are detection only in code and were unavailable on the test machine. |
+| check | Partial | Sensor execution and proof-test counting verified. Trufflehog and osv-scanner are detection only at this revision. Semgrep executes when local rules are configured or registry downloads are explicitly enabled; it was unavailable on the original field machine. |
 | Gate enforcement | Untested by design gap | Mode is recorded in metadata and reports, but no CLI command fails a build in gate mode. Locked design says deterministic proof tests gate in the target CI, which no field target has exercised yet. |
 
 ## Proof tiers and lifecycle
@@ -63,7 +63,7 @@ The earlier tier 2 field run predates the 2026-10-27 decision that tier 2 runs o
 
 ## Cold install results (skill first path, 2026-10-16)
 
-Timed runs from a clean fake home to a validated `REPORT.html`, against the locally staged unsigned v0.1.0 bundle in `dist/v0.1.0` served over the tailnet. Both bootstrap scripts verify the downloaded asset against the bundle `SHA256SUMS` and fail closed on mismatch. The sample target produced zero findings, so these runs prove the install and empty-report chain, not finding quality. Download time over a LAN is not representative of the public internet.
+Timed runs from a clean fake home to a validated `REPORT.html`, against a historical, locally staged unsigned v0.1.0 bundle in `dist/v0.1.0` served over the tailnet. That untracked bundle is stale and absent from the current worktree; it is not a distributable release. Both bootstrap scripts verify the downloaded asset against the bundle `SHA256SUMS` and fail closed on mismatch. The sample target produced zero findings, so these runs prove the install and empty-report chain, not finding quality. Download time over a LAN is not representative of the public internet.
 
 | Host | Result |
 | --- | --- |
@@ -83,9 +83,22 @@ One public third party target reviewed through `omgs review --repo-url` in advis
 - New sandbox limits observed: daemon mediated writes (preferences through cfprefsd) escape file containment, and `NSTemporaryDirectory()` ignores the scratch home. Both are recorded as suite learnings in IMPROVEMENTS.md.
 - Root-level confirmation was deferred during the main run: records requiring an installed root helper or a Developer ID signed probe package stayed needs validation with manual validation plans. The signer-trust and downgrade defects are decision-logic defects, and the `benchmark/fixtures/installer-trust` reproducer demonstrates that defect class and its fix in the sandbox (vulnerable fails, fixed passes, entirely inside `omgs prove`, no VM). That reproducer models the logic; it is proof of the class and recipe, not of any specific vendor build, so it does not by itself promote the target records. The target records themselves come from a separate static review of the real code and stay `needs_validation`/`traced`; the effect that needs real root has no proof tier and stays `needs_validation`. A separate live run did first exercise the real helper's paths as root, which established the effect, on a machine that turned out to be productive rather than disposable; that was a mistake, since remediated (Gatekeeper re-enabled, passwordless sudo and test artifacts removed), and such a live run is a manual step outside OMGS, never a tier and never required. Two symlink-handling leads were refuted. The write-ups are in [field-cases.md](field-cases.md) (candidates 4 to 6); vendor material stays in the private run directory.
 
-## Not yet existing, therefore untestable
+## Current implementation and remaining release evidence
 
-Signed release binaries and package-manager distribution, proof test staging into target suites, base-branch policy loading, batch mode, benchmark runner, and model rerouting on refusal. These are tracked in IMPROVEMENTS.md.
+Batch initialization/indexing and routing with recorded refusals exist and have
+regression tests. The offline benchmark scorer exists with arithmetic and evidence
+validation fixtures. The corpus includes five eligible post-cutoff pairs as
+metadata, not five completed paired proof runs. Proof drafts stage into workspace
+copies; committing accepted tests to target suites is an approved follow-up.
+
+PR 5 supplies consent and version-pinned installers, native publisher verification,
+mirrored MXC executors, provenance and package metadata generation. Local-bundle
+installer tests cover forged checksums with signature rejection, version mismatch,
+executor-pin mismatch and refusal of test overrides in the real installer. Public
+signed release installation, package-manager publication and fresh-machine OS
+prompts still require owner release evidence. Base-branch policy and gates remain
+in the separate policy change. See IMPROVEMENTS.md for current versus historical
+status.
 
 ## Field run 2026-10-24 (full multi-agent pipeline on a macOS updater)
 

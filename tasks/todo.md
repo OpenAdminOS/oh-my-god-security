@@ -88,9 +88,9 @@ parent-owned full-diff reviews and PR creation are separate from this implementa
 
 ## PR 5: onboarding, trust and distribution (`feat/onboarding-trust`)
 
-- [ ] README for newcomers; consent text before downloads
-- [ ] Version pin, signature checks, attestations, MXC pinning
-- [ ] Homebrew and winget files; subcommand help; env docs; SECURITY.md; stale docs
+- [x] README for newcomers; consent text before downloads
+- [x] Version pin, signature checks, attestations, MXC pinning
+- [x] Homebrew and winget files; subcommand help; env docs; SECURITY.md; stale docs
 
 ## PR 6: benchmark runner, corpus, screenshots, self-audit (`feat/benchmark`)
 

@@ -28,7 +28,7 @@ Three steps. You do not install a binary by hand.
 2. **Ask your coding agent** (Claude Code, T3 Code, and similar):
    - A local folder: open the agent in the folder and say `run an OMGS security review on this project`.
    - A remote repository: say `run an OMGS security review on https://github.com/owner/repo`. OMGS clones it locally first, then reviews it exactly like a local folder. It never reviews code in the cloud.
-3. **On first run, approve both one-time downloads: the OMGS binary and the pinned Microsoft MXC executor.** The skill fetches the `omgs` binary for your platform, verifies it against the published SHA-256 checksums, installs it without elevation into a per-user directory, and continues into the review. Later runs reuse both. MXC installation is currently a separate checksum-verified download described below; integrated mirrored assets are planned in the 0.1 release work.
+3. **On first run, approve both one-time downloads: the OMGS binary and the pinned Microsoft MXC executor.** The skill fetches the `omgs` binary for your platform, verifies it against the published SHA-256 checksums, installs it without elevation into a per-user directory, and continues into the review. Later runs reuse both. The executor is mirrored unmodified in the same pinned OMGS release, with its original Microsoft signature and MIT notice.
 
 You read the report it produces (a self contained `REPORT.html`, plus `REPORT.md` and SARIF) in a run directory that lives outside your code. As a side effect of the reconnaissance it also maps your application: `ARCHITECTURE.html` (and `ARCHITECTURE.md`) show your stack, components by trust zone, data flows, and attack surface as an auto-laid-out diagram. OMGS changes nothing in your repository and applies no fixes unless you explicitly ask.
 
@@ -39,6 +39,65 @@ You read the report it produces (a self contained `REPORT.html`, plus `REPORT.md
 > mkdir -p ~/.local/share/omgs/bin && cp target/release/omgs ~/.local/share/omgs/bin/omgs
 > ```
 > On Windows, copy `target\release\omgs.exe` to `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`.
+
+## What happens when you run it
+
+The skill guides your coding agent through mapping, hunting, independent verification
+and reporting. The deterministic `omgs` binary manages records, budgets, sensors,
+proof execution and reports. Target tests and builds run only through the pinned
+MXC sandbox, on a workspace copy with synthetic data. The original target stays
+unchanged. Output lives outside it: `findings.json`, SARIF, `REPORT.md`, the offline
+`REPORT.html`, architecture maps, coverage and retained proof artifacts. Accepted
+regression tests enter your repository only through an approved change.
+
+## What the binary does and never does
+
+The binary makes no model calls and sends no telemetry. There is no OMGS account
+or hosted service. Your chosen agent still sends code context to its configured
+provider unless it runs locally.
+
+Network use is specific: `review` and `batch init` use `git clone` over HTTPS;
+`watch` serves only loopback HTTP. The installer downloads release assets over
+HTTPS after consent. Sensors default to local tools and local data. Setting
+`OMGS_SEMGREP_ALLOW_REGISTRY=1` permits Semgrep rule downloads. This revision only
+detects OSV availability; an opt-in OSV database download belongs to the sensor
+integration and must be disclosed when enabled. Proofs never download target
+dependencies or access the external network. The CLI's git subprocess can also
+inherit user git configuration and credentials; use an appropriate review account.
+
+## Why target code only runs in a sandbox
+
+Imports, build hooks and tests can execute arbitrary repository code. OMGS runs
+them through [Microsoft MXC](https://learn.microsoft.com/en-us/windows/apps/develop/mxc/)
+with a deny-by-default filesystem, a per-run workspace copy, scratch writes, an
+environment allowlist and external network denial. macOS uses Seatbelt on Apple
+Silicon macOS 15 or later, Linux uses bubblewrap namespaces, and Windows uses
+ProcessContainer only when its probe reports no DACL augmentation.
+
+Unix adds CPU, open-file and per-file size limits. Linux tears down descendants
+through a PID namespace and applies memory/task limits when a systemd user scope
+is available. macOS sweeps for escaped process-group survivors. Windows uses an
+owned kill-on-close job and a bounded cleanup grace period. Every OS has a wall
+clock. [Platform support](https://learn.microsoft.com/en-us/windows/apps/develop/mxc/platform-support)
+and `omgs doctor` explain what is enforceable on the current host. Missing controls
+block execution and leave the finding pending.
+
+## Handing results to an agent
+
+Pass the run's `HANDOFF.md` to the agent that will implement a fix, alongside the
+run directory and source revision. The handoff contains the fix brief and proof
+acceptance checks; keep the associated findings, tests and proof artifacts
+available. Handoff generation is delivered by the reporting change in parallel
+with this onboarding change. Until that lands, pass `REPORT.md`, `findings.json`
+and the relevant `proofs/` files explicitly. Treat all of them as sensitive.
+
+## Known limitations
+
+- Tier 2 runs only on Linux. Intel Macs cannot run MXC proofs. Under Rosetta on Apple Silicon, install `omgs-aarch64-apple-darwin` instead of the x86_64 binary.
+- macOS and Linux handle SIGINT, SIGTERM and SIGHUP cleanup. Linux MXC PID namespace teardown kills detached descendants. On supported Windows tiers, `process.timeout = 0` leaves expiry to OMGS's finite supervisor wall clock. Expiry or interruption requests Ctrl+Break and allows five seconds for cleanup before forced termination. OMGS assigns itself to a kill-on-close job before spawning any executor, using a non-inherited handle; force-terminating OMGS kills the executor and its workloads without a spawn race. Before the first config-bearing invocation, including the dry run, OMGS resolves granted roots and snapshots their ACLs while retaining object identities. Every dry-run outcome and workload exit is checked. ACL drift, replacement or failed inspection blocks execution or marks cleanup incomplete. Inspection remains bounded and ignores a pending interrupt. OMGS only detects drift and never repairs ACLs. Descendants and `enumeratePaths` parents are not inspected, so unchanged roots do not prove complete host ACL restoration. Force termination skips executor cleanup; operators of earlier augmentation runs should inspect ACLs and recover from trusted backups as described in DECISIONS.md.
+- Windows DACL augmentation tiers, including the observed windows-2025 tier, are refused before any config-bearing invocation. Supported Windows 11 tiers can differ in parent enumeration support. Without it, directory listing, absolute path resolution and `NUL` redirection can fail; doctor cannot prove the outside read denial. Over SSH session 0 on Windows, PowerShell and other GUI-sensitive toolchains can fail with `STATUS_DLL_INIT_FAILED`; an existing interactive desktop session may be needed.
+- Toolchain roots and caches remain readable and can contain private source. There is no total disk quota; Unix has a 1 GiB per-file limit and Windows has no per-file limit. Memory and task limits need an available Linux systemd user scope. Target hardlinks can copy outside content into the workspace.
+- The same-process nonce limit: hostile target code sharing the harness process can read the proof nonce and forge marker lines. Run markers catch accidents. They cannot authenticate a result against hostile target code; replay and the independent evaluator remain required. Exact command and config artifacts may retain credentials even though record displays are redacted.
 
 ## How it works
 
@@ -55,27 +114,39 @@ Proof tiers decide what confirmed means. Traced is a source argument only. Test 
 
 ## The binary bootstrap
 
-In the primary flow the only thing you install by hand is the skill. On first run the skill resolves the binary in order: `omgs` on `PATH`, then `~/.local/share/omgs/bin/omgs` (Windows: `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`), then the bundled bootstrap in the skill's `scripts/` directory. The bootstrap:
+The skill carries `skill/VERSION`. It requires `omgs --version` to match exactly,
+including an already installed binary. A mismatch stops the review with both
+versions shown. The scripts download that exact tag, never `latest`.
 
-- downloads only the one binary for your platform plus the release `SHA256SUMS`,
-- verifies the SHA-256 and fails closed on any mismatch, never running an unverified binary,
-- installs it into a per-user directory without elevation, prints the path, and runs `--version`.
+Before either download, the skill and scripts show the identical consent text in
+[SKILL.md](skill/SKILL.md#setup), including source, maximum sizes, verification and
+install location. A typed `yes` authorizes the downloads. The scripts print resolved
+paths, versions and verification results afterwards. They install both the binary
+and the platform's MXC executor, plus its MIT notice, without elevation. No target
+dependencies or toolchains are fetched.
 
-It never fetches your project's dependencies, a toolchain, or anything from the target. Override the install location with `OMGS_HOME`, or the download source with `OMGS_RELEASE_BASE` (used for offline bundles). Standard tools the bootstrap relies on are already present on normal systems: `curl` plus `sha256sum` or `shasum` on macOS and Linux, and PowerShell's built in `Invoke-WebRequest` and `Get-FileHash` on Windows.
+`SHA256SUMS` covers both downloads. The binary must also pass its publisher check
+on macOS or Windows. MXC must match the skill's pinned hash and Microsoft's native
+signature where supported. Authenticated `gh` adds `gh attestation verify`; an
+unavailable or failed attestation is reported as unverified, not as tampering.
+Linux has no native publisher check, so checksum verification alone is not proof
+of publisher identity. See [SECURITY.md](SECURITY.md#verifying-a-release).
 
 To run tier 1 or tier 2 proofs OMGS uses Microsoft MXC, the only sandbox it trusts with your code: `mxc-exec-mac` on Apple Silicon macOS 15 or later, `lxc-exec` on Linux, `wxc-exec.exe` on Windows 11 builds whose probe reports no DACL augmentation. Windows Server 2025's observed augmentation tier is refused. OMGS accepts only the executor whose SHA-256 matches the MXC release it is pinned to, found at `OMGS_MXC_EXEC`, then `<OMGS data dir>/mxc/<version>/`, then `PATH`. Run `omgs doctor` to see what is installed, what each proof run enforces on your machine and what it does not, and `omgs doctor --live` to watch a denial happen. Without a verified executor OMGS stops at the traced tier and tells you rather than running your code unsandboxed. Intel Macs have no MXC executor, so proofs there stay at the traced tier.
 
-Installing the executor by hand, until OMGS releases ship it: download `mxc-release-binaries.zip` from the [MXC 1.0.1 release](https://github.com/microsoft/mxc/releases/tag/v1.0.1) (SHA-256 `0e832239454ba7fcd338ff56218a287eef4c0a01c1484084b869f55feff8abe9`), extract only your platform's executor, and place it in the OMGS data directory under `mxc/1.0.1/`:
+The release contains the five executors listed in [skill/mxc-pins.txt](skill/mxc-pins.txt),
+unmodified from MXC 1.0.1. Individual executors are about 3.8 to 11.9 MiB, instead
+of the 542,051,775-byte upstream archive. The binary download is bounded to 100 MiB;
+checksums and the notice are each bounded to 1 MiB. The installer enforces these
+limits. The data directory defaults to `~/.local/share/omgs` (Windows:
+`%USERPROFILE%\.local\share\omgs`). Executors go under `mxc/1.0.1/`.
 
-| Platform | Member in the zip | Executor SHA-256 |
-| --- | --- | --- |
-| macOS, Apple Silicon | `arm64/mxc-exec-mac` | `c54390e48a25187fdae10758c6a286bede49416cb610c88c6705fd8445e97f60` |
-| Linux arm64 | `arm64/lxc-exec` | `e8391d55c566ce95c6c838d349941fa0797f037fa617aa0fa4ec39443c6ccddf` |
-| Linux x64 | `x64/lxc-exec` | `5bd6bdf45bc6c0ecc9bccf372762b571de1f468142c4b2ff80fdb4c540922f26` |
-| Windows arm64 | `arm64/wxc-exec.exe` | `91aa4171e8809f33f19622c381116188eab7d8c8cffad231230a31b58146ee77` |
-| Windows x64 | `x64/wxc-exec.exe` | `090f5d1f7bb93104ab08dcd4e8034ef954aeefcdaf6658dde5f7dff4cfc12f3a` |
-
-The data directory is `~/.local/share/omgs` (Windows: `%USERPROFILE%\.local\share\omgs`) unless `OMGS_HOME` is set. `omgs prove` prints the exact destination when the executor is missing. The archive is large (about 540 MB) because it holds every MXC component; OMGS uses only the one executor. Microsoft documents [how MXC isolates programs](https://learn.microsoft.com/en-us/windows/apps/develop/mxc/) and [which platforms it supports](https://learn.microsoft.com/en-us/windows/apps/develop/mxc/platform-support). These explain what the sandbox can protect on your machine. Why OMGS uses it at all: target code from the repository under review never runs on your machine directly, only inside this Microsoft-signed sandbox, which restricts home reads, denies the network, and limits writes to a throwaway workspace and scratch. System directories and the installed toolchain roots remain readable (Homebrew grants cover build directories such as `bin`, `lib`, `opt` and `Cellar`, excluding `etc` and `var`; OpenSSL uses an empty config in scratch), including `~/.cargo/{bin,registry,git}` and `~/.rustup` when present. `omgs doctor` and each proof record list the actual readable roots; these caches may contain private source. There is no total disk quota. Unix has a 1 GiB per-file size limit; Windows has no per-file limit. A target file hardlinked to outside content becomes readable content in the workspace copy. This is a residual host-filesystem risk; git checkouts cannot create such a hardlink.
+System directories and installed toolchain roots remain readable, including
+`~/.cargo/{bin,registry,git}` and `~/.rustup` when present. Caches may contain private
+source. Doctor and each proof record disclose the actual roots. There is no total
+disk quota. Unix limits each file to 1 GiB; Windows has no per-file limit. Hardlinks
+to outside content become readable in the workspace copy; git checkouts cannot
+create those links.
 
 On Ubuntu 24.04 and later the kernel restricts unprivileged user namespaces, which MXC's bubblewrap backend needs; `omgs doctor` says so when it applies. Either allow them for bubblewrap with an AppArmor profile, or set `kernel.apparmor_restrict_unprivileged_userns=0` on a machine you use for proofs. On Windows, [upstream MXC issue #1465](https://github.com/microsoft/mxc/issues/1465) reports that toolchains can fail with `STATUS_DLL_INIT_FAILED` over SSH session 0 even when their executable files are readable. This observed upstream limitation can require an existing interactive desktop session; it is not a guaranteed OMGS diagnostic. Windows 11 builds where the capability probe reports `needsDaclAugmentation=false` are supported. OMGS refuses augmentation tiers, including the observed `appcontainer-dacl` tier on windows-2025, because MXC 1.0.1 leaves changed ACEs on granted folders even after a successful run. `prove` and `doctor --live` exit 3 before staging a workload or invoking MXC with a config, including a dry run. OMGS never writes host ACLs. No administrator host preparation or ACL repair is attempted.
 
@@ -117,23 +188,53 @@ Run directories can be moved or archived without rewriting the saved config. Val
 
 Commands and survivor command lines in proof records are redacted before writing. Credential flags mask their complete next token or inline `=value`, including quoted values with spaces; attached short flags such as `-pVALUE` are outside this redaction scope. `command_sha256` and `wrapped_command_sha256` bind the exact replay command and saved config. The runner keeps exact input in `proofs/<n>/command.txt` for replay; this file and the saved config can contain credentials, so protect the entire run directory. On Unix, proof directories are 0700 and command and config files are 0600. Small trust files (approvals, records, configs and answer stores) use bounded, single-link, no-follow reads. Approval stores are limited to 1 MiB. Answer stores and run-local answer snapshots enforce a 1 MiB limit on reads and writes. Executor, proof-test and snapshot content hashes accept hardlinks and symlinks resolving to regular files, with symlink targets disclosed. Snapshot hashing has no size cap; the Unix 1 GiB per-file limit applies only to sandboxed processes. Target FIFOs and sockets are skipped in the workspace copy and snapshot digest, with up to 20 sorted paths recorded as proof gaps and one aggregate count for the remainder. Devices are refused before copying. On Unix, both copy paths preserve symlinks as links; outside or unresolved links are disclosed as a counted proof gap. Copied links that still reach the live target, including absolute links and relative links that leave and re-enter it, have separate path gaps, sorted and capped at 20 paths followed by a count, and remain subject to sandbox access rules. Draft executable permissions are preserved when staged.
 
-## Known limitations
-
-- Tier 2 runs only on Linux. Intel Macs cannot run MXC proofs. Under Rosetta on Apple Silicon, install `omgs-aarch64-apple-darwin` instead of the x86_64 binary.
-- macOS and Linux handle SIGINT, SIGTERM and SIGHUP cleanup. Linux MXC PID namespace teardown kills detached descendants. On supported Windows tiers, `process.timeout = 0` leaves expiry to OMGS's finite supervisor wall clock. Expiry or interruption requests Ctrl+Break and allows five seconds for cleanup before forced termination. OMGS assigns itself to a kill-on-close job before spawning any executor, using a non-inherited handle; force-terminating OMGS kills the executor and its workloads without a spawn race. Before the first config-bearing invocation, including the dry run, OMGS resolves granted roots and snapshots their ACLs while retaining object identities. Every dry-run outcome and workload exit is checked. ACL drift, replacement or failed inspection blocks execution or marks cleanup incomplete. Inspection remains bounded and ignores a pending interrupt. OMGS only detects drift and never repairs ACLs. Descendants and `enumeratePaths` parents are not inspected, so unchanged roots do not prove complete host ACL restoration. Force termination skips executor cleanup; operators of earlier augmentation runs should inspect ACLs and recover from trusted backups as described in DECISIONS.md.
-- Windows DACL augmentation tiers, including the observed windows-2025 tier, are refused before any config-bearing invocation. Supported Windows 11 tiers can differ in parent enumeration support. Without it, directory listing, absolute path resolution and `NUL` redirection can fail; doctor cannot prove the outside read denial. PowerShell needs an interactive desktop session.
-- Toolchain roots and caches remain readable and can contain private source. There is no total disk quota; Unix has a 1 GiB per-file limit and Windows has no per-file limit. Memory and task limits need an available Linux systemd user scope. Target hardlinks can copy outside content into the workspace.
-- Run markers catch accidents. They cannot authenticate a result against hostile target code; replay and the independent evaluator remain required. Exact command and config artifacts may retain credentials even though record displays are redacted.
-
 ## Releases and verifying your download
 
-Releases are built and signed by a reproducible GitHub Actions pipeline and carry a `SHA256SUMS` manifest:
+The tag-only [release workflow](.github/workflows/release.yml) signs and notarizes
+macOS binaries, signs Windows binaries through Azure Trusted Signing, mirrors the
+five pinned MXC executors and publishes `SHA256SUMS` plus build provenance. Signing
+identities must be configured before the first public release. Follow the binary
+and MXC verification commands in [SECURITY.md](SECURITY.md#verifying-a-release).
 
-- **macOS:** Developer ID signed and notarized, so Gatekeeper does not block the binary.
-- **Windows:** signed with Azure Trusted Signing.
-- **Linux:** checksum verified.
+Homebrew formula and winget manifests are generated from final asset hashes,
+retained under `packaging/generated/` in the workflow artifact, and attached to the
+release. The owner publishes them to a tap and winget-pkgs. Winget installs the
+portable binary only; use the matching skill installer for MXC. No public release
+or package-manager publication is implied by this PR. See [packaging/README.md](packaging/README.md).
 
-The bootstrap verifies your download against `SHA256SUMS` automatically. To check by hand, download the platform binary and `SHA256SUMS` from the release into the same directory, then on Linux run `sha256sum --ignore-missing -c SHA256SUMS`, or on macOS compare your file's hash to its line in the manifest with `shasum -a 256 <asset>`.
+## Environment variables
+
+This table covers source reads (`env::var`, `var_os` and variable-key reads),
+installer controls, child-process assignments and regression hooks. Signing
+secrets are listed separately in [SECURITY.md](SECURITY.md#release-owner-configuration).
+
+| Variable | Meaning and default |
+| --- | --- |
+| `OMGS_HOME` | Absolute per-user data/install root; defaults to `<home>/.local/share/omgs`. |
+| `OMGS_RELEASE_BASE` | Installer only: HTTPS release asset base or absolute offline bundle directory; defaults to the tag from `skill/VERSION`. A custom source still requires checksums, signatures and pins. |
+| `OMGS_MXC_EXEC` | Explicit executor path, authoritative and SHA-256 pinned; otherwise data directory then PATH. |
+| `OMGS_SEMGREP_CONFIG` | Local Semgrep rules path; registry/URL values require the next opt-in. |
+| `OMGS_SEMGREP_ALLOW_REGISTRY` | Only `1` permits Semgrep registry downloads; unset means offline rules only. |
+| `HOME`, `USERPROFILE` | Host home discovery; HOME wins, then USERPROFILE on Windows. Sandboxed values point to scratch. |
+| `PATH`, `PATHEXT` | Host tool lookup, absolute entries only. Sandboxed PATH is rebuilt; Windows PATHEXT is explicit. |
+| `SYSTEMROOT`, `WINDIR` | Windows host helpers and MXC bootstrap. SYSTEMROOT defaults to `C:\Windows` where applicable; never a target-controlled grant. |
+| `TEMP`, `TMP`, `TMPDIR` | Host temporary staging (including the standard-library temp directory). Replaced with scratch in proof workloads. |
+| `LOCALAPPDATA` | Windows executor bootstrap; replaced with scratch in workloads. |
+| `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` | Linux systemd wrapper bus access only; stripped before target execution. |
+| `XDG_CACHE_HOME`, `CLANG_MODULE_CACHE_PATH` | Generated scratch cache directories for proof workloads. |
+| `LANG` | Proof workload locale, fixed to `C.UTF-8` on Unix. |
+| `OPENSSL_CONF` | macOS proof workload uses an empty scratch configuration. |
+| `CARGO_HOME`, `RUSTUP_HOME` | Generated proof environment points Cargo to scratch linked caches and Rustup to the discovered readable toolchain. Host overrides do not broaden grants. |
+| `CARGO_NET_OFFLINE`, `RUSTUP_AUTO_INSTALL` | Proof workload values `true` and `0`; installers also set auto-install to `0`. |
+| `OMGS_PROOF_NONCE`, `OMGS_PROOF_CONTRACT` | Runner-generated recipe inputs. Same-process target code can read them; they are not a private attestation channel. |
+| `GIT_TERMINAL_PROMPT` | Set to `0` for noninteractive clone operations. |
+| `GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR` | Read by external gh, not the binary. Existing gh authentication/configuration controls optional provenance checks. |
+| `OMGS_REQUIRE_RECIPES` | Test suite only: comma-separated runtimes whose absence must fail recipe tests. |
+| `OMGS_TEST_PUBLICATION_DIR`, `OMGS_OWNER_TEST_DIR`, `OMGS_CAPTURE_CHILD`, `OMGS_TEST_PROBE_JSON` | Regression child-process hooks, with no installer authority or production signature bypass. |
+
+Without `models.json`, `route` returns `host-default` and keeps the host's current
+selection. A refusal with no configured fallback records a blocker. An explicitly
+requested missing or malformed `--models` file remains an error.
 
 ## For agents: install and run
 
