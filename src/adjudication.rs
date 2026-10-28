@@ -158,13 +158,27 @@ pub fn candidates(text: &str) -> Result<crate::critic::CandidatesFile, String> {
 
 pub fn load(run: &Path) -> Result<Option<Evaluation>, String> {
     let path = run.join("evaluation.json");
-    match std::fs::read_to_string(&path) {
-        Ok(s) => parse(&s)
-            .map(Some)
-            .map_err(|e| format!("evaluation.json: {e}")),
+    // Bounded, single-link and no-follow, like other run evidence. Only a
+    // genuinely missing entry is optional; links and special files fail.
+    match crate::platform::read_bounded(&path, MAX_EVALUATION_BYTES) {
+        Ok(bytes) => {
+            let s = String::from_utf8(bytes)
+                .map_err(|_| "evaluation.json: not valid UTF-8".to_string())?;
+            parse(&s)
+                .map(Some)
+                .map_err(|e| format!("evaluation.json: {e}"))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("read evaluation.json: {e}")),
     }
+}
+
+const MAX_EVALUATION_BYTES: u64 = 8 << 20;
+
+/// Same normalization as every other separation check.
+fn same_agent(a: &str, b: &str) -> bool {
+    let id = |v: &str| crate::model::identity(&Some(v.to_string()));
+    id(a).is_some() && id(a) == id(b)
 }
 
 pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String> {
@@ -202,7 +216,7 @@ pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String>
         if [&f.hunted_by, &f.verified_by]
             .iter()
             .filter_map(|s| s.as_deref())
-            .any(|id| id.trim().eq_ignore_ascii_case(e.evaluator.trim()))
+            .any(|id| same_agent(id, &e.evaluator))
         {
             gaps.push(format!(
                 "{}: evaluator must be independent of hunter and verifier",

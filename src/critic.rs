@@ -353,11 +353,9 @@ pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport,
                     c.candidate.fingerprint == f.fingerprint
                         || f.candidates.contains(&c.candidate.fingerprint)
                 }) {
-                    if candidate
-                        .candidate
-                        .hunter
-                        .trim()
-                        .eq_ignore_ascii_case(evaluation.evaluator.trim())
+                    let id = |v: &str| crate::model::identity(&Some(v.to_string()));
+                    if id(&candidate.candidate.hunter).is_some()
+                        && id(&candidate.candidate.hunter) == id(&evaluation.evaluator)
                     {
                         report.gaps.push(format!("{}: evaluator hunted absorbed candidate {}; independent adjudication required", f.fingerprint, candidate.candidate.fingerprint));
                     }

@@ -257,6 +257,48 @@ fn evaluator_missing_verdict_independence_and_report_limits() {
     }
 }
 #[test]
+fn evaluator_identity_uses_unicode_normalization_and_bounded_reads() {
+    let f = Fixture::new();
+    let mut findings =
+        omgs::shape::findings(include_str!("fixtures/report-run/findings.json")).unwrap();
+    for (i, r) in findings.findings.iter_mut().enumerate() {
+        r.fingerprint = format!("omgs-{i:016x}");
+        r.verified_by = Some("VÉRIFIER".into());
+    }
+    let source = read(f.run.join("run-metadata.json"))["source_ref"].clone();
+    let decisions: Vec<_> = findings.findings.iter().map(|r| json!({"fingerprint":r.fingerprint,"decision":"uphold","reason":"independent trace","evidence":[],"required_changes":[]})).collect();
+    let evaluation =
+        json!({"evaluator":" vérifier ","source_ref":source,"decisions":decisions,"gaps":[]});
+    f.put("evaluation.json", evaluation.clone());
+    assert!(omgs::adjudication::check(&f.run, &findings)
+        .unwrap()
+        .iter()
+        .any(|g| g.contains("independent")));
+    let path = f.run.join("evaluation.json");
+    // Oversized evidence is refused rather than read without a bound.
+    std::fs::write(&path, " ".repeat((8 << 20) + 1)).unwrap();
+    assert!(omgs::adjudication::check(&f.run, &findings).is_err());
+    #[cfg(unix)]
+    {
+        // A link to an outside evaluation is not adjudication evidence.
+        let outside = f.run.parent().unwrap().join("outside-evaluation.json");
+        std::fs::write(&outside, evaluation.to_string()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        assert!(omgs::adjudication::check(&f.run, &findings).is_err());
+        // A dangling link is an error, not an absent evaluation.
+        std::fs::remove_file(&outside).unwrap();
+        assert!(omgs::adjudication::check(&f.run, &findings).is_err());
+        // A FIFO must fail instead of blocking forever without a writer.
+        std::fs::remove_file(&path).unwrap();
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(omgs::adjudication::check(&f.run, &findings).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+}
+
+#[test]
 fn command_help_and_intent_aliases_are_actionable() {
     let f = Fixture::new();
     for cmd in [
