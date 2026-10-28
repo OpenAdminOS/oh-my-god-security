@@ -769,6 +769,7 @@ pub(super) mod tests {
             if supervisor_timeout {
                 // Use the actual production config, including its timer policy.
                 config = super::super::mxc_config(&super::super::ConfigInput {
+                    contract: None,
                     os: "windows",
                     containment: "process",
                     command: config["process"]["commandLine"].as_str().unwrap(),

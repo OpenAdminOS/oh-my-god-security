@@ -27,7 +27,7 @@ shares the host loopback in both directions, and Windows blocks loopback inside 
 - [x] `omgs doctor`; Windows portability; Windows CI through Test (round 5 verification below)
 - [x] DECISIONS.md amendment: declared minimum set per OS
 - [x] Tests and docs for rounds 1 through 5
-- [ ] Independent round 5 full-diff re-reviews and merge
+- [x] Independent round 5 full-diff re-reviews and merge (merged as #11)
   - Round 2 (2026-10-27): GPT-6.1-Sol implements the round 2 fixes; evidence that the named test ran
     uses runner start and end markers (not per-stack adapters); windows-2025 CI must be fully green
     through the Test step before merge.
@@ -67,9 +67,9 @@ parent-owned full-diff reviews and PR creation are separate from this implementa
 ## PR 2: role briefs, stacks and packs (`feat/role-briefs-packs`)
 
 - [x] `skill/agents/` briefs: red hunter, blue verifier, evaluator, green fixer
-- [ ] Proof by default with per-stack recipes
-- [ ] Windows toolchains reachable inside MXC: on the Windows 11 mini PC, `doctor --live` lists cargo, node and pwsh as on PATH but not reachable in the sandbox, although their roots are granted readable; the per-stack recipes need them
-- [ ] Supervisor drain flake: on macos-15 CI (run 40671536208, first attempt) `executor_text_errors_and_outer_exit_codes_cannot_substitute_for_markers` reported capture incomplete after the 2 s bounded drain for a one-line `sh` command with no descendants; the rerun passed. Find why EOF can arrive late and make capture completion deterministic
+- [x] Proof by default with per-stack recipes
+- [x] Windows toolchains reachable inside MXC: replace the batch-expanded `%t` lookup loop with actual version launches, supply a safe PATHEXT and disable Rust auto-install. The Windows 11 mini PC reports cargo, node and pwsh reachable in its interactive desktop session; real proofs launch all three. SSH session 0 DLL initialization remains an explicit runtime blocker.
+- [x] Supervisor drain flake: Darwin pipe creation had a pipe()/fcntl(CLOEXEC) inheritance window across concurrent spawns. Capture uses atomically close-on-exec FIFO opens and executor children seal non-stdio descriptors. The 2 s drain bound is unchanged; deliberate inheritance and 192 interleaved supervisor calls pass.
 - [x] Shared path classifier; shell and browser-extension stacks; monorepo detection
 - [x] Packs: identity binding, fail-closed semantics
 - [x] Persona modes; host-provided accounting

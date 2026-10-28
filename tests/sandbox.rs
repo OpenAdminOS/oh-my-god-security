@@ -115,6 +115,7 @@ fn assert_augmented_tier_refusal(tier: &str, caller: u32) {
     };
     let lib_dir = d.join("library-proof");
     let request = ProveRequest {
+        expect_marker: None,
         command: "echo REFUSAL_WORKLOAD_RAN".into(),
         test: None,
         target: Some(target.clone()),
@@ -684,7 +685,7 @@ fn proof_records_back_confirmed_findings() {
     );
     assert_eq!(never_ran.status.code(), Some(1));
     assert!(
-        text(&never_ran).contains("never ran"),
+        text(&never_ran).contains("proof support requires assertion exit"),
         "{}",
         text(&never_ran)
     );
@@ -833,9 +834,13 @@ fn installer_trust_fixture_fails_vulnerable_and_passes_fixed() {
                 "prove",
                 "--target",
                 fixture.to_str().unwrap(),
+                "--test",
+                "main.swift",
+                "--expect-marker",
+                "BOUNDARY_ASSERTION_FAILED",
                 "--cmd",
                 &format!(
-                    "swiftc main.swift {variant}/Verifier.swift -o \"$TMPDIR/probe\" && \"$TMPDIR/probe\""
+                    "swiftc main.swift {variant}/Verifier.swift -o \"$TMPDIR/probe\" || exit 2; \"$TMPDIR/probe\""
                 ),
             ],
         )
@@ -845,7 +850,11 @@ fn installer_trust_fixture_fails_vulnerable_and_passes_fixed() {
     assert!(text(&vulnerable).contains("INVARIANTS VIOLATED"));
     let fixed = run("fixed");
     assert!(fixed.status.success(), "{}", text(&fixed));
-    assert!(text(&fixed).contains("INVARIANTS HOLD"));
+    assert!(text(&fixed).contains("BOUNDARY_ASSERTION_OK"));
+    assert!(text(&vulnerable).contains("OMGS_BOUNDARY_"));
+    for out in [&vulnerable, &fixed] {
+        assert!(text(out).contains("OMGS_CONTROL_"));
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -1182,6 +1191,7 @@ fn doctor_discloses_planned_controls_and_gaps_without_an_executor() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .arg("doctor")
         .env("OMGS_HOME", &d)
+        .env("PATH", "")
         .env("OMGS_MXC_EXEC", d.join("missing"))
         .output()
         .unwrap();
@@ -1191,6 +1201,9 @@ fn doctor_discloses_planned_controls_and_gaps_without_an_executor() {
         t.contains("planned proof controls if a verified MXC executor becomes available"),
         "{t}"
     );
+    for runtime in ["sh", "node", "pwsh", "python3", "swiftc"] {
+        assert!(t.contains(&format!("{runtime} not on host PATH")), "{t}");
+    }
     for gap in [
         "readable toolchain roots",
         "no total disk quota",
@@ -1446,6 +1459,7 @@ fn unreachable_tests_never_run_the_command() {
     std::fs::create_dir_all(target.join("directory")).unwrap();
     for (n, test) in ["missing test's file", "directory"].iter().enumerate() {
         let request = ProveRequest {
+            expect_marker: None,
             command: "echo UNREACHABLE_COMMAND_RAN".into(),
             test: Some((*test).into()),
             target: Some(target.clone()),

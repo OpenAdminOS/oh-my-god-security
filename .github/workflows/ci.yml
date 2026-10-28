@@ -8,6 +8,9 @@ on:
   push:
     branches: [main]
 
+env:
+  RUSTUP_AUTO_INSTALL: "0"
+
 permissions:
   contents: read
 
@@ -80,7 +83,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked -- --skip recipes
+      # Preinstalled runtimes: actions/runner-images macOS 15 arm64 and Ubuntu 24.04.
+      # Windows augmentation refusal is asserted by the recipes themselves.
+      - name: Recipe regressions and summary
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" != Windows ]]; then
+            export OMGS_REQUIRE_RECIPES=sh,python3,node,pwsh,swiftc
+          fi
+          cargo test --locked --test recipes -- --nocapture
       - name: Doctor
         shell: bash
         run: |

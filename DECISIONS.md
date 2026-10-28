@@ -38,7 +38,8 @@ Target controlled code, including builds, tests and the running app at level 2, 
 - An empty environment built from an explicit allowlist, with scratch local home, temp and cache directories. Dummy principals and dummy secrets only.
 - A read only target and toolchain. The target process writes only inside its assigned scratch directory and a per-run copy of the target; the original target is never mounted.
 - Explicit limits on CPU, memory, processes, per-file size and wall clock time where supported. There is no total disk quota. Unix limits each file to 1 GiB; Windows has no per-file limit.
-- No dependency installation and no network fetching during proof execution. Only tools and dependencies already present locally are used.
+- No dependency installation and no network fetching during proof execution. Only tools and dependencies already present locally are used. Rust proxies receive `RUSTUP_AUTO_INSTALL=0`.
+- Attempt a sandbox proof for every candidate whose runtime is reachable, within the declared budget. Use the per-stack recipes; record exact runtime, sandbox or budget blockers when an attempt cannot proceed. Runtime reachability means a successful version-command launch inside MXC, not a PATH lookup.
 - Execution stops at the minimum local effect that proves the boundary violation.
 
 Declared minimum set per OS (amended on 2026-10-27, replacing the rule that every control above must hold everywhere, because no OS sandbox offers all of them). Below this set OMGS refuses to run target code:
@@ -59,6 +60,8 @@ Declared minimum set per OS (amended on 2026-10-27, replacing the rule that ever
 - Tier 2 runs only on Linux, decided on 2026-10-27: there the sandbox has its own network namespace, so the app and its client talk over a private loopback while host services stay unreachable (verified). On macOS the sandbox shares the host loopback (a Seatbelt app could reach services on the host loopback, observed), and on Windows the container blocks loopback even within itself unless the host loopback is exempted, so `omgs prove --tier 2` refuses on both and names the reason. Tier 2 also requires the per-repository human approval given at a terminal with `omgs approve`.
 
 System directories and the installed toolchain roots remain readable, including `~/.cargo/{bin,registry,git}` and `~/.rustup` when present. Homebrew grants cover only build subdirectories, excluding `etc` and `var`. Doctor and every proof record disclose the actual roots and conditional gaps. Target hardlinks to outside content become readable workspace content; git checkouts cannot create them. Runner start and end markers catch accidents such as executor failure, truncation and timeout. They cannot establish integrity against a hostile target: the per-run nonce is visible to sandboxed code, which can print a forged end marker. The wrapper must open the named test inside the sandbox before running the command; an unreachable test or missing reachability evidence makes the record unclean for every verdict, including rejected controls. This cannot prove that the named test executed. Replay and the independent evaluator remain the stronger check. Replay requires the recorded timeout and rejects overrides, checks the target commit, copied-tree digest including all `.git` content, inner exit code and cleanliness, consumes proof budget, and is paired with the independent evaluator.
+
+Linux grants `/usr/include` read-only explicitly. The pinned MXC bubblewrap baseline does not mount it. C and Swift builds need its public system headers, so this narrow system grant is accepted; it grants no writes and does not include user data. The Swift recipe regression compiles against it inside `omgs prove`.
 
 Content hashing follows executor and test symlinks only to regular files, discloses their destinations and accepts hardlinks. Snapshot hashing has no size cap. Target FIFOs and sockets are skipped in the workspace copy and snapshot digest, with up to 20 paths recorded as proof gaps and one aggregate count for the remainder. Devices are refused before copying. Linux copies break hardlink relationships. On Unix, both copy paths preserve symlinks as links; outside or unresolved links are disclosed as a counted proof gap; live-target link disclosures are sorted, capped at 20 paths and followed by a remainder count and remain subject to sandbox access rules. Small trust files retain bounded, single-link, no-follow reads. Exact command and config artifacts can contain credentials; protect the entire run directory. On Unix proof directories are 0700 and command and config files are 0600. On macOS and Linux, SIGINT, SIGTERM and SIGHUP guards cover preparation and execution: blocked preparation removes the proof directory and releases its budget charge; interrupted execution retains an unclean record and its charge.
 
@@ -111,3 +114,21 @@ Done means: the one prompt flow works on the benchmark apps, every confirmed fin
 ## Deferred to later decisions
 
 Each of these returns for its own decision before any work starts: final brand treatment of the name, benchmark corpus licensing, additional stacks and languages, additional sandbox backends, and whether an optional hosted runner should ever exist. Accepting this record does not approve any of them.
+
+## 2026-10-28: required proof contracts and nonce-qualified recipe evidence
+
+Proof schema `omgs-proof/2` requires an explicit `contract` discriminator, either
+`none` or `recipe`. Recipe declarations and both marker evidence flags are
+required and non-null. The MXC environment records the declaration and fresh
+per-run nonce, binding them to the saved config digest and reconstructed command.
+Older schemas predate the current policy, including `RUSTUP_AUTO_INSTALL=0`, and
+must be rerun. No compatibility shim weakens the environment allowlist.
+
+Recipes emit `OMGS_CONTROL_<nonce>` and `OMGS_BOUNDARY_<nonce>_<label>` using
+`OMGS_PROOF_NONCE` and `OMGS_PROOF_CONTRACT`. Fixed or wrong-nonce output cannot
+satisfy the contract. Hostile code sharing the harness process can read the nonce
+and forge those lines. The independent evaluator remains required. Real
+provenance would need assertion reporting separated from target execution, for
+example a trusted reporter in a separately isolated process with a private
+channel unavailable to target code. That option needs a defined isolation policy
+and is not implemented in this PR.

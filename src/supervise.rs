@@ -36,6 +36,8 @@ pub struct Supervised {
     pub command_started: bool,
     pub command_finished: bool,
     pub test_reachable: Option<bool>,
+    pub boundary_marker_seen: bool,
+    pub authorized_control_seen: bool,
     pub enumerate_rejected: bool,
     pub success: bool,
     pub timed_out: bool,
@@ -324,6 +326,9 @@ struct Capture {
 #[derive(Default)]
 struct MarkerScan {
     nonce: Option<String>,
+    expect_marker: Option<String>,
+    boundary_marker_seen: bool,
+    authorized_control_seen: bool,
     lines: [Vec<u8>; 2],
     overflow: [bool; 2],
     started: bool,
@@ -355,6 +360,10 @@ impl MarkerScan {
         }
         let line = String::from_utf8_lossy(&bytes);
         let line = line.trim_end_matches('\r');
+        if let (Some(marker), Some(nonce)) = (&self.expect_marker, &self.nonce) {
+            self.boundary_marker_seen |= line == crate::proof::boundary_marker(marker, nonce);
+            self.authorized_control_seen |= line == crate::proof::control_marker(nonce);
+        }
         let lower = line.to_ascii_lowercase();
         if stream == 1
             && lower.contains("enumeratepaths")
@@ -486,6 +495,118 @@ fn reader<R: Read + Send + 'static>(
         .map(|_| ())
 }
 
+// Ignore HOME, TMPDIR and OMGS_HOME: each may point into a readable grant.
+// Darwin supplies a per-user directory that the pinned Seatbelt baseline denies.
+#[cfg(target_os = "macos")]
+pub(crate) fn capture_root() -> io::Result<PathBuf> {
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, MetadataExt},
+    };
+    let mut bytes = vec![0u8; 4096];
+    // SAFETY: confstr writes at most the supplied buffer length.
+    let size = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+        )
+    };
+    if size == 0 || size > bytes.len() {
+        return Err(io::Error::other(
+            "Darwin private temp directory unavailable",
+        ));
+    }
+    let base = std::fs::canonicalize(std::path::Path::new(std::ffi::OsStr::from_bytes(
+        &bytes[..size - 1],
+    )))?;
+    // This allowlist excludes every baseline-readable root, including /opt and
+    // /usr/local, and fails closed if Darwin changes its directory layout.
+    if !base.starts_with("/private/var/folders") {
+        return Err(io::Error::other(
+            "Darwin private temp directory is outside /private/var/folders",
+        ));
+    }
+    let dir = base.join("omgs-capture");
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let meta = std::fs::symlink_metadata(&dir)?;
+    // SAFETY: geteuid has no preconditions.
+    if !meta.is_dir()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o777 != 0o700
+        || std::fs::canonicalize(&dir)? != dir
+    {
+        return Err(io::Error::other(
+            "unsafe capture directory ownership, mode or canonical location",
+        ));
+    }
+    let roots = crate::sandbox::toolchain_roots("macos", crate::platform::home().as_deref());
+    validate_capture_grants(
+        &dir,
+        &roots.into_iter().filter(|p| p.exists()).collect::<Vec<_>>(),
+    )?;
+    Ok(dir)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn validate_capture_grants(
+    root: &std::path::Path,
+    grants: &[PathBuf],
+) -> io::Result<()> {
+    for grant in grants {
+        let grant = std::fs::canonicalize(grant)?;
+        if root.starts_with(&grant) || grant.starts_with(root) {
+            return Err(io::Error::other(format!(
+                "capture directory overlaps sandbox grant {}",
+                grant.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+// Darwin's pipe()+fcntl() is not atomic against unrelated concurrent spawns.
+// Open anonymous FIFOs with O_CLOEXEC atomically instead, then unlink them.
+#[cfg(target_os = "macos")]
+fn capture_pipe() -> io::Result<(std::fs::File, std::fs::File)> {
+    use std::ffi::CString;
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{DirBuilderExt, OpenOptionsExt},
+    };
+    let dir = capture_root()?.join(format!("pipe-{}", crate::platform::random_nonce()?));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let path = dir.join("pipe");
+    let result = (|| {
+        let name = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in temp path"))?;
+        // SAFETY: name is NUL terminated; the parent is private to this run.
+        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // std's Unix File opens set O_CLOEXEC in open(), without a race.
+        let read = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(&path)?;
+        let write = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        Ok((read, write))
+    })();
+    let unlink = std::fs::remove_file(&path);
+    let remove = std::fs::remove_dir(&dir);
+    let pair = result?;
+    unlink?;
+    remove?;
+    Ok(pair)
+}
+
 #[cfg(unix)]
 fn nonblocking(pipe: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     let fd = pipe.as_raw_fd();
@@ -544,11 +665,26 @@ fn prepare_unix(cmd: &mut Command, limits: &Limits) -> io::Result<Vec<String>> {
             enforced.push(format!("{name}={value}{suffix}"));
         }
     }
+    #[cfg(target_os = "macos")]
+    let descriptor_bound = unsafe { libc::getdtablesize() };
     cmd.process_group(0);
-    // SAFETY: all data is prepared before fork; the callback uses only setrlimit
+    // SAFETY: all data is prepared before fork; the callback uses only fcntl, setrlimit
     // and errno access, which do not acquire Rust locks or allocate on success.
     unsafe {
         cmd.pre_exec(move || {
+            // Darwin has no pipe2(O_CLOEXEC). A concurrent spawn can fork
+            // between pipe() and fcntl(FD_CLOEXEC), inheriting another run's
+            // write end. Seal all non-stdio descriptors in the child before
+            // exec, including Rust's exec-error pipe (already CLOEXEC).
+            // Do this before lowering RLIMIT_NOFILE, which could hide fds.
+            #[cfg(target_os = "macos")]
+            for fd in 3..descriptor_bound {
+                if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                    && io::Error::last_os_error().raw_os_error() != Some(libc::EBADF)
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
             for (resource, value, _, _) in settings {
                 if let Some(value) = value {
                     let limit = libc::rlimit {
@@ -1175,7 +1311,7 @@ mod sweep {
 /// does not expose whether it inherits the host environment; Linux scope wrapping
 /// reconstructs only get_envs and clears bus credentials before the executor.
 pub fn run(cmd: Command, limits: &Limits, markers: Option<&SweepMarkers>) -> Supervised {
-    run_inner(cmd, limits, markers, None, true)
+    run_inner(cmd, limits, markers, None, None, true)
 }
 
 pub fn run_marked(
@@ -1184,13 +1320,23 @@ pub fn run_marked(
     markers: Option<&SweepMarkers>,
     nonce: &str,
 ) -> Supervised {
-    run_inner(cmd, limits, markers, Some(nonce), true)
+    run_contracted(cmd, limits, markers, nonce, None)
+}
+
+pub fn run_contracted(
+    cmd: Command,
+    limits: &Limits,
+    markers: Option<&SweepMarkers>,
+    nonce: &str,
+    expect_marker: Option<&str>,
+) -> Supervised {
+    run_inner(cmd, limits, markers, Some(nonce), expect_marker, true)
 }
 
 /// Bounded cleanup inspection must still work after the user requested a stop.
 #[cfg(windows)]
 pub(crate) fn run_cleanup(cmd: Command, limits: &Limits) -> Supervised {
-    run_inner(cmd, limits, None, None, false)
+    run_inner(cmd, limits, None, None, None, false)
 }
 
 fn run_inner(
@@ -1198,6 +1344,7 @@ fn run_inner(
     limits: &Limits,
     markers: Option<&SweepMarkers>,
     nonce: Option<&str>,
+    expect_marker: Option<&str>,
     check_signals: bool,
 ) -> Supervised {
     let start = Instant::now();
@@ -1207,6 +1354,8 @@ fn run_inner(
         command_started: false,
         command_finished: false,
         test_reachable: None,
+        boundary_marker_seen: false,
+        authorized_control_seen: false,
         enumerate_rejected: false,
         success: false,
         timed_out: false,
@@ -1289,9 +1438,23 @@ fn run_inner(
         }
         cmd.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(Stdio::null());
+    #[cfg(target_os = "macos")]
+    let (stdout, stderr) = match capture_pipe().and_then(|out| capture_pipe().map(|err| (out, err)))
+    {
+        Ok(((stdout, out), (stderr, err))) => {
+            cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
+            (stdout, stderr)
+        }
+        Err(error) => {
+            result.executor_error = true;
+            result.output = format!("failed to prepare output pipes: {error}");
+            result.notes.push(result.output.clone());
+            return result;
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -1302,6 +1465,9 @@ fn run_inner(
             return result;
         }
     };
+    // File-backed Stdio remains owned by Command after spawn. Close the
+    // parent's writers before reading, otherwise EOF could never arrive.
+    drop(cmd);
     #[cfg(windows)]
     result
         .enforced
@@ -1320,6 +1486,7 @@ fn run_inner(
         cap: limits.output_cap_bytes,
         evidence: MarkerScan {
             nonce: nonce.map(String::from),
+            expect_marker: expect_marker.map(String::from),
             ..MarkerScan::default()
         },
     };
@@ -1347,8 +1514,16 @@ fn run_inner(
             }
         };
     }
-    start_reader!(child.stdout.take(), 0);
-    start_reader!(child.stderr.take(), 1);
+    #[cfg(target_os = "macos")]
+    {
+        start_reader!(Some(stdout), 0);
+        start_reader!(Some(stderr), 1);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        start_reader!(child.stdout.take(), 0);
+        start_reader!(child.stderr.take(), 1);
+    }
     drop(tx);
     let waited = wait(
         &mut child,
@@ -1395,6 +1570,8 @@ fn run_inner(
     for stream in 0..2 {
         capture.evidence.line(stream);
     }
+    result.boundary_marker_seen = capture.evidence.boundary_marker_seen;
+    result.authorized_control_seen = capture.evidence.authorized_control_seen;
     result.enumerate_rejected = capture.evidence.enumerate_rejected;
     if nonce.is_some() {
         result.command_started = capture.evidence.started;
@@ -1452,6 +1629,31 @@ fn elapsed_ms(start: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_ignores_unsafe_tmpdir_and_rejects_overlapping_grants() {
+        if std::env::var_os("OMGS_CAPTURE_CHILD").is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "supervise::tests::capture_ignores_unsafe_tmpdir_and_rejects_overlapping_grants"])
+                .env("OMGS_CAPTURE_CHILD", "1")
+                .env("TMPDIR", "/usr/local/omgs-unsafe-temp/nonexistent")
+                .output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            return;
+        }
+        let root = capture_root().unwrap();
+        assert!(root.starts_with("/private/var/folders"));
+        assert!(!root.starts_with(std::env::temp_dir()));
+        let pair = capture_pipe().unwrap();
+        drop(pair);
+        assert!(validate_capture_grants(&root, std::slice::from_ref(&root)).is_err());
+        assert!(validate_capture_grants(&root, &[root.parent().unwrap().to_path_buf()]).is_err());
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        assert!(validate_capture_grants(&root, std::slice::from_ref(&alias)).is_err());
+        std::fs::remove_file(alias).unwrap();
+    }
+
     use super::*;
 
     #[cfg(unix)]
@@ -1489,12 +1691,18 @@ mod tests {
             cap: 10,
             evidence: MarkerScan {
                 nonce: Some(nonce.clone()),
+                expect_marker: Some("BOUNDARY_ASSERTION_FAILED".into()),
                 ..MarkerScan::default()
             },
         };
         let mut bytes = format!("OMGS_START_{nonce}\r\nOMGS_TEST_{nonce}:1\r\n").into_bytes();
         bytes.extend(vec![b'x'; 300_000]);
-        bytes.extend(format!("\nOMGS_END_{nonce}:17\r\n").as_bytes());
+        bytes.extend(
+            format!(
+                "\nOMGS_CONTROL_{nonce}\r\nOMGS_BOUNDARY_{nonce}_BOUNDARY_ASSERTION_FAILED\r\nOMGS_END_{nonce}:17\r\n"
+            )
+            .as_bytes(),
+        );
         for chunk in bytes.chunks(7) {
             capture.receive(Message::Data(0, chunk.to_vec()), &mut Vec::new());
         }
@@ -1502,7 +1710,31 @@ mod tests {
         assert!(!capture.evidence.invalid);
         assert_eq!(capture.evidence.exit_code, Some(17));
         assert_eq!(capture.evidence.test_reachable, Some(true));
+        assert!(capture.evidence.boundary_marker_seen && capture.evidence.authorized_control_seen);
         assert_eq!(capture.text().len(), 10);
+    }
+
+    #[test]
+    fn contract_markers_require_exact_complete_lines_on_either_stream() {
+        let mut scan = MarkerScan {
+            nonce: Some("nonce".into()),
+            expect_marker: Some("BOUNDARY".into()),
+            ..MarkerScan::default()
+        };
+        scan.receive(
+            0,
+            b"prefix BOUNDARY\nBOUNDARY suffix\nAUTHORIZED_CONTROL_OK suffix\n",
+        );
+        assert!(!scan.boundary_marker_seen && !scan.authorized_control_seen);
+        scan.receive(
+            0,
+            b"BOUNDARY\nAUTHORIZED_CONTROL_OK\nOMGS_BOUNDARY_wrong_BOUNDARY\nOMGS_CONTROL_wrong\n",
+        );
+        assert!(!scan.boundary_marker_seen && !scan.authorized_control_seen);
+        scan.receive(1, b"OMGS_BOUNDARY_nonce_BOU");
+        scan.receive(1, b"NDARY\r\n");
+        scan.receive(0, b"OMGS_CONTROL_nonce\n");
+        assert!(scan.boundary_marker_seen && scan.authorized_control_seen);
     }
 
     #[test]
