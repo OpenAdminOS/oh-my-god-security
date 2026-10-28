@@ -1162,11 +1162,18 @@ pub fn sensor_section(report: Option<&crate::sensors::SensorsReport>, html: bool
     let mut lines = Vec::new();
     for hit in &report.hits {
         lines.push(format!(
-            "{}: {} at {}{} (class {:?}, fingerprint {})",
+            "{}: {} at {}{}{} (class {:?}, fingerprint {})",
             hit.tool,
             hit.rule,
             hit.file,
             hit.line.map(|n| format!(":{n}")).unwrap_or_default(),
+            hit.package
+                .as_ref()
+                .map(|p| format!(
+                    " (package {}, version {}, ecosystem {})",
+                    p.name, p.version, p.ecosystem
+                ))
+                .unwrap_or_default(),
             hit.class,
             hit.fingerprint
         ));

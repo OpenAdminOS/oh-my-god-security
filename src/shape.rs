@@ -210,7 +210,27 @@ pub fn sensors(text: &str) -> Result<crate::sensors::SensorsReport, String> {
                 return Err(format!("{key} must be an array of strings"));
             }
         }
-        objects(top.get("hits").ok_or("hits is required")?, "hits")?;
+        let hits = top.get("hits").ok_or("hits is required")?;
+        objects(hits, "hits")?;
+        for hit in hits.as_array().unwrap() {
+            if hit.get("tool").and_then(|v| v.as_str()) == Some("osv-scanner") {
+                let package = hit
+                    .get("package")
+                    .and_then(|v| v.as_object())
+                    .ok_or("OSV hit lacks package identity; regenerate sensor artifacts")?;
+                for key in ["name", "version", "ecosystem"] {
+                    if !package
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.trim().is_empty())
+                    {
+                        return Err(
+                            "OSV hit lacks package identity; regenerate sensor artifacts".into(),
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     })
 }

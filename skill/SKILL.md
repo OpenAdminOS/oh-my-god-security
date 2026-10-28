@@ -74,24 +74,40 @@ For initialization, `omgs audit init --target TARGET --persona builder|inheritor
 
 Every inventory class stays accountable. Test, docs, data and vendored groups each get a `planned` exclusion unit with their total count and first 20 sorted paths across all files. Assign these units to hunters to skim or sample, then hunt with `covered` plus evidence or record `out_of_scope` with `--note "reviewed, not security relevant: <reason>"`. For out_of_scope, cite at least one displayed sampled path with --evidence. Describe the review and why the group is irrelevant; classification alone cannot justify exclusion. Blocked or deferred exclusions remain critic failures. The first 20 paths are a sample, not the entire scope. Resolution reasons appear in ledger output and reports.
 
-Optional sensors are local, installed tools only. TruffleHog uses filesystem
-scanning with `--no-verification --no-update`; never verify credentials online.
-OSV-Scanner uses `--offline-vulnerabilities --offline --no-call-analysis
---no-resolve` against the existing `OMGS_OSV_DB` cache (default:
-`<OMGS data dir>/osv-db`). A missing database is a gap, never permission to fetch.
-Database download is a separate explicit network opt-in using the README's
-`--download-offline-databases` command. Semgrep similarly requires existing
-`OMGS_SEMGREP_CONFIG` rules unless `OMGS_SEMGREP_ALLOW_REGISTRY=1` explicitly
-allows registry access. Never set either network opt-in merely to remove a gap.
+Optional sensors are installed tools executed only inside pinned Microsoft MXC,
+including Gitleaks and Semgrep. MXC denies external egress, inbound connections
+and host loopback on every supported OS. Missing MXC, failed preflight and a
+Windows augmentation-tier refusal are gaps; never fall back to host execution.
+Target copies, scanner runtime roots, rules and the OSV database are read-only.
+Private scratch is outside run artifacts and removed after supervised cleanup
+on every exit path; cleanup failures remain gaps. Linux requests a 2 GiB cgroup
+memory limit and 128 tasks where the user scope is available. Elsewhere no total
+memory cap is claimed. Source input is bounded to 16 MiB/file, 64 MiB total,
+10,000 entries and 64 directory levels; omissions are gaps. Every sensor has a
+120 second deadline and 4 MiB output cap. See README for the teardown margin.
+
+TruffleHog uses `--no-verification --no-update --no-ignore-tag`. OSV-Scanner uses
+`--offline-vulnerabilities --offline --no-call-analysis --no-resolve --no-ignore`
+and an OMGS-owned empty `--config`, bypassing repository suppression files.
+Semgrep requires local `OMGS_SEMGREP_CONFIG` rules; registry fetching is disabled.
+The copied `.semgrepignore` files are removed, `.gitignore` and inline `nosemgrep`
+are disabled. Tool-reported skipped input and diagnostics remain gaps.
+
+A missing `OMGS_OSV_DB` cache (default `<OMGS data dir>/osv-db`) is a gap, never
+permission to fetch. Database download remains a separate explicit network
+opt-in using the README command, outside MXC only because this is a network fetch
+the user has opted into. OMGS never runs it automatically.
 
 Read `sensor-hits.json` and `sensors.json` during mapping. Raw secret values are
 not retained. Each code-class hit seeds a `sensor:<tool>:<fingerprint>` candidate
-unit. Assign it to a hunter and record `covered` with evidence, or resolve it
+unit. OSV package name, version and ecosystem participate in that fingerprint
+and appear in reports; each affected version requires its own resolution.
+Assign it to a hunter and record `covered` with evidence, or resolve it
 with a specific reason. The critic rejects unaccounted or missing hit units.
 Test, docs, data and vendored hits stay visible in reports and belong in their
 existing exclusion group review. Scanner matches are leads, not confirmations.
 Retain sensor gaps, including missing tools, malformed output, absent databases
-and platform network containment limitations, in the handoff.
+and unapplied resource limits, in the handoff.
 
 1. **Initialize.** Run `omgs audit init` with the resolved setup values through the documented interface. Record source identity, trusted base policy, mode, limits, and locally available tools. Let deterministic sensors inspect secrets and supply chain data; do not spend model calls duplicating those sensors or execute target code for reconnaissance.
 2. **Map.** Read [RECONNAISSANCE.md](RECONNAISSANCE.md). Map architecture, principals, input surfaces, enforcement and delegated controls. Seed coverage ledger units as surface by boundary by attack class, with evidence paths and unexamined areas. Record the structured map in `architecture.json` per [schemas/architecture.schema.json](schemas/architecture.schema.json) and render it with `omgs architecture --in architecture.json --out OUTPUT_DIR`; the resulting `ARCHITECTURE.md` and offline `ARCHITECTURE.html` show how the target is built, its trust boundaries and attack surface, and what was not examined. This map is descriptive and never changes a verdict.

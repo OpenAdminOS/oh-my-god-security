@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SensorHit {
@@ -10,6 +9,15 @@ pub struct SensorHit {
     pub vendored: bool,
     pub class: crate::paths::Class,
     pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<PackageIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PackageIdentity {
+    pub name: String,
+    pub version: String,
+    pub ecosystem: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -27,175 +35,22 @@ use crate::platform::which;
 /// Run deterministic sensor tools against source text. Sensors never execute
 /// target code. Raw scanner output can contain matched secret values, so only
 /// rule, file and line metadata is retained and the raw report is deleted.
-pub fn run_sensors(target: &Path, scratch_dir: &Path) -> SensorsReport {
+pub fn run_sensors(target: &Path, _scratch_dir: &Path) -> SensorsReport {
     let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
     let target = target.as_path();
-    let scratch = std::fs::canonicalize(scratch_dir).unwrap_or_else(|_| scratch_dir.to_path_buf());
-    let scratch_dir = scratch.as_path();
     let mut report = SensorsReport {
         tools_run: Vec::new(),
         tools_unavailable: Vec::new(),
         hits: Vec::new(),
         gaps: Vec::new(),
     };
-    match which("gitleaks") {
-        Some(executable) => {
-            let raw = scratch_dir.join("gitleaks-raw.json");
-            let status = Command::new(executable)
-                .args([
-                    "detect",
-                    "--source",
-                    &target.to_string_lossy(),
-                    "--no-git",
-                    "--report-format",
-                    "json",
-                    "--report-path",
-                    &raw.to_string_lossy(),
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            if status.is_ok() {
-                report.tools_run.push("gitleaks".into());
-                if let Ok(text) = std::fs::read_to_string(&raw) {
-                    if let Ok(serde_json::Value::Array(items)) =
-                        serde_json::from_str::<serde_json::Value>(&text)
-                    {
-                        for item in items {
-                            let file = item
-                                .get("File")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let rel = Path::new(&file)
-                                .strip_prefix(target)
-                                .map(|p| p.to_string_lossy().to_string())
-                                .unwrap_or(file);
-                            report.hits.push(SensorHit {
-                                tool: "gitleaks".into(),
-                                rule: item
-                                    .get("RuleID")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown")
-                                    .to_string(),
-                                class: crate::paths::classify_file(target, Path::new(&rel)),
-                                fingerprint: String::new(),
-                                vendored: crate::is_vendored_path(&rel),
-                                file: rel,
-                                line: item.get("StartLine").and_then(|v| v.as_u64()),
-                            });
-                        }
-                    }
-                }
-            } else {
-                report.tools_unavailable.push("gitleaks".into());
-            }
-            let _ = std::fs::remove_file(&raw);
-        }
-        None => report.tools_unavailable.push("gitleaks".into()),
+    for tool in ["gitleaks", "semgrep", "trufflehog", "osv-scanner"] {
+        run_offline(tool, target, &mut report);
     }
-    run_semgrep(target, scratch_dir, &mut report);
-    run_offline("trufflehog", target, scratch_dir, &mut report);
-    run_offline("osv-scanner", target, scratch_dir, &mut report);
     for hit in &mut report.hits {
         hit.fingerprint = hit_fingerprint(hit);
     }
     report
-}
-
-/// Run semgrep if present and given an offline ruleset. Stays network-free by
-/// default: the config comes from `OMGS_SEMGREP_CONFIG` (a local rules path),
-/// or `OMGS_SEMGREP_ALLOW_REGISTRY=1` opts into the `auto` registry explicitly.
-/// Only rule, file and line metadata is kept; the raw report is deleted.
-fn run_semgrep(target: &Path, scratch_dir: &Path, report: &mut SensorsReport) {
-    let Some(executable) = which("semgrep") else {
-        report.tools_unavailable.push("semgrep".into());
-        return;
-    };
-    let registry_ok = std::env::var("OMGS_SEMGREP_ALLOW_REGISTRY").is_ok_and(|v| v == "1");
-    // A nonempty OMGS_SEMGREP_CONFIG is only trusted when it names an existing
-    // local file or directory. A registry shorthand ("auto", "p/default"), a
-    // URL, or any nonexistent value would make semgrep fetch rules over the
-    // network, so it is allowed only under the explicit registry opt-in.
-    let config = match std::env::var("OMGS_SEMGREP_CONFIG") {
-        Ok(c) if !c.trim().is_empty() => {
-            let raw = c.trim();
-            let path = Path::new(raw);
-            if path.exists() {
-                // Fail closed: if the path cannot be canonicalized (for example it
-                // vanished after the exists() check), do not fall back to the raw
-                // string, which semgrep could still read as a registry shorthand.
-                match std::fs::canonicalize(path) {
-                    Ok(p) => p.to_string_lossy().to_string(),
-                    Err(_) => {
-                        report.tools_unavailable.push("semgrep".into());
-                        return;
-                    }
-                }
-            } else if registry_ok {
-                raw.to_string()
-            } else {
-                report.tools_unavailable.push("semgrep".into());
-                return;
-            }
-        }
-        _ => {
-            if registry_ok {
-                "auto".into()
-            } else {
-                // Present but no offline ruleset: do not fetch rules silently.
-                report.tools_unavailable.push("semgrep".into());
-                return;
-            }
-        }
-    };
-    let raw = scratch_dir.join("semgrep-raw.json");
-    let status = Command::new(executable)
-        .args([
-            "scan",
-            "--json",
-            "--strict",
-            "--quiet",
-            "--metrics=off",
-            "--disable-version-check",
-            "--config",
-            &config,
-            "--output",
-            &raw.to_string_lossy(),
-            &target.to_string_lossy(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    // semgrep exits 0 with no findings and 1 with findings; both are a real
-    // scan. Any other code (bad rules, invalid YAML, internal error) or a
-    // signal is a failed scan and must not look like a clean, zero-hit run.
-    match status.as_ref().map(|s| s.code()) {
-        Ok(Some(0)) | Ok(Some(1)) => match std::fs::read_to_string(&raw) {
-            Ok(text) => {
-                // A nonempty `errors` array means target files or rules failed to
-                // parse: the scan is incomplete and must not read as a clean run.
-                // Unparseable output is treated the same way.
-                let incomplete = serde_json::from_str::<serde_json::Value>(&text)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("errors")
-                            .and_then(|e| e.as_array())
-                            .map(|a| !a.is_empty())
-                    })
-                    .unwrap_or(true);
-                if incomplete {
-                    report.tools_unavailable.push("semgrep".into());
-                } else {
-                    report.tools_run.push("semgrep".into());
-                    parse_semgrep(&text, target, report);
-                }
-            }
-            Err(_) => report.tools_unavailable.push("semgrep".into()),
-        },
-        _ => report.tools_unavailable.push("semgrep".into()),
-    }
-    let _ = std::fs::remove_file(&raw);
 }
 
 /// Extract rule/file/line metadata from a semgrep JSON report. Split out so the
@@ -226,6 +81,7 @@ pub fn parse_semgrep(text: &str, target: &Path, report: &mut SensorsReport) {
                 .to_string(),
             class: crate::paths::classify_file(target, Path::new(&rel)),
             fingerprint: String::new(),
+            package: None,
             vendored: crate::is_vendored_path(&rel),
             file: rel,
             line: item
@@ -238,7 +94,11 @@ pub fn parse_semgrep(text: &str, target: &Path, report: &mut SensorsReport) {
 
 /// Identity is derived from retained metadata, never from a secret value.
 pub fn hit_fingerprint(hit: &SensorHit) -> String {
-    let identity = serde_json::to_vec(&(&hit.tool, &hit.rule, &hit.file, hit.line)).unwrap();
+    let identity = if let Some(package) = &hit.package {
+        serde_json::to_vec(&(&hit.tool, &hit.rule, &hit.file, hit.line, package)).unwrap()
+    } else {
+        serde_json::to_vec(&(&hit.tool, &hit.rule, &hit.file, hit.line)).unwrap()
+    };
     crate::sha256::digest(&identity)
 }
 
@@ -287,6 +147,7 @@ fn metadata_hit(
         vendored: class == crate::paths::Class::Vendored,
         class,
         fingerprint: String::new(),
+        package: None,
     };
     hit.fingerprint = hit_fingerprint(&hit);
     Ok(hit)
@@ -303,8 +164,23 @@ fn trufflehog_hits(output: &str, target: &Path) -> Result<Vec<SensorHit>, ()> {
         let fs = field(field(field(&v, "SourceMetadata")?, "Data")?, "Filesystem")?;
         let file = text(field(fs, "file")?)?;
         let line = field(fs, "line")?.as_u64().filter(|n| *n > 0).ok_or(())?;
-        // Even a scanner echoing the match in metadata must not persist it.
-        if !raw.is_empty() && (rule.contains(raw) || file.contains(raw)) {
+        // Even a scanner echoing any raw representation in metadata must
+        // not persist it. ExtraData can contain nested detector secret fields.
+        fn echoes(value: &serde_json::Value, rule: &str, file: &str) -> bool {
+            match value {
+                serde_json::Value::String(s) => {
+                    !s.is_empty() && (rule.contains(s) || file.contains(s))
+                }
+                serde_json::Value::Array(a) => a.iter().any(|v| echoes(v, rule, file)),
+                serde_json::Value::Object(o) => o.values().any(|v| echoes(v, rule, file)),
+                _ => false,
+            }
+        }
+        if (!raw.is_empty() && (rule.contains(raw) || file.contains(raw)))
+            || ["RawV2", "ExtraData"]
+                .iter()
+                .any(|key| v.get(key).is_some_and(|v| echoes(v, rule, file)))
+        {
             return Err(());
         }
         hits.push(metadata_hit("trufflehog", rule, file, Some(line), target)?);
@@ -319,13 +195,17 @@ fn osv_hits(output: &str, target: &Path) -> Result<Vec<SensorHit>, ()> {
         let file = text(field(field(source, "source")?, "path")?)?;
         for package in array(field(source, "packages")?)? {
             let info = field(package, "package")?;
-            // Package identity is required even though it is not persisted.
-            text(field(info, "name")?)?;
-            text(field(info, "version")?)?;
-            text(field(info, "ecosystem")?)?;
+            let identity = PackageIdentity {
+                name: crate::platform::escape_controls(text(field(info, "name")?)?),
+                version: crate::platform::escape_controls(text(field(info, "version")?)?),
+                ecosystem: crate::platform::escape_controls(text(field(info, "ecosystem")?)?),
+            };
             for vulnerability in array(field(package, "vulnerabilities")?)? {
                 let rule = text(field(vulnerability, "id")?)?;
-                hits.push(metadata_hit("osv-scanner", rule, file, None, target)?);
+                let mut hit = metadata_hit("osv-scanner", rule, file, None, target)?;
+                hit.package = Some(identity.clone());
+                hit.fingerprint = hit_fingerprint(&hit);
+                hits.push(hit);
             }
         }
     }
@@ -356,103 +236,170 @@ fn sensor_limits() -> crate::supervise::Limits {
         cpu_secs: Some(120),
         file_size_bytes: Some(16 * 1024 * 1024),
         open_files: Some(256),
-        memory_bytes: None,
-        tasks: None,
+        memory_bytes: Some(2 << 30),
+        tasks: Some(128),
         output_cap_bytes: 4 * 1024 * 1024,
     }
 }
 
-fn run_offline(tool: &str, target: &Path, scratch: &Path, report: &mut SensorsReport) {
+fn run_offline(tool: &str, target: &Path, report: &mut SensorsReport) {
     let Some(executable) = which(tool) else {
         report.tools_unavailable.push(tool.into());
         report.gaps.push(format!("{tool}: not present on PATH"));
         return;
     };
-    let database = if tool == "osv-scanner" {
-        match osv_database() {
-            Some(db) => Some(db),
-            None => {
+    let mut readonly = Vec::new();
+    let mut env = Vec::new();
+    let args: Vec<String> = match tool {
+        "osv-scanner" => {
+            let Some(db) = osv_database() else {
                 report
                     .gaps
                     .push("osv-scanner: osv database not present; no download attempted".into());
                 return;
+            };
+            env.push(format!(
+                "OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY={}",
+                crate::platform::mxc_path(&db)
+            ));
+            readonly.push(db);
+            [
+                "scan",
+                "source",
+                "--offline",
+                "--offline-vulnerabilities",
+                "--format=json",
+                "--recursive",
+                "--no-call-analysis",
+                "--no-resolve",
+                "--no-ignore",
+                "--config",
+                "{config}",
+                "{target}",
+            ]
+            .map(str::to_string)
+            .to_vec()
+        }
+        "semgrep" => {
+            let config =
+                std::env::var_os("OMGS_SEMGREP_CONFIG").and_then(|p| std::fs::canonicalize(p).ok());
+            let Some(config) = config else {
+                report.tools_unavailable.push(tool.into());
+                report.gaps.push(
+                    "semgrep: local rules required; registry fetching is disabled inside MXC"
+                        .into(),
+                );
+                return;
+            };
+            let mut args = [
+                "scan",
+                "--json",
+                "--strict",
+                "--quiet",
+                "--metrics=off",
+                "--disable-version-check",
+                "--disable-nosem",
+                "--no-git-ignore",
+                "--max-target-bytes=1000000",
+                "--max-memory=512",
+                "--jobs=1",
+                "--config",
+            ]
+            .map(str::to_string)
+            .to_vec();
+            args.push(crate::platform::mxc_path(&config));
+            args.push("{target}".into());
+            readonly.push(config);
+            args
+        }
+        "gitleaks" => [
+            "detect",
+            "--source",
+            "{target}",
+            "--no-git",
+            "--ignore-gitleaks-allow",
+            "--report-format",
+            "json",
+            "--report-path",
+            "-",
+            "--config",
+            "{config}",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+        _ => [
+            "filesystem",
+            "--no-verification",
+            "--no-update",
+            "--json",
+            "--no-ignore-tag",
+            "{target}",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+    };
+    let result = crate::sandbox::run_sensor(crate::sandbox::SensorRequest {
+        executable: &executable,
+        args,
+        target,
+        readonly,
+        env,
+        limits: sensor_limits(),
+        semgrep: tool == "semgrep",
+        config: if tool == "gitleaks" {
+            "[extend]\nuseDefault = true\n"
+        } else {
+            ""
+        },
+    });
+    let (output, code, gaps) = match result {
+        Ok(result) => result,
+        Err(reason) => {
+            report.gaps.push(format!("{tool}: {reason}"));
+            return;
+        }
+    };
+    report
+        .gaps
+        .extend(gaps.into_iter().map(|g| format!("{tool}: {g}")));
+    if code != 0 && !(matches!(tool, "osv-scanner" | "semgrep" | "gitleaks") && code == 1) {
+        report.gaps.push(format!(
+            "{tool}: scan failed, timed out, or output incomplete (exit={code})"
+        ));
+        return;
+    }
+    let hits = if output.contains('\u{fffd}') {
+        Err(())
+    } else {
+        match tool {
+            "trufflehog" => trufflehog_hits(&output, target),
+            "osv-scanner" => osv_hits(&output, target),
+            "semgrep" | "gitleaks" => simple_hits(tool, &output, target),
+            _ => unreachable!(),
+        }
+    };
+    // Preserve only the existence of diagnostics or skipped inputs, never
+    // their raw text or file contents. Tool-reported omissions are accountable.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&output) {
+        for key in [
+            "errors",
+            "skipped",
+            "skipped_files",
+            "warnings",
+            "paths.skipped",
+        ] {
+            let value = if key == "paths.skipped" {
+                v.pointer("/paths/skipped")
+            } else {
+                v.get(key)
+            };
+            if value.is_some_and(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty())) {
+                report.gaps.push(format!(
+                    "{tool}: tool reported skipped input or diagnostics ({key})"
+                ));
             }
         }
-    } else {
-        None
-    };
-    let home = scratch.join(format!("{tool}-home"));
-    if std::fs::create_dir_all(&home).is_err() {
-        report
-            .gaps
-            .push(format!("{tool}: cannot create isolated sensor home"));
-        return;
     }
-    let mut cmd = offline_command(&executable);
-    cmd.env_clear()
-        .current_dir(scratch)
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env("TMPDIR", &home)
-        .env("TMP", &home)
-        .env("TEMP", &home)
-        .env("XDG_CACHE_HOME", &home)
-        .env("LOCALAPPDATA", &home)
-        .env("RUSTUP_AUTO_INSTALL", "0");
-    #[cfg(windows)]
-    for key in ["SystemRoot", "WINDIR"] {
-        if let Some(value) = std::env::var_os(key) {
-            cmd.env(key, value);
-        }
-    }
-    if let Some(db) = database {
-        cmd.env("OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY", db).args([
-            "scan",
-            "source",
-            "--offline",
-            "--offline-vulnerabilities",
-            "--format=json",
-            "--recursive",
-            "--no-call-analysis",
-            "--no-resolve",
-        ]);
-    } else {
-        cmd.args(["filesystem", "--no-verification", "--no-update", "--json"]);
-    }
-    cmd.arg(target);
-    #[cfg(windows)]
-    report.gaps.push(format!(
-        "{tool}: OS network containment unavailable; offline flags only"
-    ));
-    #[cfg(target_os = "macos")]
-    if !Path::new("/usr/bin/sandbox-exec").is_file() {
-        report.gaps.push(format!(
-            "{tool}: OS network containment unavailable; offline flags only"
-        ));
-    }
-    let result = crate::supervise::run(cmd, &sensor_limits(), None);
-    // Never save raw output, stderr, parser diagnostics or survivor commands:
-    // each can contain secrets. Capped or unclean capture is never parsed.
-    if result.timed_out
-        || result.interrupted
-        || !result.capture_complete
-        || !result.cleanup_complete
-        || result.output_bytes_total > sensor_limits().output_cap_bytes as u64
-        || !matches!(result.exit_code, Some(0))
-            && !(tool == "osv-scanner" && result.exit_code == Some(1))
-    {
-        report.gaps.push(format!(
-            "{tool}: scan failed, timed out, or output incomplete"
-        ));
-        return;
-    }
-    let hits = if result.stdout.contains('\u{fffd}') {
-        Err(())
-    } else if tool == "trufflehog" {
-        trufflehog_hits(&result.stdout, target)
-    } else {
-        osv_hits(&result.stdout, target)
-    };
     match hits {
         Ok(hits) => {
             report.tools_run.push(tool.into());
@@ -464,65 +411,33 @@ fn run_offline(tool: &str, target: &Path, scratch: &Path, report: &mut SensorsRe
     }
 }
 
-/// Tools are trusted installations and read source as data. Deny socket
-/// creation on Linux and all network operations on macOS as extra containment.
-fn offline_command(executable: &Path) -> Command {
-    #[cfg(target_os = "macos")]
-    if Path::new("/usr/bin/sandbox-exec").is_file() {
-        let mut cmd = Command::new("/usr/bin/sandbox-exec");
-        cmd.args(["-p", "(version 1)(allow default)(deny network*)"]);
-        cmd.arg(executable);
-        return cmd;
+fn simple_hits(tool: &str, output: &str, target: &Path) -> Result<Vec<SensorHit>, ()> {
+    let v = crate::shape::strict_json(output).map_err(|_| ())?;
+    let items = if tool == "semgrep" {
+        array(field(&v, "results")?)?
+    } else {
+        array(&v)?
+    };
+    let mut hits = Vec::new();
+    for item in items {
+        let (rule, file, line) = if tool == "semgrep" {
+            (
+                text(field(item, "check_id")?)?,
+                text(field(item, "path")?)?,
+                field(field(item, "start")?, "line")?.as_u64().ok_or(())?,
+            )
+        } else {
+            (
+                text(field(item, "RuleID")?)?,
+                text(field(item, "File")?)?,
+                field(item, "StartLine")?.as_u64().ok_or(())?,
+            )
+        };
+        // Semgrep paths in the disposable copy are returned relative to the
+        // scan root by requesting a relative target from that copy's parent.
+        hits.push(metadata_hit(tool, rule, file, Some(line), target)?);
     }
-    #[allow(unused_mut)]
-    let mut cmd = Command::new(executable);
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: the child only installs a fixed seccomp filter using stack
-        // memory and async-signal-safe syscalls before exec. Failure blocks it.
-        unsafe {
-            cmd.pre_exec(|| {
-                let mut filter = [
-                    libc::sock_filter {
-                        code: 0x20,
-                        jt: 0,
-                        jf: 0,
-                        k: 0,
-                    },
-                    libc::sock_filter {
-                        code: 0x15,
-                        jt: 0,
-                        jf: 1,
-                        k: libc::SYS_socket as u32,
-                    },
-                    libc::sock_filter {
-                        code: 0x06,
-                        jt: 0,
-                        jf: 0,
-                        k: 0x00050000 | libc::EPERM as u32,
-                    },
-                    libc::sock_filter {
-                        code: 0x06,
-                        jt: 0,
-                        jf: 0,
-                        k: 0x7fff0000,
-                    },
-                ];
-                let program = libc::sock_fprog {
-                    len: filter.len() as u16,
-                    filter: filter.as_mut_ptr(),
-                };
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                    || libc::prctl(libc::PR_SET_SECCOMP, 2, &program) != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
-    cmd
+    Ok(hits)
 }
 
 /// Every code hit has its own candidate unit so one resolution cannot hide
@@ -714,6 +629,39 @@ mod offline_tests {
         assert!(osv_hits(r#"{"results":[],"results":[]}"#, target).is_err());
         assert!(osv_hits("[]", target).is_err());
     }
+    #[test]
+    fn alternate_raw_representations_cannot_echo_into_metadata() {
+        for key in ["RawV2", "ExtraData"] {
+            let mut value = truffle();
+            value[key] = json!({"nested": ["alternate-secret"]});
+            value["DetectorName"] = json!("rule-alternate-secret");
+            assert!(trufflehog_hits(&value.to_string(), Path::new("/target")).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_osv_artifacts_require_regeneration() {
+        let hit = metadata_hit(
+            "osv-scanner",
+            "OSV-1",
+            "Cargo.lock",
+            None,
+            Path::new("/target"),
+        )
+        .unwrap();
+        let report = SensorsReport {
+            tools_run: vec![],
+            tools_unavailable: vec![],
+            hits: vec![hit],
+            gaps: vec![],
+        };
+        assert!(
+            crate::shape::sensors(&serde_json::to_string(&report).unwrap())
+                .unwrap_err()
+                .contains("regenerate")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn unix_metadata_preserves_literal_windows_looking_names() {
@@ -727,23 +675,5 @@ mod offline_tests {
         .unwrap();
         assert_eq!(hit.class, crate::paths::Class::Code);
         assert_eq!(hit.file, "%5C%5C?%5Cvendor/lib.rs");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sensor_supervision_enforces_wall_clock_and_output_cap() {
-        let mut limits = sensor_limits();
-        limits.wall_ms = 50;
-        limits.output_cap_bytes = 64;
-        let mut cmd = offline_command(Path::new("/bin/sh"));
-        cmd.args(["-c", "exec /bin/sleep 5"]).env_clear();
-        let result = crate::supervise::run(cmd, &limits, None);
-        assert!(result.timed_out);
-        assert!(result.duration_ms < 3000);
-        let mut cmd = offline_command(Path::new("/bin/sh"));
-        cmd.args(["-c", "printf '%01000d' 0"]).env_clear();
-        let result = crate::supervise::run(cmd, &limits, None);
-        assert!(result.output_bytes_total > 64);
-        assert!(result.stdout.len() <= 64);
     }
 }
