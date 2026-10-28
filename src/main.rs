@@ -1069,10 +1069,10 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         let mut cmd = names
             .iter()
             .map(|name| {
-                let flag = if *name == "java" {
-                    "-version"
-                } else {
-                    "--version"
+                let flag = match *name {
+                    "java" => "-version",
+                    "go" => "version",
+                    _ => "--version",
                 };
                 format!("({name} {flag} > tool-{name}.txt 2>&1 && echo omgs-reach {name})")
             })
