@@ -2834,6 +2834,10 @@ fn finding_content_cannot_forge_markdown_structure() {
                                 a.command.contains(payload),
                                 "the quoted command must be retained"
                             );
+                            assert!(
+                                handoff.contains(&format!("\n{}\n", a.command)),
+                                "the command bytes must remain exact"
+                            );
                             assert!(blocks
                                 .contains(&format!("{}\n", omgs::handoff::normalized(&a.command))));
                             assert_eq!(

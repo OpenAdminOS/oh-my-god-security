@@ -196,7 +196,6 @@ pub(crate) fn markdown_inline(s: &str) -> String {
 
 /// Fences must exceed every content backtick run, including embedded fences.
 pub(crate) fn markdown_data(label: &str, s: &str) -> String {
-    let s = normalized(s);
     let longest = s.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(3.max(longest + 1));
     format!("{label} data (untrusted):\n\n{fence}text\n{s}\n{fence}\n\n")
