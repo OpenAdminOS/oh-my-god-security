@@ -1133,6 +1133,68 @@ mod sweep {
         Ok(info)
     }
 
+    // kinfo_proc starts with extern_proc. Only this exported prefix from
+    // <sys/proc.h> is needed; the rest of the kernel reply stays opaque.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct KernelProcPrefix {
+        start: libc::timeval,
+        vmspace: *mut libc::c_void,
+        sigacts: *mut libc::c_void,
+        flags: libc::c_int,
+        status: libc::c_char,
+        pid: libc::pid_t,
+    }
+
+    fn zombie_identity(pid: i32) -> io::Result<Option<(u64, u64)>> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        // A bounded buffer holds kinfo_proc without duplicating its unused
+        // ABI fields. A larger future reply fails closed with ENOMEM.
+        let mut bytes = [0u8; 4096];
+        let mut length = bytes.len();
+        // SAFETY: mib and the byte buffer are writable for their stated sizes.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as u32,
+                bytes.as_mut_ptr().cast(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            let error = io::Error::last_os_error();
+            return if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        if length == 0 {
+            return Ok(None);
+        }
+        if length < std::mem::size_of::<KernelProcPrefix>() || length > bytes.len() {
+            return Err(io::Error::other("truncated kernel process status reply"));
+        }
+        // SAFETY: the reply contains the complete exported prefix. Byte storage
+        // may be unaligned; the C fields have no invalid bit representations.
+        let info = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<KernelProcPrefix>()) };
+        if info.pid != pid || info.status != 5 {
+            return Ok(None);
+        }
+        let sec = u64::try_from(info.start.tv_sec)
+            .map_err(|_| io::Error::other("invalid zombie start time"))?;
+        let usec = u64::try_from(info.start.tv_usec)
+            .ok()
+            .filter(|usec| *usec < 1_000_000)
+            .ok_or_else(|| io::Error::other("invalid zombie start time"))?;
+        if sec == 0 {
+            return Err(io::Error::other("missing zombie start time"));
+        }
+        Ok(Some((sec, usec)))
+    }
+
     fn pids() -> io::Result<Vec<i32>> {
         // SAFETY: a null buffer asks libproc for the process count.
         let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
@@ -1266,6 +1328,7 @@ mod sweep {
         fn pids(&mut self) -> io::Result<Vec<i32>>;
         fn owned_pids(&mut self, uid: libc::uid_t, capacity: usize) -> io::Result<Vec<i32>>;
         fn info(&mut self, pid: i32) -> io::Result<libc::proc_bsdinfo>;
+        fn zombie_identity(&mut self, pid: i32) -> io::Result<Option<(u64, u64)>>;
         fn policy_check(&mut self, pid: i32, path: Option<&CString>) -> io::Result<i32>;
         fn matches(&mut self, pid: i32, allowed: &CString, denied: &CString) -> io::Result<bool> {
             policy_matches(allowed, denied, |path| self.policy_check(pid, path))
@@ -1291,6 +1354,10 @@ mod sweep {
 
         fn info(&mut self, pid: i32) -> io::Result<libc::proc_bsdinfo> {
             info(pid)
+        }
+
+        fn zombie_identity(&mut self, pid: i32) -> io::Result<Option<(u64, u64)>> {
+            zombie_identity(pid)
         }
 
         fn policy_check(&mut self, pid: i32, path: Option<&CString>) -> io::Result<i32> {
@@ -1416,8 +1483,29 @@ mod sweep {
                         continue;
                     }
                     Err(error) => {
-                        found = true;
-                        if !matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
+                        if matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
+                            // libproc returns ESRCH for retained zombies too.
+                            // A positive kernel zombie identity can become
+                            // stable only after another complete enumeration.
+                            match processes.zombie_identity(pid) {
+                                Ok(Some((sec, usec))) => {
+                                    let identity = (pid, uid, sec, usec);
+                                    if !zombies.contains(&identity) {
+                                        zombies.push(identity);
+                                        found = true;
+                                    }
+                                }
+                                Ok(None) => found = true,
+                                Err(error) => {
+                                    found = true;
+                                    healthy = false;
+                                    result.notes.push(format!(
+                                        "survivor zombie lookup for {pid} failed: {error}"
+                                    ));
+                                }
+                            }
+                        } else {
+                            found = true;
                             result
                                 .notes
                                 .push(format!("survivor uid lookup for {pid} failed: {error}"));
@@ -1612,6 +1700,7 @@ mod sweep {
         enum Step {
             Pids(Vec<i32>, Duration),
             Info(i32, Result<libc::proc_bsdinfo, i32>),
+            Zombie(i32, Result<Option<(u64, u64)>, i32>),
             Matches(i32),
             Policy(i32, Option<&'static str>, Result<i32, i32>),
             Command(i32, Option<&'static str>),
@@ -1654,6 +1743,14 @@ mod sweep {
             fn info(&mut self, pid: i32) -> io::Result<libc::proc_bsdinfo> {
                 let Step::Info(expected, result) = self.next() else {
                     panic!("expected info query for {pid}");
+                };
+                assert_eq!(pid, expected);
+                result.map_err(io::Error::from_raw_os_error)
+            }
+
+            fn zombie_identity(&mut self, pid: i32) -> io::Result<Option<(u64, u64)>> {
+                let Step::Zombie(expected, result) = self.next() else {
+                    panic!("expected kernel zombie lookup for {pid}");
                 };
                 assert_eq!(pid, expected);
                 result.map_err(io::Error::from_raw_os_error)
@@ -1769,9 +1866,11 @@ mod sweep {
             let mut zombie = live();
             zombie.pbi_status = 5;
             for first_lookup in [Err(libc::ESRCH), Err(libc::ENOENT), Ok(zombie)] {
-                let (result, processes) = exercise(vec![
-                    scan(&[A]),
-                    Step::Info(A, first_lookup),
+                let mut steps = vec![scan(&[A]), Step::Info(A, first_lookup)];
+                if first_lookup.is_err() {
+                    steps.push(Step::Zombie(A, Ok(None)));
+                }
+                steps.extend([
                     Step::Pause,
                     scan(&[B]),
                     Step::Info(B, Ok(live())),
@@ -1782,6 +1881,7 @@ mod sweep {
                     Step::Pause,
                     scan(&[]),
                 ]);
+                let (result, processes) = exercise(steps);
                 assert!(result.cleanup_complete, "{result:?}");
                 assert!(result.notes.is_empty(), "{result:?}");
                 assert_eq!(processes.scans, 3);
@@ -1820,12 +1920,89 @@ mod sweep {
         }
 
         #[test]
+        fn libproc_hidden_zombie_rescans_and_finds_child_without_stalling() {
+            let (result, processes) = exercise(vec![
+                scan(&[A]),
+                Step::Info(A, Err(libc::ESRCH)),
+                Step::Zombie(A, Ok(Some((10, 20)))),
+                Step::Pause,
+                scan(&[A, B]),
+                Step::Info(A, Err(libc::ESRCH)),
+                Step::Zombie(A, Ok(Some((10, 20)))),
+                Step::Info(B, Ok(live())),
+                Step::Matches(B),
+                Step::Command(B, Some("child")),
+                Step::Info(B, Ok(live())),
+                Step::Signal(B),
+                Step::Pause,
+                scan(&[A]),
+                Step::Info(A, Err(libc::ESRCH)),
+                Step::Zombie(A, Ok(Some((10, 20)))),
+            ]);
+            assert!(result.cleanup_complete, "{result:?}");
+            assert!(result.notes.is_empty(), "{result:?}");
+            assert_eq!(processes.scans, 3);
+            assert_eq!(processes.signalled, [B]);
+            assert_eq!(result.survivors.len(), 1);
+            assert_eq!(result.survivors[0].pid, B);
+        }
+
+        #[test]
+        fn kernel_zombie_lookup_errors_fail_closed_without_signalling() {
+            let (result, processes) = exercise(vec![
+                scan(&[A]),
+                Step::Info(A, Err(libc::ESRCH)),
+                Step::Zombie(A, Err(libc::EPERM)),
+                Step::Pause,
+                scan(&[]),
+            ]);
+            assert!(!result.cleanup_complete, "{result:?}");
+            assert!(processes.signalled.is_empty());
+            assert!(result
+                .notes
+                .iter()
+                .any(|note| note.contains("zombie lookup")));
+        }
+
+        #[test]
+        fn kernel_query_identifies_retained_zombie_but_not_a_live_process() {
+            // SAFETY: getpid has no preconditions.
+            assert_eq!(zombie_identity(unsafe { libc::getpid() }).unwrap(), None);
+            assert_eq!(zombie_identity(i32::MAX).unwrap(), None);
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap();
+            let start = Instant::now();
+            while !super::super::exited_without_reaping(child.id()).unwrap() {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let pid = i32::try_from(child.id()).unwrap();
+            let first = zombie_identity(pid).unwrap();
+            let second = zombie_identity(pid).unwrap();
+            let libproc_result = info(pid);
+            child.wait().unwrap();
+            assert!(first.is_some());
+            assert_eq!(first, second);
+            assert_eq!(
+                libproc_result.unwrap_err().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+
+        #[test]
         fn early_ambiguity_at_scan_or_time_bound_fails_cleanup() {
             for time_bound in [false, true] {
                 let scans = if time_bound { 1 } else { MAX_SCANS };
                 let mut steps = Vec::new();
                 for _ in 0..scans {
-                    steps.extend([scan(&[A]), Step::Info(A, Err(libc::ESRCH)), Step::Pause]);
+                    steps.extend([
+                        scan(&[A]),
+                        Step::Info(A, Err(libc::ESRCH)),
+                        Step::Zombie(A, Ok(None)),
+                        Step::Pause,
+                    ]);
                 }
                 if time_bound {
                     steps.push(Step::Pids(vec![], DRAIN));
