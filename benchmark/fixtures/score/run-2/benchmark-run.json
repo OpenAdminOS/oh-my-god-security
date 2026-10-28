@@ -38,7 +38,8 @@
           "boundary": "member to private data",
           "fingerprint": "omgs-e00e625fa57d963e",
           "verdict": "confirmed",
-          "proof_tier": "test_proven"
+          "proof_tier": "test_proven",
+          "proof_ref": "proofs/1.json"
         },
         {
           "attack_class": "tenant_isolation",
@@ -47,10 +48,12 @@
           "boundary": "member to private data",
           "fingerprint": "omgs-1dbc0388d873fabe",
           "verdict": "confirmed",
-          "proof_tier": "test_proven"
+          "proof_tier": "test_proven",
+          "proof_ref": "proofs/2.json"
         }
       ],
-      "adjudications": []
+      "adjudications": [],
+      "source_run": "positive"
     },
     {
       "case_id": "fixture",
@@ -63,7 +66,8 @@
       "unexamined_units": [],
       "candidates": [],
       "findings": [],
-      "adjudications": []
+      "adjudications": [],
+      "source_run": null
     },
     {
       "case_id": "fixture",
@@ -78,12 +82,13 @@
       ],
       "candidates": [],
       "findings": [],
-      "adjudications": []
+      "adjudications": [],
+      "source_run": null
     }
   ],
   "resource_usage": {
     "proof_tool_cost_usd": null,
-    "wall_seconds": 14
+    "wall_seconds": 14.4
   },
   "manifest_sha256": "3bb49c77f2a98cea379036f4e8ff1399a6072ce2866af64b0eb062f370da0035"
 }

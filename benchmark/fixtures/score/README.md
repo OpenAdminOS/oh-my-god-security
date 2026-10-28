@@ -1,8 +1,10 @@
 # Scorer arithmetic fixture
 
-These JSON artifacts test arithmetic only. They do not claim a real security
-review or runner-attested proof. No executable target or source snapshot is
-included. Paths and provenance labeled fixture are inert test data. This fixture
+These artifacts test scoring with synthetic archived source runs. Their
+`findings.json`, proof records, saved commands, drafts and MXC configs pass the
+same offline validation as `omgs validate`, including recipe contracts. They do
+not claim a real security review or actual target execution. No executable
+target or source snapshot is included. Paths and provenance labeled fixture are inert test data. This fixture
 is separate from both the excluded examples and the real corpus inventory.
 
 Four positive defects are frozen: a, b, c and d. Defect d's snapshot is blocked in
@@ -24,8 +26,9 @@ Hand calculation:
   supplies no billing, so cost and campaign total are null. Variance cannot be
   computed over the complete cost distribution. Token input/output splits are
   unknown, even when a combined total is supplied. Proof/tool cost is unknown.
-- Wall times: 10 and 14 seconds. Mean 12, range 4, population deviation 2.
+- Wall times: 10.1 and 14.4 seconds. Mean 12.25, range 4.3, population deviation 2.15.
 
 [expected.json](expected.json) records those hand-computed metrics. The golden
-integration test compares all metric objects exactly and separately checks paired
+integration test compares metric structure and counts exactly, with floating point tolerance
+`1e-12 + 1e-12 * abs(expected)` for means, ratios and deviations and separately checks paired
 outcomes, blocked snapshots, pending volume and unexpected confirmations.

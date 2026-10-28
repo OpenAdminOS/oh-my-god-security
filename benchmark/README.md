@@ -84,10 +84,15 @@ omgs bench score --cases benchmark/fixtures/score/cases.json \
 ```
 
 JSON goes to stdout and a short Markdown table to stderr. Errors return exit 2
-without partial results. The command reads JSON only. It performs no fetches,
-proof replays, builds or target execution. Validate proof records and complete
-independent adjudication before freezing the evaluator's scoring exports. A
-claimed tier in an export is not new proof attestation by the scorer.
+without partial results. The command reads saved artifacts only. It performs no fetches,
+proof replays, builds or target execution. Every exported finding is bound to its
+source run's `findings.json`, including the identity, verdict, tier and
+`proof_ref`. Source findings must pass the evidence rules used by `omgs validate`.
+Each matching finding then passes the same offline proof validator, including
+runner config, command and draft digests, clean execution and `omgs-proof/2`
+recipe contract rules. Missing, mismatched or invalid evidence is excluded from
+TP, recovery and FP counts and listed in `invalid_evidence` with diagnostics.
+These are offline consistency checks, not fresh execution or attestation.
 
 Each `--runs` directory is **one complete independent repetition** across every
 case snapshot, including blocked and budget-exhausted snapshots. Save a
@@ -105,7 +110,13 @@ case snapshot, including blocked and budget-exhausted snapshots. Save a
 Every observation requires `case_id`, `snapshot_id`, `status` (`complete`,
 `blocked`, `budget_exhausted`), string arrays `blockers`, `examined_units`,
 `unexamined_units`, and arrays `candidates`, `findings`, `adjudications`.
-Incomplete observations must name blockers. They may retain partial findings.
+Each observation also requires `source_run`, a directory relative to its
+`--runs` repetition containing the archived source `findings.json` and adjacent
+`proofs/` records and runner artifacts. Use null when no source run is available;
+any exported findings then appear in `invalid_evidence` and cannot count.
+Absolute paths, parent traversal and directories escaping the repetition are
+rejected as evidence. Incomplete observations must name blockers. They may
+retain partial findings.
 An empty findings array never removes a case from the primary denominator.
 
 - Each candidate has required `attack_class`, `entry_point`, `sink`, `boundary`
@@ -117,15 +128,22 @@ An empty findings array never removes a case from the primary denominator.
   with multiple submitted identities. They are not inferred from final verdicts.
 - Each finding has required `fingerprint`, the four identity inputs, `verdict`
   (`confirmed`, `rejected`, `needs_validation`) and `proof_tier` (`traced`,
-  `test_proven`, `sandbox_exploited`). Fingerprints must match `omgs fingerprint`.
-  Recovery requires the expected minimum tier, never below `test_proven`.
+  `test_proven`, `sandbox_exploited`) and `proof_ref` (string or explicit null).
+  Fingerprints must match `omgs fingerprint`. Recovery requires validated source
+  evidence at the expected minimum tier, never below `test_proven`. The source
+  file is checked as a whole for invalid identities and conflicting records;
+  proof errors are reported per exported finding.
 - Each adjudication has required `fingerprint`, `outcome` (`false_positive`,
-  `pending`), `negative_unit` and `review`. A false positive names the zero-based
+  `pending`, `disputed`), `negative_unit` and `review`. A false positive names the zero-based
   index of an independently adjudicated `known_clean_units` entry covering that
-  snapshot. Pending uses null. `review` has `reviewer`, ISO UTC `reviewed_at`,
+  snapshot. Pending and disputed use null. `review` has `reviewer`, ISO UTC `reviewed_at`,
   and evaluator-only `evidence_path`. Only independently refuted proven
   confirmations count as FP. Unexpected confirmations, including unreviewed
-  fixed-snapshot findings, stay listed for adjudication.
+  fixed-snapshot findings, stay listed for adjudication. Pending and disputed
+  adjudications are listed separately in `pending_adjudications`, even for a
+  positive identity match. They count neither as TP nor recovery until resolved.
+  The frozen denominator is unchanged. This list is separate from
+  `true_candidates_pending`, which measures verifier deferrals.
 
 Required manifest fields from the format above are validated recursively,
 including explicit nullable fields. Unknown keys, duplicates, missing fields,
@@ -151,7 +169,11 @@ Mean recall reports the sum of recovered defect counts over all repetitions
 divided by positive defects times `k`, equivalent to the arithmetic mean because
 every repetition has the same frozen denominator. Variance objects contain the
 distribution, known-sample numerator and total-repetition denominator. Standard deviation is the population
-standard deviation (divide by `k`). Zero denominators and unavailable values
+standard deviation (divide by `k`), using `delta * delta` for squared deviations.
+Floating point comparisons use an absolute tolerance of `1e-12` plus a relative
+tolerance of `1e-12 * abs(expected)`; counts and structural fields remain exact.
+The golden wall-time fixture includes decimal samples to exercise this tolerance.
+Zero denominators and unavailable values
 produce null. Any unknown sample makes complete-distribution mean, range and
 standard deviation null, rather than silently selecting a cheaper executable
 subset. Per-defect frequency uses recovered repetitions divided by `k`. Its display

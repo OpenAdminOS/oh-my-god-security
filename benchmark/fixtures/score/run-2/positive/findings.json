@@ -1,0 +1,42 @@
+{
+  "findings": [
+    {
+      "attack_class": "tenant_isolation",
+      "entry_point": "app/api/b-refactor/route.ts:GET",
+      "sink": "loadb-refactor",
+      "boundary": "member to private data",
+      "fingerprint": "omgs-e00e625fa57d963e",
+      "verdict": "confirmed",
+      "proof_tier": "test_proven",
+      "proof_ref": "proofs/1.json",
+      "title": "Fixture omgs-e00e625fa57d963e",
+      "location": {
+        "path": "app/api/b-refactor/route.ts",
+        "line": 1
+      },
+      "evidence": "Fixture source trace and archived failing assertion.",
+      "hunted_by": "fixture-hunter",
+      "verified_by": "fixture-verifier",
+      "severity": "high"
+    },
+    {
+      "attack_class": "tenant_isolation",
+      "entry_point": "app/api/c/route.ts:GET",
+      "sink": "loadc",
+      "boundary": "member to private data",
+      "fingerprint": "omgs-1dbc0388d873fabe",
+      "verdict": "confirmed",
+      "proof_tier": "test_proven",
+      "proof_ref": "proofs/2.json",
+      "title": "Fixture omgs-1dbc0388d873fabe",
+      "location": {
+        "path": "app/api/c/route.ts",
+        "line": 1
+      },
+      "evidence": "Fixture source trace and archived failing assertion.",
+      "hunted_by": "fixture-hunter",
+      "verified_by": "fixture-verifier",
+      "severity": "high"
+    }
+  ]
+}

@@ -145,6 +145,25 @@ fn refs(v: &Value, snapshots: &BTreeMap<String, String>, roles: &str) -> Result<
     Ok(())
 }
 
+fn repository_family(url: &str) -> String {
+    let url = url.trim_end_matches('/');
+    let url = if url.to_ascii_lowercase().ends_with(".git") {
+        &url[..url.len() - 4]
+    } else {
+        url
+    };
+    let rest = url.strip_prefix("https://").unwrap_or(url);
+    if rest
+        .split('/')
+        .next()
+        .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+    {
+        url.to_ascii_lowercase()
+    } else {
+        url.to_owned()
+    }
+}
+
 /// Required fields are checked before any value is used. Null is explicit only.
 pub fn manifest(v: &Value) -> Result<()> {
     object(v, "format_version examples_only cases")?;
@@ -165,10 +184,7 @@ pub fn manifest(v: &Value) -> Result<()> {
         }
         let split = (&c["split"]["partition"], &c["split"]["rotation_id"]);
         if let Some(url) = c["source"]["repository_url"].as_str() {
-            if let Some(previous) = repositories.insert(
-                url.trim_end_matches(".git").trim_end_matches('/'),
-                &c["split"],
-            ) {
+            if let Some(previous) = repositories.insert(repository_family(url), &c["split"]) {
                 if previous != &c["split"] {
                     return Err("repository family has inconsistent cohort/split".into());
                 }
@@ -398,7 +414,17 @@ fn stats(values: Vec<Option<f64>>) -> Value {
     let mean = all.then(|| known.iter().sum::<f64>() / n as f64);
     let min = all.then(|| known.iter().copied().fold(f64::INFINITY, f64::min));
     let max = all.then(|| known.iter().copied().fold(f64::NEG_INFINITY, f64::max));
-    let sd = mean.map(|m| (known.iter().map(|v| (v - m).powi(2)).sum::<f64>() / n as f64).sqrt());
+    let sd = mean.map(|m| {
+        (known
+            .iter()
+            .map(|v| {
+                let delta = v - m;
+                delta * delta
+            })
+            .sum::<f64>()
+            / n as f64)
+            .sqrt()
+    });
     json!({"distribution":values,"numerator":n,"denominator":values.len(),"mean":mean,"min":min,"max":max,"range":min.zip(max).map(|(a,b)|b-a),"standard_deviation":sd})
 }
 fn tier(v: &Value) -> Result<u8> {
@@ -442,7 +468,7 @@ fn validate_run(r: &Value, m: &Value) -> Result<()> {
     }
     let mut seen = BTreeSet::new();
     for o in list(&r["observations"])? {
-        object(o,"case_id snapshot_id status blockers examined_units unexamined_units candidates findings adjudications")?;
+        object(o,"case_id snapshot_id status blockers examined_units unexamined_units candidates findings adjudications source_run")?;
         texts(o, "case_id snapshot_id")?;
         choice(&o["status"], "complete blocked budget_exhausted")?;
         for f in ["blockers", "examined_units", "unexamined_units"] {
@@ -464,6 +490,9 @@ fn validate_run(r: &Value, m: &Value) -> Result<()> {
         if !seen.insert((text(&o["case_id"])?, text(&o["snapshot_id"])?)) {
             return Err("duplicate snapshot observation".into());
         }
+        if !o["source_run"].is_null() {
+            text(&o["source_run"])?;
+        }
         let mut candidates = BTreeSet::new();
         for c in list(&o["candidates"])? {
             object(c, "attack_class entry_point sink boundary verifier")?;
@@ -476,10 +505,13 @@ fn validate_run(r: &Value, m: &Value) -> Result<()> {
         for f in list(&o["findings"])? {
             object(
                 f,
-                "fingerprint attack_class entry_point sink boundary verdict proof_tier",
+                "fingerprint attack_class entry_point sink boundary verdict proof_tier proof_ref",
             )?;
             choice(&f["verdict"], "confirmed rejected needs_validation")?;
             tier(&f["proof_tier"])?;
+            if !f["proof_ref"].is_null() {
+                text(&f["proof_ref"])?;
+            }
             let fp = identity(f)?;
             if f["fingerprint"] != fp || !findings.insert(fp) {
                 return Err("incorrect or duplicate finding fingerprint".into());
@@ -496,7 +528,7 @@ fn validate_run(r: &Value, m: &Value) -> Result<()> {
             if !adjudications.insert(text(&a["fingerprint"])?) {
                 return Err("duplicate adjudication".into());
             }
-            choice(&a["outcome"], "false_positive pending")?;
+            choice(&a["outcome"], "false_positive pending disputed")?;
             review(&a["review"])?;
             if a["outcome"] == "false_positive" {
                 let i = a["negative_unit"]
@@ -509,7 +541,7 @@ fn validate_run(r: &Value, m: &Value) -> Result<()> {
                     return Err("negative unit snapshot mismatch".into());
                 }
             } else if !a["negative_unit"].is_null() {
-                return Err("pending negative_unit must be null".into());
+                return Err("unresolved negative_unit must be null".into());
             }
         }
     }
@@ -521,6 +553,105 @@ fn validate_run(r: &Value, m: &Value) -> Result<()> {
         return Err("every snapshot needs an observation, including blocked snapshots".into());
     }
     Ok(())
+}
+
+// Keep proof validation results separate from the evaluator's exported claims.
+struct ScoringRun {
+    export: Value,
+    accounting: Value,
+    evidence_errors: BTreeMap<(String, String, String), Vec<String>>,
+}
+
+fn source_findings(
+    dir: &Path,
+    observation: &Value,
+) -> Result<(crate::model::FindingsFile, PathBuf)> {
+    let source = text(&observation["source_run"]).map_err(|_| "missing source_run".to_owned())?;
+    // Archived source runs must stay within the supplied repetition, including symlinks.
+    if source.contains('\\')
+        || source.contains(':')
+        || source.starts_with('/')
+        || source
+            .split('/')
+            .any(|part| part == ".." || part.is_empty())
+    {
+        return Err("source_run must be a relative directory within the repetition".into());
+    }
+    let root = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+    let source =
+        std::fs::canonicalize(root.join(source)).map_err(|e| format!("source_run: {e}"))?;
+    if !source.starts_with(&root) {
+        return Err("source_run escapes the repetition".into());
+    }
+    let path = source.join("findings.json");
+    let input = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let file = crate::shape::findings(&input)?;
+    let errors = crate::model::validate(&file);
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    Ok((file, source))
+}
+
+fn evidence_errors(
+    dir: &Path,
+    r: &Value,
+) -> Result<BTreeMap<(String, String, String), Vec<String>>> {
+    let mut errors = BTreeMap::new();
+    for o in list(&r["observations"])? {
+        if list(&o["findings"])?.is_empty() {
+            continue;
+        }
+        let source = source_findings(dir, o);
+        for f in list(&o["findings"])? {
+            let result = match &source {
+                Err(e) => vec![e.clone()],
+                Ok((file, source)) => match file
+                    .findings
+                    .iter()
+                    .find(|s| s.fingerprint == f["fingerprint"])
+                {
+                    None => vec!["exported finding is missing from source findings.json".into()],
+                    Some(finding) => {
+                        let original = serde_json::to_value(finding).map_err(|e| e.to_string())?;
+                        if [
+                            "fingerprint",
+                            "attack_class",
+                            "entry_point",
+                            "sink",
+                            "boundary",
+                            "verdict",
+                            "proof_tier",
+                            "proof_ref",
+                        ]
+                        .iter()
+                        .any(|key| original[*key] != f[*key])
+                        {
+                            vec!["exported finding does not match source findings.json (identity, verdict, tier or proof_ref)".into()]
+                        } else {
+                            // The same offline proof validator used by `omgs validate`, including
+                            // runner artifacts and omgs-proof/2 contract rules. No replay.
+                            crate::proof::validate_proofs(
+                                &crate::model::FindingsFile {
+                                    findings: vec![finding.clone()],
+                                },
+                                source,
+                            )
+                        }
+                    }
+                },
+            };
+            errors.insert(
+                (
+                    text(&o["case_id"])?.to_owned(),
+                    text(&o["snapshot_id"])?.to_owned(),
+                    text(&f["fingerprint"])?.to_owned(),
+                ),
+                result,
+            );
+        }
+    }
+    Ok(errors)
 }
 
 // Consume the host accounting shape without depending on report/status modules.
@@ -644,15 +775,20 @@ pub fn score(cases: &Path, dirs: &[PathBuf]) -> Result<Value> {
         if r["repetitions"].as_u64() != Some(dirs.len() as u64) {
             return Err("run count differs from predeclared repetitions".into());
         }
-        if let Some((first, _)) = runs.first() {
-            let first: &Value = first;
+        if let Some(first) = runs.first() {
+            let first: &ScoringRun = first;
+            let first = &first.export;
             for field in ["campaign_id", "configuration", "repetitions"] {
                 if r[field] != first[field] {
                     return Err("inconsistent campaign configuration".into());
                 }
             }
         }
-        runs.push((r, accounting(dir)?));
+        runs.push(ScoringRun {
+            evidence_errors: evidence_errors(dir, &r)?,
+            export: r,
+            accounting: accounting(dir)?,
+        });
     }
     let mut cohorts = BTreeMap::<String, Vec<&Value>>::new();
     for c in list(&m["cases"])? {
@@ -668,10 +804,13 @@ pub fn score(cases: &Path, dirs: &[PathBuf]) -> Result<Value> {
     for (cohort, cases) in cohorts {
         output.push(score_cohort(&cohort, &cases, &runs)?);
     }
-    let costs: Vec<Option<f64>> = runs.iter().map(|(_, a)| a["cost_usd"].as_f64()).collect();
+    let costs: Vec<Option<f64>> = runs
+        .iter()
+        .map(|r| r.accounting["cost_usd"].as_f64())
+        .collect();
     let total = costs.iter().try_fold(0.0, |s, c| c.map(|v| s + v));
     Ok(
-        json!({"format_version":1,"cohort":"entire_campaign","campaign_id":runs[0].0["campaign_id"],"configuration":runs[0].0["configuration"],"k":runs.len(),"cli_model_calls":0,"cohorts":output,"cost_per_run":runs.iter().map(|(r,a)|json!({"run_id":r["run_id"],"numerator":a,"denominator":1,"cohort":"entire_campaign","resource_usage":r["resource_usage"]})).collect::<Vec<_>>(),"total_k_run_cost_usd":{"numerator":total,"denominator":runs.len(),"cohort":"entire_campaign"},"cost_variance":stats(costs),"time_variance":stats(runs.iter().map(|(r,_)|r["resource_usage"]["wall_seconds"].as_f64()).collect())}),
+        json!({"format_version":1,"cohort":"entire_campaign","campaign_id":runs[0].export["campaign_id"],"configuration":runs[0].export["configuration"],"k":runs.len(),"cli_model_calls":0,"cohorts":output,"cost_per_run":runs.iter().map(|r|json!({"run_id":r.export["run_id"],"numerator":r.accounting,"denominator":1,"cohort":"entire_campaign","resource_usage":r.export["resource_usage"]})).collect::<Vec<_>>(),"total_k_run_cost_usd":{"numerator":total,"denominator":runs.len(),"cohort":"entire_campaign"},"cost_variance":stats(costs),"time_variance":stats(runs.iter().map(|r|r.export["resource_usage"]["wall_seconds"].as_f64()).collect())}),
     )
 }
 // Escape the separator and escape character so case/defect pairs cannot alias.
@@ -680,7 +819,7 @@ fn defect_key(case_id: &str, defect_id: &str) -> String {
     format!("{}:{}", component(case_id), component(defect_id))
 }
 
-fn score_cohort(cohort: &str, cases: &[&Value], runs: &[(Value, Value)]) -> Result<Value> {
+fn score_cohort(cohort: &str, cases: &[&Value], runs: &[ScoringRun]) -> Result<Value> {
     let denominator: usize = cases
         .iter()
         .map(|c| c["expected_findings"].as_array().unwrap().len())
@@ -706,7 +845,8 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[(Value, Value)]) -> Resu
     let mut per_run = Vec::new();
     let mut recalls = Vec::new();
     let mut fps = Vec::new();
-    for (r, _) in runs {
+    for run in runs {
+        let r = &run.export;
         let mut recovered = BTreeSet::new();
         let mut tp = BTreeSet::new();
         let mut fp = 0;
@@ -715,6 +855,8 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[(Value, Value)]) -> Resu
         let mut rejected = BTreeSet::new();
         let mut pending = BTreeSet::new();
         let mut unexpected = Vec::new();
+        let mut invalid_evidence = Vec::new();
+        let mut pending_adjudications = Vec::new();
         let mut needs_validation = 0;
         let mut blocked = Vec::new();
         let mut paired = Vec::new();
@@ -727,6 +869,24 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[(Value, Value)]) -> Resu
                 let sid = text(&o["snapshot_id"])?;
                 if o["status"] != "complete" {
                     blocked.push(json!({"case_id":cid,"snapshot_id":sid,"status":o["status"],"blockers":o["blockers"]}));
+                }
+                let mut invalid = BTreeSet::new();
+                let mut unresolved = BTreeSet::new();
+                for f in list(&o["findings"])? {
+                    let fingerprint = text(&f["fingerprint"])?;
+                    let errors = &run.evidence_errors
+                        [&(cid.to_owned(), sid.to_owned(), fingerprint.to_owned())];
+                    if !errors.is_empty() {
+                        invalid.insert(fingerprint);
+                        invalid_evidence.push(json!({"case_id":cid,"snapshot_id":sid,"fingerprint":fingerprint,"source_run":o["source_run"],"errors":errors}));
+                    }
+                    if let Some(adj) = list(&o["adjudications"])?.iter().find(|a| {
+                        a["fingerprint"] == fingerprint
+                            && (a["outcome"] == "pending" || a["outcome"] == "disputed")
+                    }) {
+                        unresolved.insert(fingerprint);
+                        pending_adjudications.push(json!({"case_id":cid,"snapshot_id":sid,"fingerprint":fingerprint,"outcome":adj["outcome"],"review":adj["review"]}));
+                    }
                 }
                 let mut matched = BTreeSet::new();
                 for e in list(&c["expected_findings"])? {
@@ -749,6 +909,8 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[(Value, Value)]) -> Resu
                     let mut found = false;
                     for f in list(&o["findings"])? {
                         if positive
+                            && !invalid.contains(text(&f["fingerprint"])?)
+                            && !unresolved.contains(text(&f["fingerprint"])?)
                             && f["verdict"] == "confirmed"
                             && tier(&f["proof_tier"])? >= tier(&e["minimum_proof_tier"])?
                             && aliases.contains(text(&f["fingerprint"])?)
@@ -780,7 +942,10 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[(Value, Value)]) -> Resu
                         continue;
                     }
                     let fingerprint = text(&f["fingerprint"])?;
-                    if matched.contains(fingerprint) {
+                    if matched.contains(fingerprint)
+                        || invalid.contains(fingerprint)
+                        || unresolved.contains(fingerprint)
+                    {
                         continue;
                     }
                     let adj = list(&o["adjudications"])?
@@ -815,7 +980,7 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[(Value, Value)]) -> Resu
             .filter(|o| cases.iter().any(|c| c["id"] == o["case_id"]))
             .map(|o| json!({"case_id":o["case_id"],"snapshot_id":o["snapshot_id"],"status":o["status"],"blockers":o["blockers"],"examined_units":o["examined_units"],"unexamined_units":o["unexamined_units"]}))
             .collect();
-        per_run.push(json!({"run_id":r["run_id"],"recall":ratio(recovered.len(),denominator),"false_positives":ratio(fp,1),"true_positive_detections":ratio(tp.len(),1),"false_discovery_fraction":ratio(fp,tp.len()+fp),"negative_unit_rate":ratio(fp_units.len(),negative_units),"verifier_false_rejection_rate":ratio(rejected.len(),submitted.len()),"true_candidates_pending":ratio(pending.len(),submitted.len()),"needs_validation":ratio(needs_validation,1),"unexpected_confirmations":unexpected,"blocked_or_exhausted":blocked,"paired_outcomes":paired,"snapshot_context":snapshot_context}));
+        per_run.push(json!({"run_id":r["run_id"],"recall":ratio(recovered.len(),denominator),"false_positives":ratio(fp,1),"true_positive_detections":ratio(tp.len(),1),"false_discovery_fraction":ratio(fp,tp.len()+fp),"negative_unit_rate":ratio(fp_units.len(),negative_units),"verifier_false_rejection_rate":ratio(rejected.len(),submitted.len()),"true_candidates_pending":ratio(pending.len(),submitted.len()),"needs_validation":ratio(needs_validation,1),"unexpected_confirmations":unexpected,"invalid_evidence":invalid_evidence,"pending_adjudications":pending_adjudications,"blocked_or_exhausted":blocked,"paired_outcomes":paired,"snapshot_context":snapshot_context}));
     }
     Ok(
         json!({"cohort":cohort,"context":cases,"runs":per_run,"mean_recall":ratio(frequency.values().sum(),denominator * runs.len()),"union_recall":ratio(union.len(),denominator),"recall_variance":stats(recalls),"false_positive_variance":stats(fps),"detection_frequency":frequency.into_iter().map(|(id,n)|json!({"defect":id,"frequency":ratio(n,runs.len())})).collect::<Vec<_>>()}),
@@ -823,7 +988,7 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[(Value, Value)]) -> Resu
 }
 
 pub fn markdown(result: &Value) -> String {
-    let mut s=String::from("| Cohort | Run | Recall | FP | FDR | Negative-unit rate | Verifier rejection | Pending |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    let mut s=String::from("| Cohort | Run | Recall | FP | FDR | Negative-unit rate | Verifier rejection | Verifier pending | Pending adjudications | Invalid evidence |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
     let display = |v: &Value| format!("{}/{} ({})", v["numerator"], v["denominator"], v["value"]);
     for c in result["cohorts"].as_array().unwrap() {
         let name = c["cohort"]
@@ -832,7 +997,7 @@ pub fn markdown(result: &Value) -> String {
             .replace(['|', '\n', '\r'], " ");
         for r in c["runs"].as_array().unwrap() {
             s.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 name,
                 r["run_id"]
                     .as_str()
@@ -843,11 +1008,13 @@ pub fn markdown(result: &Value) -> String {
                 display(&r["false_discovery_fraction"]),
                 display(&r["negative_unit_rate"]),
                 display(&r["verifier_false_rejection_rate"]),
-                display(&r["true_candidates_pending"])
+                display(&r["true_candidates_pending"]),
+                r["pending_adjudications"].as_array().unwrap().len(),
+                r["invalid_evidence"].as_array().unwrap().len()
             ));
         }
         s.push_str(&format!(
-            "| {name} | union of {} | {} | | | | | |\n",
+            "| {name} | union of {} | {} | | | | | | | |\n",
             result["k"],
             display(&c["union_recall"])
         ));
@@ -898,7 +1065,21 @@ mod tests {
         }
         let mut run = original.clone();
         run["observations"] = json!(observations);
-        let result = score_cohort("separate_ids", &[&first, &second], &[(run, json!({}))]).unwrap();
+        let result = score_cohort(
+            "separate_ids",
+            &[&first, &second],
+            &[ScoringRun {
+                evidence_errors: evidence_errors(
+                    &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("benchmark/fixtures/score/run-1"),
+                    &run,
+                )
+                .unwrap(),
+                export: run,
+                accounting: json!({}),
+            }],
+        )
+        .unwrap();
         assert_eq!(result["union_recall"], ratio(2, 2));
         assert_eq!(result["runs"][0]["recall"], ratio(2, 2));
         assert_eq!(result["detection_frequency"].as_array().unwrap().len(), 2);

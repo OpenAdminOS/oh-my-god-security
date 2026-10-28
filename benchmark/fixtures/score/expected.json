@@ -151,16 +151,16 @@
   },
   "time_variance": {
     "distribution": [
-      10.0,
-      14.0
+      10.1,
+      14.4
     ],
     "numerator": 2,
     "denominator": 2,
-    "mean": 12.0,
-    "min": 10.0,
-    "max": 14.0,
-    "range": 4.0,
-    "standard_deviation": 2.0
+    "mean": 12.25,
+    "min": 10.1,
+    "max": 14.4,
+    "range": 4.3,
+    "standard_deviation": 2.15
   },
   "costs": [
     2.0,
