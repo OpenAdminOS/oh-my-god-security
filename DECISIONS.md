@@ -30,6 +30,21 @@ Acceptance test for this directive: a new user goes from zero to a first proven 
    Escalation is decided by the deterministic runner under the run budget, cheapest decisive tier first. Public wording is sandbox verified against a local build. OMGS never claims to pen test a live system.
 6. Findings never live in the target tree. Run output defaults to a directory outside the repository. Only intent answers, policy, suppressions and accepted proof tests are committed.
 
+## Local trust and CI enforcement
+
+The enforcement point is `omgs gate` in CI. It reads policy from the base
+commit, reruns committed tests in MXC, and trusts no local run artifacts.
+CI gate results remain authoritative.
+
+Locally, OMGS protects against run artifacts written or edited through the run
+directory, including agent output and imported or copied runs, and against other
+OS users. Owner-private storage and admission checks enforce this boundary.
+
+A process running as the same OS user with arbitrary file access can change
+anything that user owns, including `OMGS_HOME`. Local reports cannot be protected
+against such a fully compromised agent shell. This is a documented limit.
+Local provenance does not isolate a run from its owner.
+
 ## Sandbox requirements for proof execution
 
 Target controlled code, including builds, tests and the running app at level 2, executes only inside an OS enforced sandbox. Amended on 2026-10-27: Microsoft MXC is the only backend on every OS (Seatbelt through `mxc-exec-mac` on Apple Silicon macOS 15 or later, bubblewrap through `lxc-exec` on Linux, ProcessContainer through `wxc-exec.exe` on Windows 11 builds where the MXC probe reports no DACL augmentation; tiers that need augmentation, such as the one observed on Windows Server 2025, are refused); OMGS's own Seatbelt and bubblewrap profiles are removed. The executor is pinned by SHA-256 to one MXC release and refused on any mismatch. Every proof run aims for all of the following, and its proof record names exactly what was enforced and what was not:
@@ -87,7 +102,7 @@ Sandbox proofs may capture screenshots as supporting evidence, opt-in per run. W
 
 ## Reporting
 
-Every run produces three views of the same verified records. `findings.json` and SARIF are the machine readable truth. `REPORT.md` is the plain text record. `REPORT.html` is a single self contained one pager for humans, rendered deterministically by the CLI from the same records: verdict summary without any coverage score, confirmed findings with severity and proof tier, pending intent questions, what was not examined, and run metadata covering mode, budget, model and sandbox backend. The HTML file carries inline styling only, makes no external requests, works offline, prints cleanly to PDF, and escapes all target derived content so audited code cannot inject markup into the report. It is stored with the other run output outside the target tree and treated as sensitive, because it describes vulnerabilities.
+Every run produces three views of the same verified records. `findings.json` and SARIF are the machine readable local record, subject to the local trust limits above. `REPORT.md` is the plain text record. `REPORT.html` is a single self contained one pager for humans, rendered deterministically by the CLI from the same records: verdict summary without any coverage score, confirmed findings with severity and proof tier, pending intent questions, what was not examined, and run metadata covering mode, budget, model and sandbox backend. The HTML file carries inline styling only, makes no external requests, works offline, prints cleanly to PDF, and escapes all target derived content so audited code cannot inject markup into the report. It is stored with the other run output outside the target tree and treated as sensitive, because it describes vulnerabilities.
 
 ## Privacy and network
 

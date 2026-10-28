@@ -303,13 +303,17 @@ A missing blob uses the defaults; a bad ref or malformed committed blob is an
 error. The resolved commit, source, exact blob, parsed policy and SHA-256 are
 saved in `run-metadata.json` under `policy` for review. The CLI also records the
 full base SHA and policy blob digest beside the reviewer's intent store, outside
-the run and target, bound to their canonical paths. Reports, fix runs and policy
-proposals reload policy using this trusted record. Edited snapshots warn and are
+the run and target, bound to their canonical paths, a fresh run generation and
+the physical directory identity. Records are exclusive and never replaced;
+reinitializing a retired output path requires a new path. Store directories and
+opened records undergo owner-private admission on every platform. Reports, fix
+runs and policy proposals reload policy using this trusted record. Edited snapshots warn and are
 ignored. No-base CLI settings are retained in the trusted record for inheritance.
 Gate independently reads its explicit immutable base from Git at invocation
 time. Conflicting mode, persona or budget flags cannot override committed policy.
 Fix runs inherit authenticated policy and spend only the computed remaining
-budget. Older or moved runs without trusted provenance require a fresh audit;
+budget, bounded by the original run's authenticated cap rather than edited
+metadata. Older or moved runs without trusted provenance require a fresh audit;
 see [policy provenance](docs/policy-workflow.md#reviewer-owned-policy-provenance).
 
 The object reader executes the following commands with a cleared environment,

@@ -425,6 +425,8 @@ pub fn load_base(target: &Path, base: Option<&str>) -> Result<Snapshot, String> 
 pub struct TrustedPolicy {
     pub target: String,
     pub run: String,
+    pub generation: String,
+    pub directory_identity: (u64, u64),
     pub base_commit: Option<String>,
     pub sha256: String,
     /// CLI settings are retained only when the base has no policy blob.
@@ -432,11 +434,19 @@ pub struct TrustedPolicy {
 }
 
 impl TrustedPolicy {
-    pub fn new(target: &Path, run: &Path, snapshot: &Snapshot) -> Result<Self, String> {
+    pub fn new(
+        target: &Path,
+        run: &Path,
+        generation: &str,
+        snapshot: &Snapshot,
+    ) -> Result<Self, String> {
         let base = load_base(target, snapshot.base_commit.as_deref())?;
         Ok(Self {
             target: target.to_string_lossy().into(),
             run: run.to_string_lossy().into(),
+            generation: generation.into(),
+            directory_identity: crate::platform::directory_identity(run)
+                .map_err(|e| e.to_string())?,
             base_commit: base.base_commit,
             sha256: base.sha256,
             no_base_policy: base.original.is_none().then(|| snapshot.policy.clone()),
@@ -470,6 +480,17 @@ pub fn committed_snapshot(
     }
     if Path::new(&trusted.target) != target || Path::new(&trusted.run) != run {
         return Err("trusted policy record belongs to another target or run".into());
+    }
+    let generation = crate::platform::read_bounded(&run.join(".omgs-claim"), 64).map_err(|e| {
+        format!("run generation unavailable: {e}; re-initialize into a new output path")
+    })?;
+    if trusted.generation.len() != 64
+        || !trusted.generation.bytes().all(|b| b.is_ascii_hexdigit())
+        || generation != trusted.generation.as_bytes()
+        || crate::platform::directory_identity(&run).map_err(|e| e.to_string())?
+            != trusted.directory_identity
+    {
+        return Err("trusted policy run generation or directory identity mismatch; re-initialize into a new output path".into());
     }
     if trusted.base_commit.as_deref().is_some_and(|b| !oid(b)) {
         return Err("trusted base must be a full immutable commit SHA".into());

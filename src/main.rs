@@ -1569,6 +1569,10 @@ fn trusted_store(target: &Path) -> Result<PathBuf, String> {
             path.display()
         ));
     }
+    if parent.exists() {
+        omgs::platform::check_private_dir(parent)
+            .map_err(|e| format!("owner-private intent store: {e}"))?;
+    }
     Ok(path)
 }
 
@@ -1628,30 +1632,32 @@ fn authenticated_policy(
     let bytes = omgs::platform::read_bounded(&path, omgs::policy::MAX_BYTES)
         .map_err(|e| format!("trusted policy record unavailable: {e}; initialize a fresh audit; see docs/policy-workflow.md#pre-policy-runs"))?;
     let text = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
-    let record = serde_json::from_value(omgs::shape::strict_json(text)?)
-        .map_err(|e| format!("invalid trusted policy record: {e}"))?;
+    let record = serde_json::from_value(omgs::shape::strict_json(text)?).map_err(|e| {
+        format!("invalid trusted policy record: {e}; re-initialize into a new output path")
+    })?;
     omgs::policy::committed_snapshot(&run, &target, &record)
 }
 
 fn save_trusted_policy(
     target: &Path,
     run: &Path,
+    generation: &str,
     snapshot: &omgs::policy::Snapshot,
 ) -> Result<(), String> {
     let run = std::fs::canonicalize(run).map_err(|e| e.to_string())?;
     let path = trusted_policy_path(target, &run)?;
-    // Existing intent stores may have searchable, owner-writable directories.
-    // Match answer-store creation; the record itself is private and single-link.
-    std::fs::create_dir_all(path.parent().ok_or("trusted store needs a parent")?)
+    omgs::platform::create_private_tree(path.parent().ok_or("trusted store needs a parent")?)
         .map_err(|e| e.to_string())?;
-    // Check again after creating the store, including all resolved parents.
+    // Re-resolve and admit the store after creating it.
     let path = trusted_policy_path(target, &run)?;
-    let record = omgs::policy::TrustedPolicy::new(target, &run, snapshot)?;
+    let record = omgs::policy::TrustedPolicy::new(target, &run, generation, snapshot)?;
     let text = serde_json::to_string_pretty(&record).map_err(|e| e.to_string())?;
     if text.len() as u64 > omgs::policy::MAX_BYTES {
         return Err("trusted policy record exceeds 1 MiB".into());
     }
-    omgs::runmeta::write_atomic(&path, &text)
+    omgs::platform::write_private_new(&path, text.as_bytes()).map_err(|e| {
+        format!("cannot publish trusted policy record: {e}; re-initialize into a new output path")
+    })
 }
 
 /// The run's intent answers, only when they belong to the run's target as
@@ -1765,8 +1771,8 @@ fn run_reroutes(dir: Option<&Path>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Every file OMGS writes into a run or output directory goes through an
-/// atomic replace, so a planted symlink or hardlink at the destination is
+/// Mutable run output goes through an atomic replace, so a planted symlink
+/// or hardlink at the destination is
 /// replaced rather than written through into another location.
 fn write_out(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> std::io::Result<()> {
     omgs::runmeta::write_atomic_bytes(path.as_ref(), contents.as_ref())
@@ -1941,43 +1947,52 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     }
     let target = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
     authenticated_policy(Path::new(&parent), Path::new(&target))?;
-    omgs::budget::init_fix(Path::new(&parent), |root, original, remaining| {
-        let target = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
-        let target = std::fs::canonicalize(target).map_err(|e| e.to_string())?;
-        if original.get("target").and_then(|v| v.as_str()) != target.to_str() {
-            return Err("fix run target must match its original run".into());
-        }
-        let runs_dir = root.parent().ok_or("original run needs a runs directory")?;
-        let output_parent = if let Some(out) = flag(rest, "--out") {
-            let out = PathBuf::from(out);
-            let absolute = if out.is_absolute() {
-                out
+    omgs::budget::init_fix(
+        Path::new(&parent),
+        |root| {
+            Ok(authenticated_policy(root, Path::new(&target))?
+                .snapshot()
+                .policy
+                .budget)
+        },
+        |root, original, remaining| {
+            let target = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
+            let target = std::fs::canonicalize(target).map_err(|e| e.to_string())?;
+            if original.get("target").and_then(|v| v.as_str()) != target.to_str() {
+                return Err("fix run target must match its original run".into());
+            }
+            let runs_dir = root.parent().ok_or("original run needs a runs directory")?;
+            let output_parent = if let Some(out) = flag(rest, "--out") {
+                let out = PathBuf::from(out);
+                let absolute = if out.is_absolute() {
+                    out
+                } else {
+                    std::env::current_dir()
+                        .map_err(|e| e.to_string())?
+                        .join(out)
+                };
+                resolve_existing_prefix(absolute.parent().ok_or("fix output needs a parent")?)?
             } else {
-                std::env::current_dir()
-                    .map_err(|e| e.to_string())?
-                    .join(out)
+                data_dir().join(target.file_name().ok_or("target needs a name")?)
             };
-            resolve_existing_prefix(absolute.parent().ok_or("fix output needs a parent")?)?
-        } else {
-            data_dir().join(target.file_name().ok_or("target needs a name")?)
-        };
-        if resolve_existing_prefix(&output_parent)? != runs_dir {
-            return Err("fix run must be in the trusted runs directory; supply --out with a sibling of the original run".into());
-        }
-        let mut args = rest.to_vec();
-        if let Some(cap) = remaining {
-            args.extend(["--budget".into(), cap.to_string()]);
-        }
-        let run = audit_init_limited(&args, omgs::stacks::INVENTORY_LIMIT)?;
-        if remaining.is_none() {
-            // Persona defaults must not invent a cap for an uncapped original.
-            omgs::runmeta::update(&run, |m| {
-                m.remove("budget_agent_calls");
-                Ok(())
-            })?;
-        }
-        Ok(run)
-    })
+            if resolve_existing_prefix(&output_parent)? != runs_dir {
+                return Err("fix run must be in the trusted runs directory; supply --out with a sibling of the original run".into());
+            }
+            let mut args = rest.to_vec();
+            if let Some(cap) = remaining {
+                args.extend(["--budget".into(), cap.to_string()]);
+            }
+            let run = audit_init_limited(&args, omgs::stacks::INVENTORY_LIMIT)?;
+            if remaining.is_none() {
+                // Persona defaults must not invent a cap for an uncapped original.
+                omgs::runmeta::update(&run, |m| {
+                    m.remove("budget_agent_calls");
+                    Ok(())
+                })?;
+            }
+            Ok(run)
+        },
+    )
 }
 
 fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf, String> {
@@ -2041,6 +2056,8 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
         } else {
             policy.policy.budget
         }
+    } else if has(rest, "--fix-of") {
+        selected_budget
     } else {
         selected_budget
             .or(policy.policy.budget)
@@ -2137,21 +2154,14 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
     outside(&std::fs::canonicalize(&out_abs).map_err(|e| e.to_string())?)?;
     // Claim the directory exclusively, so two concurrent inits given the same
     // --out cannot both pass the emptiness check and overwrite each other.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(out_abs.join(".omgs-claim"))
-        .map_err(|e| {
-            format!(
-                "{} is already claimed by another run ({e}); choose a new run directory",
-                out_abs.display()
-            )
-        })?;
+    let generation = omgs::platform::random_nonce().map_err(|e| e.to_string())?;
+    omgs::platform::write_private_new(&out_abs.join(".omgs-claim"), generation.as_bytes())
+        .map_err(|e| format!("run already claimed ({e}); re-initialize into a new output path"))?;
     omgs::platform::check_private_dir(&out_abs).map_err(|e| e.to_string())?;
     if out_abs.starts_with("/tmp") || out_abs.starts_with("/private/tmp") {
         eprintln!("warning: run output is under a shared temp directory and describes vulnerabilities. Prefer the default runs directory under your home.");
     }
-    save_trusted_policy(&target, &out_abs, &policy)?;
+    save_trusted_policy(&target, &out_abs, &generation, &policy)?;
     let source_ref = omgs::proof::git_head(&target)
         .map(|h| h[..7].to_string())
         .unwrap_or_else(|| "working tree".into());
@@ -3261,7 +3271,7 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
             };
             let path = trusted_store(&target)?;
             if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                omgs::platform::create_private_tree(dir).map_err(|e| e.to_string())?;
             }
             // Recheck after creating the directories, in case a parent link
             // appeared in between.
@@ -3417,7 +3427,8 @@ mod cli_tests {
     fn oversized_answer_store_is_refused() {
         let path =
             std::env::temp_dir().join(format!("omgs-answer-large-{}.json", std::process::id()));
-        let file = std::fs::File::create(&path).unwrap();
+        omgs::platform::write_private_new(&path, b"").unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_len((1 << 20) + 1).unwrap();
         assert!(read_store(&path).unwrap_err().contains("byte limit"));
         drop(file);

@@ -1094,6 +1094,20 @@ pub fn markdown(result: &Value) -> String {
 mod tests {
     use super::*;
 
+    fn copy_private(from: &Path, to: &Path) {
+        crate::platform::create_private_tree(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let dest = to.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_private(&entry.path(), &dest);
+            } else {
+                crate::runmeta::write_atomic_bytes(&dest, &std::fs::read(entry.path()).unwrap())
+                    .unwrap();
+            }
+        }
+    }
+
     #[test]
     fn colon_ids_do_not_merge_distinct_defects() {
         let m: Value =
@@ -1119,13 +1133,17 @@ mod tests {
         }
         let mut run = original.clone();
         run["observations"] = json!(observations);
+        let source = std::env::temp_dir().join(format!("omgs-colon-score-{}", std::process::id()));
+        copy_private(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score/run-1"),
+            &source,
+        );
         let result = score_cohort(
             "separate_ids",
             &[&first, &second],
             &[ScoringRun {
                 evidence_errors: evidence_errors(
-                    &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("benchmark/fixtures/score/run-1"),
+                    &source,
                     &run,
                     &json!({"cases": [&first, &second]}),
                 )
@@ -1135,6 +1153,7 @@ mod tests {
             }],
         )
         .unwrap();
+        std::fs::remove_dir_all(source).unwrap();
         assert_eq!(result["union_recall"], ratio(2, 2));
         assert_eq!(result["runs"][0]["recall"], ratio(2, 2));
         assert_eq!(result["detection_frequency"].as_array().unwrap().len(), 2);

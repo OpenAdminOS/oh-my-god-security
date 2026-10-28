@@ -1572,3 +1572,252 @@ fn trusted_policy_requires_immutable_base_and_matching_run_target_and_digest() {
     assert!(!child.exists());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+fn provenance_record(root: &Path) -> PathBuf {
+    let entries: Vec<_> = std::fs::read_dir(root.join("home/omgs-data/intent"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(entries.len(), 1);
+    entries[0].clone()
+}
+
+#[test]
+fn provenance_is_exclusive_and_new_output_paths_have_fresh_generations() {
+    let root = scratch("exclusive-provenance");
+    let repo = repo(&root);
+    let base = commit_policy(&repo, &Policy::default());
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, Some(&base)).status.success());
+    let path = provenance_record(&root);
+    let record = std::fs::read(&path).unwrap();
+    let mut changed = Policy::default();
+    changed.excluded_paths.push("main.rs".into());
+    let other = commit_policy(&repo, &changed);
+    // Empty the run without retiring its trusted record, keeping its inode.
+    for entry in std::fs::read_dir(&run).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(path).unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let out = init(&root, &repo, &run, Some(&other));
+    assert!(!out.status.success(), "{}", output(&out));
+    assert!(
+        output(&out).contains("re-initialize into a new output path"),
+        "{}",
+        output(&out)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), record);
+    let fresh = root.join("fresh");
+    let out = init(&root, &repo, &fresh, Some(&other));
+    assert!(out.status.success(), "{}", output(&out));
+    assert_ne!(
+        std::fs::read(run.join(".omgs-claim")).unwrap(),
+        std::fs::read(fresh.join(".omgs-claim")).unwrap()
+    );
+    assert_eq!(
+        read(&fresh.join(omgs::runmeta::FILE))["policy"]["base_commit"],
+        other
+    );
+    let out = fix_init(&root, &repo, &fresh, &root.join("fresh-child"));
+    assert!(out.status.success(), "{}", output(&out));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provenance_refuses_replaced_directory_even_with_copied_run_identity() {
+    let root = scratch("replacement-provenance");
+    let repo = repo(&root);
+    let base = commit_policy(&repo, &Policy::default());
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, Some(&base)).status.success());
+    let metadata = read(&run.join(omgs::runmeta::FILE));
+    let generation = std::fs::read(run.join(".omgs-claim")).unwrap();
+    let moved = root.join("moved");
+    std::fs::rename(&run, &moved).unwrap();
+    omgs::platform::create_private_dir(&run).unwrap();
+    write(&run.join(omgs::runmeta::FILE), &metadata);
+    for claim in ["0".repeat(64).into_bytes(), generation] {
+        omgs::runmeta::write_atomic_bytes(&run.join(".omgs-claim"), &claim).unwrap();
+        let out = fix_init(&root, &repo, &run, &root.join("child"));
+        assert!(!out.status.success(), "{}", output(&out));
+        assert!(
+            output(&out).contains("generation or directory identity mismatch"),
+            "{}",
+            output(&out)
+        );
+        assert!(!root.join("child").exists());
+    }
+    std::fs::remove_dir_all(&run).unwrap();
+    std::fs::rename(&moved, &run).unwrap();
+    let out = fix_init(&root, &repo, &run, &root.join("child"));
+    assert!(out.status.success(), "{}", output(&out));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fix_budget_uses_trusted_family_cap_despite_edited_parent_metadata() {
+    let root = scratch("trusted-family-cap");
+    let repo = repo(&root);
+    let base = commit_policy(
+        &repo,
+        &Policy {
+            budget: Some(10),
+            ..Policy::default()
+        },
+    );
+    for (i, base) in [Some(base.as_str()), None].into_iter().enumerate() {
+        let run = root.join(format!("run-{i}"));
+        let out = cli(
+            &root.join("home"),
+            &[
+                "audit",
+                "init",
+                "--target",
+                repo.to_str().unwrap(),
+                "--out",
+                run.to_str().unwrap(),
+                "--no-sensors",
+                "--budget",
+                "10",
+            ]
+            .into_iter()
+            .chain(base.into_iter().flat_map(|b| ["--base", b]))
+            .collect::<Vec<_>>(),
+        );
+        assert!(out.status.success(), "{}", output(&out));
+        for (j, cap) in [json!(1000), json!(1), Value::Null].into_iter().enumerate() {
+            let mut edited = read(&run.join(omgs::runmeta::FILE));
+            if cap.is_null() {
+                edited.as_object_mut().unwrap().remove("budget_agent_calls");
+            } else {
+                edited["budget_agent_calls"] = cap;
+            }
+            edited["agent_calls_used"] = json!(3);
+            write(&run.join(omgs::runmeta::FILE), &edited);
+            let child = root.join(format!("fix-{i}-{j}"));
+            let out = fix_init(&root, &repo, &run, &child);
+            assert!(out.status.success(), "{}", output(&out));
+            let meta = read(&child.join(omgs::runmeta::FILE));
+            assert_eq!(meta["budget_agent_calls"], 7);
+            if base.is_none() {
+                assert_eq!(meta["policy"]["policy"]["budget"], 7);
+            }
+            // Descendants still use the original family's authenticated cap.
+            let out = fix_init(&root, &repo, &child, &root.join(format!("next-{i}-{j}")));
+            assert!(out.status.success(), "{}", output(&out));
+        }
+    }
+    let run = root.join("uncapped");
+    assert!(init(&root, &repo, &run, None).status.success());
+    let mut edited = read(&run.join(omgs::runmeta::FILE));
+    edited["budget_agent_calls"] = json!(1000);
+    write(&run.join(omgs::runmeta::FILE), &edited);
+    let child = root.join("uncapped-child");
+    let out = fix_init(&root, &repo, &run, &child);
+    assert!(out.status.success(), "{}", output(&out));
+    let meta = read(&child.join(omgs::runmeta::FILE));
+    assert!(meta.get("budget_agent_calls").is_none());
+    assert!(meta["policy"]["policy"]["budget"].is_null());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+fn icacls(path: &Path, args: &[&str]) {
+    let out = Command::new("icacls.exe")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", output(&out));
+}
+
+#[cfg(windows)]
+#[test]
+fn provenance_refuses_writable_store_on_creation_and_use() {
+    let root = scratch("provenance-store-dacl");
+    let repo = repo(&root);
+    let run = root.join("run");
+    let store = root.join("home/omgs-data/intent");
+    omgs::platform::create_private_tree(&store).unwrap();
+    icacls(&store, &["/grant", "*S-1-1-0:(OI)(CI)(W)"]);
+    let out = init(&root, &repo, &run, None);
+    assert!(!out.status.success(), "{}", output(&out));
+    assert!(
+        output(&out).contains("writable by another principal"),
+        "{}",
+        output(&out)
+    );
+    assert!(!run.exists());
+    icacls(&store, &["/remove:g", "*S-1-1-0"]);
+    assert!(init(&root, &repo, &run, None).status.success());
+    icacls(&store, &["/grant", "*S-1-1-0:(W)"]);
+    let out = fix_init(&root, &repo, &run, &root.join("child"));
+    assert!(!out.status.success(), "{}", output(&out));
+    assert!(
+        output(&out).contains("owner-private intent store"),
+        "{}",
+        output(&out)
+    );
+    assert!(!root.join("child").exists());
+    assert!(omgs::platform::check_private_dir(&store).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn provenance_refuses_record_with_unsafe_dacl_on_every_read() {
+    let root = scratch("provenance-record-dacl");
+    let repo = repo(&root);
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, None).status.success());
+    let record = provenance_record(&root);
+    for sid in ["*S-1-1-0:(W)", "*S-1-5-32-545:(W)"] {
+        icacls(&record, &["/grant", sid]);
+        let out = fix_init(&root, &repo, &run, &root.join("child"));
+        assert!(!out.status.success(), "{}", output(&out));
+        assert!(
+            output(&out).contains("writable by another principal"),
+            "{}",
+            output(&out)
+        );
+        assert!(!root.join("child").exists());
+        icacls(&record, &["/remove:g", sid.split(':').next().unwrap()]);
+    }
+    assert!(fix_init(&root, &repo, &run, &root.join("child"))
+        .status
+        .success());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn provenance_refuses_foreign_owned_record_on_every_read() {
+    let root = scratch("provenance-record-owner");
+    let repo = repo(&root);
+    let run = root.join("run");
+    assert!(init(&root, &repo, &run, None).status.success());
+    let record = provenance_record(&root);
+    let user = Command::new("whoami.exe").output().unwrap();
+    assert!(user.status.success());
+    let user = String::from_utf8(user.stdout).unwrap();
+    // Administrators is an assignable owner for these elevated Windows test hosts,
+    // but it is not the current user's SID. Keep the private DACL intact.
+    icacls(&record, &["/setowner", "*S-1-5-32-544"]);
+    let out = fix_init(&root, &repo, &run, &root.join("child"));
+    icacls(&record, &["/setowner", user.trim()]);
+    assert!(!out.status.success(), "{}", output(&out));
+    assert!(
+        output(&out).contains("owned by the current user"),
+        "{}",
+        output(&out)
+    );
+    assert!(!root.join("child").exists());
+    assert!(fix_init(&root, &repo, &run, &root.join("child"))
+        .status
+        .success());
+    std::fs::remove_dir_all(root).unwrap();
+}

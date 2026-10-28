@@ -105,7 +105,8 @@ enabling the gate. Proofs never install dependencies or fetch packages.
 
 Runs created before reviewer-owned policy provenance was introduced cannot seed
 `audit init --fix-of` or generate policy proposals, even if they contain a policy
-snapshot. OMGS rejects them when no trusted record exists. Reports can still show
+snapshot. Records without a generation and directory identity also require a
+fresh audit. OMGS rejects missing or invalid provenance. Reports can still show
 answers recorded independently in the reviewer's intent store, but omit
 policy-derived answers with a warning. Keep the old run for evidence, then
 initialize a fresh audit with `omgs audit init --target /path/to/repo
@@ -120,9 +121,14 @@ to supported fix runs.
 
 At initialization, the CLI resolves `--base` and records the full commit SHA and
 exact policy blob digest beside the target's reviewer-owned intent store. Each
-record binds the canonical target and run paths. The record lives outside both
-the target and the run directory. A later init for the same target creates a
-separate record and does not retarget earlier runs.
+record binds the canonical target and run paths, a fresh random generation saved
+in the run's `.omgs-claim`, and the directory identity (device and inode on Unix,
+volume and file ID on Windows). Records are published exclusively and never
+replaced. Even after deleting or emptying a run, reinitializing that output path
+is refused. Use a new output path. There is no record retirement command.
+The record lives outside both the target and the run directory. The store
+directory and each opened record must pass owner-private admission, including
+owner and DACL checks on Windows, without repairing unsafe existing storage.
 
 Reports, fix initialization and policy proposals obtain the base only from this
 record. They require a full immutable SHA, re-read the policy through the safe
@@ -134,11 +140,16 @@ explicit caller-supplied base independently.
 
 When no committed policy exists, the trusted record retains the CLI-selected
 mode, persona and budget. Fix runs inherit those settings, subject to existing
-explicit override rules and cumulative budget limits. When a policy blob exists,
+explicit override rules and cumulative budget limits. The family cap comes from
+the original run's authenticated record, never `budget_agent_calls` metadata;
+the remaining allowance cannot exceed that cap. When a policy blob exists,
 fix runs inherit its authenticated mode, persona, excluded paths, suppressions
 and test registrations. Policy patches use the exact authenticated base blob as
 their baseline. Moving a run to another path or machine requires a fresh audit;
-copying its snapshot alone cannot establish provenance.
+copying its snapshot or generation cannot establish directory identity. Local
+provenance protects against run-directory edits and other OS users, subject to
+the [documented same-user limit](../DECISIONS.md#local-trust-and-ci-enforcement).
+CI gate results remain authoritative.
 
 ## Building the embedded skill
 
