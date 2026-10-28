@@ -7,6 +7,7 @@ struct Fixture {
     bin: PathBuf,
     target: PathBuf,
     db: PathBuf,
+    listener: std::net::TcpListener,
 }
 impl Fixture {
     fn new() -> Self {
@@ -50,7 +51,9 @@ impl Fixture {
             "secret // trufflehog:ignore // nosemgrep",
         )
         .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         Self {
+            listener,
             root,
             bin,
             target,
@@ -88,6 +91,11 @@ impl Fixture {
         std::fs::write(
             self.bin.join(format!("{tool}.outside")),
             self.root.join("outside").to_str().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            self.bin.join(format!("{tool}.port")),
+            self.listener.local_addr().unwrap().to_string(),
         )
         .unwrap();
         let path = self.bin.join(if cfg!(windows) {

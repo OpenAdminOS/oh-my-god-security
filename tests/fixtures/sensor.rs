@@ -46,7 +46,8 @@ fn main() {
         assert!(fs::read(PathBuf::from(&db).join("osv-scanner/crates.io/all.zip")).is_ok());
         assert!(fs::write(PathBuf::from(db).join("scanner-wrote-db"), "bad").is_err());
     }
-    for ip in ["127.0.0.1:9", "1.1.1.1:443"] {
+    let loopback = fs::read_to_string(exe.with_extension("port")).unwrap();
+    for ip in [loopback.as_str(), "1.1.1.1:443"] {
         assert!(std::net::TcpStream::connect_timeout(
             &ip.parse().unwrap(),
             Duration::from_millis(100)
