@@ -175,8 +175,10 @@ pub fn names(dir: &File) -> io::Result<Vec<OsString>> {
                 .filter(|_| len % 2 == 0)
                 .ok_or_else(|| io::Error::other("invalid directory name"))?;
             let wide: Vec<u16> = name
-                .chunks_exact(2)
-                .map(|b| u16::from_ne_bytes([b[0], b[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_ne_bytes(*b))
                 .collect();
             let name = OsString::from_wide(&wide);
             if name != "." && name != ".." {
