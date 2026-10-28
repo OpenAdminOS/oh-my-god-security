@@ -327,7 +327,10 @@ Invalid policy, missing tests, contract errors, unclean runs, unavailable MXC an
 head mismatch return 3. Gate currently requires regular committed files and
 refuses symlinks and submodules in the exported tree. Each blob is limited to
 64 MiB. Dependencies must already be part of the committed tree or available in
-the existing sandbox toolchain; gate installs nothing.
+the existing sandbox toolchain; gate installs nothing. The gate runs head content.
+Owners should protect registered test paths with CODEOWNERS or branch protection.
+Modified or deleted active tests print `registered gate test modified in head`
+in both modes; modifications retain the normal result.
 
 Once valid base policy establishes advisory mode, execution and infrastructure
 results are display-only and exit 0. Invalid base policy still returns 3 because

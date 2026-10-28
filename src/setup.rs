@@ -1,5 +1,7 @@
 //! Skill placement and explicitly requested policy creation. Installs no tools.
 use std::path::{Path, PathBuf};
+#[path = "../bundle_path.rs"]
+mod bundle_path;
 pub const SKILL_NAME: &str = "omgs-security-review";
 
 /// Agent roots are evidence of an installation. Never create an undetected root.
@@ -51,6 +53,12 @@ fn manifest(root: &Path) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>,
             if crate::platform::is_link(&meta) {
                 return Err("skill tree contains a link".into());
             }
+            bundle_path::validate(
+                entry
+                    .file_name()
+                    .to_str()
+                    .ok_or("non-UTF-8 skill destination")?,
+            )?;
             let rel = entry.path().strip_prefix(root).unwrap().to_owned();
             if meta.is_dir() {
                 walk(root, &entry.path(), out)?;
@@ -78,8 +86,11 @@ pub fn install(from: Option<&Path>, targets: &[PathBuf], replace: bool) -> Resul
         Some(from) => manifest(from)?,
         None => BUNDLED
             .iter()
-            .map(|(p, b)| (PathBuf::from(p), b.to_vec()))
-            .collect(),
+            .map(|(p, b)| {
+                bundle_path::validate(p)?;
+                Ok((PathBuf::from(p), b.to_vec()))
+            })
+            .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?,
     };
     let text = std::str::from_utf8(
         files

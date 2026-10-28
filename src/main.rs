@@ -1765,6 +1765,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     if flag(rest, "--budget").is_some() {
         return Err("--fix-of computes the budget; omit --budget".into());
     }
+    omgs::policy::snapshot(Path::new(&parent))?;
     omgs::budget::init_fix(Path::new(&parent), |root, original, remaining| {
         let target = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
         let target = std::fs::canonicalize(target).map_err(|e| e.to_string())?;

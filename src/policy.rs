@@ -424,7 +424,7 @@ pub fn snapshot(run: &Path) -> Result<Snapshot, String> {
     let m = crate::runmeta::read(run)?;
     let value = m
         .get("policy")
-        .ok_or("run has no base-policy snapshot; initialize a new run")?;
+        .ok_or("legacy run has no base-policy snapshot and cannot seed a fix run; see docs/policy-workflow.md#pre-policy-runs")?;
     parse(
         &serde_json::to_string(value.get("policy").ok_or("snapshot requires policy")?)
             .map_err(|e| e.to_string())?,
@@ -560,7 +560,7 @@ pub fn gate(target: &Path, base: &str, head: &str, run: Option<&Path>) -> Result
     let s = load_base(target, Some(base))?;
     // Once advisory is established by valid base policy, even infrastructure
     // errors are display-only. Invalid policy cannot establish advisory mode.
-    let outcome = gate_tests(target, head, &s.policy);
+    let outcome = gate_tests(target, base, head, &s.policy);
     if let Some(run) = run {
         advisory_findings(run, &s.policy);
     }
@@ -573,7 +573,7 @@ pub fn gate(target: &Path, base: &str, head: &str, run: Option<&Path>) -> Result
         Err(e) => Err(e),
     }
 }
-fn gate_tests(target: &Path, head: &str, p: &Policy) -> Result<bool, String> {
+fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool, String> {
     let actual = git(target, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     if std::str::from_utf8(&actual)
         .map_err(|e| e.to_string())?
@@ -596,6 +596,34 @@ fn gate_tests(target: &Path, head: &str, p: &Policy) -> Result<bool, String> {
     if tests.is_empty() {
         println!("{}: no active registered gate tests", p.mode.label());
         return Ok(false);
+    }
+    // Inspect all active registrations before export or sandbox setup can fail.
+    let blobs = |commit: &str| -> Result<std::collections::BTreeMap<Vec<u8>, Vec<u8>>, String> {
+        let tree = git(target, &["ls-tree", "-rz", commit])?;
+        tree.split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .map(|entry| {
+                let tab = entry
+                    .iter()
+                    .position(|b| *b == b'\t')
+                    .ok_or("invalid tree entry")?;
+                let blob = entry[..tab]
+                    .split(|b| *b == b' ')
+                    .nth(2)
+                    .ok_or("invalid tree entry")?;
+                Ok((entry[tab + 1..].to_vec(), blob.to_vec()))
+            })
+            .collect()
+    };
+    let before = blobs(base)?;
+    let after = blobs(head)?;
+    for t in &tests {
+        if before.get(t.test.as_bytes()) != after.get(t.test.as_bytes()) {
+            println!(
+                "WARNING: registered gate test modified in head: {} {}",
+                t.id, t.test
+            );
+        }
     }
     let dir = GateDir(std::env::temp_dir().join(format!(
         "omgs-gate-{}",

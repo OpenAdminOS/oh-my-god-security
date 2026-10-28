@@ -82,3 +82,42 @@ For gate mode, commit the default policy with `mode` changed to `gate`. For
 advisory mode, commit the default as shown. In both modes the event base SHA,
 source and policy digest remain visible in run metadata. Upload reports through
 your organization's approved artifact step only after its privacy review.
+
+## Registered test ownership and dependencies
+
+The gate runs head content, including registered tests. Protect registered test
+paths with CODEOWNERS or branch protection and require owner review of changes.
+Both modes print `registered gate test modified in head: <id> <path>` when an
+active test's blob changes or disappears. Modification keeps the normal result;
+a missing test is an infrastructure error (exit 3 in gate mode, display-only in
+advisory mode).
+
+The gate exports only committed files. Checkout-local `node_modules` and `.venv`
+directories are dropped unless committed. Provision dependencies outside proof
+execution in an owner-managed, sandbox-readable location. For example, provision
+and pin a Python environment under `/opt/omgs/python` during runner preparation,
+then register the absolute command `/opt/omgs/python/bin/python security_test.py`.
+The interpreter and its dependencies must be admitted by the runner's read-only
+toolchain configuration. Verify that location is readable inside MXC before
+enabling the gate. Proofs never install dependencies or fetch packages.
+
+## Pre-policy runs
+
+Runs created before base-policy snapshots were introduced cannot seed
+`audit init --fix-of`. OMGS rejects them before creating a child run. Keep the
+old run for evidence, then initialize a fresh audit with `omgs audit init
+--target /path/to/repo --base <full-base-sha> --out /private/runs/new-audit`.
+Complete that audit before using its path with `--fix-of`. This is a new budget
+family, not a continuation or refund of the legacy allowance. Set the reviewed
+budget in base policy and account for any earlier spending separately. Do not
+fabricate a snapshot in old metadata. Existing target and cumulative budget
+constraints continue to apply to supported fix runs.
+
+## Building the embedded skill
+
+The default setup source is the skill embedded in the binary. Only explicit
+`--from` selects another source; adjacent sidecar directories do not override it.
+The build embeds every regular file under `skill`. Keep that directory clean
+when building releases: remove untracked files and review all tracked changes
+before building. Bundle roots and entries must not be symlinks. Unsafe relative
+destinations are rejected during the build and checked again during installation.

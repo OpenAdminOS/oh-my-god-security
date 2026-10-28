@@ -264,7 +264,11 @@ fn registered_gate_executes_immutable_head_and_ignores_advisory_artifacts() {
     gate(&root, &repo, &base, &head, Some(&run), 1); // Head-only policy cannot disable gate.
     std::fs::write(repo.join(&t.test), test_source(false)).unwrap();
     let fixed = commit_policy(&repo, &Policy::default());
-    gate(&root, &repo, &base, &fixed, None, 0);
+    let modified = gate(&root, &repo, &base, &fixed, None, 0);
+    assert!(output(&modified).contains(&format!(
+        "registered gate test modified in head: {} {}",
+        t.id, t.test
+    )));
     // A failing draft exists only in run storage and cannot add a gate test.
     std::fs::write(run.join("draft"), test_source(true)).unwrap();
     gate(&root, &repo, &base, &fixed, Some(&run), 0);
@@ -880,5 +884,160 @@ fn stage_and_intent_propose_patch_validated_tests_and_registry_together() {
     )
     .status
     .success());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn changed_registered_test_is_visible_before_sandbox_in_both_modes() {
+    let root = scratch("changed-test-warning");
+    let repo = repo(&root);
+    let t = registered();
+    for mode in [Mode::Gate, Mode::Advisory] {
+        std::fs::write(repo.join(&t.test), test_source(true)).unwrap();
+        let base = commit_policy(
+            &repo,
+            &Policy {
+                mode,
+                gate_tests: vec![t.clone()],
+                ..Default::default()
+            },
+        );
+        std::fs::write(repo.join(&t.test), test_source(false)).unwrap();
+        let head = commit_policy(&repo, &Policy::default());
+        let run_gate = |head: &str| {
+            Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .args([
+                    "gate",
+                    "--target",
+                    repo.to_str().unwrap(),
+                    "--base",
+                    &base,
+                    "--head",
+                    head,
+                ])
+                .env("OMGS_MXC_EXEC", root.join("missing-executor"))
+                .output()
+                .unwrap()
+        };
+        let warning = format!("registered gate test modified in head: {} {}", t.id, t.test);
+        let changed = run_gate(&head);
+        assert!(output(&changed).contains(&warning), "{}", output(&changed));
+        assert_eq!(
+            changed.status.code(),
+            Some(if mode == Mode::Gate { 3 } else { 0 })
+        );
+        std::fs::remove_file(repo.join(&t.test)).unwrap();
+        let deleted = commit_policy(&repo, &Policy::default());
+        let deleted = run_gate(&deleted);
+        assert!(output(&deleted).contains(&warning), "{}", output(&deleted));
+        assert!(output(&deleted).contains("registered test missing from head"));
+        assert_eq!(
+            deleted.status.code(),
+            Some(if mode == Mode::Gate { 3 } else { 0 })
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn pre_policy_run_cannot_seed_a_fix_run() {
+    let root = scratch("legacy-fix");
+    let repo = repo(&root);
+    let legacy = root.join("legacy");
+    omgs::platform::private_dir(&legacy).unwrap();
+    let mut metadata: Value =
+        serde_json::from_str(include_str!("fixtures/pre-policy-run.json")).unwrap();
+    metadata["target"] = json!(repo.to_str().unwrap());
+    omgs::runmeta::write_atomic(&legacy.join("run-metadata.json"), &metadata.to_string()).unwrap();
+    let before = std::fs::read(legacy.join("run-metadata.json")).unwrap();
+    let child = root.join("fix");
+    let result = cli(
+        &root,
+        &[
+            "audit",
+            "init",
+            "--target",
+            repo.to_str().unwrap(),
+            "--out",
+            child.to_str().unwrap(),
+            "--fix-of",
+            legacy.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert_eq!(result.status.code(), Some(2), "{}", output(&result));
+    assert!(output(&result)
+        .contains("legacy run has no base-policy snapshot and cannot seed a fix run"));
+    assert!(output(&result).contains("docs/policy-workflow.md#pre-policy-runs"));
+    assert!(!child.exists());
+    assert_eq!(
+        std::fs::read(legacy.join("run-metadata.json")).unwrap(),
+        before
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn bundle_build_rejects_literal_backslashes_and_linked_root() {
+    use std::os::unix::fs::symlink;
+    let root = scratch("bundle-build-paths");
+    let builder = root.join("bundle-builder");
+    let built = Command::new("rustc")
+        .args(["--edition=2021", "build.rs", "-o"])
+        .arg(&builder)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .output()
+        .unwrap();
+    assert!(built.status.success(), "{}", output(&built));
+    let skill = root.join("skill");
+    std::fs::create_dir(&skill).unwrap();
+    let build = || {
+        Command::new(&builder)
+            .env("CARGO_MANIFEST_DIR", &root)
+            .env("OUT_DIR", &root)
+            .output()
+            .unwrap()
+    };
+    for name in ["a\\b", "..\\escape", "C:prefix"] {
+        let path = skill.join(name);
+        std::fs::write(&path, "content").unwrap();
+        assert!(!build().status.success());
+        assert!(!root.join("skill.rs").exists());
+        std::fs::remove_file(path).unwrap();
+    }
+    std::fs::rename(&skill, root.join("real-skill")).unwrap();
+    symlink(root.join("real-skill"), &skill).unwrap();
+    assert!(!build().status.success());
+    assert!(!root.join("skill.rs").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn default_setup_ignores_adjacent_and_checkout_sidecars() {
+    let root = scratch("embedded-sidecars");
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join(".agents")).unwrap();
+    let binary_dir = root.join("bin");
+    let checkout = root.join("checkout");
+    for dir in [&binary_dir, &checkout] {
+        std::fs::create_dir_all(dir.join("skill")).unwrap();
+        std::fs::write(dir.join("skill/SKILL.md"), "sidecar content").unwrap();
+    }
+    let binary = binary_dir.join(if cfg!(windows) { "omgs.exe" } else { "omgs" });
+    std::fs::copy(env!("CARGO_BIN_EXE_omgs"), &binary).unwrap();
+    let result = Command::new(&binary)
+        .args(["setup", "--install-skills"])
+        .current_dir(&checkout)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", output(&result));
+    let installed = home.join(".agents/skills").join(omgs::setup::SKILL_NAME);
+    for (path, bytes) in omgs::setup::BUNDLED {
+        assert_eq!(std::fs::read(installed.join(path)).unwrap(), *bytes);
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
