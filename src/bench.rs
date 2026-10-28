@@ -674,6 +674,12 @@ pub fn score(cases: &Path, dirs: &[PathBuf]) -> Result<Value> {
         json!({"format_version":1,"cohort":"entire_campaign","campaign_id":runs[0].0["campaign_id"],"configuration":runs[0].0["configuration"],"k":runs.len(),"cli_model_calls":0,"cohorts":output,"cost_per_run":runs.iter().map(|(r,a)|json!({"run_id":r["run_id"],"numerator":a,"denominator":1,"cohort":"entire_campaign","resource_usage":r["resource_usage"]})).collect::<Vec<_>>(),"total_k_run_cost_usd":{"numerator":total,"denominator":runs.len(),"cohort":"entire_campaign"},"cost_variance":stats(costs),"time_variance":stats(runs.iter().map(|(r,_)|r["resource_usage"]["wall_seconds"].as_f64()).collect())}),
     )
 }
+// Escape the separator and escape character so case/defect pairs cannot alias.
+fn defect_key(case_id: &str, defect_id: &str) -> String {
+    let component = |s: &str| s.replace('%', "%25").replace(':', "%3A");
+    format!("{}:{}", component(case_id), component(defect_id))
+}
+
 fn score_cohort(cohort: &str, cases: &[&Value], runs: &[(Value, Value)]) -> Result<Value> {
     let denominator: usize = cases
         .iter()
@@ -694,7 +700,7 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[(Value, Value)]) -> Resu
     let mut frequency = BTreeMap::<String, usize>::new();
     for c in cases {
         for e in list(&c["expected_findings"])? {
-            frequency.insert(format!("{}:{}", text(&c["id"])?, text(&e["id"])?), 0);
+            frequency.insert(defect_key(text(&c["id"])?, text(&e["id"])?), 0);
         }
     }
     let mut per_run = Vec::new();
@@ -724,7 +730,7 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[(Value, Value)]) -> Resu
                 }
                 let mut matched = BTreeSet::new();
                 for e in list(&c["expected_findings"])? {
-                    let key = format!("{cid}:{}", text(&e["id"])?);
+                    let key = defect_key(cid, text(&e["id"])?);
                     let aliases = ids(e)?;
                     let positive = contains(&e["positive_snapshot_ids"], sid);
                     let cs: Vec<&Value> = list(&o["candidates"])?
@@ -866,6 +872,38 @@ pub fn markdown(result: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colon_ids_do_not_merge_distinct_defects() {
+        let m: Value =
+            serde_json::from_str(include_str!("../benchmark/fixtures/score/cases.json")).unwrap();
+        let original: Value = serde_json::from_str(include_str!(
+            "../benchmark/fixtures/score/run-1/benchmark-run.json"
+        ))
+        .unwrap();
+        let mut first = m["cases"][0].clone();
+        first["id"] = json!("fixture:a");
+        first["expected_findings"] = json!([first["expected_findings"][0]]);
+        first["expected_findings"][0]["id"] = json!("b");
+        let mut second = first.clone();
+        second["id"] = json!("fixture");
+        second["expected_findings"][0]["id"] = json!("a:b");
+        let mut observations = Vec::new();
+        for c in [&first, &second] {
+            for o in original["observations"].as_array().unwrap() {
+                let mut o = o.clone();
+                o["case_id"] = c["id"].clone();
+                observations.push(o);
+            }
+        }
+        let mut run = original.clone();
+        run["observations"] = json!(observations);
+        let result = score_cohort("separate_ids", &[&first, &second], &[(run, json!({}))]).unwrap();
+        assert_eq!(result["union_recall"], ratio(2, 2));
+        assert_eq!(result["runs"][0]["recall"], ratio(2, 2));
+        assert_eq!(result["detection_frequency"].as_array().unwrap().len(), 2);
+        assert_ne!(defect_key("x%3A", "y"), defect_key("x:", "y"));
+    }
     #[test]
     fn run_shapes_and_zero_denominators() {
         let m: Value =

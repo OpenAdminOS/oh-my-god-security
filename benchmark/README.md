@@ -154,7 +154,9 @@ distribution, known-sample numerator and total-repetition denominator. Standard 
 standard deviation (divide by `k`). Zero denominators and unavailable values
 produce null. Any unknown sample makes complete-distribution mean, range and
 standard deviation null, rather than silently selecting a cheaper executable
-subset. Per-defect frequency uses recovered repetitions divided by `k`.
+subset. Per-defect frequency uses recovered repetitions divided by `k`. Its display
+keys join case and defect IDs with `:` after escaping `%` as `%25` and `:` as
+`%3A` in each component, so identifiers cannot collide.
 
 Optional `run-metadata.json` provides cumulative host accounting. The existing
 `agent_calls_used` field supplies calls. `accounting` maps `red-hunter`,
