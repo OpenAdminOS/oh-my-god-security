@@ -66,6 +66,7 @@ fn usage() {
 fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
     let (allowed, positional): (&str, bool) = match cmd {
         "setup" => ("--yes --from", false),
+        "install-self" => ("--to --mxc --license", false),
         "review" => ("--repo-url --mode --budget --no-sensors", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
             "--target --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of",
@@ -197,6 +198,7 @@ fn main() -> ExitCode {
             println!("omgs {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        "install-self" => cmd_install_self(rest),
         "setup" => cmd_setup(rest),
         "review" => cmd_review(rest),
         "audit" => cmd_audit(rest),
@@ -234,6 +236,13 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+fn cmd_install_self(rest: &[String]) -> Result<(), String> {
+    let to = PathBuf::from(flag(rest, "--to").ok_or("install-self requires --to")?);
+    let mxc = flag(rest, "--mxc").map(PathBuf::from);
+    let license = flag(rest, "--license").map(PathBuf::from);
+    omgs::install::install_self(&to, mxc.as_deref(), license.as_deref()).map_err(|e| e.to_string())
 }
 
 fn cmd_budget(args: &[String]) -> Result<(), String> {
@@ -3217,6 +3226,7 @@ mod cli_tests {
 
     const COMMANDS: &[(&str, &str)] = &[
         ("setup", ""),
+        ("install-self", ""),
         ("review", ""),
         ("audit", "init"),
         ("batch", "init"),
@@ -3252,7 +3262,7 @@ mod cli_tests {
             .unwrap();
         let mut covered = BTreeMap::<String, BTreeSet<&str>>::new();
         for &(cmd, sub) in COMMANDS {
-            let name = format!("cmd_{cmd}");
+            let name = format!("cmd_{}", cmd.replace('-', "_"));
             let mut sections = vec![(name.as_str(), function(source, &name))];
             match (cmd, sub) {
                 ("handoff" | "stage", _) => {

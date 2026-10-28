@@ -107,3 +107,18 @@ uploads use the built-in `GITHUB_TOKEN`. No keys or certificates belong in git.
 The owner controls repository visibility, immutable tag rules, tag creation,
 release execution, tap publication and winget-pkgs submission. This change does
 none of those operations.
+
+
+### Internal verified installer publication
+
+`omgs install-self --to <absolute-OMGS_HOME> [--mxc <verified-mirrored-asset>
+--license <verified-license>]` is an internal command, omitted from normal help.
+It publishes its own running executable and the optional MXC files. The
+bootstrap must verify all source files in private staging before calling it;
+this command is not a replacement for publisher, checksum or pin verification.
+It admits the complete destination chain using the same Rust safe-path policy
+as run storage, rejects unsafe existing leaves without repair, and stages all
+copies before exact-path atomic replacement. Windows replacements retain the
+fresh owner-only DACL, and locked-file failures preserve the locked destination
+and clean temporary siblings. See DECISIONS.md for ancestor-specific Windows
+rights and the Unix sticky-ancestor exception.

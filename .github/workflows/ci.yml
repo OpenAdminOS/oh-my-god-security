@@ -78,6 +78,12 @@ jobs:
           if [[ "$RUNNER_OS" == Windows ]]; then
             "$OMGS_MXC_EXEC" --probe || echo "MXC probe returned nonzero; doctor and tests validate the response"
           fi
+      # Admission rejects symlink ancestors. macOS TMPDIR may use /var,
+      # which is a system alias for /private/var; use its physical path.
+      - name: Resolve macOS temporary storage
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "TMPDIR=$(cd "$TMPDIR" && pwd -P)/" >> "$GITHUB_ENV"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy

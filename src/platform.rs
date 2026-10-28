@@ -182,10 +182,7 @@ pub fn private_dir(path: &Path) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 pub fn private_dir(path: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)?;
-    #[cfg(windows)]
-    windows_private::restrict(path)?;
-    Ok(())
+    create_private_tree(path)
 }
 
 /// Remove Windows extended path prefixes for both writer and validator.
@@ -625,14 +622,78 @@ mod macos_private;
 #[path = "windows_private.rs"]
 mod windows_private;
 
+/// Admit every existing directory from the filesystem root to `path`.
+/// Missing suffixes are allowed for creation, but parent traversal and links
+/// are not. The leaf is a publication/storage directory, never a sticky anchor.
+/// No HOME, profile, or root-owned intermediate directory ends the walk.
+pub fn safe_path(path: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    if absolute
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(Error::other(format!(
+            "storage {}: parent traversal is forbidden",
+            path.display()
+        )));
+    }
+    let mut chain: Vec<_> = absolute.ancestors().collect();
+    chain.reverse();
+    for entry in chain {
+        let meta = match std::fs::symlink_metadata(entry) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => return Err(Error::other(format!("storage {}: {e}", entry.display()))),
+        };
+        let check = || -> std::io::Result<()> {
+            if is_link(&meta) || !meta.is_dir() {
+                return Err(Error::other(
+                    "storage must be a directory without symlinks or reparse points",
+                ));
+            }
+            let ancestor = entry != absolute;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                // SAFETY: geteuid has no preconditions.
+                let user = unsafe { libc::geteuid() };
+                if meta.uid() != user && !(ancestor && meta.uid() == 0) {
+                    return Err(Error::other(
+                        "storage must be owned by the current user (or root for ancestors)",
+                    ));
+                }
+                if meta.mode() & 0o022 != 0 && !(ancestor && meta.mode() & 0o1000 != 0) {
+                    return Err(Error::other("storage must not be group- or world-writable (sticky is allowed only on ancestors)"));
+                }
+                // The next entry is checked independently for trusted ownership.
+                // Thus a sticky directory cannot protect an attacker-owned child.
+                #[cfg(target_os = "macos")]
+                macos_private::check_dir(entry, meta.uid())?;
+            }
+            #[cfg(windows)]
+            windows_private::check_path(entry, ancestor)?;
+            Ok(())
+        };
+        check().map_err(|e| {
+            Error::other(format!(
+                "storage {}: {e}; see README.md#storage-migration",
+                entry.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Run storage is trusted only while the owner prevents concurrent replacement.
 pub fn check_private_dir(path: &Path) -> std::io::Result<()> {
+    safe_path(path)?;
+    #[cfg(unix)]
     let meta = std::fs::symlink_metadata(path)?;
-    if is_link(&meta) || !meta.is_dir() {
-        return Err(std::io::Error::other(
-            "storage must be a directory without links",
-        ));
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -698,7 +759,7 @@ pub fn check_private_file(file: &std::fs::File) -> std::io::Result<()> {
 }
 
 /// Create owner-private storage or fail closed on an existing unsafe directory.
-/// Parent directories must already be trusted against concurrent replacement.
+/// The complete existing ancestor chain is admitted before creation.
 pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
     match create_private_dir_new(path) {
         Ok(()) => Ok(()),
@@ -715,6 +776,8 @@ pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
 
 /// Reserve a new directory exclusively with owner-private permissions.
 pub fn create_private_dir_new(path: &Path) -> std::io::Result<()> {
+    safe_path(path)?;
+    #[cfg(not(windows))]
     let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     let builder = {
@@ -723,12 +786,13 @@ pub fn create_private_dir_new(path: &Path) -> std::io::Result<()> {
         builder.mode(0o700);
         builder
     };
+    #[cfg(not(windows))]
     builder.create(path)?;
+    #[cfg(windows)]
+    windows_private::create_dir(path)?;
     // Only an exclusive successful create authorizes changing this ACL.
     #[cfg(target_os = "macos")]
     macos_private::restrict_created_dir(path)?;
-    #[cfg(windows)]
-    windows_private::restrict(path)?;
     check_private_dir(path)
 }
 

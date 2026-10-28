@@ -41,7 +41,13 @@ Download and install these files? Type yes to consent:
 Write-Output "Resolved: OMGS $Version; source $Base; destination $DestRoot; binary $asset; executor $mxcAsset"
 if ((Read-Host) -cne 'yes') { throw 'Installation cancelled before downloads' }
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ('omgs-bootstrap-' + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory $tmp | Out-Null
+# Create staging with an owner-only protected DACL supplied at creation.
+$StorageUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl = [Security.AccessControl.DirectorySecurity]::new()
+$acl.SetOwner($StorageUser)
+$acl.SetAccessRuleProtection($true, $false)
+$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($StorageUser, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))
+[IO.DirectoryInfo]::new($tmp).Create($acl)
 function Fetch([string]$Name, [long]$Limit) {
     $to = Join-Path $tmp $Name
     if ($Base.StartsWith('https://', [StringComparison]::Ordinal)) {
@@ -111,79 +117,6 @@ function Provenance([string]$Path) {
     return $false
 }
 
-$StorageUser = [Security.Principal.WindowsIdentity]::GetCurrent().User
-$TrustedStorageSids = @($StorageUser.Value, 'S-1-5-18', 'S-1-5-32-544')
-function Check-Storage([string]$Path, [bool]$Ancestor = $false) {
-    $item = Get-Item -LiteralPath $Path -Force
-    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        throw "owner-private installation storage '$Path': storage must be a directory without links; see README.md#storage-migration"
-    }
-    $acl = Get-Acl -LiteralPath $Path
-    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-    if ($owner -ne $StorageUser.Value -and -not ($Ancestor -and $owner -in $TrustedStorageSids)) {
-        throw "owner-private installation storage '$Path': storage must be owned by the current user with a restrictive DACL; see README.md#storage-migration"
-    }
-    $raw = [Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
-    if ($null -eq $raw.DiscretionaryAcl) { throw "owner-private installation storage '$Path': missing restrictive DACL" }
-    foreach ($ace in $raw.DiscretionaryAcl) {
-        # Like run storage, unknown ACEs fail closed and deny ACEs grant no access.
-        if ($ace.AceType -eq [Security.AccessControl.AceType]::AccessDenied) { continue }
-        if ($ace.AceType -ne [Security.AccessControl.AceType]::AccessAllowed) {
-            throw "owner-private installation storage '$Path': unsupported storage DACL ACE"
-        }
-        if (($ace.AccessMask -band 0x500d0156) -ne 0 -and $ace.SecurityIdentifier.Value -notin $TrustedStorageSids) {
-            throw "owner-private installation storage '$Path': storage is writable by another principal; see README.md#storage-migration"
-        }
-    }
-}
-function Check-Ancestors([string]$Path) {
-    $current = [IO.Path]::GetFullPath($Path)
-    while ($current) {
-        if (Test-Path -LiteralPath $current) { Check-Storage $current $true }
-        if ($current.TrimEnd('\') -ieq $env:USERPROFILE.TrimEnd('\')) { break }
-        $current = Split-Path $current -Parent
-    }
-}
-function New-PrivateTree([string]$Path) {
-    if (Test-Path -LiteralPath $Path) { Check-Storage $Path; return }
-    $parent = Split-Path $Path -Parent
-    if (-not (Test-Path -LiteralPath $parent)) { New-PrivateTree $parent }
-    $acl = [Security.AccessControl.DirectorySecurity]::new()
-    $acl.SetOwner($StorageUser)
-    $acl.SetAccessRuleProtection($true, $false)
-    $rule = [Security.AccessControl.FileSystemAccessRule]::new($StorageUser, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
-    $acl.AddAccessRule($rule)
-    # Supply a protected owner-only DACL at creation, with no inherited grants.
-    $directory = [IO.DirectoryInfo]::new($Path)
-    $directory.Create($acl)
-    Check-Storage $Path
-}
-
-$staged = [Collections.Generic.List[string]]::new()
-function Stage([string]$Name, [string]$Destination) {
-    $path = Join-Path (Split-Path $Destination -Parent) ('.omgs-' + [guid]::NewGuid().ToString('N') + [IO.Path]::GetExtension($Destination))
-    # CreateNew reserves a unique sibling without overwriting an existing file.
-    $output = [IO.File]::Open($path, [IO.FileMode]::CreateNew)
-    $staged.Add($path)
-    try {
-        $inputFile = [IO.File]::OpenRead((Join-Path $tmp $Name))
-        try { $inputFile.CopyTo($output) } finally { $inputFile.Dispose() }
-    } finally { $output.Dispose() }
-    return $path
-}
-function Publish([string]$Path, [string]$Destination) {
-    try {
-        if ([IO.File]::Exists($Destination)) {
-            [IO.File]::Replace($Path, $Destination, [NullString]::Value)
-        } else {
-            [IO.File]::Move($Path, $Destination)
-        }
-    } catch {
-        Write-Output "Publication failed for '$Destination'."
-        throw "Publication failed for '$Destination'. A running omgs.exe or MXC executor may hold the file. Stop it and retry. The existing destination is preserved on a sharing violation. Earlier published files remain individually verified and complete, but the installation may contain a mix of old and new files until retry succeeds. Staged temporary files are cleaned up. Cause: $($_.Exception.Message)"
-    }
-}
-
 try {
     Fetch 'SHA256SUMS' 1048576
     Fetch $asset 104857600
@@ -201,29 +134,9 @@ try {
     else { Write-Output 'OMGS provenance: unverified (unavailable or failed; this alone is not evidence of tampering)' }
     $actual = & (Join-Path $tmp $asset) --version
     if ($LASTEXITCODE -ne 0 -or $actual -cne "omgs $Version") { throw "version mismatch: skill expects omgs $Version; binary reports $actual" }
-    $bin = Join-Path $DestRoot 'bin'
-    $mxc = Join-Path $DestRoot 'mxc/1.0.1'
-    Check-Ancestors $bin
-    Check-Ancestors $mxc
-    New-PrivateTree $bin
-    New-PrivateTree $mxc
-    # Verify all destination siblings before the first atomic replacement.
-    $stagedOmgs = Stage $asset (Join-Path $bin 'omgs.exe')
-    $stagedMxc = Stage $mxcAsset (Join-Path $mxc $mxcFile)
-    $stagedLicense = Stage 'MXC-LICENSE.txt' (Join-Path $mxc 'MXC-LICENSE.txt')
-    Checksum $asset $stagedOmgs
-    Signature $stagedOmgs $OmgsSubject
-    Checksum $mxcAsset $stagedMxc
-    Signature $stagedMxc $MicrosoftSubject
-    Checksum 'MXC-LICENSE.txt' $stagedLicense
-    Publish $stagedMxc (Join-Path $mxc $mxcFile)
-    Publish $stagedLicense (Join-Path $mxc 'MXC-LICENSE.txt')
-    Publish $stagedOmgs (Join-Path $bin 'omgs.exe')
-    Write-Output "Installed MXC 1.0.1: $(Join-Path $mxc $mxcFile)"
-    Write-Output "Installed $actual`: $(Join-Path $bin 'omgs.exe')"
+    # The verified executable owns admission and exact-path publication.
+    & (Join-Path $tmp $asset) install-self --to $DestRoot --mxc (Join-Path $tmp $mxcAsset) --license (Join-Path $tmp 'MXC-LICENSE.txt')
+    if ($LASTEXITCODE -ne 0) { throw 'Verified install-self failed' }
 } finally {
-    foreach ($path in $staged) {
-        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-    }
     Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 }

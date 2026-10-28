@@ -27,7 +27,7 @@ class Installers(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix='omgs-installer-',
                                                dir=os.environ['USERPROFILE'] if os.name == 'nt' else None)
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.skill = self.root / 'skill'
         shutil.copytree(ROOT / 'skill', self.skill)
         self.bundle = self.root / 'bundle'
@@ -127,18 +127,18 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
             path.write_bytes(data)
         text = self.script.read_text()
         if self.windows:
-            marker = '    Checksum $asset $stagedOmgs'
+            marker = '    $actual = & (Join-Path $tmp $asset) --version'
             injection = {
                 'abort': "    throw 'simulated staging failure'",
-                'checksum': "    [IO.File]::WriteAllText($stagedLicense, 'corrupt staged bytes')",
-                'signature': "    function Test-AuthenticodeSignature { return [pscustomobject]@{ Status='HashMismatch'; SignerCertificate=$null } }",
+                'checksum': "    [IO.File]::WriteAllText((Join-Path $tmp 'MXC-LICENSE.txt'), 'corrupt staged bytes')\n    Checksum 'MXC-LICENSE.txt'",
+                'signature': "    function Test-AuthenticodeSignature { return [pscustomobject]@{ Status='HashMismatch'; SignerCertificate=$null } }\n    Signature (Join-Path $tmp $asset) $OmgsSubject",
             }[failure]
         else:
-            marker = 'checksum "$asset" "$staged_omgs"'
+            marker = 'chmod 0755 "$tmp/$asset"'
             injection = {
                 'abort': "echo 'simulated staging failure' >&2; exit 1",
-                'checksum': "printf 'corrupt staged bytes' > \"$staged_license\"",
-                'signature': "MICROSOFT_TEAM_ID=wrong-staged-signer\nverify_signature() { echo 'publisher signature rejected: staged file' >&2; exit 1; }",
+                'checksum': "printf 'corrupt staged bytes' > \"$tmp/MXC-LICENSE.txt\"\nchecksum MXC-LICENSE.txt",
+                'signature': "verify_signature() { echo 'publisher signature rejected: staged file' >&2; exit 1; }\nverify_signature \"$tmp/$asset\" \"$OMGS_TEAM_ID\"",
             }[failure]
         self.assertEqual(text.count(marker), 1)
         self.script.write_text(text.replace(marker, injection + '\n' + marker))
@@ -207,6 +207,33 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
                 self.assertEqual(unsafe.stat().st_mode & 0o7777, mode)
                 self.assertFalse(any(p.is_file() for p in home.rglob('*')))
 
+    @unittest.skipIf(os.name == 'nt', 'Unix publication paths')
+    def test_sticky_bin_and_precreated_leaf_directory_or_symlink_are_refused(self):
+        self.fake_verifiers()
+        for kind in ('sticky', 'directory', 'symlink', 'ancestor-link'):
+            home = self.root / kind
+            bin_dir = home / 'bin'
+            bin_dir.mkdir(parents=True)
+            binary = bin_dir / 'omgs'
+            if kind == 'sticky':
+                bin_dir.chmod(0o1777)
+            elif kind == 'directory':
+                binary.mkdir()
+            elif kind == 'symlink':
+                binary.symlink_to(self.binary)
+            else:
+                alias = self.root / 'alias'
+                alias.symlink_to(home, target_is_directory=True)
+                home = alias
+            self.env['OMGS_HOME'] = str(home)
+            out = self.run_install()
+            self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+            expected = (home if kind == 'ancestor-link' else
+                        bin_dir if kind == 'sticky' else binary)
+            self.assertIn(str(expected), out.stderr)
+            self.assertFalse(list(bin_dir.glob('.omgs-*')))
+            self.assertEqual(sha(self.binary), self.original)
+
     @unittest.skipUnless(os.name == 'nt', 'Windows ACLs')
     def test_windows_created_directories_have_owner_only_protected_dacl(self):
         self.fake_verifiers()
@@ -217,7 +244,7 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
 $ErrorActionPreference = 'Stop'
 $user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $root = Get-Item -LiteralPath '{home}'
-foreach ($d in @($root) + @(Get-ChildItem -LiteralPath $root.FullName -Directory -Recurse)) {{
+foreach ($d in @($root) + @(Get-ChildItem -LiteralPath $root.FullName -Recurse)) {{
     $a = Get-Acl -LiteralPath $d.FullName
     if (-not $a.AreAccessRulesProtected -or $a.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $user) {{ throw 'Directory owner or protection mismatch' }}
     $rules = @($a.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
@@ -234,7 +261,7 @@ foreach ($d in @($root) + @(Get-ChildItem -LiteralPath $root.FullName -Directory
         # First create the installation with the production private DACL.
         out = self.run_install()
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
-        destination = home / 'bin'
+        destination = home / 'bin' / 'omgs.exe'
         command = f"""
 $p = '{str(destination).replace("'", "''")}'
 $a = Get-Acl -LiteralPath $p
@@ -263,10 +290,9 @@ Set-Acl -LiteralPath $p -AclObject $a
             destination.write_bytes(b'previous locked file')
             escaped = str(destination).replace("'", "''")
             injection = f"    $held = [IO.File]::Open('{escaped}', 'Open', 'Read', 'Read')\n"
-            marker = '    Publish $stagedMxc (Join-Path $mxc $mxcFile)'
+            marker = '    # The verified executable owns admission and exact-path publication.'
             text = original_script.replace(marker, injection + marker)
-            text = text.replace('    foreach ($path in $staged) {',
-                                '    if ($held) { $held.Dispose() }\n    foreach ($path in $staged) {')
+            text = text.replace('} finally {\n    Remove-Item -LiteralPath $tmp', '} finally {\n    if ($held) { $held.Dispose() }\n    Remove-Item -LiteralPath $tmp')
             self.script.write_text(text)
             out = self.run_install()
             message = ' '.join((out.stdout + out.stderr).split())

@@ -132,3 +132,51 @@ provenance would need assertion reporting separated from target execution, for
 example a trusted reporter in a separately isolated process with a private
 channel unavailable to target code. That option needs a defined isolation policy
 and is not implemented in this PR.
+
+
+## Complete storage-chain admission and verified publication
+
+Onboarding installers verify SHA256SUMS, publisher signatures, optional provenance
+and MXC pins in newly created owner-only staging. Only then do they invoke the
+staged executable's internal `install-self` command. Rust owns admission and
+publication for OMGS, the mirrored MXC executor and its license. There is no
+second shell or PowerShell permission policy.
+
+One shared safe-path check covers installation and run storage. It walks the
+complete existing directory chain through the filesystem root, including above
+HOME and USERPROFILE. Root-owned intermediate directories are not anchors.
+Symlink and reparse ancestors are refused; callers must use physical paths.
+On Unix, ancestors must be owned by root or the current user and must not be
+writable by other users. A sticky writable ancestor is allowed only when its
+child is owned by root or the current user. macOS extended ACL mutation grants
+are checked on every ancestor and leaf under the existing ACL rules, including
+inheritable grants. The publication or run directory never gets a sticky
+exception. Run directories still require mode 0700.
+
+Windows ancestors allow the current user, SYSTEM, BUILTIN\Administrators and
+TrustedInstaller as owners and mutation principals. An INHERIT_ONLY_ACE is
+ignored on ancestors because it grants no rights on that directory; each child
+is checked independently using its own DACL. Effective DELETE_CHILD, DELETE,
+WRITE_DAC, WRITE_OWNER and FILE_WRITE_ATTRIBUTES grants to other principals
+are refused, including generic write/all mappings. FILE_ADD_FILE and
+FILE_ADD_SUBDIRECTORY alone are allowed on ancestors because they cannot
+replace an existing entry. This permits default drive roots without trusting
+profile paths implicitly. Publication directories, run directories and leaf
+files retain the strict current-user ownership and existing mutation allowlist
+(current user, SYSTEM, Administrators, and CREATOR OWNER mapping to that user),
+including effective and inheritable ACEs. TrustedInstaller gets no exception
+there. New Windows directories and files receive owner-only protected DACLs
+at creation.
+
+Existing installation files must be single-link regular files, owned by the
+current user and without write grants for other principals. Unsafe existing
+objects are refused with their path and are never repaired. All verified files
+are copied to exclusive same-filesystem siblings and checked for complete bytes
+before any publication. Unix rename and Windows MoveFileEx(REPLACE_EXISTING)
+replace the exact destination entry. The latter retains the fresh source DACL,
+unlike File.Replace, which preserves destination permissions. Admission is
+rechecked before and after publication. Sharing violations preserve the locked
+destination, report stop-and-retry guidance, and clean remaining siblings.
+A failure after an earlier successful publication can leave a mix of complete,
+verified versions; retry completes the installation. Trusted owners must not
+rename or replace storage concurrently with a run or installation.

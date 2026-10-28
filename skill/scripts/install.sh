@@ -49,16 +49,11 @@ CONSENT
 printf 'Resolved: OMGS %s; source %s; destination %s; binary %s; executor %s\n' "$VERSION" "$BASE" "$DEST_ROOT" "$asset" "${mxc_asset:-unavailable}"
 IFS= read -r answer || answer=''
 [ "$answer" = yes ] || { echo 'Installation cancelled before downloads' >&2; exit 1; }
+umask 077
 tmp=$(mktemp -d)
-staged_omgs=''
-staged_mxc=''
-staged_license=''
-cleanup() {
-  for staged in "$staged_omgs" "$staged_mxc" "$staged_license"; do
-    [ -z "$staged" ] || rm -f -- "$staged"
-  done
-  rm -rf "$tmp"
-}
+# Clear inherited ACLs only on this exclusively created disposable directory.
+if [ "$(uname -s)" = Darwin ]; then chmod -N "$tmp"; fi
+cleanup() { rm -rf "$tmp"; }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 fetch() {
@@ -114,82 +109,9 @@ if ! actual_version=$("$tmp/$asset" --version); then
   echo "version mismatch: skill expects omgs $VERSION; binary --version failed" >&2; exit 1
 fi
 [ "$actual_version" = "omgs $VERSION" ] || { echo "version mismatch: skill expects omgs $VERSION; binary reports $actual_version" >&2; exit 1; }
-# Existing storage is inspected, never repaired. Check every replaceable parent.
-# Outside HOME, a root-owned non-writable (or sticky) directory anchors the walk.
-umask 077
-storage_error() {
-  echo "owner-private installation storage $1: $2; see README.md#storage-migration" >&2
-  exit 1
-}
-check_storage() {
-  [ ! -L "$1" ] && [ -d "$1" ] || storage_error "$1" 'storage must be a directory without links'
-  if [ "$(uname -s)" = Darwin ]; then
-    info=$(stat -f '%u %OLp' "$1")
-  else
-    info=$(stat -c '%u %a' "$1")
-  fi
-  owner=${info%% *}
-  mode=${info#* }
-  bits=$((0$mode))
-  [ "$owner" = "$(id -u)" ] || [ "$2" = anchor -a "$owner" = 0 ] || storage_error "$1" 'storage must be owned by the current user'
-  [ $((bits & 0022)) -eq 0 ] || [ $((bits & 01000)) -ne 0 ] || storage_error "$1" 'storage must not be group- or world-writable without the sticky bit'
-}
-check_ancestors() {
-  current=$1
-  while :; do
-    if [ -e "$current" ] || [ -L "$current" ]; then
-      case "$current/" in
-        "$HOME/"*) check_storage "$current" ancestor ;;
-        *) check_storage "$current" anchor ;;
-      esac
-      [ "$current" != "$HOME" ] || break
-      # A custom root outside HOME can end at a non-replaceable system anchor.
-      if [ "$owner" = 0 ] && [ "$(id -u)" != 0 ]; then
-        check_storage "$current" anchor
-        break
-      fi
-    fi
-    [ "$current" != / ] || break
-    current=$(dirname -- "$current")
-  done
-}
-private_tree() (
-  directory=$1
-  if [ -e "$directory" ] || [ -L "$directory" ]; then
-    check_storage "$directory" destination
-  else
-    parent=$(dirname -- "$directory")
-    if [ ! -d "$parent" ]; then private_tree "$parent"; fi
-    mkdir -m 0700 -- "$directory"
-    # Remove inherited extended ACLs only on directories just created by us.
-    if [ "$(uname -s)" = Darwin ]; then chmod -N "$directory"; fi
-    chmod 0700 "$directory"
-    check_storage "$directory" destination
-  fi
-)
-check_ancestors "$DEST_ROOT/bin"
-check_ancestors "$DEST_ROOT/mxc/1.0.1"
-
-# Stage every file on its destination filesystem before publishing any file.
-private_tree "$DEST_ROOT/bin"
-staged_omgs=$(mktemp "$DEST_ROOT/bin/.omgs.XXXXXXXX")
-install -m 0755 "$tmp/$asset" "$staged_omgs"
+# The verified executable owns admission and exact-path publication.
 if [ -n "$mxc_asset" ]; then
-  private_tree "$DEST_ROOT/mxc/1.0.1"
-  staged_mxc=$(mktemp "$DEST_ROOT/mxc/1.0.1/.mxc.XXXXXXXX")
-  install -m 0755 "$tmp/$mxc_asset" "$staged_mxc"
-  staged_license=$(mktemp "$DEST_ROOT/mxc/1.0.1/.license.XXXXXXXX")
-  install -m 0644 "$tmp/MXC-LICENSE.txt" "$staged_license"
+  "$tmp/$asset" install-self --to "$DEST_ROOT" --mxc "$tmp/$mxc_asset" --license "$tmp/MXC-LICENSE.txt"
+else
+  "$tmp/$asset" install-self --to "$DEST_ROOT"
 fi
-checksum "$asset" "$staged_omgs"
-verify_signature "$staged_omgs" "$OMGS_TEAM_ID"
-if [ -n "$mxc_asset" ]; then
-  checksum "$mxc_asset" "$staged_mxc"
-  verify_signature "$staged_mxc" "$MICROSOFT_TEAM_ID"
-  checksum MXC-LICENSE.txt "$staged_license"
-  mv -f -- "$staged_mxc" "$DEST_ROOT/mxc/1.0.1/$mxc_file"
-  mv -f -- "$staged_license" "$DEST_ROOT/mxc/1.0.1/MXC-LICENSE.txt"
-  echo "Installed MXC 1.0.1: $DEST_ROOT/mxc/1.0.1/$mxc_file"
-fi
-mv -f -- "$staged_omgs" "$DEST_ROOT/bin/omgs"
-echo "Installed $actual_version: $DEST_ROOT/bin/omgs"

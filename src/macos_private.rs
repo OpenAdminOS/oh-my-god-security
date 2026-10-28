@@ -365,6 +365,17 @@ mod tests {
         );
         let before = acl_text(&fixture.0);
         let run = fixture.0.join("store/repo/run");
+        assert!(platform::create_private_tree(&run).is_err());
+        assert_eq!(acl_text(&fixture.0), before);
+        assert!(!fixture.0.join("store").exists());
+        // Non-mutating inherited ACLs remain safe and are stripped only on
+        // newly created directories, never on the existing parent.
+        restrict_created_dir(&fixture.0).unwrap();
+        add_acl(
+            &fixture.0,
+            "everyone allow list,search,file_inherit,directory_inherit",
+        );
+        let before = acl_text(&fixture.0);
         platform::create_private_tree(&run).unwrap();
         for dir in [
             fixture.0.join("store"),
@@ -382,6 +393,6 @@ mod tests {
         assert!(!String::from_utf8_lossy(&acl_text(&run.join(runmeta::FILE))).contains("allow"));
         assert!(!String::from_utf8_lossy(&acl_text(&run.join(".omgs-run.lock"))).contains("allow"));
         assert_eq!(acl_text(&fixture.0), before);
-        assert!(platform::create_private_tree(&fixture.0).is_err());
+        platform::create_private_tree(&fixture.0).unwrap();
     }
 }
