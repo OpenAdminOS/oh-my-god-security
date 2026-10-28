@@ -1,2 +1,5 @@
 # Archived proof digests cover exact bytes on every platform.
 benchmark/fixtures/score/**/proofs/** -text
+
+# The embedded skill bundle must have identical bytes on every platform.
+skill/** text eol=lf
