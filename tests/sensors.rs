@@ -1,3 +1,11 @@
+// Valid run evidence uses the same ownership and ACL as runtime writers.
+fn write_private_fixture(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    omgs::runmeta::write_atomic_bytes(path.as_ref(), bytes.as_ref())
+}
+
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -281,8 +289,8 @@ fn offline_tools_feed_redacted_artifacts_reports_and_critic() {
         u["status"] = json!("covered");
         u["evidence"] = json!(["reviewed source"]);
     }
-    std::fs::write(run.join("coverage-ledger.json"), ledger.to_string()).unwrap();
-    std::fs::write(run.join("candidates-empty.json"), r#"{"candidates":[]}"#).unwrap();
+    write_private_fixture(run.join("coverage-ledger.json"), ledger.to_string()).unwrap();
+    write_private_fixture(run.join("candidates-empty.json"), r#"{"candidates":[]}"#).unwrap();
     let critic = omgs::critic::critique_run(&run).unwrap();
     assert!(!critic.passed());
     assert_eq!(critic.gaps.len(), 2, "{:?}", critic.gaps);
@@ -295,7 +303,7 @@ fn offline_tools_feed_redacted_artifacts_reports_and_critic() {
         u["status"] = json!("out_of_scope");
         u["note"] = json!("Reviewed fixture, no reachable production effect");
     }
-    std::fs::write(run.join("coverage-ledger.json"), ledger.to_string()).unwrap();
+    write_private_fixture(run.join("coverage-ledger.json"), ledger.to_string()).unwrap();
     assert!(omgs::critic::critique_run(&run).unwrap().passed());
     // Removing a hit's unit cannot bypass reconciliation.
     let mut removed = ledger.clone();
@@ -303,9 +311,9 @@ fn offline_tools_feed_redacted_artifacts_reports_and_critic() {
         .as_array_mut()
         .unwrap()
         .retain(|u| !u["id"].as_str().unwrap().starts_with("sensor:trufflehog:"));
-    std::fs::write(run.join("coverage-ledger.json"), removed.to_string()).unwrap();
+    write_private_fixture(run.join("coverage-ledger.json"), removed.to_string()).unwrap();
     assert!(!omgs::critic::critique_run(&run).unwrap().passed());
-    std::fs::write(run.join("coverage-ledger.json"), ledger.to_string()).unwrap();
+    write_private_fixture(run.join("coverage-ledger.json"), ledger.to_string()).unwrap();
     let out = f.cli(&[
         "report",
         "--findings",

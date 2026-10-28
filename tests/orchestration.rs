@@ -139,7 +139,7 @@ fn batch_summary_reads_a_run_directory() {
     let index = scratch("batch");
     let run = index.join("github.com__a__b");
     omgs::platform::create_private_dir(&run).unwrap();
-    std::fs::write(run.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    write_private_fixture(run.join("findings.json"), r#"{"findings": []}"#).unwrap();
     write_private_fixture(
         run.join("run-metadata.json"),
         r#"{"run_status":"complete","agent_calls_used":12,"reroutes":[{"role":"hunter","from":"m1","to":"m2","reason":"declined"}],"blockers":["route exhausted"]}"#,
@@ -252,7 +252,7 @@ fn watch_routes_and_host_rules() {
         r#"{"stages":[],"updated_ms":5}"#,
     )
     .unwrap();
-    std::fs::write(dir.join("findings.json"), "secret").unwrap();
+    write_private_fixture(dir.join("findings.json"), "secret").unwrap();
     let req = |line: &str, host: &str| format!("{line}\r\nHost: {host}\r\n\r\n");
     let r = respond(&req("GET / HTTP/1.1", "127.0.0.1:4000"), 4000, &dir);
     assert_eq!(r.status, 200);
@@ -571,7 +571,7 @@ fn answer_scopes_match_path_prefixes_only_at_boundaries() {
 #[test]
 fn report_marks_the_run_complete_and_records_metadata() {
     let dir = scratch("complete");
-    std::fs::write(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    write_private_fixture(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
     write_private_fixture(
         dir.join("run-metadata.json"),
         r#"{"run_status":"in_progress","models":{"hunter":"model-a"},"reroutes":[{"role":"hunter","from":"model-z","to":"model-a","reason":"declined"}]}"#,
@@ -835,7 +835,7 @@ fn answers_files_are_strict_and_bound_to_the_run_target() {
     .unwrap();
     let mut f = open_record("a", Some("web.public-resource"), "a.ts");
     f.title = "Shared question".into();
-    std::fs::write(
+    write_private_fixture(
         dir.join("findings.json"),
         serde_json::to_string(&FindingsFile { findings: vec![f] }).unwrap(),
     )
@@ -1239,7 +1239,7 @@ fn report_shows_only_reviewer_recorded_answers() {
     .status
     .success());
     let f = open_record("a", Some("web.public-resource"), "app/x.ts");
-    std::fs::write(
+    write_private_fixture(
         run.join("findings.json"),
         serde_json::to_string(&FindingsFile { findings: vec![f] }).unwrap(),
     )
@@ -1363,7 +1363,7 @@ fn duplicate_keys_in_run_metadata_and_batch_files_are_errors() {
 #[test]
 fn watch_never_serves_a_linked_or_special_status_file() {
     let dir = scratch("watch-links");
-    std::fs::write(dir.join("findings.json"), "SECRET FINDING").unwrap();
+    write_private_fixture(dir.join("findings.json"), "SECRET FINDING").unwrap();
     std::os::unix::fs::symlink(dir.join("findings.json"), dir.join("pipeline-status.json"))
         .unwrap();
     let req = "GET /pipeline-status.json HTTP/1.1\r\nHost: 127.0.0.1:4000\r\n\r\n";
@@ -1395,7 +1395,7 @@ fn batch_index_fails_on_malformed_run_metadata() {
     let index = scratch("index-malformed");
     let run = index.join("r");
     std::fs::create_dir_all(&run).unwrap();
-    std::fs::write(run.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    write_private_fixture(run.join("findings.json"), r#"{"findings": []}"#).unwrap();
     write_private_fixture(
         run.join("run-metadata.json"),
         r#"{"blockers":["x"],"blockers":[]}"#,
@@ -1416,7 +1416,7 @@ fn batch_index_rejects_wrong_metadata_types() {
     let index = scratch("index-types");
     let run = index.join("r");
     std::fs::create_dir_all(&run).unwrap();
-    std::fs::write(run.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    write_private_fixture(run.join("findings.json"), r#"{"findings": []}"#).unwrap();
     let r = BatchRun {
         url: "https://github.com/a/b".into(),
         run_dir: Some(run.to_string_lossy().to_string()),
@@ -1474,7 +1474,7 @@ fn similar_paths_never_share_an_answer_store() {
 #[test]
 fn report_rejects_malformed_routing_metadata() {
     let dir = scratch("report-routing");
-    std::fs::write(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
+    write_private_fixture(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
     for bad in [
         r#"{"reroutes": false}"#,
         r#"{"models": {"hunter": 42}}"#,

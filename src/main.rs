@@ -4110,7 +4110,8 @@ mod inventory_regressions {
             assert_eq!(unit["inventory_gap_count"], 1);
             assert_eq!(unit["inventory_gap_samples"].as_array().unwrap().len(), 1);
         }
-        std::fs::write(run.join("candidates-red.json"), "{\"candidates\":[]}").unwrap();
+        omgs::runmeta::write_atomic(&run.join("candidates-red.json"), "{\"candidates\":[]}")
+            .unwrap();
         let args = vec![
             "--findings".into(),
             run.join("findings.json").to_str().unwrap().into(),
