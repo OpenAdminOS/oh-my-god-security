@@ -2273,8 +2273,16 @@ fn run_inner(
             result.enforced.extend(pending_cgroups);
         }
     }
-    let executor_failed =
-        nonce.is_some() && result.command_finished && result.executor_exit_code != result.exit_code;
+    // A requested shutdown can race with the wrapper's end marker. Signal
+    // termination is expected after our interrupt/timeout cleanup, even if the
+    // wrapper managed to report its inner status first. Unexpected executor
+    // failures still invalidate cleanup, and requested stops never pass proofs.
+    let expected_signal_exit = (waited.interrupted || waited.timed_out)
+        && waited.status.is_some_and(|status| status.code().is_none());
+    let executor_failed = nonce.is_some()
+        && result.command_finished
+        && result.executor_exit_code != result.exit_code
+        && !expected_signal_exit;
     if executor_failed {
         result.notes.push(format!(
             "executor termination disagrees with completed workload: executor={:?}, workload={:?}",
@@ -2348,6 +2356,76 @@ mod tests {
         assert!(run.command_finished, "{run:?}");
         assert_eq!(run.exit_code, Some(0));
         assert_eq!(run.executor_exit_code, Some(99));
+        assert!(!run.cleanup_complete && !run.success, "{run:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn requested_signal_exit_after_end_marker_preserves_verified_cleanup() {
+        if std::env::var_os("OMGS_SHUTDOWN_MARKER_CHILD").is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "supervise::tests::requested_signal_exit_after_end_marker_preserves_verified_cleanup", "--nocapture"])
+                .env("OMGS_SHUTDOWN_MARKER_CHILD", "1")
+                .output().unwrap();
+            assert!(out.status.success(), "{out:?}");
+            return;
+        }
+        for interrupted in [true, false] {
+            let stop = if interrupted {
+                format!("kill -TERM {};", std::process::id())
+            } else {
+                String::new()
+            };
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", &format!("printf 'OMGS_START_test\\nOMGS_END_test:137\\n'; {stop} while :; do /bin/sleep 1; done")]);
+            let run = run_marked(
+                cmd,
+                &Limits {
+                    wall_ms: if interrupted { 5000 } else { 100 },
+                    cpu_secs: None,
+                    file_size_bytes: None,
+                    open_files: None,
+                    memory_bytes: None,
+                    tasks: None,
+                    output_cap_bytes: 65536,
+                },
+                None,
+                "test",
+            );
+            assert!(run.command_started && run.command_finished, "{run:?}");
+            assert_eq!(run.exit_code, Some(137), "{run:?}");
+            assert_eq!(run.executor_exit_code, None, "{run:?}");
+            assert_eq!(run.interrupted, interrupted, "{run:?}");
+            assert_eq!(run.timed_out, !interrupted, "{run:?}");
+            assert!(run.capture_complete && run.cleanup_complete, "{run:?}");
+            assert!(!run.success, "{run:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsolicited_signal_exit_after_end_marker_still_fails_cleanup() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "printf 'OMGS_START_test\\nOMGS_END_test:0\\n'; kill -KILL $$",
+        ]);
+        let run = run_marked(
+            cmd,
+            &Limits {
+                wall_ms: 5000,
+                cpu_secs: None,
+                file_size_bytes: None,
+                open_files: None,
+                memory_bytes: None,
+                tasks: None,
+                output_cap_bytes: 65536,
+            },
+            None,
+            "test",
+        );
+        assert!(run.command_finished, "{run:?}");
+        assert!(!run.interrupted && !run.timed_out, "{run:?}");
         assert!(!run.cleanup_complete && !run.success, "{run:?}");
     }
 
