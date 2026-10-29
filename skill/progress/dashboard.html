@@ -77,8 +77,8 @@ h2{font-size:13px;color:var(--muted);margin:24px 0 10px;font-weight:600}
   <aside class="sandbox" aria-labelledby="sandbox-heading">
     <h2 id="sandbox-heading">When a proof runs</h2>
     <ul>
-      <li>Works on a copy; the original is never touched.</li>
-      <li>Files are blocked unless access is explicitly allowed.</li>
+      <li>Proofs run on a copy and cannot modify the original.</li>
+      <li>Writes stay within the copy and scratch folders. Granted toolchain folders and caches remain readable.</li>
       <li>No network in or out, and no access to this computer's local services (host loopback).</li>
       <li>The environment is cleared, with scratch folders for home, temporary files and caches.</li>
       <li>Time and saved output have limits.</li>
