@@ -61,6 +61,17 @@ OSV availability and never downloads its database. Proofs never download target
 dependencies or access the external network. The CLI's git subprocess can also
 inherit user git configuration and credentials; use an appropriate review account.
 
+## Why a binary at all?
+
+The tradeoff in one sentence: the binary replaces trust in a model's
+self-discipline, which fails silently, with trust in an inspectable,
+version-pinned artifact that is checksum-verified on every platform and
+publisher-signed on macOS and Windows, which fails loudly and can be audited.
+For a tool whose job is running untrusted code safely, we judged the second
+trust to be the smaller one. If you disagree, source builds and offline bundles
+are supported alternatives, and those are the routes to keep improving rather
+than dropping the enforcement layer.
+
 ## Why target code only runs in a sandbox
 
 Imports, build hooks and tests can execute arbitrary repository code. OMGS runs
