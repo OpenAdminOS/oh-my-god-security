@@ -43,7 +43,8 @@ $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($user, 'Fu
 Set-Acl -LiteralPath '{escaped}' -AclObject $acl
 """
             subprocess.run(['powershell', '-NoProfile', '-Command', command],
-                           text=True, capture_output=True, check=True)
+                           text=True, encoding='utf-8', errors='backslashreplace',
+                           capture_output=True, check=True)
         self.skill = self.root / 'skill'
         shutil.copytree(ROOT / 'skill', self.skill)
         self.bundle = self.root / 'bundle'
@@ -88,7 +89,7 @@ Set-Acl -LiteralPath '{escaped}' -AclObject $acl
             raise RuntimeError('Test copies require explicit --allow-test-verifiers')
         text = self.read_script()
         pins = self.skill / 'mxc-pins.txt'
-        rows = pins.read_text().splitlines()
+        rows = pins.read_text(encoding='utf-8-sig').splitlines()
         pins.write_text('\n'.join(' '.join(row.split()[:-1] + [self.executor_hash])
                                  if self.executor in row else row for row in rows) + '\n')
         if self.windows:
@@ -119,7 +120,11 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
     def run_install(self, answer='yes\n', real=False, extra=()):
         script = ROOT / 'skill/scripts' / self.script.name if real else self.script
         command = [os.environ.get('OMGS_TEST_POWERSHELL', 'powershell'), '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(script)] if self.windows else ['sh', str(script)]
-        return subprocess.run(command + list(extra), input=answer, text=True, capture_output=True,
+        # PowerShell 5.1 can emit OEM bytes even when Python uses an ANSI locale.
+        # Preserve undecodable diagnostic bytes visibly instead of losing a pipe
+        # to a background reader exception. Assertions still inspect all output.
+        return subprocess.run(command + list(extra), input=answer, text=True,
+                              encoding='utf-8', errors='backslashreplace', capture_output=True,
                               env=self.env, timeout=60)
 
     def assert_failed(self, result, message):
@@ -349,7 +354,8 @@ $a.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($s, 'FullCon
 Set-Acl -LiteralPath $p -AclObject $a
 """
         subprocess.run(['powershell', '-NoProfile', '-Command', seed],
-                       text=True, capture_output=True, check=True)
+                       text=True, encoding='utf-8', errors='backslashreplace',
+                       capture_output=True, check=True)
         replacement = self.run_install()
         self.assertEqual(replacement.returncode, 0, replacement.stdout + replacement.stderr)
         command = f"""
@@ -364,7 +370,8 @@ foreach ($d in @($root) + @(Get-ChildItem -LiteralPath $root.FullName -Recurse))
 }}
 """
         subprocess.run(['powershell', '-NoProfile', '-Command', command],
-                       text=True, capture_output=True, check=True)
+                       text=True, encoding='utf-8', errors='backslashreplace',
+                       capture_output=True, check=True)
 
     @unittest.skipUnless(os.name == 'nt', 'Windows ACLs')
     def test_windows_users_write_acl_is_rejected(self):
@@ -383,7 +390,8 @@ $a.AddAccessRule($r)
 Set-Acl -LiteralPath $p -AclObject $a
 """
         subprocess.run(['powershell', '-NoProfile', '-Command', command],
-                                text=True, capture_output=True, check=True)
+                       text=True, encoding='utf-8', errors='backslashreplace',
+                       capture_output=True, check=True)
         out = self.run_install()
         self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertIn('storage is writable by another principal', out.stderr)
@@ -513,16 +521,16 @@ if ((Normalize-DirectoryArgument '\\server\share\') -cne '\\server\share') { thr
         self.assert_failed(self.run_install(), 'checksum mismatch')
 
     def test_consent_text_is_identical(self):
-        shell = (ROOT / 'skill/scripts/install.sh').read_text()
+        shell = (ROOT / 'skill/scripts/install.sh').read_text(encoding='utf-8-sig')
         block = shell.split("cat <<'CONSENT'\n")[1].split('\nCONSENT')[0]
-        self.assertIn(block, (ROOT / 'skill/scripts/install.ps1').read_text())
-        self.assertIn(block, (ROOT / 'skill/SETUP.md').read_text())
+        self.assertIn(block, (ROOT / 'skill/scripts/install.ps1').read_text(encoding='utf-8-sig'))
+        self.assertIn(block, (ROOT / 'skill/SETUP.md').read_text(encoding='utf-8-sig'))
         for script in ['install.sh', 'install.ps1']:
-            source = (ROOT / 'skill/scripts' / script).read_text()
+            source = (ROOT / 'skill/scripts' / script).read_text(encoding='utf-8-sig')
             self.assertNotIn('OMGS_TEST_', source)
             self.assertNotIn('Test-AuthenticodeSignature', source)
         self.assertIn('/usr/bin/codesign --verify --strict', shell)
-        self.assertIn('Microsoft.PowerShell.Security\\Get-AuthenticodeSignature', (ROOT / 'skill/scripts/install.ps1').read_text())
+        self.assertIn('Microsoft.PowerShell.Security\\Get-AuthenticodeSignature', (ROOT / 'skill/scripts/install.ps1').read_text(encoding='utf-8-sig'))
 
     def test_package_templates_render_final_hashes(self):
         spec = importlib.util.spec_from_file_location('release', ROOT / 'packaging/release.py')
@@ -543,7 +551,7 @@ if ((Normalize-DirectoryArgument '\\server\share\') -cne '\\server\share') { thr
         output = self.root / 'rendered'
         module.packages('v0.1.0', self.bundle, output)
         self.assertEqual(len(list(output.iterdir())), 4)
-        formula = (output / 'omgs.rb').read_text()
+        formula = (output / 'omgs.rb').read_text(encoding='utf-8-sig')
         self.assertNotIn('@SHA_', formula)
         self.assertIn(sha(self.bundle / names[0]), formula)
         self.assertIn('mxc-1.0.1-macos-arm64', formula)
