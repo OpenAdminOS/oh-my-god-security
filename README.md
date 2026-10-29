@@ -78,6 +78,37 @@ clock. [Platform support](https://learn.microsoft.com/en-us/windows/apps/develop
 and `omgs doctor` explain what is enforceable on the current host. Missing controls
 block execution and leave the finding pending.
 
+Only proof workloads cross into the sandbox. Hunters and verifiers read code and
+write proof tests on the host, but never execute target code there.
+
+```mermaid
+flowchart TB
+    subgraph Host["Your machine (host)"]
+        Agent["Coding agent<br/>hunters read code, verifier writes a proof test<br/>no target code runs here"]
+        CLI["omgs prove<br/>copies the target to a per-run workspace<br/>writes a deny-by-default MXC config<br/>verifies the pinned executor SHA-256<br/>executor dry-run must accept the config"]
+        Repo["Your repository<br/>never mounted, never modified"]
+        Agent --> CLI
+    end
+
+    subgraph Sandbox["MXC 1.0.1 sandbox (pinned executor)"]
+        Work["Proof workload<br/>tier 1: proof test<br/>tier 2: locally built app on synthetic data (Linux)<br/>backend by OS: Seatbelt, bubblewrap, ProcessContainer"]
+        FS["Filesystem: deny by default<br/>write: workspace copy and scratch only<br/>read-only: granted toolchain roots"]
+        Net["Network: egress deny, ingress deny,<br/>host loopback deny<br/>tier 2 gets a sandbox-private loopback only"]
+        Env["Environment: cleared to an allowlist<br/>scratch HOME, TEMP and cache"]
+        Lim["Limits: wall clock and output cap<br/>Unix CPU, file-size and open-file limits<br/>OS-specific process cleanup"]
+        Work --- FS
+        Work --- Net
+        Work --- Env
+        Work --- Lim
+    end
+
+    CLI -->|"launches the workload inside MXC"| Work
+    Work -->|"exit code, markers, redacted output"| Record["Proof record<br/>names every enforced control and every gap"]
+    Record --> Replay["Independent evaluator<br/>replays the proof before a verdict stands"]
+    Net -. "no route out" .-> Internet["Internet and live services"]
+    FS -. "no access" .-> Repo
+```
+
 ## Handing results to an agent
 
 Pass the run's `HANDOFF.md` to the agent that will implement a fix, alongside the
