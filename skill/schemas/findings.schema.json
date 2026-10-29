@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OMGS findings",
+  "type": "object",
+  "required": [
+    "findings"
+  ],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "fingerprint",
+          "title",
+          "verdict",
+          "proof_tier",
+          "attack_class",
+          "entry_point",
+          "sink",
+          "boundary",
+          "location",
+          "hunted_by",
+          "verified_by"
+        ],
+        "properties": {
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^omgs-[0-9a-f]{16}$"
+          },
+          "title": {
+            "type": "string"
+          },
+          "verdict": {
+            "enum": [
+              "confirmed",
+              "needs_validation",
+              "rejected"
+            ]
+          },
+          "severity": {
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low",
+              "informational"
+            ]
+          },
+          "proof_tier": {
+            "enum": [
+              "traced",
+              "test_proven",
+              "sandbox_exploited"
+            ]
+          },
+          "attack_class": {
+            "type": "string"
+          },
+          "entry_point": {
+            "type": "string"
+          },
+          "sink": {
+            "type": "string"
+          },
+          "boundary": {
+            "type": "string"
+          },
+          "location": {
+            "type": "object",
+            "required": [
+              "path"
+            ],
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          },
+          "locations": {
+            "type": "array",
+            "description": "Further locations of the same root cause, so one copied defect stays one record.",
+            "items": {
+              "type": "object",
+              "required": [
+                "path"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            }
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "fix_brief": {
+            "type": "string"
+          },
+          "intent_question": {
+            "type": "string"
+          },
+          "intent_id": {
+            "type": "string",
+            "description": "Intent library question this record asks (omgs intent list)."
+          },
+          "family": {
+            "type": "string"
+          },
+          "prerequisites": {
+            "type": "string"
+          },
+          "hunted_by": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Hunter whose candidate produced this record."
+          },
+          "verified_by": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Independent verifier who decided this record. Must differ from hunted_by."
+          },
+          "candidates": {
+            "type": "array",
+            "uniqueItems": true,
+            "description": "Fingerprints of further candidates merged into this record; its own fingerprint is implicit.",
+            "items": {
+              "type": "string",
+              "pattern": "^omgs-[0-9a-f]{16}$"
+            }
+          },
+          "proof_ref": {
+            "type": "string",
+            "pattern": "^proofs/[1-9][0-9]*\\.json$",
+            "description": "The proof record omgs prove wrote beside this findings file. Required when proof_tier is test_proven or sandbox_exploited."
+          },
+          "trace": {
+            "type": "array",
+            "description": "Source to sink steps in order, for readers and fixing agents.",
+            "items": {
+              "type": "object",
+              "required": [
+                "location",
+                "note"
+              ],
+              "properties": {
+                "location": {
+                  "type": "object",
+                  "required": [
+                    "path"
+                  ],
+                  "properties": {
+                    "path": {
+                      "type": "string"
+                    },
+                    "line": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  }
+                },
+                "note": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

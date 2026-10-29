@@ -1,0 +1,134 @@
+{
+  "version": 1,
+  "description": "Reusable intent questions. A finding names one with intent_id; one recorded answer then resolves every record that asks it. Answers are stored on the reviewer's machine with omgs intent answer, never in the reviewed repository.",
+  "questions": [
+    {
+      "id": "web.public-resource",
+      "stacks": ["nextjs-app-router", "node", "aspnet", "python"],
+      "attack_classes": ["missing_authz", "client_only_auth"],
+      "question": "Is this resource meant to be readable without signing in?",
+      "why": "An unauthenticated read is a finding only when the resource is private; public catalogs and status pages are intended.",
+      "answers": ["public", "signed-in users only", "specific roles only"]
+    },
+    {
+      "id": "web.cross-tenant-read",
+      "stacks": ["nextjs-app-router", "node", "aspnet", "python"],
+      "attack_classes": ["idor_tenant_isolation"],
+      "question": "May a member of one workspace or tenant ever read another workspace's records through this route?",
+      "why": "Shared or federated workspaces exist; without that intent, any cross-tenant read is an isolation break.",
+      "answers": ["never", "only for explicitly shared records", "yes, data is global"]
+    },
+    {
+      "id": "web.admin-only-action",
+      "stacks": ["nextjs-app-router", "node", "aspnet", "python"],
+      "attack_classes": ["missing_authz"],
+      "question": "Which roles are allowed to perform this action?",
+      "why": "A missing role check matters only when the action is meant to be restricted.",
+      "answers": ["any signed-in user", "workspace admins", "platform operators only"]
+    },
+    {
+      "id": "web.client-gate-only",
+      "stacks": ["nextjs-app-router", "node", "static-web"],
+      "attack_classes": ["client_only_auth"],
+      "question": "Is hiding this screen in the browser meant to be the only control, or must the server refuse the request too?",
+      "why": "A UI-only gate is acceptable for cosmetics and never for protected data or actions.",
+      "answers": ["server must refuse", "UI only is acceptable"]
+    },
+    {
+      "id": "webhook.sender-scope",
+      "stacks": ["nextjs-app-router", "node", "aspnet", "python"],
+      "attack_classes": ["webhook_signature"],
+      "question": "Which senders may call this webhook, and must every delivery be signed and fresh?",
+      "why": "Unsigned or replayable webhooks are findings when only one provider is meant to trigger the handler.",
+      "answers": ["one signed provider, replay refused", "any caller with the URL", "internal network only"]
+    },
+    {
+      "id": "feed.lower-security-minimum",
+      "stacks": ["powershell"],
+      "attack_classes": ["feed_to_policy_write", "credential_handling"],
+      "question": "May an external feed lower a security minimum (for example an OS version floor) automatically, or only raise it?",
+      "why": "A feed that can move a minimum backwards weakens policy without review; many teams intend raise-only.",
+      "answers": ["raise only", "lowering allowed with review", "lowering allowed automatically"]
+    },
+    {
+      "id": "feed.unsupported-filter",
+      "stacks": ["powershell", "aspnet"],
+      "attack_classes": ["feed_to_policy_write", "import_parsing"],
+      "question": "When an imported rule uses a filter the tool does not support, should the rule be dropped (fail closed) or applied without the filter?",
+      "why": "Applying a rule without its filter widens its scope, for example a group-limited mapping becoming universal.",
+      "answers": ["drop the rule", "apply without the filter"]
+    },
+    {
+      "id": "script.manifest-supplier",
+      "stacks": ["powershell", "swift", "python"],
+      "attack_classes": ["generated_script_injection", "shell_injection", "command_injection"],
+      "question": "Who is allowed to supply the manifest, project, or configuration file whose values reach a generated script?",
+      "why": "Values becoming code is a finding when the file can come from someone less trusted than the person running the tool.",
+      "answers": ["only the operator running the tool", "teammates through review", "anyone, for example downloaded files"]
+    },
+    {
+      "id": "script.dry-run-executes",
+      "stacks": ["swift", "powershell", "python"],
+      "attack_classes": ["shell_injection", "command_injection", "generated_script_injection"],
+      "question": "Must a dry run be free of side effects, including executing commands built from input?",
+      "why": "A dry run that still executes manifest-controlled commands breaks the safety the flag promises.",
+      "answers": ["no side effects at all", "read-only commands are acceptable"]
+    },
+    {
+      "id": "browser.url-schemes",
+      "stacks": ["static-web"],
+      "attack_classes": ["export_integrity", "dom_injection"],
+      "question": "Which URL schemes may reach managed browser policy through this export?",
+      "why": "Schemes such as javascript: or file: in managed bookmarks or start pages are rarely intended.",
+      "answers": ["https only", "http and https", "any scheme"]
+    },
+    {
+      "id": "import.nesting-limit",
+      "stacks": ["static-web", "aspnet"],
+      "attack_classes": ["unbounded_import_recursion", "import_parsing"],
+      "question": "Are imported files trusted to be well formed, or must the importer bound nesting and size?",
+      "why": "Unbounded recursion is a denial of service only when imports can come from untrusted sources.",
+      "answers": ["untrusted, must be bounded", "trusted operator files only"]
+    },
+    {
+      "id": "local.privileged-delete-scope",
+      "stacks": ["swift", "powershell"],
+      "attack_classes": ["deletion_path_safety", "privileged_local_ops"],
+      "question": "Which directories may this tool delete from, and may the user control any parent of those paths?",
+      "why": "Deletion through a user-controlled parent or symlink is a finding when the tool runs with more privilege than the user.",
+      "answers": ["fixed allowlist, no user-controlled parents", "any path the invoking user owns"]
+    },
+    {
+      "id": "local.installer-signer",
+      "stacks": ["swift"],
+      "attack_classes": ["download_integrity", "privileged_local_ops"],
+      "question": "Must every installed payload be signed by one expected team and match the requested version?",
+      "why": "A helper that installs as root with a skipped signer or version check runs attacker code with root.",
+      "answers": ["expected team and version always required", "any valid signature is acceptable"]
+    },
+    {
+      "id": "local.downgrade",
+      "stacks": ["swift", "powershell"],
+      "attack_classes": ["download_integrity", "feed_to_policy_write"],
+      "question": "May an older version ever replace a newer installed version?",
+      "why": "Downgrades reintroduce fixed vulnerabilities; most updaters intend never, or only with an explicit rollback flag.",
+      "answers": ["never", "only with an explicit rollback action"]
+    },
+    {
+      "id": "identity.resource-binding",
+      "stacks": ["nextjs-app-router", "node", "aspnet", "python", "powershell", "swift", "shell", "browser-extension", "rust"],
+      "attack_classes": ["identity_binding"],
+      "question": "Must the requested resource belong to the authenticated identity or an explicitly authorized delegate?",
+      "why": "A valid identity must still be bound to the selected resource and operation.",
+      "answers": ["owner or explicit delegate only", "shared resources are allowed"]
+    },
+    {
+      "id": "policy.failure-behavior",
+      "stacks": ["nextjs-app-router", "node", "aspnet", "python", "powershell", "swift", "shell", "browser-extension", "rust"],
+      "attack_classes": ["fail_closed_semantics"],
+      "question": "Must an unavailable or unsupported security decision stop the protected operation?",
+      "why": "Error handling can widen authority when unknown is treated as permission.",
+      "answers": ["stop the operation", "use a reviewed restricted fallback"]
+    }
+  ]
+}

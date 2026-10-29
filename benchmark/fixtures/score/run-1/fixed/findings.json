@@ -1,0 +1,23 @@
+{
+  "findings": [
+    {
+      "attack_class": "tenant_isolation",
+      "entry_point": "app/api/a/route.ts:GET",
+      "sink": "loada",
+      "boundary": "member to private data",
+      "fingerprint": "omgs-d7c7756a1f68ec92",
+      "verdict": "confirmed",
+      "proof_tier": "test_proven",
+      "proof_ref": "proofs/1.json",
+      "title": "Fixture omgs-d7c7756a1f68ec92",
+      "location": {
+        "path": "app/api/a/route.ts",
+        "line": 1
+      },
+      "evidence": "Fixture source trace and archived failing assertion.",
+      "hunted_by": "fixture-hunter",
+      "verified_by": "fixture-verifier",
+      "severity": "high"
+    }
+  ]
+}

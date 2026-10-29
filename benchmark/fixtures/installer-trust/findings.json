@@ -1,0 +1,38 @@
+{
+  "findings": [
+    {
+      "fingerprint": "omgs-8804101e90b78ada",
+      "title": "Nil expected signing team disables signer verification in the installer helper",
+      "verdict": "confirmed",
+      "severity": "high",
+      "proof_tier": "test_proven",
+      "attack_class": "installer_signer_trust_bypass",
+      "entry_point": "vulnerable/Verifier.swift:decide",
+      "sink": "vulnerable/Verifier.swift:decide",
+      "boundary": "unsigned installer to root install hook",
+      "location": { "path": "benchmark/fixtures/installer-trust/vulnerable/Verifier.swift", "line": 10 },
+      "evidence": "Trace: decide(_:) checks the signing team only inside `if let expected = r.expectedTeam`, so a nil expected team skips verification and returns .authorized for any payload. Sandbox evidence (omgs prove, Seatbelt): the invariant harness run against the vulnerable snapshot reports FAIL on 'nil expected team must not accept an unnotarized mismatched signer' while the authorized control passes; the fixed snapshot upholds every invariant. No root, installer, or Gatekeeper interaction was needed.",
+      "fix_brief": "Invariant: a verified signer is always required. Narrowest change: when expectedTeam is nil, require the payload to be notarized rather than skipping the check. Acceptance check: benchmark/fixtures/installer-trust fixed snapshot upholds the signer invariant and the control.",
+      "hunted_by": "red-installer",
+      "verified_by": "blue-1",
+      "prerequisites": "Caller passes nil as the expected team; payload is signed (not necessarily notarized)."
+    },
+    {
+      "fingerprint": "omgs-7c24e0f1f417c124",
+      "title": "Installer helper accepts a downgrade and never enforces the expected version",
+      "verdict": "confirmed",
+      "severity": "high",
+      "proof_tier": "test_proven",
+      "attack_class": "installer_version_downgrade",
+      "entry_point": "vulnerable/Verifier.swift:decide",
+      "sink": "vulnerable/Verifier.swift:decide",
+      "boundary": "older payload over newer install",
+      "location": { "path": "benchmark/fixtures/installer-trust/vulnerable/Verifier.swift", "line": 18 },
+      "evidence": "Trace: decide(_:) never compares expectedVersion to payloadVersion and never compares payloadVersion to installedVersion, so an older payload installs over a newer one. Sandbox evidence (omgs prove, Seatbelt): the vulnerable snapshot reports FAIL on 'downgrade over a newer install is refused' and 'expected version must match the payload version'; the fixed snapshot refuses both.",
+      "fix_brief": "Invariant: the installed version never decreases and matches the request. Narrowest change: require expectedVersion == payloadVersion and refuse when installedVersion is newer. Acceptance check: the fixed snapshot refuses the downgrade and version-mismatch cases.",
+      "hunted_by": "red-installer",
+      "verified_by": "blue-1",
+      "prerequisites": "A newer version is already installed; caller supplies an older payload."
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
+PackageIdentifier: OpenAdminOS.OMGS
+PackageVersion: '@VERSION@'
+InstallerType: portable
+Commands:
+  - omgs
+Installers:
+  - Architecture: x64
+    InstallerUrl: @BASE@/omgs-x86_64-pc-windows-msvc.exe
+    InstallerSha256: @SHA_omgs-x86_64-pc-windows-msvc.exe@
+ManifestType: installer
+ManifestVersion: 1.9.0

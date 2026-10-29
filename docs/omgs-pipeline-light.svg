@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 720" width="1000" height="720" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif" role="img" aria-labelledby="t d">
+  <title id="t">OMGS pipeline: hunt, verify, adjudicate, guard</title>
+  <desc id="d">A central OMGS hub branches to four numbered stages. 01 Hunt: isolated red hunters, one per trust boundary. 02 Verify: an independent blue verifier makes survivors earn sandbox proof. 03 Adjudicate: a separate evaluator upholds, adjusts, or overturns each verdict. 04 Guard: confirmed findings become fix briefs and regression tests.</desc>
+  <defs>
+    <linearGradient id="cHunt" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff8f8f"/><stop offset="1" stop-color="#ff4d6d"/></linearGradient>
+    <linearGradient id="cVerify" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5fb0ff"/><stop offset="1" stop-color="#3f63e8"/></linearGradient>
+    <linearGradient id="cAdj" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a08dff"/><stop offset="1" stop-color="#6f45ef"/></linearGradient>
+    <linearGradient id="cGuard" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4fe0a6"/><stop offset="1" stop-color="#17b083"/></linearGradient>
+    <linearGradient id="lnHunt" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#cfd4dc"/><stop offset="1" stop-color="#ff5f7e"/></linearGradient>
+    <linearGradient id="lnVerify" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#cfd4dc"/><stop offset="1" stop-color="#4a74ea"/></linearGradient>
+    <linearGradient id="lnAdj" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#cfd4dc"/><stop offset="1" stop-color="#7d55ef"/></linearGradient>
+    <linearGradient id="lnGuard" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#cfd4dc"/><stop offset="1" stop-color="#1fb98a"/></linearGradient>
+    <radialGradient id="bg" cx="0.28" cy="0.2" r="1.1"><stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#eef0f4"/></radialGradient>
+    <filter id="softCard" x="-20%" y="-40%" width="140%" height="190%"><feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#2a3a66" flood-opacity="0.22"/></filter>
+    <filter id="softHub" x="-60%" y="-60%" width="220%" height="220%"><feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#1f2a44" flood-opacity="0.16"/></filter>
+  </defs>
+
+  <rect x="0" y="0" width="1000" height="720" rx="28" fill="url(#bg)" stroke="#e4e7ec"/>
+
+  <!-- connectors -->
+  <g fill="none" stroke-width="2.5" stroke-linecap="round">
+    <path d="M362 360 C 470 360 462 123 560 123" stroke="url(#lnHunt)"/>
+    <path d="M362 360 C 470 360 470 281 560 281" stroke="url(#lnVerify)"/>
+    <path d="M362 360 C 470 360 470 439 560 439" stroke="url(#lnAdj)"/>
+    <path d="M362 360 C 470 360 462 597 560 597" stroke="url(#lnGuard)"/>
+  </g>
+
+  <!-- hub -->
+  <g filter="url(#softHub)">
+    <circle cx="250" cy="360" r="120" fill="#ffffff"/>
+  </g>
+  <circle cx="250" cy="360" r="120" fill="none" stroke="#edeff3"/>
+  <text x="250" y="352" text-anchor="middle" fill="#1d2330" font-size="40" font-weight="800" letter-spacing="0.5">OMGS</text>
+  <text x="250" y="382" text-anchor="middle" fill="#8a90a0" font-size="15" font-weight="600" letter-spacing="2.5">SECURITY REVIEW</text>
+  <text x="250" y="408" text-anchor="middle" fill="#b7bcc7" font-size="12.5">red &#183; blue &#183; green</text>
+
+  <!-- card 01 Hunt -->
+  <g filter="url(#softCard)"><rect x="560" y="63" width="400" height="120" rx="60" fill="url(#cHunt)"/></g>
+  <text x="600" y="139" fill="#ffffff" fill-opacity="0.92" font-size="46" font-weight="800">01</text>
+  <text x="676" y="115" fill="#ffffff" font-size="23" font-weight="750">Hunt</text>
+  <text x="676" y="139" fill="#ffffff" fill-opacity="0.9" font-size="13">Isolated red hunters,</text>
+  <text x="676" y="157" fill="#ffffff" fill-opacity="0.9" font-size="13">one per trust boundary.</text>
+  <g transform="translate(872,106)" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="13" cy="13" r="9"/><line x1="19.5" y1="19.5" x2="28" y2="28"/>
+  </g>
+
+  <!-- card 02 Verify -->
+  <g filter="url(#softCard)"><rect x="560" y="221" width="400" height="120" rx="60" fill="url(#cVerify)"/></g>
+  <text x="600" y="297" fill="#ffffff" fill-opacity="0.92" font-size="46" font-weight="800">02</text>
+  <text x="676" y="273" fill="#ffffff" font-size="23" font-weight="750">Verify</text>
+  <text x="676" y="297" fill="#ffffff" fill-opacity="0.9" font-size="13">Independent blue verifier;</text>
+  <text x="676" y="315" fill="#ffffff" fill-opacity="0.9" font-size="13">survivors earn sandbox proof.</text>
+  <g transform="translate(872,262)" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M16 2 L29 7 V16 C29 24 23 29 16 32 C9 29 3 24 3 16 V7 Z"/><polyline points="10,16 14.5,20.5 22,11.5"/>
+  </g>
+
+  <!-- card 03 Adjudicate -->
+  <g filter="url(#softCard)"><rect x="560" y="379" width="400" height="120" rx="60" fill="url(#cAdj)"/></g>
+  <text x="600" y="455" fill="#ffffff" fill-opacity="0.92" font-size="46" font-weight="800">03</text>
+  <text x="676" y="431" fill="#ffffff" font-size="23" font-weight="750">Adjudicate</text>
+  <text x="676" y="455" fill="#ffffff" fill-opacity="0.9" font-size="13">A separate evaluator upholds,</text>
+  <text x="676" y="473" fill="#ffffff" fill-opacity="0.9" font-size="13">adjusts, or overturns verdicts.</text>
+  <g transform="translate(870,420)" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="16" y1="5" x2="16" y2="29"/><line x1="6" y1="10" x2="26" y2="10"/>
+    <path d="M2 11 a4 4 0 0 0 8 0"/><path d="M22 11 a4 4 0 0 0 8 0"/><line x1="10" y1="30" x2="22" y2="30"/>
+  </g>
+
+  <!-- card 04 Guard -->
+  <g filter="url(#softCard)"><rect x="560" y="537" width="400" height="120" rx="60" fill="url(#cGuard)"/></g>
+  <text x="600" y="613" fill="#ffffff" fill-opacity="0.92" font-size="46" font-weight="800">04</text>
+  <text x="676" y="589" fill="#ffffff" font-size="23" font-weight="750">Guard</text>
+  <text x="676" y="613" fill="#ffffff" fill-opacity="0.9" font-size="13">Green locks it in: fix briefs</text>
+  <text x="676" y="631" fill="#ffffff" fill-opacity="0.9" font-size="13">and regression tests.</text>
+  <g transform="translate(873,578)" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="5" y="14" width="22" height="16" rx="3.5"/><path d="M9 14 V10 a7 7 0 0 1 14 0 V14"/><circle cx="16" cy="21" r="1.6" fill="#ffffff"/>
+  </g>
+</svg>

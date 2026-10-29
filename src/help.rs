@@ -1,0 +1,40 @@
+//! Command-specific help without loading target content.
+const USAGE: &str = "omgs\n\nUsage:\n  omgs setup [--yes | --dry-run] [--from <skill-dir>] [--install-skills] [--replace] [--verify-mxc] [--write-policy <repo> --mode gate|advisory]\n  omgs review --repo-url <https-url> [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--clone-root <dir>] [--out <run-dir>]\n  omgs batch init --list <file> --out <dir> [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--clone-root <dir>]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--base <ref>] [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>]\n  omgs gate --target <checkout> --base <base-sha> --head <head-sha> [--run <dir>]\n  omgs stage --run <run-dir>\n    Only confirmed test_proven or higher with valid runner-attested proofs. Invalid proofs are excluded and reported; pending drafts stay in HANDOFF.md.\n  omgs handoff --run <run-dir> [--finding <id>]\n  omgs intent propose --run <run-dir>\n  omgs budget --run <run-dir> [--charge-calls <n>]\n  omgs bench score --cases <manifest> --runs <run-dir> [--runs <run-dir>]...\n  omgs validate (--findings | --candidates | --dispositions | --evaluation) <file>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--persona builder|inheritor|team] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]... [--model role=name]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger ingest --ledger <file> --dispositions <file>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>] [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role hunter|verifier|evaluator|guard [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n\nBoolean options: --replace, --yes, --dry-run, --install-skills, --verify-mxc, --no-sensors and --live. Every other option takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n";
+
+pub fn usage() {
+    eprintln!(
+        "omgs {}\n{}",
+        env!("CARGO_PKG_VERSION"),
+        USAGE.trim_start_matches("omgs")
+    );
+}
+
+pub fn command(cmd: &str, args: &[String]) {
+    let sub = args
+        .first()
+        .filter(|s| !s.starts_with('-'))
+        .map(|s| s.as_str());
+    let prefix = sub.map_or_else(
+        || format!("  omgs {cmd} "),
+        |s| format!("  omgs {cmd} {s} "),
+    );
+    eprintln!("Usage:");
+    for line in USAGE.lines().filter(|l| l.starts_with(&prefix)) {
+        eprintln!("{line}");
+    }
+    let detail = match cmd {
+        "prove" => "Outer exits: 0 clean success; 1 supported assertion; 2 harness, usage or execution error; 3 unavailable tier 2. Replay exits: 0 reproduced; 1 mismatch; 2 setup error. --timeout-ms defaults to 120000; the outer supervisor adds 15000 ms for startup and cleanup. --tier defaults to 1. --test-from stages an external synthetic draft at --test. --expect-marker declares a nonce-qualified recipe contract.",
+        "review" | "batch" | "audit" => "--persona builder|inheritor|team sets report and budget defaults. --budget overrides call/proof allowance. --mode defaults to advisory unless trusted policy selects gate. --out selects private external run storage (required for batch). --clone-root selects clone storage (default OMGS_HOME/targets); it does not move models, intent answers or scratch. --no-sensors skips optional offline scanners. Existing runs are never overwritten.",
+        "route" => "--refused MODEL --reason TEXT records a refusal or provider block even without models.json. --models supplies an ordered fallback list; defaults to OMGS_HOME/models.json. Without it, keep host-default until a refusal is recorded. Exit 0 selected a route; 1 recorded blocker with no eligible route; 2 invalid input. Recording a fallback does not authorize switching providers or models.",
+        "validate" => "Exactly one input: --findings, --candidates, --dispositions or --evaluation. Validates strict JSON and semantic fields; findings also validate retained proofs. Exit 0 valid; 1 evidence violations; 2 malformed input. Critic checks adjudication against the run.",
+        "budget" => "--charge-calls N atomically charges host calls before dispatch. Output is cumulative JSON including proofs, linked fix runs and remaining allowance. Exits 2 if exhausted or invalid; no silent reset.",
+        "report" => "--model role=name records host-supplied model identity (repeat per role). --agent-calls is the cumulative local count, never a delta or decrease. --accounting role=tokens,cost-usd,duration-ms accepts unknown components. Output includes evaluator decisions, replays, gaps, sensor limits and budget.",
+        "ledger" => "ingest --dispositions FILE atomically applies validated hunter dispositions. Candidate dispositions map to covered with evidence; covered means examined, not safe. list prints status: unit. set requires --unit and --status; repeat --evidence for references.",
+        "critic" => "Reconciles coverage, candidate provenance, proof records and evaluation.json. Every finalized record needs an independent evaluator verdict; upheld proofs need attested reproduced replays. Exit 0 pass; 1 gaps; 2 malformed artifacts. Parenthetical counts are inspected objects.",
+        "status" => "--stage ID --state pending|active|done|failed updates progress. --parent ID creates a child. Mark active when work starts; done alone leaves start unknown. Optional --accounting is printed only when supplied.",
+        "stage" => "Writes proposed-tests.patch for confirmed proof-backed records and policy.patch as an owner-review proposal. Applying either requires separate authorization; tiered gate selection follows trusted policy.",
+        "intent" => "list filters by --stack and canonical attack class; hyphen aliases are accepted and unknown classes diagnosed. answer records owner intent outside target; propose writes policy.patch for review.",
+        _ => "Options shown with <value> require a value; bracketed options are optional. --run is an initialized private external run directory. Input errors exit 2; successful operations exit 0. See README and the installed skill detail files for command-specific evidence rules.",
+    };
+    eprintln!("\n{detail}");
+}

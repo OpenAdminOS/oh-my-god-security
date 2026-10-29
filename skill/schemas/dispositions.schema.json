@@ -1,0 +1,53 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "hunter": {
+      "type": "string",
+      "minLength": 1
+    },
+    "units": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "unit_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "disposition": {
+            "enum": [
+              "candidate",
+              "covered",
+              "blocked",
+              "deferred",
+              "out_of_scope"
+            ]
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "unit_id",
+          "disposition",
+          "evidence",
+          "note"
+        ]
+      }
+    }
+  },
+  "required": [
+    "hunter",
+    "units"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema"
+}

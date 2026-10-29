@@ -1,0 +1,59 @@
+{
+  "target": "acme-shop (example)",
+  "source_ref": "git@c0ffee…",
+  "stack": {
+    "languages": ["TypeScript"],
+    "frameworks": ["Next.js App Router", "Prisma"],
+    "package_managers": ["pnpm"],
+    "runtimes": ["Node.js 20"],
+    "datastores": ["PostgreSQL", "Redis"],
+    "notes": "Single Next.js app with server actions and a Prisma data layer."
+  },
+  "zones": [
+    { "id": "z-net", "name": "Internet", "trust": "untrusted" },
+    { "id": "z-edge", "name": "Edge", "trust": "edge" },
+    { "id": "z-app", "name": "Application", "trust": "application" },
+    { "id": "z-data", "name": "Data", "trust": "data" },
+    { "id": "z-ext", "name": "Third party", "trust": "external_service" }
+  ],
+  "principals": [
+    { "id": "p-anon", "name": "Anonymous visitor", "kind": "anonymous" },
+    { "id": "p-user", "name": "Signed-in user", "kind": "authenticated" },
+    { "id": "p-admin", "name": "Admin", "kind": "admin" }
+  ],
+  "components": [
+    { "id": "browser", "name": "Browser", "zone": "z-net", "kind": "client", "tech": "React" },
+    { "id": "mw", "name": "Auth middleware", "zone": "z-edge", "kind": "middleware", "path": "middleware.ts" },
+    { "id": "login", "name": "POST /api/login", "zone": "z-app", "kind": "route", "path": "app/api/login/route.ts", "entry_point": true },
+    { "id": "dashboard", "name": "GET /dashboard", "zone": "z-app", "kind": "route", "path": "app/dashboard/page.tsx", "entry_point": true },
+    { "id": "checkout", "name": "checkout()", "zone": "z-app", "kind": "action", "path": "app/checkout/actions.ts" },
+    { "id": "user_svc", "name": "User service", "zone": "z-app", "kind": "service", "path": "lib/users.ts" },
+    { "id": "db", "name": "PostgreSQL", "zone": "z-data", "kind": "datastore", "tech": "Prisma" },
+    { "id": "cache", "name": "Redis", "zone": "z-data", "kind": "cache" },
+    { "id": "stripe", "name": "Stripe API", "zone": "z-ext", "kind": "external_service", "tech": "HTTPS" }
+  ],
+  "boundaries": [
+    { "id": "b-edge", "name": "Network edge", "between": ["z-net", "z-app"], "enforcement": ["TLS", "session cookie", "middleware auth"] },
+    { "id": "b-data", "name": "Data access", "between": ["z-app", "z-data"], "enforcement": ["row-level security"] }
+  ],
+  "flows": [
+    { "id": "f1", "from": "browser", "to": "mw", "data": "HTTP request", "protocol": "HTTPS" },
+    { "id": "f2", "from": "mw", "to": "login", "data": "credentials", "protocol": "HTTPS", "authn": "none (pre-auth)", "crosses": "b-edge" },
+    { "id": "f3", "from": "mw", "to": "dashboard", "data": "session request", "protocol": "HTTPS", "authn": "session cookie", "crosses": "b-edge" },
+    { "id": "f4", "from": "login", "to": "user_svc", "data": "lookup" },
+    { "id": "f5", "from": "dashboard", "to": "user_svc", "data": "profile" },
+    { "id": "f6", "from": "dashboard", "to": "checkout", "data": "cart" },
+    { "id": "f7", "from": "user_svc", "to": "db", "data": "SQL", "protocol": "TCP", "authz": "row-level security", "crosses": "b-data" },
+    { "id": "f8", "from": "user_svc", "to": "cache", "data": "session", "crosses": "b-data" },
+    { "id": "f9", "from": "checkout", "to": "stripe", "data": "charge", "protocol": "HTTPS", "authn": "API key" }
+  ],
+  "input_surfaces": [
+    { "id": "s-login", "name": "POST /api/login", "component": "login", "attacker": "anonymous visitor" },
+    { "id": "s-dash", "name": "GET /dashboard", "component": "dashboard", "attacker": "any session holder" }
+  ],
+  "unexamined": [
+    "Admin console (apps/admin) was not mapped in this pass.",
+    "Background jobs and webhooks were not reviewed."
+  ],
+  "notes": "Mapped from the main web app only."
+}

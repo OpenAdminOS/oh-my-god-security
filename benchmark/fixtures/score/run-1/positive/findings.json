@@ -1,0 +1,80 @@
+{
+  "findings": [
+    {
+      "attack_class": "tenant_isolation",
+      "entry_point": "app/api/a/route.ts:GET",
+      "sink": "loada",
+      "boundary": "member to private data",
+      "fingerprint": "omgs-d7c7756a1f68ec92",
+      "verdict": "confirmed",
+      "proof_tier": "test_proven",
+      "proof_ref": "proofs/1.json",
+      "title": "Fixture omgs-d7c7756a1f68ec92",
+      "location": {
+        "path": "app/api/a/route.ts",
+        "line": 1
+      },
+      "evidence": "Fixture source trace and archived failing assertion.",
+      "hunted_by": "fixture-hunter",
+      "verified_by": "fixture-verifier",
+      "severity": "high"
+    },
+    {
+      "attack_class": "tenant_isolation",
+      "entry_point": "app/api/b/route.ts:GET",
+      "sink": "loadb",
+      "boundary": "member to private data",
+      "fingerprint": "omgs-ff2d11f545a90e74",
+      "verdict": "rejected",
+      "proof_tier": "traced",
+      "proof_ref": null,
+      "title": "Fixture omgs-ff2d11f545a90e74",
+      "location": {
+        "path": "app/api/b/route.ts",
+        "line": 1
+      },
+      "evidence": "Fixture source trace and archived failing assertion.",
+      "hunted_by": "fixture-hunter",
+      "verified_by": "fixture-verifier",
+      "severity": null
+    },
+    {
+      "attack_class": "tenant_isolation",
+      "entry_point": "app/api/c/route.ts:GET",
+      "sink": "loadc",
+      "boundary": "member to private data",
+      "fingerprint": "omgs-1dbc0388d873fabe",
+      "verdict": "needs_validation",
+      "proof_tier": "traced",
+      "proof_ref": null,
+      "title": "Fixture omgs-1dbc0388d873fabe",
+      "location": {
+        "path": "app/api/c/route.ts",
+        "line": 1
+      },
+      "evidence": "Fixture source trace and archived failing assertion.",
+      "hunted_by": "fixture-hunter",
+      "verified_by": "fixture-verifier",
+      "severity": null
+    },
+    {
+      "attack_class": "tenant_isolation",
+      "entry_point": "app/api/unexpected/route.ts:GET",
+      "sink": "loadunexpected",
+      "boundary": "member to private data",
+      "fingerprint": "omgs-02f3376c7e8b992e",
+      "verdict": "confirmed",
+      "proof_tier": "test_proven",
+      "proof_ref": "proofs/2.json",
+      "title": "Fixture omgs-02f3376c7e8b992e",
+      "location": {
+        "path": "app/api/unexpected/route.ts",
+        "line": 1
+      },
+      "evidence": "Fixture source trace and archived failing assertion.",
+      "hunted_by": "fixture-hunter",
+      "verified_by": "fixture-verifier",
+      "severity": "high"
+    }
+  ]
+}
