@@ -78,15 +78,16 @@ clock. [Platform support](https://learn.microsoft.com/en-us/windows/apps/develop
 and `omgs doctor` explain what is enforceable on the current host. Missing controls
 block execution and leave the finding pending.
 
-Only proof workloads cross into the sandbox. Hunters and verifiers read code and
-write proof tests on the host, but never execute target code there.
+Target code executes only as a sandboxed proof workload. Hunters and verifiers read
+code and write proof tests on the host, but never execute target code there.
+Optional local scanners run inside the sandbox too.
 
 ```mermaid
 flowchart TB
     subgraph Host["Your machine (host)"]
         Agent["Coding agent<br/>hunters read code, verifier writes a proof test<br/>no target code runs here"]
         CLI["omgs prove<br/>copies the target to a per-run workspace<br/>writes a deny-by-default MXC config<br/>verifies the pinned executor SHA-256<br/>executor dry-run must accept the config"]
-        Repo["Your repository<br/>never mounted, never modified"]
+        Repo["Your repository<br/>no direct grant, never modified<br/>may stay readable under a granted toolchain root"]
         Agent --> CLI
     end
 
@@ -106,7 +107,7 @@ flowchart TB
     Work -->|"exit code, markers, redacted output"| Record["Proof record<br/>names every enforced control and every gap"]
     Record --> Replay["Independent evaluator<br/>replays the proof before a verdict stands"]
     Net -. "no route out" .-> Internet["Internet and live services"]
-    FS -. "no access" .-> Repo
+    FS -. "no direct grant" .-> Repo
 ```
 
 ## Handing results to an agent
