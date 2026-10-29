@@ -4113,6 +4113,7 @@ mod cli_tests {
     fn documented_omgs_options_are_accepted() {
         for text in [
             include_str!("../README.md"),
+            include_str!("../docs/internals.md"),
             include_str!("../skill/SKILL.md"),
         ] {
             for part in text.split("--").skip(1) {
