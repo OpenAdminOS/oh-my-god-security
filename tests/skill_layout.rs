@@ -227,3 +227,53 @@ fn bundled_markdown_links_resolve_after_moves() {
         }
     }
 }
+
+#[test]
+fn progress_is_required_without_browser_consent() {
+    let entry = normalized(include_str!("../skill/SKILL.md"));
+    let pipeline = normalized(include_str!("../skill/PIPELINE.md"));
+    let handoff = normalized(include_str!("../skill/HANDOFF-AND-PROGRESS.md"));
+    assert!(entry.contains("At run start, read [HANDOFF-AND-PROGRESS.md]"));
+    assert!(entry.contains("mandatory `omgs status`"));
+    assert!(entry.contains("immediately after initialization, even without the live view"));
+    for rule in [
+        "verify that `OUTPUT_DIR/pipeline-status.json` exists",
+        "If status fails, report and resolve the error",
+        "mark the outgoing stage `done`",
+        "mark the incoming stage `active`",
+        "Before **every** sandbox proof or replay, including evaluator replays",
+    ] {
+        assert!(pipeline.contains(rule), "missing progress rule: {rule}");
+    }
+    for stage in [
+        "initialize",
+        "map",
+        "hunt",
+        "verify",
+        "prove",
+        "adjudicate",
+        "report",
+    ] {
+        assert!(
+            pipeline.contains(&format!(
+                "omgs status --run OUTPUT_DIR --stage {stage} --state active --detail \""
+            )),
+            "missing entry update for {stage}"
+        );
+    }
+    assert!(pipeline.contains("--stage report --state done --detail"));
+    for rule in [
+        "Only an explicit yes authorizes opening it",
+        "Continue the review without a browser if the user says no or does not answer",
+        "In a headless or non-interactive session, do not open a browser",
+        "open \"$URL\"",
+        "xdg-open \"$URL\"",
+        "start \"\" \"%URL%\"",
+        "never open a browser without that explicit yes",
+    ] {
+        assert!(
+            handoff.contains(rule),
+            "missing browser consent rule: {rule}"
+        );
+    }
+}

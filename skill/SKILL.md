@@ -60,6 +60,12 @@ permission to fetch.
 
 Read the linked phase text before performing that phase. Preserve role separation in fresh contexts
 and hand each role its full brief with explicit scope, resolved inputs and remaining budget.
+At run start, read [HANDOFF-AND-PROGRESS.md](HANDOFF-AND-PROGRESS.md).
+Ask once to open the live view. Never open a browser without that explicit yes.
+Follow the mandatory `omgs status` transitions in
+[PIPELINE.md](PIPELINE.md#required-progress-at-every-transition), with plain-language details,
+including `prove` during sandbox proofs and replays. Create and verify
+`pipeline-status.json` immediately after initialization, even without the live view.
 Before dispatching any agent, read [BUDGETS-AND-ROUTING.md](BUDGETS-AND-ROUTING.md).
 Before consuming any handoff artifacts, read
 [HANDOFF-AND-PROGRESS.md](HANDOFF-AND-PROGRESS.md).
