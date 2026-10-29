@@ -37,11 +37,11 @@ the following checks before executing the downloaded binary:
    `OMGS_TEAM_ID` constant in `skill/scripts/install.sh`:
 
    ```sh
-   codesign --verify --strict -R '=anchor apple generic and certificate leaf[subject.OU] = "OWNER_TEAM_ID"' ./omgs-aarch64-apple-darwin
+   codesign --verify --strict -R '=anchor apple generic and certificate leaf[subject.OU] = "D259ULY2B4"' ./omgs-aarch64-apple-darwin
    codesign --verify --strict -R '=anchor apple generic and certificate leaf[subject.OU] = "UBF8T346G9"' ./mxc-1.0.1-macos-arm64
    ```
 
-   Replace `OWNER_TEAM_ID` with the owner-published value. The Microsoft executor
+   The OMGS Team ID was configured as `D259ULY2B4`. The Microsoft executor
    keeps Team ID `UBF8T346G9`, verified on the pinned upstream bytes. OMGS binaries
    are also notarized during release; the installer checks the signature, not an
    offline notarization ticket. Gatekeeper remains enabled.
@@ -57,7 +57,7 @@ the following checks before executing the downloaded binary:
    ```
 
    Require status `Valid` and an exact subject match with `$OmgsSubject` in
-   `install.ps1`, which the owner configures before publication. MXC must match
+   `install.ps1`, which was configured with the verified leaf subject. MXC must match
    `CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US`.
    A valid signature from an unrelated publisher is rejected. If OS trust cannot
    establish validity, installation stops.
@@ -88,11 +88,18 @@ publisher rejection while production Linux checks remain checksum and pin based.
 
 ## Release owner configuration
 
-Before the first public release, replace `OWNER_TEAM_ID` in `install.sh` with the
-Apple Developer ID Team ID and `CN=OWNER_WINDOWS_SIGNER_SUBJECT` in `install.ps1`
-with the exact Azure Trusted Signing leaf certificate subject. These are public
-identities, not secrets. Keep the values under review with the skill. Never take
-expected publisher identities from a downloaded manifest or environment override.
+The public publisher identities were configured in the installers: Apple
+Developer ID Team ID `D259ULY2B4` in `install.sh`, and the exact Azure Trusted
+Signing leaf certificate subject in `install.ps1` (saved as UTF-8 with BOM for
+Windows PowerShell 5.1):
+
+```text
+CN=Ugurlabs UG (haftungsbeschränkt), O=Ugurlabs UG (haftungsbeschränkt), L=Düsseldorf, S=North Rhine-Westphalia, C=DE
+```
+
+These are public identities, not secrets. Keep the values under review with the
+skill. Never take expected publisher identities from a downloaded manifest or
+environment override.
 
 The existing signing pipeline requires all of these repository secrets:
 

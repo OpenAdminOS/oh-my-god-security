@@ -10,7 +10,7 @@ BASE=${OMGS_RELEASE_BASE:-https://github.com/OpenAdminOS/oh-my-god-security/rele
 DEST_ROOT=${OMGS_HOME:-$HOME/.local/share/omgs}
 case "$DEST_ROOT" in /*) ;; *) echo 'OMGS_HOME must be absolute' >&2; exit 1 ;; esac
 # Owner sets this public signing identity before the first public release.
-OMGS_TEAM_ID='OWNER_TEAM_ID'
+OMGS_TEAM_ID='D259ULY2B4'
 MICROSOFT_TEAM_ID='UBF8T346G9'
 os=$(uname -s)
 arch=$(uname -m)

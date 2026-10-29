@@ -71,6 +71,14 @@ Set-Acl -LiteralPath '{escaped}' -AclObject $acl
         self.env['LOCALAPPDATA' if self.windows else 'HOME'] = str(profile)
         self.script = self.skill / 'scripts' / ('install.ps1' if self.windows else 'install.sh')
 
+    def read_script(self):
+        # Decode the Windows BOM before adding verifier shims to disposable copies.
+        return self.script.read_text(encoding='utf-8-sig')
+
+    def write_script(self, text):
+        # Keep the BOM at byte zero for Windows PowerShell 5.1 after every edit.
+        self.script.write_text(text, encoding='utf-8-sig' if self.windows else 'utf-8')
+
     def checksums(self):
         (self.bundle / 'SHA256SUMS').write_text(''.join(
             f'{sha(p)}  {p.name}\n' for p in sorted(self.bundle.iterdir()) if p.name != 'SHA256SUMS'))
@@ -78,7 +86,7 @@ Set-Acl -LiteralPath '{escaped}' -AclObject $acl
     def fake_verifiers(self):
         if not ALLOW_TEST_VERIFIERS:
             raise RuntimeError('Test copies require explicit --allow-test-verifiers')
-        text = self.script.read_text()
+        text = self.read_script()
         pins = self.skill / 'mxc-pins.txt'
         rows = pins.read_text().splitlines()
         pins.write_text('\n'.join(' '.join(row.split()[:-1] + [self.executor_hash])
@@ -106,7 +114,7 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
 ''')
             shim.chmod(0o755)
             text = text.replace('/usr/bin/codesign', '"' + str(shim) + '"')
-        self.script.write_text(text)
+        self.write_script(text)
 
     def run_install(self, answer='yes\n', real=False, extra=()):
         script = ROOT / 'skill/scripts' / self.script.name if real else self.script
@@ -164,7 +172,7 @@ Set-Acl -LiteralPath '{escaped}' -AclObject $a
 
     def test_staging_ancestor_swap_after_verification_is_refused(self):
         self.fake_verifiers()
-        text = self.script.read_text()
+        text = self.read_script()
         if self.windows:
             marker = '    Admit-Staging $tmp'
             injection = """    $parent = Split-Path $tmp -Parent
@@ -185,18 +193,18 @@ chmod 0777 "$staging_parent"
 mv "$staging_parent-moved/$(basename "$tmp")" "$tmp"
 '''
         self.assertEqual(text.count(marker), 1)
-        self.script.write_text(text.replace(marker, injection + marker))
+        self.write_script(text.replace(marker, injection + marker))
         self.assert_failed(self.run_install(), 'Unsafe staging')
 
     def test_source_mutation_after_verification_is_refused_by_install_self(self):
         self.fake_verifiers()
-        text = self.script.read_text()
+        text = self.read_script()
         marker = ('    # The verified executable owns admission' if self.windows else
                   '# The verified executable owns admission')
         injection = ("    [IO.File]::WriteAllText((Join-Path $tmp 'MXC-LICENSE.txt'), 'changed after verification')\n"
                      if self.windows else
                      "printf 'changed after verification' > \"$tmp/MXC-LICENSE.txt\"\n")
-        self.script.write_text(text.replace(marker, injection + marker))
+        self.write_script(text.replace(marker, injection + marker))
         self.assert_failed(self.run_install(), 'verified source checksum mismatch')
 
     def assert_existing_install_survives(self, failure):
@@ -215,7 +223,7 @@ mv "$staging_parent-moved/$(basename "$tmp")" "$tmp"
             path = home / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
-        text = self.script.read_text()
+        text = self.read_script()
         if self.windows:
             marker = '    $actual = & (Join-Path $tmp $asset) --version'
             injection = {
@@ -231,7 +239,7 @@ mv "$staging_parent-moved/$(basename "$tmp")" "$tmp"
                 'signature': "verify_signature() { echo 'publisher signature rejected: staged file' >&2; exit 1; }\nverify_signature \"$tmp/$asset\" \"$OMGS_TEAM_ID\"",
             }[failure]
         self.assertEqual(text.count(marker), 1)
-        self.script.write_text(text.replace(marker, injection + '\n' + marker))
+        self.write_script(text.replace(marker, injection + '\n' + marker))
         out = self.run_install()
         self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
         expected = {'abort': 'simulated staging failure', 'checksum': 'checksum mismatch',
@@ -386,10 +394,10 @@ Set-Acl -LiteralPath $p -AclObject $a
     @unittest.skipUnless(os.name == 'nt', 'Windows sharing violations')
     def test_locked_destinations_preserve_existing_files_and_clean_staging(self):
         self.fake_verifiers()
-        original_script = self.script.read_text()
+        original_script = self.read_script()
         home = Path(self.env['OMGS_HOME'])
         for relative in ('bin/omgs.exe', 'mxc/1.0.1/wxc-exec.exe'):
-            self.script.write_text(original_script)
+            self.write_script(original_script)
             out = self.run_install()
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
             destination = home / relative
@@ -399,7 +407,7 @@ Set-Acl -LiteralPath $p -AclObject $a
             marker = '    # The verified executable owns admission and exact-path publication.'
             text = original_script.replace(marker, injection + marker)
             text = text.replace('} finally {\n    Remove-Item -LiteralPath $tmp', '} finally {\n    if ($held) { $held.Dispose() }\n    Remove-Item -LiteralPath $tmp')
-            self.script.write_text(text)
+            self.write_script(text)
             out = self.run_install()
             message = ' '.join((out.stdout + out.stderr).split())
             self.assertNotEqual(out.returncode, 0, message)
@@ -426,7 +434,7 @@ if ((Normalize-DirectoryArgument 'C:\Users\ugur\My Tools\') -cne 'C:\Users\ugur\
 if ((Normalize-DirectoryArgument 'C:\') -cne 'C:\') { throw 'drive root normalization failed' }
 if ((Normalize-DirectoryArgument '\\server\share\') -cne '\\server\share') { throw 'UNC root normalization failed' }
 """
-        self.script.write_text(self.script.read_text().replace(marker, marker + assertions))
+        self.write_script(self.read_script().replace(marker, marker + assertions))
         self.env['OMGS_HOME'] = str(self.root / 'My Tools') + "\\"
         out = self.run_install()
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
@@ -435,9 +443,9 @@ if ((Normalize-DirectoryArgument '\\server\share\') -cne '\\server\share') { thr
     def test_authenticated_attestation_failure_is_unverified(self):
         self.fake_verifiers()
         if self.windows:
-            text = self.script.read_text()
+            text = self.read_script()
             text = "function gh { if ($args[0] -eq 'auth') { $global:LASTEXITCODE=0 } else { $global:LASTEXITCODE=1 } }\n" + text
-            self.script.write_text(text)
+            self.write_script(text)
         else:
             tools = self.root / 'tools'
             tools.mkdir()
@@ -453,7 +461,7 @@ if ((Normalize-DirectoryArgument '\\server\share\') -cne '\\server\share') { thr
     def test_unavailable_authentication_is_unverified(self):
         self.fake_verifiers()
         if self.windows:
-            self.script.write_text("function gh { Write-Error 'Authentication unavailable'; $global:LASTEXITCODE=1 }\n" + self.script.read_text())
+            self.write_script("function gh { Write-Error 'Authentication unavailable'; $global:LASTEXITCODE=1 }\n" + self.read_script())
         else:
             tools = self.root / 'tools'
             tools.mkdir()

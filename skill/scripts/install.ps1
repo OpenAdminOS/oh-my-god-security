@@ -1,4 +1,4 @@
-# Per-user bootstrap. No test verifier or signature bypass is accepted here.
+﻿# Per-user bootstrap. No test verifier or signature bypass is accepted here.
 $ErrorActionPreference = 'Stop'
 if ($args.Count -ne 0) { throw 'No installer arguments are accepted' }
 $env:RUSTUP_AUTO_INSTALL = '0'
@@ -17,7 +17,7 @@ function Normalize-DirectoryArgument([string]$Path) {
 }
 $DestRoot = Normalize-DirectoryArgument $DestRoot
 # Owner sets this exact public certificate subject before the first public release.
-$OmgsSubject = 'CN=OWNER_WINDOWS_SIGNER_SUBJECT'
+$OmgsSubject = 'CN=Ugurlabs UG (haftungsbeschränkt), O=Ugurlabs UG (haftungsbeschränkt), L=Düsseldorf, S=North Rhine-Westphalia, C=DE'
 $MicrosoftSubject = 'CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US'
 $asset = 'omgs-x86_64-pc-windows-msvc.exe'
 $arch = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToUpperInvariant()

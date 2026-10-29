@@ -1,7 +1,7 @@
-# 0.1.0 release candidate notes
+# 0.1.0 release notes
 
-These notes describe the onboarding and distribution changes prepared for 0.1.0.
-They do not announce an already published release.
+OMGS 0.1.0 ships skill-first installation, signed macOS and Windows binaries,
+mirrored MXC executors and layered release verification.
 
 ## Installation and trust
 
@@ -46,9 +46,10 @@ refused before configuration. Windows SSH session 0 can prevent PowerShell start
 Tier 2 remains Linux only. Same-process nonce markers cannot authenticate hostile
 target assertions; replay and independent evaluation remain required.
 
-The owner must configure the two public signing identities and the eleven signing
-secrets documented in SECURITY.md before release, plus repository visibility and
-immutable tag protection. Package-manager publication remains an owner action.
+The two public signing identities were configured in the installers. Before
+release, the owner must provide the eleven signing secrets documented in
+SECURITY.md and configure repository visibility and immutable tag protection.
+Package-manager publication remains an owner action.
 No migration rewrites older proof records; rerun evidence that predates the current
 proof schema and execution policy.
 
