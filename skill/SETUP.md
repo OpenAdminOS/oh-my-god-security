@@ -43,8 +43,9 @@ Download and install these files? Type yes to consent:
 ```
 
 Wait for the user's explicit consent. Then run `sh "<SKILL_DIR>/scripts/install.sh"` on macOS or
-Linux, or `powershell -NoProfile -File "<SKILL_DIR>\scripts\install.ps1"` on Windows, passing `yes`
-to its prompt only after that consent. Never auto-consent from a general review request. The scripts
+Linux, or `powershell -NoProfile -ExecutionPolicy Bypass -File "<SKILL_DIR>\scripts\install.ps1"` on Windows, passing `yes`
+to its prompt only after that consent. The Windows execution policy option applies only to that
+PowerShell process and does not persistently change user or machine policy. Never auto-consent from a general review request. The scripts
 fetch both assets from the pinned OMGS release, verify them before executing the binary, and install
 without elevation. They accept an absolute local bundle through `OMGS_RELEASE_BASE` for offline use.
 Show every printed path, version, checksum, publisher and provenance result. After installation,

@@ -151,6 +151,31 @@ case "${{hash%% *}}" in {self.original}|{self.executor_hash}) exit 0 ;; *) exit 
         self.env['OMGS_RELEASE_BASE'] = str(self.root / 'missing-bundle')
         self.assert_failed(self.run_install(), 'Unsafe staging')
 
+    @unittest.skipUnless(platform.system() == 'Darwin', 'Darwin sticky mode bits')
+    def test_darwin_sticky_staging_ancestors_are_admitted(self):
+        # Use the real root-owned sticky ancestor that exposed the cold-install failure.
+        ancestor = Path('/private/tmp')
+        self.assertEqual(ancestor.stat().st_uid, 0)
+        self.assertEqual(ancestor.stat().st_mode & 0o1777, 0o1777)
+        with tempfile.TemporaryDirectory(dir=ancestor, prefix='omgs-sticky-') as temporary:
+            parent = Path(temporary)
+            profile = parent / 'profile'
+            profile.mkdir(mode=0o700)
+            self.env['HOME'] = str(profile)
+            self.env['OMGS_RELEASE_BASE'] = str(parent / 'missing-bundle')
+            for mode in (0o1777, 0o1775, 0o777, 0o775):
+                with self.subTest(mode=oct(mode)):
+                    parent.chmod(mode)
+                    out = self.run_install(real=True)
+                    self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+                    if mode & 0o1000:
+                        # Missing bundle proves admission reached fetch, without a verifier shim.
+                        self.assertIn('missing-bundle/SHA256SUMS', out.stderr)
+                        self.assertNotIn('Unsafe staging', out.stderr)
+                    else:
+                        self.assertIn(f'Unsafe staging ancestor: {parent}', out.stderr)
+                    self.assertFalse(list(profile.glob('.omgs-bootstrap.*')))
+
     def make_staging_unsafe(self, path):
         if self.windows:
             escaped = str(path).replace("'", "''")
