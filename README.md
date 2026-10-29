@@ -229,7 +229,20 @@ runtime, within the proof budget. The [per-stack recipes](skill/PROOF-RECIPES.md
 cover PowerShell, Node, Python isolated mode, shell and Swift, including exact
 commands, invariant assertions and blockers. `doctor --live` launches each
 runtime's bounded version command (or `sh -c 'exit 0'`) inside MXC before
-calling it reachable. Missing tools print `<runtime> not on host PATH`.
+calling it reachable. The probe uses the same command lookup as proofs,
+including the `/usr/bin/swiftc` and `/usr/bin/clang` shims when selected by
+the sandbox PATH. On macOS, these compiler probes have a thirty-second
+budget for xcrun's first-launch SDK discovery. Other tools retain their
+three-second budget. One 180-second wall-clock deadline covers the entire
+`doctor --live` operation, starting before executor discovery and preparation,
+including staging, policy validation, and all probes. When it expires, OMGS
+stops active execution, reports the current and remaining probes as not checked,
+and exits nonzero. Bounded executor cleanup and output draining still finish
+before exit, so cleanup can extend the elapsed time beyond 180 seconds.
+A working direct toolchain binary cannot make a
+failing shim pass this check. `TMPDIR` points to per-proof scratch; OMGS
+does not grant access to the host user cache for compiler discovery.
+Missing tools print `<runtime> not on host PATH`.
 Installed tools whose probes fail print
 `<runtime> on host PATH but failed to launch inside MXC` and a reason.
 Retain those exact lines and the proof startup diagnostic with the pending finding. No installation or
@@ -238,6 +251,24 @@ scratch `CARGO_HOME`, the existing `RUSTUP_HOME` and `RUSTUP_AUTO_INSTALL=0`.
 Host credentials and broad home access stay outside the grants. Linux explicitly
 grants read-only `/usr/include` for local compiler headers; MXC does not mount
 that system directory by default.
+
+On macOS the survivor sweep identifies each run by its distinct allowed and
+denied marker paths. Kernel process creation counters exclude services that
+predate the executor, even if their policy happens to match those paths.
+The identity query includes retained zombies; their first observation requires
+another scan before cleanup can be complete. If the executor's creation identity
+cannot be established, cleanup fails closed. It skips unsandboxed processes
+before path-policy queries
+and checks the denied path before the allowed path. A process exiting or
+entering another sandbox during inspection cannot turn an earlier unrestricted
+read into evidence that it belongs to this run. Concurrent proofs retain their
+own process groups, workspaces, scratch directories and markers. Live doctor
+runs also use distinct temporary directories, including when they share
+`OMGS_HOME`.
+Older OMGS binaries still use the unsafe query order. Running an older binary
+alongside a fixed binary on the same Mac can still interrupt the fixed run.
+Upgrade every concurrently running OMGS installation before relying on this
+isolation guarantee.
 
 ## What a proof record does and does not prove
 
@@ -300,7 +331,7 @@ secrets are listed separately in [SECURITY.md](SECURITY.md#release-owner-configu
 | `GIT_TERMINAL_PROMPT` | Set to `0` for noninteractive clone operations. |
 | `GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR` | Read by external gh, not the binary. Existing gh authentication/configuration controls optional provenance checks. |
 | `OMGS_REQUIRE_RECIPES` | Test suite only: comma-separated runtimes whose absence must fail recipe tests. |
-| `OMGS_TEST_PUBLICATION_DIR`, `OMGS_OWNER_TEST_DIR`, `OMGS_CAPTURE_CHILD`, `OMGS_TEST_PROBE_JSON` | Regression child-process hooks, with no installer authority or production signature bypass. |
+| `OMGS_TEST_PUBLICATION_DIR`, `OMGS_OWNER_TEST_DIR`, `OMGS_CAPTURE_CHILD`, `OMGS_SHUTDOWN_MARKER_CHILD`, `OMGS_TEST_PROBE_JSON` | Regression child-process hooks, with no installer authority or production signature bypass. |
 
 Without `models.json`, `route` returns `host-default` and keeps the host's current
 selection. A refusal with no configured fallback records a blocker. An explicitly

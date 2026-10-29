@@ -156,6 +156,15 @@ pub fn with_lock_file<T>(
     lock_path: &Path,
     f: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    with_lock_file_checked(lock_path, || Ok(()), f)
+}
+
+pub(crate) fn with_lock_file_checked<T>(
+    lock_path: &Path,
+    check: impl Fn() -> std::io::Result<()>,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    check().map_err(|e| e.to_string())?;
     #[cfg(windows)]
     let opened = crate::platform::open_private_write(lock_path, false);
     #[cfg(not(windows))]
@@ -176,6 +185,7 @@ pub fn with_lock_file<T>(
         .map_err(|e| format!("storage {}: {e}", lock_path.display()))?;
     let start = std::time::Instant::now();
     loop {
+        check().map_err(|e| e.to_string())?;
         match file.try_lock() {
             Ok(()) => break,
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -189,7 +199,7 @@ pub fn with_lock_file<T>(
             }
         }
     }
-    let result = f();
+    let result = check().map_err(|e| e.to_string()).and_then(|()| f());
     let _ = file.unlock();
     result
 }

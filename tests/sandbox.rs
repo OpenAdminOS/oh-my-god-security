@@ -5,6 +5,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
+// Independent fixtures create short-lived processes during staging and replay.
+// Keep them apart while a fail-closed global sweep needs a complete scan.
+// Each fixture retains its own concurrency, including simultaneous proofs and
+// budget races. No production scan bound or test assertion is relaxed.
+#[cfg(target_os = "macos")]
+static PROCESS_ACTIVITY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Valid storage fixtures must have the same owner and ACL as runtime files,
 // including when the Windows test process has an elevated token.
 fn write_private_fixture(
@@ -181,6 +188,8 @@ fn text(o: &Output) -> String {
 
 #[test]
 fn prove_refuses_an_executor_that_does_not_match_the_pin() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     let d = scratch("pin");
     let fake = d.join("fake-exec");
     std::fs::write(&fake, b"#!/bin/sh\necho ran\n").unwrap();
@@ -206,6 +215,8 @@ fn prove_refuses_an_executor_that_does_not_match_the_pin() {
 #[cfg(unix)]
 #[test]
 fn blocked_reason_escapes_terminal_controls() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     let d = scratch("blocked-controls");
     let fake = d.join("fake\x1b[31m\r\nexecutor");
     std::fs::write(&fake, b"not a pinned executor").unwrap();
@@ -231,6 +242,8 @@ fn blocked_reason_escapes_terminal_controls() {
 #[cfg(unix)]
 #[test]
 fn denials_hold_and_the_target_is_untouched() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -313,6 +326,8 @@ fn denials_hold_and_the_target_is_untouched() {
 #[cfg(unix)]
 #[test]
 fn timeout_kills_the_tree_and_fails_the_run() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -336,6 +351,8 @@ fn timeout_kills_the_tree_and_fails_the_run() {
 #[cfg(target_os = "macos")]
 #[test]
 fn setsid_escape_is_killed_reported_and_fails_the_run() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -372,6 +389,8 @@ fn record_from(output: &str) -> serde_json::Value {
 
 #[test]
 fn tier2_is_refused_without_linux_or_approval() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     let d = scratch("tier2-refuse");
     let target = d.join("target");
     std::fs::create_dir_all(&target).unwrap();
@@ -399,6 +418,8 @@ fn tier2_is_refused_without_linux_or_approval() {
 
 #[test]
 fn proof_records_back_confirmed_findings() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -715,6 +736,8 @@ fn proof_records_back_confirmed_findings() {
 #[cfg(target_os = "macos")]
 #[test]
 fn posix_spawn_setsid_escape_is_killed_and_fails_the_run() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -736,6 +759,8 @@ fn posix_spawn_setsid_escape_is_killed_and_fails_the_run() {
 
 #[test]
 fn concurrent_or_repeated_proofs_cannot_overspend_the_budget() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     // Without MXC nothing runs and the charge is given back, so this needs it.
     if !mxc_ready() {
         return;
@@ -819,6 +844,8 @@ fn concurrent_or_repeated_proofs_cannot_overspend_the_budget() {
 #[cfg(target_os = "macos")]
 #[test]
 fn installer_trust_fixture_fails_vulnerable_and_passes_fixed() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -861,6 +888,8 @@ fn installer_trust_fixture_fails_vulnerable_and_passes_fixed() {
 
 #[test]
 fn an_mxc_timeout_is_never_a_proof() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -961,6 +990,8 @@ fn an_mxc_timeout_is_never_a_proof() {
 #[cfg(windows)]
 #[test]
 fn windows_denials_hold_and_the_target_is_untouched() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -988,6 +1019,8 @@ fn windows_denials_hold_and_the_target_is_untouched() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_tier2_has_a_private_loopback() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -1041,6 +1074,8 @@ fn linux_tier2_has_a_private_loopback() {
 
 #[test]
 fn invalid_proof_inputs_and_failed_reservation_do_not_spend_budget() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     let d = scratch("invalid-budget");
     let home = d.join("home");
     let target = d.join("target");
@@ -1097,6 +1132,8 @@ fn invalid_proof_inputs_and_failed_reservation_do_not_spend_budget() {
 
 #[test]
 fn markers_survive_a_real_mxc_output_flood() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -1120,6 +1157,8 @@ fn markers_survive_a_real_mxc_output_flood() {
 #[cfg(unix)]
 #[test]
 fn sensors_execute_resolved_paths_even_with_a_poisoned_current_directory() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     use std::os::unix::fs::PermissionsExt;
     if !mxc_ready() {
         return;
@@ -1193,6 +1232,8 @@ fn sensors_execute_resolved_paths_even_with_a_poisoned_current_directory() {
 
 #[test]
 fn a_relative_executor_override_runs_the_verified_file() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -1211,6 +1252,8 @@ fn a_relative_executor_override_runs_the_verified_file() {
 
 #[test]
 fn doctor_discloses_planned_controls_and_gaps_without_an_executor() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     let d = scratch("doctor-missing");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .arg("doctor")
@@ -1241,6 +1284,8 @@ fn doctor_discloses_planned_controls_and_gaps_without_an_executor() {
 
 #[test]
 fn target_mismatch_and_invalid_metadata_never_charge_budget() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     let d = scratch("strict-meta");
     let target = d.join("target");
     let other = d.join("other");
@@ -1298,6 +1343,8 @@ fn target_mismatch_and_invalid_metadata_never_charge_budget() {
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn approve_refuses_tier2_before_prompting_or_writing() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     let d = scratch("approve-refuse");
     let out = omgs(
         &d.join("home"),
@@ -1312,6 +1359,8 @@ fn approve_refuses_tier2_before_prompting_or_writing() {
 
 #[test]
 fn proof_test_paths_are_counted_on_every_os() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     let d = scratch("check-paths");
     let target = d.join("target");
     std::fs::create_dir_all(target.join("tests/security")).unwrap();
@@ -1341,6 +1390,8 @@ fn proof_test_paths_are_counted_on_every_os() {
 
 #[test]
 fn doctor_and_proofs_list_memory_and_task_gap_once() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     #[cfg(windows)]
     if !mxc_ready() {
         return;
@@ -1375,9 +1426,81 @@ fn doctor_and_proofs_list_memory_and_task_gap_once() {
     std::fs::remove_dir_all(d).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn concurrent_proofs_do_not_sweep_each_others_processes() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("concurrent-sweep");
+    let home = d.join("home");
+    let run = d.join("held");
+    omgs::platform::private_dir(&run).unwrap();
+    write_private_fixture(run.join(omgs::runmeta::FILE), "{}").unwrap();
+    let executor = omgs::sandbox::locate_executor().unwrap();
+
+    struct HeldProof {
+        child: Option<std::process::Child>,
+        release: PathBuf,
+    }
+    impl Drop for HeldProof {
+        fn drop(&mut self) {
+            // Release the workload on assertion failure as well, so its own
+            // supervisor can finish cleanup and reap the executor.
+            let _ = std::fs::write(&self.release, b"release");
+            if let Some(child) = &mut self.child {
+                let _ = child.wait();
+            }
+        }
+    }
+    let workspace = run.join("proofs/1/workspace");
+    let mut held = HeldProof {
+        release: workspace.join("release"),
+        child: Some(
+            std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .args([
+                    "prove",
+                    "--run",
+                    run.to_str().unwrap(),
+                    "--cmd",
+                    "echo ready > ready; while [ ! -f release ]; do /bin/sleep 0.02; done",
+                ])
+                .env("OMGS_HOME", &home)
+                .env("OMGS_MXC_EXEC", executor.path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap(),
+        ),
+    };
+    let start = std::time::Instant::now();
+    while !workspace.join("ready").exists() {
+        assert!(held.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        assert!(start.elapsed().as_secs() < 20, "held proof did not start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for _ in 0..8 {
+        let out = omgs(&home, &["prove", "--cmd", "echo concurrent-proof"]);
+        assert!(out.status.success(), "{}", text(&out));
+        let record = record_from(&text(&out));
+        assert_eq!(record["survivors"], serde_json::json!([]));
+        assert!(held.child.as_mut().unwrap().try_wait().unwrap().is_none());
+    }
+    std::fs::write(&held.release, b"release").unwrap();
+    let out = held.child.take().unwrap().wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert!(record.clean() && record.survivors.is_empty(), "{record:?}");
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn narrowed_homebrew_roots_support_python_node_and_cargo() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -1405,6 +1528,8 @@ fn narrowed_homebrew_roots_support_python_node_and_cargo() {
 #[cfg(unix)]
 #[test]
 fn interrupting_prove_cleans_the_executor_group_and_marks_the_record_unclean() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -1474,6 +1599,8 @@ fn interrupting_prove_cleans_the_executor_group_and_marks_the_record_unclean() {
 
 #[test]
 fn unreachable_tests_never_run_the_command() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     use omgs::sandbox::{prove, ProveOutcome, ProveRequest, Tier};
     if !mxc_ready() {
         return;
@@ -1507,6 +1634,8 @@ fn unreachable_tests_never_run_the_command() {
 
 #[test]
 fn a_test_readable_only_on_the_host_is_not_a_clean_record() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -1554,6 +1683,8 @@ fn a_test_readable_only_on_the_host_is_not_a_clean_record() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_new_session_descendants_die_with_the_pid_namespace() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -1576,7 +1707,7 @@ fn linux_new_session_descendants_die_with_the_pid_namespace() {
         } else {
             format!("if os.fork()==0:\n os.setsid()\n if os.fork()==0:\n  os.execv(\"{}\", {args})\n os._exit(0)", py.display())
         };
-        let command = format!("'{}' -I -c 'import os,time\n{launch}\nwhile not os.path.exists(\"release\"):\n time.sleep(0.01)\nprint(\"escape positive control observed\")'", py.display());
+        let command = format!("'{}' -I -c 'import os,time\nopen(\"ready\",\"w\").close()\n{launch}\nwhile not os.path.exists(\"release\"):\n time.sleep(0.01)\nprint(\"escape positive control observed\")'", py.display());
         let executor = omgs::sandbox::locate_executor().unwrap();
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
             .args([
@@ -1602,24 +1733,49 @@ fn linux_new_session_descendants_die_with_the_pid_namespace() {
                     })
             })
         };
-        let start = std::time::Instant::now();
-        while !visible() && start.elapsed().as_secs() < 8 && child.try_wait().unwrap().is_none() {
+        // Staging and executor startup are separate from observing a launched
+        // descendant. Heavy parallelism must not spend the observation budget
+        // before Python has even started running the fixture.
+        let ready_path = run.join("proofs/1/workspace/ready");
+        let readiness_start = std::time::Instant::now();
+        while !ready_path.exists()
+            && readiness_start.elapsed().as_secs() < 30
+            && child.try_wait().unwrap().is_none()
+        {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let observed = visible();
+        let ready = ready_path.exists();
+        let observation_start = std::time::Instant::now();
+        while ready
+            && !visible()
+            && observation_start.elapsed().as_secs() < 8
+            && child.try_wait().unwrap().is_none()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let observed = ready && visible();
         if observed {
             std::fs::write(run.join("proofs/1/workspace/release"), b"go").unwrap();
         }
         let out = child.wait_with_output().unwrap();
         assert!(
-            observed,
-            "host must see the detached descendant before teardown: {}",
+            ready,
+            "readiness phase: Python fixture did not signal startup for {method}: {}",
             text(&out)
         );
-        assert!(out.status.success(), "{}", text(&out));
+        assert!(
+            observed,
+            "observation phase: host did not see the detached descendant within eight seconds after readiness for {method}: {}",
+            text(&out)
+        );
+        assert!(
+            out.status.success(),
+            "release phase: proof failed for {method}: {}",
+            text(&out)
+        );
         assert!(
             !visible(),
-            "detached descendant survived namespace teardown"
+            "teardown phase: detached descendant survived namespace teardown for {method}"
         );
         let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
         assert!(record.clean(), "{record:?}");
@@ -1633,6 +1789,8 @@ fn linux_new_session_descendants_die_with_the_pid_namespace() {
 
 #[test]
 fn doctor_rejects_unknown_arguments_with_usage_hint() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     let d = scratch("doctor-args");
     for args in [
         vec!["doctor", "--bogus"],
@@ -1655,6 +1813,8 @@ fn doctor_rejects_unknown_arguments_with_usage_hint() {
 #[cfg(unix)]
 #[test]
 fn executable_drafts_keep_their_mode_and_commands_are_redacted() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     use std::os::unix::fs::PermissionsExt;
     if !mxc_ready() {
         return;
@@ -1727,6 +1887,8 @@ fn executable_drafts_keep_their_mode_and_commands_are_redacted() {
 
 #[test]
 fn cli_rejects_unknown_and_duplicate_options_before_charging_budget() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     let d = scratch("cli-options");
     let run = d.join("run");
     omgs::platform::private_dir(&run).unwrap();
@@ -1774,6 +1936,8 @@ fn cli_rejects_unknown_and_duplicate_options_before_charging_budget() {
 #[cfg(unix)]
 #[test]
 fn symlinked_executor_and_proof_test_run_with_private_artifacts() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     use std::os::unix::fs::{symlink, PermissionsExt};
     if !mxc_ready() {
         return;
@@ -1842,6 +2006,8 @@ fn symlinked_executor_and_proof_test_run_with_private_artifacts() {
 #[cfg(unix)]
 #[test]
 fn preparation_signals_release_the_reservation_and_remove_the_workspace() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }
@@ -1901,6 +2067,8 @@ fn preparation_signals_release_the_reservation_and_remove_the_workspace() {
 
 #[test]
 fn missing_executor_is_explicit_in_live_doctor_and_free_text_prove() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     let d = scratch("no-executor");
     let run = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
@@ -1928,6 +2096,8 @@ fn missing_executor_is_explicit_in_live_doctor_and_free_text_prove() {
 #[cfg(unix)]
 #[test]
 fn socket_and_fifo_gaps_survive_validation_and_replay() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     use std::os::unix::ffi::OsStrExt;
     if !mxc_ready() {
         return;
@@ -2007,6 +2177,8 @@ fn socket_and_fifo_gaps_survive_validation_and_replay() {
 
 #[test]
 fn approve_refuses_filesystem_roots_before_prompting() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     let d = scratch("approve-root");
     let canonical = std::fs::canonicalize(&d).unwrap();
     let root = canonical.ancestors().last().unwrap();
@@ -2022,6 +2194,8 @@ fn approve_refuses_filesystem_roots_before_prompting() {
 #[cfg(unix)]
 #[test]
 fn symlink_proofs_replay_when_sockets_appear_or_disappear() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     use std::os::unix::fs::symlink;
     if !mxc_ready() {
         return;
@@ -2100,6 +2274,8 @@ fn symlink_proofs_replay_when_sockets_appear_or_disappear() {
 #[cfg(unix)]
 #[test]
 fn gap_paths_escape_terminal_controls_but_records_keep_the_path() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     use std::os::unix::ffi::OsStrExt;
     if !mxc_ready() {
         return;
@@ -2137,6 +2313,8 @@ fn gap_paths_escape_terminal_controls_but_records_keep_the_path() {
 #[cfg(windows)]
 #[test]
 fn windows_records_bind_probe_selection_to_the_saved_config() {
+    #[cfg(target_os = "macos")]
+    let _activity = PROCESS_ACTIVITY.lock().unwrap();
     if !mxc_ready() {
         return;
     }

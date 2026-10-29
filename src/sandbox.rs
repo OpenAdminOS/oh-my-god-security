@@ -88,12 +88,32 @@ pub fn this_executor() -> Result<Executor, String> {
     executor_for(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-fn rosetta_translated() -> bool {
-    Command::new("/usr/sbin/sysctl")
-        .args(["-in", "sysctl.proc_translated"])
+// Host discovery must share doctor's overall deadline, including commands
+// that run before the first proof is prepared.
+fn host_query(program: &str, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .env_clear()
-        .output()
-        .is_ok_and(|out| out.status.success() && out.stdout.trim_ascii() == b"1")
+        .stdin(std::process::Stdio::null());
+    let run = supervise::run(
+        cmd,
+        &supervise::Limits {
+            wall_ms: 3000,
+            cpu_secs: None,
+            file_size_bytes: None,
+            open_files: None,
+            memory_bytes: None,
+            tasks: None,
+            output_cap_bytes: 4096,
+        },
+        None,
+    );
+    run.success.then_some(run.stdout)
+}
+
+fn rosetta_translated() -> bool {
+    host_query("/usr/sbin/sysctl", &["-in", "sysctl.proc_translated"])
+        .is_some_and(|out| out.trim() == "1")
 }
 
 /// Where OMGS installs the executor: `<data dir>/mxc/<version>/<file>`.
@@ -166,15 +186,7 @@ pub fn locate_executor() -> Result<Located, String> {
 
 /// The running macOS major version, read from `sw_vers`.
 fn macos_major() -> Option<u32> {
-    let out = Command::new("/usr/bin/sw_vers")
-        .arg("-productVersion")
-        .env_clear()
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&out.stdout)
+    host_query("/usr/bin/sw_vers", &["-productVersion"])?
         .trim()
         .split('.')
         .next()?
@@ -1582,6 +1594,19 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn host_discovery_respects_overall_deadline() {
+        assert_eq!(
+            host_query("/bin/sh", &["-c", "printf ready"]),
+            Some("ready".into())
+        );
+        let _deadline = supervise::Deadline::after(std::time::Duration::from_millis(100));
+        let start = std::time::Instant::now();
+        assert!(host_query("/bin/sh", &["-c", "while :; do :; done"]).is_none());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
 
     #[test]
     fn macos_version_check_refuses_old_or_unknown_versions() {

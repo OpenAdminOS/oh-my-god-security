@@ -1040,12 +1040,24 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn doctor_probe_command(name: &str) -> String {
+fn doctor_probe_command(_os: &str, name: &str) -> String {
+    // Use the same PATH lookup as proof commands, including Apple's compiler
+    // shims. A working direct compiler does not establish shim readiness.
     match name {
         "sh" => "sh -c 'exit 0'".into(),
         "java" => "java -version".into(),
         "go" => "go version".into(),
         _ => format!("{name} --version"),
+    }
+}
+
+fn doctor_probe_timeout_ms(os: &str, name: &str) -> u64 {
+    if os == "macos" && matches!(name, "swiftc" | "clang") {
+        // xcrun may perform SDK discovery on its first launch. This changes
+        // only doctor's fixed probe budget, not proof containment limits.
+        30_000
+    } else {
+        3_000
     }
 }
 
@@ -1081,9 +1093,45 @@ fn doctor_probe_result(run: &omgs::supervise::Supervised) -> Result<(), String> 
     ))
 }
 
+const DOCTOR_TOOLS: &[&str] = &[
+    "sh", "swiftc", "cargo", "clang", "python3", "node", "npm", "pwsh", "go", "dotnet", "java",
+];
+const DOCTOR_LIVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+
+fn doctor_live_with_budget(
+    budget: std::time::Duration,
+    check: impl FnOnce(&mut Vec<String>) -> Result<(), String>,
+) -> Result<(), String> {
+    let _deadline = omgs::supervise::Deadline::after(budget);
+    let mut remaining = vec!["outside-file denial".to_string()];
+    remaining.extend(DOCTOR_TOOLS.iter().map(|name| name.to_string()));
+    let result = check(&mut remaining);
+    if omgs::supervise::Deadline::expired() {
+        eprintln!(
+            "doctor --live overall wall-clock deadline of {}s exceeded; remaining probes were not checked",
+            budget.as_secs()
+        );
+        for name in remaining {
+            println!("{name} not checked: overall doctor deadline exceeded");
+        }
+        return Err("__EXIT1__".into());
+    }
+    result
+}
+
+fn cmd_doctor(args: &[String]) -> Result<(), String> {
+    if has(args, "--live") {
+        doctor_live_with_budget(DOCTOR_LIVE_BUDGET, |remaining| {
+            cmd_doctor_inner(args, remaining)
+        })
+    } else {
+        cmd_doctor_inner(args, &mut Vec::new())
+    }
+}
+
 /// What this machine can and cannot do for OMGS. Executes no target code;
 /// `--live` runs one fixed command inside MXC to show a denial is enforced.
-fn cmd_doctor(args: &[String]) -> Result<(), String> {
+fn cmd_doctor_inner(args: &[String], remaining: &mut Vec<String>) -> Result<(), String> {
     omgs::scratch::recover()?;
     use omgs::platform::which;
     let os = std::env::consts::OS;
@@ -1163,14 +1211,11 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
             .map(|n| n.to_string())
             .collect()
     };
-    let tools = found(&[
-        "sh", "swiftc", "cargo", "clang", "python3", "node", "npm", "pwsh", "go", "dotnet", "java",
-    ]);
-    for name in [
-        "sh", "swiftc", "cargo", "clang", "python3", "node", "npm", "pwsh", "go", "dotnet", "java",
-    ] {
+    let tools = found(DOCTOR_TOOLS);
+    for name in DOCTOR_TOOLS {
         if !tools.iter().any(|t| t == name) {
             println!("{name} not on host PATH");
+            remaining.retain(|probe| probe != name);
         }
     }
     println!(
@@ -1208,10 +1253,14 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         return Err("__EXIT1__".into());
     }
     if has(args, "--live") {
+        omgs::supervise::check_interrupted().map_err(|e| e.to_string())?;
         let probe = omgs::platform::scratch_root()
             .map_err(|e| e.to_string())?
-            .join("doctor");
-        let _ = std::fs::remove_dir_all(&probe);
+            .join(format!(
+                "doctor-{}",
+                omgs::platform::random_nonce().map_err(|e| e.to_string())?
+            ));
+        omgs::platform::create_private_dir_new(&probe).map_err(|e| e.to_string())?;
         let target = probe.join("target");
         omgs::platform::create_private_tree(&target).map_err(|e| e.to_string())?;
         // Two fresh tokens: one inside the workspace that must be readable
@@ -1260,6 +1309,8 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         };
         let out = outcome.run.output.clone();
         let _ = std::fs::remove_dir_all(&probe);
+        omgs::supervise::check_interrupted().map_err(|e| e.to_string())?;
+        remaining.retain(|name| name != "outside-file denial");
         if !out.contains(&inside)
             || !outcome.run.command_started
             || !outcome.run.command_finished
@@ -1305,12 +1356,16 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
         }
         let mut inside = Vec::new();
         for name in &tools {
-            // Separate deadlines keep one hanging tool from hiding the rest.
+            // Per-tool limits share the overall preparation and probe budget.
+            if let Err(error) = omgs::supervise::check_interrupted() {
+                let _ = std::fs::remove_dir_all(&probe);
+                return Err(error.to_string());
+            }
             let reach = ProveRequest {
                 expect_marker: None,
-                command: doctor_probe_command(name),
+                command: doctor_probe_command(os, name),
                 test: None,
-                timeout_ms: 3_000,
+                timeout_ms: doctor_probe_timeout_ms(os, name),
                 target: None,
                 run_dir: probe.join(format!("reach-{name}")),
                 tier: Tier::Test,
@@ -1321,6 +1376,11 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
                 ProveOutcome::Ran(r) => doctor_probe_result(&r.run),
                 ProveOutcome::Blocked { reason } => Err(reason),
             };
+            if omgs::supervise::Deadline::expired() {
+                let _ = std::fs::remove_dir_all(&probe);
+                return Err("__EXIT1__".into());
+            }
+            remaining.retain(|probe| probe != name);
             match result {
                 Ok(()) => inside.push(name.as_str()),
                 Err(reason) => {
@@ -3584,8 +3644,105 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod cli_tests {
     #[test]
+    fn doctor_overall_deadline_covers_preparation_and_leaves_unchecked_probes() {
+        for preparation in [true, false] {
+            let result = super::doctor_live_with_budget(std::time::Duration::ZERO, |remaining| {
+                if !preparation {
+                    remaining.retain(|name| name != "outside-file denial");
+                }
+                assert!(omgs::supervise::check_interrupted().is_err());
+                assert!(remaining.iter().any(|name| name == "sh"));
+                assert!(remaining.iter().any(|name| name == "java"));
+                Ok(())
+            });
+            assert_eq!(result, Err("__EXIT1__".into()));
+            assert!(!omgs::supervise::Deadline::expired());
+        }
+    }
+
+    #[test]
+    fn doctor_budget_stops_real_scratch_recovery() {
+        const MODE: &str = "OMGS_TEST_DOCTOR_RECOVERY";
+        if let Ok(mode) = std::env::var(MODE) {
+            if mode == "seed" {
+                let scratch = omgs::scratch::Scratch::create("sensor").unwrap();
+                std::fs::write(scratch.path().join("raw"), b"discard").unwrap();
+                // Process exit releases the lock without running owner cleanup.
+                std::mem::forget(scratch);
+                return;
+            }
+            let home = omgs::platform::scratch_root().unwrap();
+            let orphan = std::fs::read_dir(&home)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.join("payload/raw").is_file())
+                .expect("seeded orphan");
+            let result = super::doctor_live_with_budget(std::time::Duration::ZERO, |remaining| {
+                let recovery = omgs::scratch::recover();
+                println!(
+                    "recover_result={recovery:?}, orphan_exists={}",
+                    orphan.exists()
+                );
+                assert!(recovery
+                    .as_ref()
+                    .is_err_and(|e| e.contains("deadline exceeded")));
+                assert!(orphan.join("payload/raw").is_file());
+                assert_eq!(remaining.len(), super::DOCTOR_TOOLS.len() + 1);
+                recovery
+            });
+            assert_eq!(result, Err("__EXIT1__".into()));
+            // The next run can still validate ownership and finish recovery.
+            omgs::scratch::recover().unwrap();
+            assert!(!orphan.exists());
+            return;
+        }
+        let home = omgs::platform::temp_root().unwrap().join(format!(
+            "omgs-doctor-recovery-{}",
+            omgs::platform::random_nonce().unwrap()
+        ));
+        omgs::platform::create_private_dir_new(&home).unwrap();
+        for mode in ["seed", "recover"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli_tests::doctor_budget_stops_real_scratch_recovery",
+                    "--nocapture",
+                ])
+                .env("OMGS_HOME", &home)
+                .env(MODE, mode)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.status.success() || mode == "recover" {
+                std::fs::remove_dir_all(&home).unwrap();
+            }
+            assert!(output.status.success(), "{mode}: {stdout}\n{stderr}");
+            if mode == "recover" {
+                println!("{stdout}{stderr}");
+                assert!(stderr.contains("overall wall-clock deadline of 0s exceeded"));
+                for name in ["outside-file denial", "sh", "java"] {
+                    assert!(stdout.contains(&format!(
+                        "{name} not checked: overall doctor deadline exceeded"
+                    )));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn doctor_shell_probe_and_unreachable_reasons() {
-        assert_eq!(super::doctor_probe_command("sh"), "sh -c 'exit 0'");
+        assert_eq!(super::doctor_probe_command("macos", "sh"), "sh -c 'exit 0'");
+        for os in ["macos", "linux", "windows"] {
+            for name in ["swiftc", "clang"] {
+                let command = super::doctor_probe_command(os, name);
+                assert_eq!(command, format!("{name} --version"));
+                assert_eq!(
+                    super::doctor_probe_timeout_ms(os, name),
+                    if os == "macos" { 30_000 } else { 3_000 }
+                );
+            }
+        }
         assert_eq!(
             super::doctor_tool_failure("node", "timeout=true"),
             "node on host PATH but failed to launch inside MXC\n  reason: timeout=true"
@@ -3620,6 +3777,68 @@ mod cli_tests {
         run.capture_complete = true;
         run.executor_error = true;
         assert!(super::doctor_probe_result(&run).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_rejects_failing_compiler_shims_even_when_direct_binaries_work() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "omgs-doctor-shims-{}",
+            omgs::platform::random_nonce().unwrap()
+        ));
+        let shims = dir.join("shims");
+        let direct = dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin");
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::create_dir_all(&direct).unwrap();
+        for name in ["swiftc", "clang"] {
+            for (path, body) in [
+                (
+                    shims.join(name),
+                    "#!/bin/sh\necho shim-unavailable >&2\nexit 1\n",
+                ),
+                (direct.join(name), "#!/bin/sh\necho direct-compiler-ready\n"),
+            ] {
+                std::fs::write(&path, body).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            // Exercise the same acceptance check used by doctor with runner
+            // markers. The direct binary is a positive control only; readiness
+            // must be decided by the shim that proof commands resolve.
+            let command = super::doctor_probe_command("macos", name);
+            assert_eq!(command, format!("{name} --version"));
+            for (path, ready) in [(&direct, true), (&shims, false)] {
+                let script = format!(
+                    "printf 'OMGS_START_doctor\\n'; {command}; status=$?; printf '\\nOMGS_END_doctor:%s\\n' \"$status\"; exit \"$status\""
+                );
+                let mut probe = std::process::Command::new("/bin/sh");
+                probe.args(["-c", &script]).env_clear().env("PATH", path);
+                let run = omgs::supervise::run_marked(
+                    probe,
+                    &omgs::supervise::Limits {
+                        wall_ms: super::doctor_probe_timeout_ms("macos", name),
+                        cpu_secs: None,
+                        file_size_bytes: None,
+                        open_files: None,
+                        memory_bytes: None,
+                        tasks: None,
+                        output_cap_bytes: 1024,
+                    },
+                    None,
+                    "doctor",
+                );
+                assert_eq!(super::doctor_probe_result(&run).is_ok(), ready, "{run:?}");
+                assert!(
+                    run.output.contains(if ready {
+                        "direct-compiler-ready"
+                    } else {
+                        "shim-unavailable"
+                    }),
+                    "{run:?}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     use super::*;
@@ -3824,6 +4043,9 @@ mod cli_tests {
                 ("audit", _) => {
                     sections.push(("audit_init", function(source, "audit_init")));
                     sections.push(("audit_init_limited", function(source, "audit_init_limited")));
+                }
+                ("doctor", _) => {
+                    sections.push(("cmd_doctor_inner", function(source, "cmd_doctor_inner")));
                 }
                 ("route", _) => sections.push(("models_path", function(source, "models_path"))),
                 ("ledger", _) => {
