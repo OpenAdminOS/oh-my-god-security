@@ -139,6 +139,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         }
         "check" => ("--target --out", false),
         "doctor" => ("--live", false),
+        "update-check" => ("", false),
         "help" | "--help" | "-h" | "--version" | "-V" => ("", false),
         "audit" | "batch" | "ledger" | "intent" | "bench" if args == ["--help"] || args == ["-h"] => {
             ("", false)
@@ -227,6 +228,7 @@ fn main() -> ExitCode {
             println!("omgs {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        "update-check" => cmd_update_check(),
         "install-self" => cmd_install_self(rest),
         "gate" => cmd_gate(rest),
         "setup" => cmd_setup(rest),
@@ -266,6 +268,13 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+fn cmd_update_check() -> Result<(), String> {
+    if let Some(line) = omgs::update::check() {
+        println!("{line}");
+    }
+    Ok(())
 }
 
 fn cmd_install_self(rest: &[String]) -> Result<(), String> {
@@ -4024,6 +4033,7 @@ mod cli_tests {
         ("intent", "answer"),
         ("check", ""),
         ("doctor", ""),
+        ("update-check", ""),
     ];
 
     #[test]
@@ -4140,6 +4150,7 @@ mod cli_tests {
                         "download-offline-databases",
                         "no-pager",
                         "no-replace-objects",
+                        "tags",
                         "verify",
                         "end-of-options",
                     ]

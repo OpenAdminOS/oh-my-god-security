@@ -36,6 +36,15 @@ The signed [v0.1.0 release](https://github.com/OpenAdminOS/oh-my-god-security/re
 is available. The skill downloads its pinned release after your consent, using the
 [setup instructions](skill/SETUP.md).
 
+At setup, after the installed binary matches `skill/VERSION`, the skill runs
+`omgs update-check` once per run. If a newer release exists, your agent offers to
+update now or continue with the installed pinned version; continue is the default,
+including when you give no answer. To update, refresh the skill with the Skills CLI
+command above, then give the existing typed-yes consent to install its matching
+binary before the review. The skill and binary move together through the pinned
+version. The binary never self-updates: update-check downloads no executable and
+updates no files. Offline or failed checks are silent and never block a review.
+
 ## What happens when you run it
 
 The skill guides your coding agent through mapping, hunting, independent verification
@@ -53,13 +62,17 @@ or hosted service. Your chosen agent still sends code context to its configured
 provider unless it runs locally.
 
 Network use is specific: `review` and `batch init` use `git clone` over HTTPS;
-`watch` serves only loopback HTTP. The installer downloads release assets over
+`update-check` makes one Git protocol request to GitHub when invoked, using
+`git ls-remote --tags` (or to the `OMGS_UPDATE_REMOTE` mirror). It uses no stored
+credentials or telemetry and has a short deadline and output cap. `watch` serves
+only loopback HTTP. The installer downloads release assets over
 HTTPS after consent. Sensors default to local tools and local data. Setting
 `OMGS_SEMGREP_ALLOW_REGISTRY=1` permits Semgrep rule downloads. OSV database preparation is
 opt-in and separate from proof execution. At this revision the binary only detects
 OSV availability and never downloads its database. Proofs never download target
 dependencies or access the external network. The CLI's git subprocess can also
-inherit user git configuration and credentials; use an appropriate review account.
+inherit user git configuration and credentials for cloning; use an appropriate review account.
+The update lookup ignores that configuration and disables credential helpers and prompts.
 
 ## Why target code only runs in a sandbox
 
@@ -341,6 +354,7 @@ secrets are listed separately in [SECURITY.md](SECURITY.md#release-owner-configu
 | --- | --- |
 | `OMGS_HOME` | Absolute per-user data/install root; defaults to `<home>/.local/share/omgs`. |
 | `OMGS_RELEASE_BASE` | Installer only: HTTPS release asset base or absolute offline bundle directory; defaults to the tag from `skill/VERSION`. A custom source still requires checksums, signatures and pins. |
+| `OMGS_UPDATE_REMOTE` | Update-check tag source; defaults to `https://github.com/OpenAdminOS/oh-my-god-security.git`. Supports HTTPS mirrors and local Git repositories, passed as one argument without a shell. Other Git transports are disabled. Empty or failed lookups are silent. |
 | `OMGS_MXC_EXEC` | Explicit executor path, authoritative and SHA-256 pinned; otherwise data directory then PATH. |
 | `OMGS_SEMGREP_CONFIG` | Local Semgrep rules path; registry/URL values require the next opt-in. |
 | `OMGS_SEMGREP_ALLOW_REGISTRY` | Only `1` permits Semgrep registry downloads; unset means offline rules only. |
@@ -351,12 +365,14 @@ secrets are listed separately in [SECURITY.md](SECURITY.md#release-owner-configu
 | `LOCALAPPDATA` | Windows executor bootstrap; replaced with scratch in workloads. |
 | `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS` | Linux systemd wrapper bus access only; stripped before target execution. |
 | `XDG_CACHE_HOME`, `CLANG_MODULE_CACHE_PATH` | Generated scratch cache directories for proof workloads. |
+| `XDG_CONFIG_HOME` | Set to the null device for update-check, along with HOME and USERPROFILE, to avoid stored configuration and credentials. |
 | `LANG` | Proof workload locale, fixed to `C.UTF-8` on Unix. |
 | `OPENSSL_CONF` | macOS proof workload uses an empty scratch configuration. |
 | `CARGO_HOME`, `RUSTUP_HOME` | Generated proof environment points Cargo to scratch linked caches and Rustup to the discovered readable toolchain. Host overrides do not broaden grants. |
 | `CARGO_NET_OFFLINE`, `RUSTUP_AUTO_INSTALL` | Proof workload values `true` and `0`; installers also set auto-install to `0`. |
 | `OMGS_PROOF_NONCE`, `OMGS_PROOF_CONTRACT` | Runner-generated recipe inputs. Same-process target code can read them; they are not a private attestation channel. |
-| `GIT_TERMINAL_PROMPT` | Set to `0` for noninteractive clone operations. |
+| `GIT_TERMINAL_PROMPT` | Set to `0` for noninteractive clone and update-check operations. |
+| `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL` | Update-check disables system configuration and points global configuration to the null device; repository configuration is bypassed too. |
 | `GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR` | Read by external gh, not the binary. Existing gh authentication/configuration controls optional provenance checks. |
 | `OMGS_REQUIRE_RECIPES` | Test suite only: comma-separated runtimes whose absence must fail recipe tests. |
 | `OMGS_TEST_PUBLICATION_DIR`, `OMGS_OWNER_TEST_DIR`, `OMGS_CAPTURE_CHILD`, `OMGS_SHUTDOWN_MARKER_CHILD`, `OMGS_TEST_PROBE_JSON` | Regression child-process hooks, with no installer authority or production signature bypass. |

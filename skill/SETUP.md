@@ -19,6 +19,23 @@ only `--version` on an existing installation and require the exact string `omgs 
 mismatch, stop and report both versions clearly. Do not continue a review with a mismatched binary
 or silently replace it.
 
+After the exact version match passes (including after a consented first installation), run
+`"<OMGS_BIN>" update-check` once per run at setup, before the review starts. This check only
+informs: it downloads no executable and updates no files. Never fetch release information in the
+agent.
+If it prints `omgs <VERSION>: update available <LATEST>`, tell the user a newer OMGS skill exists
+and offer these two paths, with continue as the default:
+
+- Update now: refresh the skill with the Skills CLI command from the README:
+  `npx skills add https://github.com/OpenAdminOS/oh-my-god-security --skill omgs-security-review`.
+  Reload the refreshed skill and its `VERSION`, then use the existing typed-yes consent flow below
+  to install the matching pinned binary before the review starts. Require the exact version match
+  again. Do not rerun update-check during this run.
+- Continue with the installed pinned version. No answer means continue. An up-to-date line needs
+  no user action. No output or failure means proceed silently. Never block a review on this check
+  or auto-download anything on the strength of the check alone. Explicit consent is still required
+  before any download; choosing update now authorizes the skill refresh, not the binary download.
+
 Before the first binary or executor download, show this exact consent text, plus the resolved
 version, platform assets, source and destination:
 

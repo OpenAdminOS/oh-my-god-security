@@ -5,6 +5,31 @@ fn normalized(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+#[test]
+fn setup_requires_one_informational_update_check_after_version_match() {
+    let setup = normalized(include_str!("../skill/SETUP.md"));
+    for requirement in [
+        "After the exact version match passes (including after a consented first installation)",
+        "`\"<OMGS_BIN>\" update-check` once per run at setup, before the review starts",
+        "it downloads no executable and updates no files",
+        "Never fetch release information in the agent",
+        "tell the user a newer OMGS skill exists",
+        "with continue as the default",
+        "npx skills add https://github.com/OpenAdminOS/oh-my-god-security --skill omgs-security-review",
+        "Reload the refreshed skill and its `VERSION`",
+        "existing typed-yes consent flow",
+        "install the matching pinned binary before the review starts",
+        "Do not rerun update-check during this run",
+        "No answer means continue",
+        "No output or failure means proceed silently",
+        "Never block a review on this check or auto-download anything on the strength of the check alone",
+        "Explicit consent is still required before any download",
+    ] {
+        assert!(setup.contains(requirement), "missing setup rule: {requirement}");
+    }
+    assert!(setup.find("require the exact string").unwrap() < setup.find("update-check").unwrap());
+}
+
 // Inspect the entry's phase routing, not the concatenated bundle or detail index.
 fn phase_routes(entry: &str) -> Vec<String> {
     let phases = entry
