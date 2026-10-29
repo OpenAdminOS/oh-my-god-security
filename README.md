@@ -66,8 +66,10 @@ Network use is specific: `review` and `batch init` use `git clone` over HTTPS;
 `git ls-remote --tags` (or to the `OMGS_UPDATE_REMOTE` mirror). It uses no stored
 credentials or telemetry and has a short deadline and output cap. `watch` serves
 only loopback HTTP. The installer downloads release assets over
-HTTPS after consent. Sensors default to local tools and local data. Setting
-`OMGS_SEMGREP_ALLOW_REGISTRY=1` permits Semgrep rule downloads. OSV database preparation is
+HTTPS after consent. Sensors use local tools and local data inside MXC with the
+network denied. Semgrep requires an existing local rules file or directory in
+`OMGS_SEMGREP_CONFIG`; registry shorthand and URL values do not enable fetching.
+Download rules separately before scanning if needed. OSV database preparation is
 opt-in and separate from proof execution. At this revision the binary only detects
 OSV availability and never downloads its database. Proofs never download target
 dependencies or access the external network. The CLI's git subprocess can also
@@ -246,8 +248,7 @@ secrets are listed separately in [SECURITY.md](SECURITY.md#release-owner-configu
 | `OMGS_UPDATE_REMOTE` | Update-check tag source; defaults to `https://github.com/OpenAdminOS/oh-my-god-security.git`. Supports HTTPS mirrors and local Git repositories, passed as one argument without a shell. Other Git transports are disabled. Empty or failed lookups are silent. |
 | `OMGS_OSV_DB` | Existing offline OSV cache root, containing `osv-scanner/<ecosystem>/all.zip`; defaults to `<OMGS data dir>/osv-db`. |
 | `OMGS_MXC_EXEC` | Explicit executor path, authoritative and SHA-256 pinned; otherwise data directory then PATH. |
-| `OMGS_SEMGREP_CONFIG` | Local Semgrep rules path; registry/URL values require the next opt-in. |
-| `OMGS_SEMGREP_ALLOW_REGISTRY` | Only `1` permits Semgrep registry downloads; unset means offline rules only. |
+| `OMGS_SEMGREP_CONFIG` | Existing local Semgrep rules file or directory. Registry shorthand and URL values do not enable fetching; download rules separately before scanning if needed. |
 | `HOME`, `USERPROFILE` | Host home discovery; HOME wins, then USERPROFILE on Windows. Sandboxed values point to scratch. |
 | `PATH`, `PATHEXT` | Host tool lookup, absolute entries only. Sandboxed PATH is rebuilt; Windows PATHEXT is explicit. |
 | `SYSTEMROOT`, `SystemRoot`, `WINDIR` | Windows host helpers and MXC bootstrap. SYSTEMROOT defaults to `C:\Windows` where applicable; never a target-controlled grant. |
