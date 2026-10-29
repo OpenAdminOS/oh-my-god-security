@@ -30,6 +30,7 @@ pub mod shape;
 pub mod stacks;
 pub mod status;
 pub mod supervise;
+pub mod update;
 pub mod watch;
 
 /// Stable, non cryptographic fingerprint for finding identity across runs.

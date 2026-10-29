@@ -49,6 +49,7 @@ fn every_subcommand_has_help_without_initializing_state() {
         "intent answer",
         "check",
         "doctor",
+        "update-check",
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_omgs"))
             .args(command.split_whitespace())
@@ -143,6 +144,7 @@ fn literal_environment_reads_are_documented() {
         include_str!("../src/sensors.rs"),
         include_str!("../src/sandbox.rs"),
         include_str!("../src/supervise.rs"),
+        include_str!("../src/update.rs"),
         include_str!("../src/sandbox/preflight.rs"),
     ] {
         for prefix in ["env::var(\"", "env::var_os(\""] {
