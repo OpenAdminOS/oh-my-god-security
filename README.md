@@ -63,14 +63,17 @@ inherit user git configuration and credentials; use an appropriate review accoun
 
 ## Why a binary at all?
 
-The tradeoff in one sentence: the binary replaces trust in a model's
-self-discipline, which fails silently, with trust in an inspectable,
-version-pinned artifact that is checksum-verified on every platform and
-publisher-signed on macOS and Windows, which fails loudly and can be audited.
-For a tool whose job is running untrusted code safely, we judged the second
-trust to be the smaller one. If you disagree, source builds and offline bundles
-are supported alternatives, and those are the routes to keep improving rather
-than dropping the enforcement layer.
+The tradeoff in one sentence: the binary reduces reliance on a model's
+self-discipline, which fails silently, by enforcing explicit controls for
+OMGS-managed proofs through an inspectable, version-pinned artifact that is
+checksum-verified on every platform and publisher-signed on macOS and Windows,
+and that can be audited. When its checks fail, installation or proof execution
+stops instead of continuing unchecked. For a tool whose job is running
+untrusted code safely, we judged that smaller, explicit trust to be the safer
+one. If you disagree, source builds and offline bundles are supported
+alternatives, and those are the routes to keep improving rather than dropping
+the enforcement layer. The binary cannot police an agent that ignores the skill
+and runs target code itself; its guarantees cover work routed through OMGS.
 
 ## Why target code only runs in a sandbox
 
