@@ -74,6 +74,20 @@ dependencies or access the external network. The CLI's git subprocess can also
 inherit user git configuration and credentials for cloning; use an appropriate review account.
 The update lookup ignores that configuration and disables credential helpers and prompts.
 
+## Why a binary at all?
+
+The tradeoff in one sentence: the binary reduces reliance on a model's
+self-discipline, which fails silently, by enforcing explicit controls for
+OMGS-managed proofs through an inspectable, version-pinned artifact that is
+checksum-verified on every platform and publisher-signed on macOS and Windows,
+and that can be audited. When its checks fail, installation or proof execution
+stops instead of continuing unchecked. For a tool whose job is running
+untrusted code safely, we judged that smaller, explicit trust to be the safer
+one. If you disagree, source builds and offline bundles are supported
+alternatives, and those are the routes to keep improving rather than dropping
+the enforcement layer. The binary cannot police an agent that ignores the skill
+and runs target code itself; its guarantees cover work routed through OMGS.
+
 ## Why target code only runs in a sandbox
 
 Imports, build hooks and tests can execute arbitrary repository code. OMGS runs

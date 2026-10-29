@@ -36,14 +36,31 @@ the pipeline timeline, proof links and a glossary. A zero-confirmed report expli
 to fix". SARIF carries rule help, verdicts and severity levels; pending records are notes, never
 errors.
 
-### Live progress (optional)
+### Status updates and optional live view
 
-For a long run, the orchestrator may expose a progress view of the pipeline (which hunters are
-running, what the verifier decided, the proof outcomes). It is optional and never changes a verdict.
-Start `omgs watch --run OUTPUT_DIR` in the background at Initialize and print the URL it reports for
-the user; do not open a browser. It binds `127.0.0.1` only, serves just the dashboard and
-`pipeline-status.json` (never findings or reports), rejects foreign Host headers, and exits on its
-own shortly after `omgs report` marks the run complete. Update progress at each milestone with `omgs
-status --run OUTPUT_DIR --stage <id> --state active|done|failed` (add `--parent hunt` for each
-hunter, `--counter candidates=N`, `--log <message>`) instead of writing the JSON by hand. The page
-and its status schema live in [progress/](progress/).
+Status recording is mandatory even when no browser or watch server is used. Follow the transition
+commands in [PIPELINE.md](PIPELINE.md): create `pipeline-status.json` immediately after
+initialization, update it at every stage transition with a plain-language `--detail`, and record
+`prove` while
+sandbox proofs or replays run. Use `omgs status`, never hand-write the JSON. Add `--parent hunt` for
+individual hunters, `--counter candidates=N` (and the other schema counters) for cumulative totals,
+and `--log <message>` for short activity notes. Leads remain unproven until the evidence earns a
+confirmed verdict; progress never changes a verdict.
+
+At run start, ask once: "Would you like me to open the live view in your browser?" Only an explicit
+yes authorizes opening it. Do not treat silence, a general review request or previous download
+consent as yes. Continue the review without a browser if the user says no or does not answer. In a
+headless or non-interactive session, do not open a browser.
+
+After an explicit yes in an interactive session, start `omgs watch --run OUTPUT_DIR` in the
+background at Initialize, capture and print its loopback URL, then open that exact printed URL
+with the default browser using the OS opener: `open "$URL"` on macOS, `xdg-open "$URL"` on Linux,
+or `start "" "%URL%"` from Windows cmd (the empty argument is the window title). Do not guess a
+port. If watch or the opener fails, report the reason and continue the review. Without yes, starting
+watch in the background and printing its URL remains allowed, but never open a browser without
+that explicit yes. Ask only once per run; an unanswered prompt must not stall the review.
+
+Watch binds `127.0.0.1` on an ephemeral port, serves just the dashboard and `pipeline-status.json`
+(never findings or reports), rejects foreign Host headers, and exits on its own shortly after
+`omgs report` marks the run complete. Never bind a non-loopback interface or serve the run directory
+with a generic file server. The page and its status schema live in [progress/](progress/).

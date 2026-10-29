@@ -252,3 +252,248 @@ fn bundled_markdown_links_resolve_after_moves() {
         }
     }
 }
+
+#[test]
+fn progress_is_required_without_browser_consent() {
+    let entry = normalized(include_str!("../skill/SKILL.md"));
+    let pipeline = normalized(include_str!("../skill/PIPELINE.md"));
+    let handoff = normalized(include_str!("../skill/HANDOFF-AND-PROGRESS.md"));
+    assert!(entry.contains("At run start, read [HANDOFF-AND-PROGRESS.md]"));
+    assert!(entry.contains("mandatory `omgs status`"));
+    assert!(entry.contains("immediately after initialization, even without the live view"));
+    for rule in [
+        "verify that `OUTPUT_DIR/pipeline-status.json` exists",
+        "If status fails, report and resolve the error",
+        "mark the outgoing stage `done`",
+        "mark the incoming stage `active`",
+        "Before **every** sandbox proof or replay, including evaluator replays",
+    ] {
+        assert!(pipeline.contains(rule), "missing progress rule: {rule}");
+    }
+    for stage in [
+        "initialize",
+        "map",
+        "hunt",
+        "verify",
+        "prove",
+        "adjudicate",
+        "report",
+    ] {
+        assert!(
+            pipeline.contains(&format!(
+                "omgs status --run OUTPUT_DIR --stage {stage} --state active --detail \""
+            )),
+            "missing entry update for {stage}"
+        );
+    }
+    assert!(pipeline.contains("--stage report --state done --detail"));
+    for rule in [
+        "Only an explicit yes authorizes opening it",
+        "Continue the review without a browser if the user says no or does not answer",
+        "In a headless or non-interactive session, do not open a browser",
+        "open \"$URL\"",
+        "xdg-open \"$URL\"",
+        "start \"\" \"%URL%\"",
+        "never open a browser without that explicit yes",
+    ] {
+        assert!(
+            handoff.contains(rule),
+            "missing browser consent rule: {rule}"
+        );
+    }
+}
+
+#[test]
+fn dashboard_explains_counters_and_sandbox_limits() {
+    let dashboard = include_str!("../skill/progress/dashboard.html");
+    for text in [
+        ">Leads found</div>",
+        ">Proven problems</div>",
+        ">Still checking</div>",
+        ">Ruled out</div>",
+        "Leads are possibilities, not findings. Only proven problems count as confirmed.",
+        "Proofs run on a copy and cannot modify the original.",
+        "Writes stay within the copy and scratch folders.",
+        "Granted toolchain folders and caches remain readable.",
+        "No network in or out, and no access to this computer's local services (host loopback).",
+    ] {
+        assert!(
+            dashboard.contains(text),
+            "missing dashboard explanation: {text}"
+        );
+    }
+    assert!(!dashboard.contains("the original is never touched"));
+}
+
+#[test]
+fn dashboard_maps_stages_to_plain_language_and_architecture_areas() {
+    let dashboard = include_str!("../skill/progress/dashboard.html");
+    assert!(dashboard.contains("<h2 id=\"now-heading\">Happening now</h2>"));
+    for (area, heading) in [
+        ("agent", "Your agent reads the code"),
+        ("omgs", "OMGS checks and records"),
+        ("sandbox", "Sandbox runs the proofs"),
+    ] {
+        assert!(dashboard.contains(&format!("id=\"area-{area}\"")));
+        assert!(dashboard.contains(&format!("<h3>{heading}</h3>")));
+    }
+    let stages = dashboard
+        .split_once("const STAGES={")
+        .expect("dashboard stage descriptions")
+        .1
+        .split_once("};")
+        .unwrap()
+        .0;
+    for (id, area, label, detail) in [
+        (
+            "initialize",
+            "omgs",
+            "Prepare the review",
+            "OMGS is recording the project and review settings.",
+        ),
+        (
+            "map",
+            "omgs",
+            "Understand the project",
+            "OMGS is mapping how the project fits together.",
+        ),
+        (
+            "hunt",
+            "agent",
+            "Look for possible problems",
+            "Your agent is reading the code for possible security problems.",
+        ),
+        (
+            "verify",
+            "agent",
+            "Check each lead",
+            "An independent agent is checking whether each lead holds up.",
+        ),
+        (
+            "challenge",
+            "agent",
+            "Check each lead",
+            "An independent agent is checking whether each lead holds up.",
+        ),
+        (
+            "prove",
+            "sandbox",
+            "Test leads safely",
+            "The sandbox is testing whether a lead breaks a security rule.",
+        ),
+        (
+            "adjudicate",
+            "omgs",
+            "Review the evidence",
+            "The evidence is being reviewed before any decision is final.",
+        ),
+        (
+            "evaluate",
+            "omgs",
+            "Review the evidence",
+            "The evidence is being reviewed before any decision is final.",
+        ),
+        (
+            "report",
+            "omgs",
+            "Prepare your report",
+            "OMGS is preparing the results and remaining questions.",
+        ),
+    ] {
+        let entry = stages
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{id}:")))
+            .unwrap_or_else(|| panic!("missing dashboard stage: {id}"));
+        for property in [
+            format!("area:\"{area}\""),
+            format!("label:\"{label}\""),
+            format!("detail:\"{detail}\""),
+        ] {
+            assert!(entry.contains(&property), "{id}: missing {property}");
+        }
+    }
+    // Pin both the lookup fallback and the code that consumes the mapping.
+    for code in [
+        "Object.prototype.hasOwnProperty.call(STAGES,st.id)?STAGES[st.id]:null",
+        "return info?info.label:st.label;",
+        "return info?info.detail:stageLabel(st)+\" is in progress.\";",
+        "const info=active&&stageInfo(active.owner);",
+        "for(const area of [\"agent\",\"omgs\",\"sandbox\"])",
+        "document.getElementById(\"area-\"+area),current=!!info&&info.area===area;",
+        "el.classList.toggle(\"active\",current);",
+    ] {
+        assert!(
+            dashboard.contains(code),
+            "missing dashboard stage routing: {code}"
+        );
+    }
+}
+
+#[test]
+fn dashboard_escapes_stage_and_log_values_before_html_rendering() {
+    let dashboard = include_str!("../skill/progress/dashboard.html");
+    let escape = dashboard
+        .split_once("function esc(s){")
+        .expect("dashboard escape function")
+        .1
+        .split_once("const STATES=")
+        .unwrap()
+        .0;
+    for code in [
+        "String(s==null?\"\":s).replace(/[&<>\"']/g",
+        "\"&\":\"&amp;\"",
+        "\"<\":\"&lt;\"",
+        "\">\":\"&gt;\"",
+        "\"\\\"\":\"&quot;\"",
+        "\"'\":\"&#39;\"",
+    ] {
+        assert!(escape.contains(code), "missing dashboard escaping: {code}");
+    }
+    let nodes = dashboard
+        .split_once("function renderNode(st){")
+        .unwrap()
+        .1
+        .split_once("function render(d){")
+        .unwrap()
+        .0;
+    for code in [
+        "esc(stageLabel(st))",
+        "esc(st.detail||\"\")",
+        "esc(stageLabel(c))",
+        "esc(c.detail||\"\")",
+    ] {
+        assert!(
+            nodes.contains(code),
+            "unescaped dashboard stage field: {code}"
+        );
+    }
+    let log = dashboard
+        .split_once("document.getElementById(\"log\").innerHTML=")
+        .unwrap()
+        .1
+        .split_once("const upd=")
+        .unwrap()
+        .0;
+    for code in ["esc(e.ts||\"\")", "esc(e.m||\"\")", "kindClass(e.kind)"] {
+        assert!(log.contains(code), "unescaped dashboard log field: {code}");
+    }
+}
+
+#[test]
+fn dashboard_announces_summary_only_when_it_changes() {
+    let dashboard = include_str!("../skill/progress/dashboard.html");
+    assert!(dashboard.contains("<p id=\"happening\" role=\"status\">"));
+    let render = dashboard
+        .split_once("function render(d){")
+        .unwrap()
+        .1
+        .split_once("async function tick(){")
+        .unwrap()
+        .0;
+    assert!(render.contains(
+        "const summary=document.getElementById(\"happening\"),sentence=happening(stages,active);"
+    ));
+    assert!(render.contains("if(summary.textContent!==sentence)summary.textContent=sentence;"));
+    // No other assignment may bypass the change guard on each two-second poll.
+    assert_eq!(render.matches("summary.textContent=").count(), 1);
+}

@@ -1,21 +1,33 @@
 # Pipeline progress (optional live view)
 
-`dashboard.html` is a self-contained, offline progress view for a running OMGS pipeline. It polls a
-sibling `pipeline-status.json` (schema: `status.schema.json`) that the orchestrator writes at each
-milestone, and renders the stages (map, the parallel red hunters, blue verify, prove, adjudicate,
-report) with live states, timers, counters, and an activity log. It loads no external resources and
-runs no scripts beyond its own inline polling.
+`dashboard.html` is a self-contained progress view for a running OMGS review. It polls a sibling
+`pipeline-status.json` (schema: `status.schema.json`) every 2 seconds. It shows plain-language review
+steps, a "Happening now" summary, which part of the system is working, sandbox controls, timers,
+counters and an activity log. Leads found are possibilities, not findings. Proven problems, Still
+checking and Ruled out reflect the existing schema counters without changing their meaning.
+Updates older than 2 minutes and failed polls show a stale indicator. It loads no external resources.
 
-This view is optional and never changes a verdict. The deterministic `findings.json`, SARIF, and
-`REPORT.html` remain the record. Serve it with:
+The view is optional and never changes a verdict. `findings.json`, SARIF and `REPORT.html` remain
+the record. Status recording is mandatory, even without this view: follow the transition commands
+in [PIPELINE.md](../PIPELINE.md#required-progress-at-every-transition). Use `omgs status` with a
+plain-language detail, never hand-write the JSON.
+
+At run start, ask once whether to open the live view. Only after an explicit yes in an interactive
+session, start watch in the background and open its printed URL with the default OS browser opener.
+Never open a browser without that explicit yes. With no answer, no, or a headless or non-interactive
+session, do not open a browser; starting watch and printing the URL remains allowed. See
+[HANDOFF-AND-PROGRESS.md](../HANDOFF-AND-PROGRESS.md#status-updates-and-optional-live-view)
+for opener commands and the full consent flow. To serve the view:
 
     omgs watch --run <run-dir>
 
 It binds 127.0.0.1 on an ephemeral port and prints the URL, serves only this page and
 `pipeline-status.json` (never findings, reports, or anything else in the run directory), rejects
-foreign Host headers, and exits shortly after `omgs report` marks the run complete. Update the status
-file with `omgs status --run <run-dir> --stage <id> --state active` rather than writing it by hand.
-Live status is served on Unix (macOS, Linux) only, where the file can be opened without following
-links and its link count checked; on other platforms watch fails closed and shows an empty status.
-Do not serve the run directory with a generic file server: that would expose the findings. Never
-auto-open a browser and never bind a non-loopback interface: the page describes vulnerabilities.
+foreign Host headers, and exits shortly after `omgs report` marks the run complete. The server
+itself never opens a browser. Never bind a non-loopback interface or serve the run directory with a
+generic file server.
+
+Live status works on macOS, Linux and Windows using the shared protected run-artifact reader. It
+rejects linked or non-private status files and bounds reads to 1 MiB. A missing file yields empty
+status; a file that fails protected-read checks returns HTTP 500 instead of empty status. Other
+platforms fail closed when contained reads are unavailable.

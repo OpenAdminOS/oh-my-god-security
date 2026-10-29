@@ -1,75 +1,103 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'">
-<title>OMGS pipeline live</title>
+<meta name="theme-color" content="#101215">
+<title>OMGS live review</title>
 <style>
-:root{color-scheme:light dark;--bg:#0e0e11;--surface:#17171b;--sunk:#1f1f25;--text:#ececef;--muted:#a0a0aa;--faint:#71717a;--line:#2a2a31;--red:#ff8a80;--amber:#f5c451;--green:#7ee0a0;--blue:#8fb4ff;--violet:#c3b2ff;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+:root{color-scheme:dark;--bg:#101215;--surface:#191c20;--sunk:#22262b;--text:#eceef1;--muted:#b0b6bf;--line:#363c44;--red:#ffaaa2;--amber:#f2ce7b;--green:#9bd6af;--blue:#a7c8fa;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-.wrap{max-width:1040px;margin:0 auto;padding:22px 20px 60px}
-header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:14px}
-h1{font-size:18px;margin:0;font-weight:650;letter-spacing:.01em}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;overflow-wrap:anywhere}
+.wrap{max-width:1040px;margin:0 auto;padding:28px 24px 48px}
+header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;border-bottom:1px solid var(--line);padding-bottom:16px}
+h1{font-size:20px;margin:0;font-weight:650}
 .sub{color:var(--muted);font-size:13px}
 .live{margin-left:auto;display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted)}
-.dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(126,224,160,.6);animation:pulse 1.8s infinite}
-.dot.stale{background:var(--faint);animation:none}
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(126,224,160,.5)}70%{box-shadow:0 0 0 7px rgba(126,224,160,0)}100%{box-shadow:0 0 0 0 rgba(126,224,160,0)}}
-.counters{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:18px 0 8px}
-.counter{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0}
+.dot.stale{background:var(--muted)}
+h2{font-size:13px;color:var(--muted);margin:24px 0 10px;font-weight:600}
+.now{border-left:3px solid var(--amber);padding:0 0 0 16px;margin:24px 0}
+.now h2{margin:0 0 5px;color:var(--amber)}
+.now p{font-size:20px;line-height:1.45;margin:0;max-width:850px}
+.architecture{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.area{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:14px}
+.area h3{font-size:14px;margin:0 0 5px;font-weight:600}
+.area p{color:var(--muted);font-size:12px;margin:0}
+.area .current{display:block;min-height:18px;color:var(--amber);font-size:11px;margin-bottom:6px}
+.area.active{border-color:var(--amber)}
+.sandbox{border:1px solid var(--line);border-radius:6px;padding:12px 16px;margin-top:12px}
+.sandbox h2{margin:0 0 6px;color:var(--text)}
+.sandbox ul{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px 28px;padding-left:18px;margin:0;color:var(--muted);font-size:12px}
+.counters{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:24px}
+.counter{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:12px 14px}
 .counter .n{font-size:26px;font-weight:650;font-variant-numeric:tabular-nums}
 .counter .l{color:var(--muted);font-size:12px;margin-top:2px}
 .counter.confirmed .n{color:var(--red)} .counter.needs .n{color:var(--amber)} .counter.rejected .n{color:var(--green)} .counter.cand .n{color:var(--blue)}
-.flow{margin:22px 0 10px;display:flex;flex-direction:column;gap:10px}
-.row{display:flex;align-items:stretch;gap:10px;flex-wrap:wrap}
-.node{flex:1;min-width:150px;background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--faint);border-radius:10px;padding:12px 14px;position:relative;transition:border-color .3s}
-.node .st{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);display:flex;align-items:center;gap:6px}
-.node .nm{font-weight:650;margin:3px 0 1px}
-.node .dt{color:var(--muted);font-size:12.5px;min-height:1.2em}
-.node .tm{color:var(--faint);font-size:11.5px;font-variant-numeric:tabular-nums;margin-top:5px}
-.node.pending{opacity:.62}
-.node.active{border-left-color:var(--amber);box-shadow:0 0 0 1px var(--amber) inset}
-.node.active .st{color:var(--amber)}
-.node.done{border-left-color:var(--green)}
-.node.done .st{color:var(--green)}
+.note{color:var(--muted);font-size:12px;margin:8px 0 0}
+.flow{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.node{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--line);border-radius:6px;padding:12px 14px;min-width:0}
+.node.has-children{grid-column:1/-1}
+.node .st{font-size:11px;color:var(--muted)}
+.node .nm{font-weight:600;margin:3px 0}
+.node .dt{color:var(--muted);font-size:12.5px}
+.node .tm{color:var(--muted);font-size:11.5px;font-variant-numeric:tabular-nums;margin-top:5px}
+.node.active{border-left-color:var(--amber)} .node.active .st{color:var(--amber)}
+.node.done{border-left-color:var(--green)} .node.done .st{color:var(--green)}
 .node.failed{border-left-color:var(--red)} .node.failed .st{color:var(--red)}
-.spin{width:10px;height:10px;border:2px solid var(--amber);border-top-color:transparent;border-radius:50%;display:inline-block;animation:spin .8s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.tick{color:var(--green)} .pend{color:var(--faint)}
 .children{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
-.child{flex:1;min-width:120px;background:var(--sunk);border:1px solid var(--line);border-left:3px solid var(--faint);border-radius:8px;padding:8px 10px;font-size:12.5px}
+.child{flex:1;min-width:120px;background:var(--sunk);border:1px solid var(--line);border-left:3px solid var(--line);border-radius:4px;padding:8px 10px;font-size:12.5px}
 .child.active{border-left-color:var(--amber)} .child.done{border-left-color:var(--green)} .child.failed{border-left-color:var(--red)}
 .child .cn{font-weight:600} .child .cs{color:var(--muted);font-size:11.5px;margin-top:2px}
-.arrow{align-self:center;color:var(--faint);font-size:18px;padding:0 2px}
-.stage-hunt{border-left-color:var(--blue)}
-h2{font-size:13px;text-transform:uppercase;letter-spacing:.07em;color:var(--faint);margin:26px 0 8px}
-.log{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:6px 0;max-height:320px;overflow:auto;font-family:var(--mono);font-size:12.5px}
+.log{background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:6px 0;max-height:260px;overflow:auto;font-family:var(--mono);font-size:12px}
 .log .e{display:flex;gap:10px;padding:5px 14px;border-top:1px solid var(--line)}
 .log .e:first-child{border-top:0}
-.log .t{color:var(--faint);white-space:nowrap}
-.log .m{color:var(--text)}
-.log .e.k-done .m{color:var(--green)} .log .e.k-start .m{color:var(--amber)} .log .e.k-find .m{color:var(--blue)}
-.foot{color:var(--faint);font-size:11.5px;margin-top:16px}
+.log .t{color:var(--muted);white-space:nowrap}
+.log .m{min-width:0}
+.foot{color:var(--muted);font-size:11.5px;margin-top:20px}
+@media(max-width:640px){.wrap{padding:20px 16px 36px}.architecture,.flow,.sandbox ul{grid-template-columns:1fr}.counters{grid-template-columns:repeat(2,minmax(0,1fr))}.live{margin-left:0}.now p{font-size:18px}}
 </style></head>
-<body><div class="wrap">
+<body><main class="wrap">
 <header>
-  <h1>OMGS pipeline</h1>
-  <span class="sub" id="meta">loading…</span>
-  <span class="live"><span class="dot" id="dot"></span><span id="upd">connecting</span></span>
+  <h1>OMGS live review</h1>
+  <span class="sub" id="meta">Waiting for review details</span>
+  <span class="live"><span class="dot stale" id="dot" aria-hidden="true"></span><span id="upd">Connecting</span></span>
 </header>
 
-<div class="counters">
-  <div class="counter cand"><div class="n" id="c-cand">0</div><div class="l">candidates</div></div>
-  <div class="counter confirmed"><div class="n" id="c-conf">0</div><div class="l">confirmed</div></div>
-  <div class="counter needs"><div class="n" id="c-needs">0</div><div class="l">needs validation</div></div>
-  <div class="counter rejected"><div class="n" id="c-rej">0</div><div class="l">rejected</div></div>
-</div>
+<section class="now" aria-labelledby="now-heading">
+  <h2 id="now-heading">Happening now</h2>
+  <p id="happening" role="status">No updates yet. Waiting for the review to start.</p>
+</section>
 
-<div class="flow" id="flow"></div>
+<section aria-labelledby="architecture-heading">
+  <h2 id="architecture-heading">How the review works</h2>
+  <div class="architecture">
+    <div class="area" id="area-agent"><span class="current"></span><h3>Your agent reads the code</h3><p>Looks for possible problems and checks each lead independently.</p></div>
+    <div class="area" id="area-omgs"><span class="current"></span><h3>OMGS checks and records</h3><p>Maps the project, records evidence and prepares the report.</p></div>
+    <div class="area" id="area-sandbox"><span class="current"></span><h3>Sandbox runs the proofs</h3><p>Tests whether a lead really breaks a security rule.</p></div>
+  </div>
+  <aside class="sandbox" aria-labelledby="sandbox-heading">
+    <h2 id="sandbox-heading">When a proof runs</h2>
+    <ul>
+      <li>Proofs run on a copy and cannot modify the original.</li>
+      <li>Writes stay within the copy and scratch folders. Granted toolchain folders and caches remain readable.</li>
+      <li>No network in or out, and no access to this computer's local services (host loopback).</li>
+      <li>The environment is cleared, with scratch folders for home, temporary files and caches.</li>
+      <li>Time and saved output have limits.</li>
+    </ul>
+  </aside>
+</section>
 
-<h2>Activity</h2>
-<div class="log" id="log"></div>
-<p class="foot" id="foot"></p>
+<div class="counters" aria-label="Review totals">
+  <div class="counter cand"><div class="n" id="c-cand">0</div><div class="l">Leads found</div></div>
+  <div class="counter confirmed"><div class="n" id="c-conf">0</div><div class="l">Proven problems</div></div>
+  <div class="counter needs"><div class="n" id="c-needs">0</div><div class="l">Still checking</div></div>
+  <div class="counter rejected"><div class="n" id="c-rej">0</div><div class="l">Ruled out</div></div>
 </div>
+<p class="note">Leads are possibilities, not findings. Only proven problems count as confirmed.</p>
+
+<section aria-labelledby="steps-heading"><h2 id="steps-heading">Review steps</h2><div class="flow" id="flow"></div></section>
+<section aria-labelledby="activity-heading"><h2 id="activity-heading">Activity</h2><div class="log" id="log" tabindex="0" aria-label="Review activity, newest first"></div></section>
+<p class="foot">Local progress only. Updates every 2 seconds. No findings or reports are served here.</p>
+</main>
 <script>
 function fmtDur(ms){if(ms<0)ms=0;const s=Math.floor(ms/1000);if(s<60)return s+"s";const m=Math.floor(s/60);return m+"m "+(s%60)+"s";}
 function now(){return Date.now();}
@@ -77,54 +105,81 @@ function now(){return Date.now();}
 // the orchestrator, but its detail/label/log fields carry target-derived text
 // (candidate titles, file paths), so treat all of it as untrusted.
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];});}
-const STATES={pending:1,active:1,done:1,failed:1};
+const STATES={pending:"Waiting",active:"In progress",done:"Done",failed:"Stopped"};
+const STAGES={
+  initialize:{label:"Prepare the review",area:"omgs",detail:"OMGS is recording the project and review settings."},
+  map:{label:"Understand the project",area:"omgs",detail:"OMGS is mapping how the project fits together."},
+  hunt:{label:"Look for possible problems",area:"agent",detail:"Your agent is reading the code for possible security problems."},
+  verify:{label:"Check each lead",area:"agent",detail:"An independent agent is checking whether each lead holds up."},
+  challenge:{label:"Check each lead",area:"agent",detail:"An independent agent is checking whether each lead holds up."},
+  prove:{label:"Test leads safely",area:"sandbox",detail:"The sandbox is testing whether a lead breaks a security rule."},
+  adjudicate:{label:"Review the evidence",area:"omgs",detail:"The evidence is being reviewed before any decision is final."},
+  evaluate:{label:"Review the evidence",area:"omgs",detail:"The evidence is being reviewed before any decision is final."},
+  report:{label:"Prepare your report",area:"omgs",detail:"OMGS is preparing the results and remaining questions."}
+};
+function stageInfo(st){return Object.prototype.hasOwnProperty.call(STAGES,st.id)?STAGES[st.id]:null;}
+function stageLabel(st){const info=stageInfo(st);return info?info.label:st.label;}
 function stateClass(s){return Object.prototype.hasOwnProperty.call(STATES,s)?s:"pending";}
 function kindClass(k){return /^[a-z]+$/.test(k||"")?k:"";}
-function icon(s){if(s==="active")return '<span class="spin"></span>';if(s==="done")return '<span class="tick">✓</span>';if(s==="failed")return '<span>✗</span>';return '<span class="pend">○</span>';}
 function elapsed(st){if(!st.started_ms)return "";const end=st.ended_ms||now();let t=fmtDur(end-st.started_ms);return st.status==="active"?t+" elapsed":(st.ended_ms?t:"");}
-
-function renderNode(st,extraClass){
+function activeStage(stages){
+  // Prefer an active phase, then a still-running child if its parent is waiting.
+  const parent=stages.find(st=>st.status==="active");
+  if(parent)return {stage:parent,owner:parent};
+  for(const st of stages){const child=(st.children||[]).find(c=>c.status==="active");if(child)return {stage:child,owner:st};}
+  return null;
+}
+function happening(stages,active){
+  if(active){
+    const st=active.stage,info=stageInfo(st),detail=(st.detail||"").trim();
+    if(detail)return stageLabel(st)+": "+detail.replace(/[.!?]+$/,"")+".";
+    return info?info.detail:stageLabel(st)+" is in progress.";
+  }
+  if(!stages.length)return "No updates yet. Waiting for the review to start.";
+  if(stages.some(st=>st.id==="report"&&st.status==="done"))return "Reporting has finished. Your report is ready in the run folder.";
+  if(stages.some(st=>st.status==="failed"||(st.children||[]).some(c=>c.status==="failed")))return "The review has stopped. Check the steps below for details.";
+  return "Waiting for the next review step.";
+}
+function renderNode(st){
   let kids="";
   if(st.children&&st.children.length){
     kids='<div class="children">'+st.children.map(c=>
-      '<div class="child '+stateClass(c.status)+'"><div class="cn">'+icon(c.status)+' '+esc(c.label)+'</div><div class="cs">'+esc(c.detail||"")+'</div></div>').join("")+'</div>';
+      '<div class="child '+stateClass(c.status)+'"><div class="st">'+esc(STATES[stateClass(c.status)])+'</div><div class="cn">'+esc(stageLabel(c))+'</div><div class="cs">'+esc(c.detail||"")+'</div></div>').join("")+'</div>';
   }
-  return '<div class="node '+stateClass(st.status)+' '+(extraClass||"")+'">'
-    +'<div class="st">'+icon(st.status)+' '+esc(stateClass(st.status))+'</div>'
-    +'<div class="nm">'+esc(st.label)+'</div>'
+  return '<div class="node '+stateClass(st.status)+(kids?' has-children':'')+'">'
+    +'<div class="st">'+esc(STATES[stateClass(st.status)])+'</div>'
+    +'<div class="nm">'+esc(stageLabel(st))+'</div>'
     +'<div class="dt">'+esc(st.detail||"")+'</div>'
     +'<div class="tm">'+esc(elapsed(st))+'</div>'+kids+'</div>';
 }
-
 function render(d){
-  document.getElementById("meta").textContent=(d.target||"")+"  ·  "+(d.run||"");
+  document.getElementById("meta").textContent=[d.target,d.run].filter(Boolean).join(" / ");
   const c=d.counters||{};
   document.getElementById("c-cand").textContent=c.candidates??0;
   document.getElementById("c-conf").textContent=c.confirmed??0;
   document.getElementById("c-needs").textContent=c.needs_validation??0;
   document.getElementById("c-rej").textContent=c.rejected??0;
-  const stages=d.stages||[];
-  const flow=document.getElementById("flow");
-  // Build rows: each stage on its own row with an arrow between, hunt stage highlighted.
-  flow.innerHTML=stages.map((st,i)=>{
-    const node=renderNode(st, st.id==="hunt"?"stage-hunt":"");
-    const arrow=i<stages.length-1?'<div class="arrow">↓</div>':'';
-    return '<div class="row">'+node+'</div>'+arrow;
-  }).join("");
-  const log=document.getElementById("log");
-  log.innerHTML=(d.log||[]).slice().reverse().map(e=>
-    '<div class="e k-'+kindClass(e.kind)+'"><span class="t">'+esc(e.ts||"")+'</span><span class="m">'+esc(e.m||"")+'</span></div>').join("")||'<div class="e"><span class="m">no events yet</span></div>';
+  const stages=d.stages||[],active=activeStage(stages);
+  const summary=document.getElementById("happening"),sentence=happening(stages,active);
+  if(summary.textContent!==sentence)summary.textContent=sentence;
+  const info=active&&stageInfo(active.owner);
+  for(const area of ["agent","omgs","sandbox"]){
+    const el=document.getElementById("area-"+area),current=!!info&&info.area===area;
+    el.classList.toggle("active",current);
+    el.querySelector(".current").textContent=current?"Working now":"";
+  }
+  document.getElementById("flow").innerHTML=stages.map(renderNode).join("")||'<p class="note">Review steps will appear here when the agent sends an update.</p>';
+  document.getElementById("log").innerHTML=(d.log||[]).slice().reverse().map(e=>
+    '<div class="e k-'+kindClass(e.kind)+'"><span class="t">'+esc(e.ts||"")+'</span><span class="m">'+esc(e.m||"")+'</span></div>').join("")||'<div class="e"><span class="m">No activity yet</span></div>';
   const upd=document.getElementById("upd"),dot=document.getElementById("dot");
-  if(typeof d.updated_ms==="number"&&isFinite(d.updated_ms)){const age=now()-d.updated_ms;upd.textContent="updated "+fmtDur(age)+" ago";dot.classList.toggle("stale",age>120000);}
-  else{upd.textContent="no timestamp";dot.classList.add("stale");}
-  document.getElementById("foot").textContent="Local dashboard. Polls pipeline-status.json every 2s. No external resources.";
+  if(typeof d.updated_ms==="number"&&isFinite(d.updated_ms)&&d.updated_ms>0){const age=now()-d.updated_ms;upd.textContent=(age>120000?"No recent updates; last updated ":"Updated ")+fmtDur(age)+" ago";dot.classList.toggle("stale",age>120000);}
+  else{upd.textContent="No updates yet";dot.classList.add("stale");}
 }
 async function tick(){
-  // Let render() decide staleness from the timestamp age on a successful fetch
-  // (a stopped orchestrator leaves old JSON, which must still read as stale);
-  // a fetch failure marks stale directly.
-  try{const r=await fetch("pipeline-status.json?_="+now());const d=await r.json();render(d);}
-  catch(e){const upd=document.getElementById("upd");upd.textContent="waiting for status…";document.getElementById("dot").classList.add("stale");}
+  // A stopped orchestrator leaves old JSON, which must still read as stale.
+  // A fetch failure marks stale directly. Keep the last progress visible.
+  try{const r=await fetch("pipeline-status.json?_="+now());if(!r.ok)throw new Error("Status unavailable");const d=await r.json();render(d);}
+  catch(e){document.getElementById("upd").textContent="Waiting for status";document.getElementById("dot").classList.add("stale");}
 }
 tick();setInterval(tick,2000);
 </script></body></html>

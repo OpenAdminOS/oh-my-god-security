@@ -68,12 +68,42 @@ are leads, not confirmations. Retain sensor gaps, including missing tools, malfo
 databases and unapplied resource limits, in the handoff.
 
 
+## Required progress at every transition
+
+Status recording is required for every run, independently of the optional browser view. Before
+initialization, read [HANDOFF-AND-PROGRESS.md](HANDOFF-AND-PROGRESS.md)
+and ask once whether to open the live view. Never open a browser without that explicit yes.
+
+Immediately after `audit init` resolves `OUTPUT_DIR`, run the Initialize status command below and
+verify that `OUTPUT_DIR/pipeline-status.json` exists. If status fails, report and resolve the error;
+never silently continue a full run with no status file. Do this even when live view is declined.
+At every transition, mark the outgoing stage `done` (or `failed` with the actual blocker), then
+mark the incoming stage `active`, always with a short, plain-language `--detail`. Record completion
+or failure of the final stage too. Use `omgs status`, not hand-written JSON. The commands below
+show entry updates; use the same stage id and a result detail for the corresponding exit update.
+Keep only the currently running stages active. For parallel hunters, record each child's entry and
+exit with `--parent hunt`, a useful `--label` and a plain-language detail.
+
+Before **every** sandbox proof or replay, including evaluator replays, run the Prove status
+command below. Mark `prove` done or failed afterward with the actual outcome, and reactivate the
+calling stage if more work remains.
+A blocked proof remains `needs_validation`; progress states never change verdicts. Do not leave
+`prove` active during later adjudication or reporting. Update cumulative counters as decisions are
+recorded, using the existing keys `candidates`, `confirmed`, `needs_validation`, and `rejected`.
+
+
 ### Initialize
 
 1. **Initialize.** Run `omgs audit init` with the resolved setup values through the documented
    interface. Record source identity, trusted base policy, mode, limits, and locally available
    tools. Let deterministic sensors inspect secrets and supply chain data; do not spend model calls
    duplicating those sensors or execute target code for reconnaissance.
+
+   Once `OUTPUT_DIR` exists, create the mandatory status file before starting optional watch:
+
+   ```sh
+   omgs status --run OUTPUT_DIR --stage initialize --state active --detail "Preparing the review"
+   ```
 
 ### Map
 
@@ -85,6 +115,10 @@ databases and unapplied resource limits, in the handoff.
    `ARCHITECTURE.md` and offline `ARCHITECTURE.html` show how the target is built, its trust
    boundaries and attack surface, and what was not examined. This map is descriptive and never
    changes a verdict.
+
+   ```sh
+   omgs status --run OUTPUT_DIR --stage map --state active --detail "Mapping the project"
+   ```
 
 ### Hunt
 
@@ -99,6 +133,10 @@ databases and unapplied resource limits, in the handoff.
    `omgs fingerprint` with attack class, entry point, sink symbol, and violated boundary for
    identity and deduplication.
 
+   ```sh
+   omgs status --run OUTPUT_DIR --stage hunt --state active --detail "Looking for leads"
+   ```
+
 ### Challenge
 
 4. **Challenge.** Read [VALIDATION-AND-REPORTING.md](VALIDATION-AND-REPORTING.md). A fresh,
@@ -106,6 +144,10 @@ databases and unapplied resource limits, in the handoff.
    adversarially tries to disprove each one, following shared and delegated controls, rejecting the
    leads a control defeats, and recording exact missing facts. Run `omgs validate` on the records
    before proof; keep valid unresolved candidates pending.
+
+   ```sh
+   omgs status --run OUTPUT_DIR --stage verify --state active --detail "Checking each lead"
+   ```
 
 ### Prove
 
@@ -145,6 +187,10 @@ databases and unapplied resource limits, in the handoff.
    snapshot; a replay that is NOT reproduced overturns the tier and recomputes identities with `omgs
    fingerprint` after any semantic change, so records are final before adjudication.
 
+   ```sh
+   omgs status --run OUTPUT_DIR --stage prove --state active --detail "Testing a lead safely"
+   ```
+
 ### Adjudicate
 
 6. **Adjudicate.** A separate evaluator, independent of both the hunt and the verify, reviews every
@@ -159,6 +205,10 @@ databases and unapplied resource limits, in the handoff.
    verdict, severity, proof tier, or fingerprint) requires another adjudication pass on the changed
    record before reporting.
 
+   ```sh
+   omgs status --run OUTPUT_DIR --stage adjudicate --state active --detail "Reviewing the evidence"
+   ```
+
 ### Report
 
 7. **Report.** Let the coverage critic reconcile every ledger unit against the adjudicated records
@@ -172,6 +222,16 @@ databases and unapplied resource limits, in the handoff.
    `OUTPUT_DIR`, alongside the `ARCHITECTURE.md` and `ARCHITECTURE.html` map from the Map phase.
    Report confirmed findings with tier and severity, pending questions, exact blockers, what was not
    examined, and mode/budget/model/sandbox metadata. Do not publish a score or coverage percentage.
+
+   ```sh
+   omgs status --run OUTPUT_DIR --stage report --state active --detail "Preparing your report"
+   ```
+
+   After rendering and checking the outputs, record the final transition:
+
+   ```sh
+   omgs status --run OUTPUT_DIR --stage report --state done --detail "Report saved"
+   ```
 
 If budget or a provider block prevents resolving a late lead, record a blocked or deferred ledger
 unit and preserve the pending fact. Render a partial handoff with the critic gaps visible rather
