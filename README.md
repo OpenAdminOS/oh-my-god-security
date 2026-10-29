@@ -32,13 +32,9 @@ Three steps. You do not install a binary by hand.
 
 You read the report it produces (a self contained `REPORT.html`, plus `REPORT.md` and SARIF) in a run directory that lives outside your code. As a side effect of the reconnaissance it also maps your application: `ARCHITECTURE.html` (and `ARCHITECTURE.md`) show your stack, components by trust zone, data flows, and attack surface as an auto-laid-out diagram. OMGS changes nothing in your repository and applies no fixes unless you explicitly ask.
 
-> Early v0 status: the first public signed release is not published yet, so the automatic download cannot resolve today. Until it is, build the binary once and place it where the skill looks for it, then the agent flow above works:
-> ```sh
-> git clone https://github.com/OpenAdminOS/oh-my-god-security
-> cd oh-my-god-security && cargo build --release
-> mkdir -p ~/.local/share/omgs/bin && cp target/release/omgs ~/.local/share/omgs/bin/omgs
-> ```
-> On Windows, copy `target\release\omgs.exe` to `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`.
+The signed [v0.1.0 release](https://github.com/OpenAdminOS/oh-my-god-security/releases/tag/v0.1.0)
+is available. The skill downloads its pinned release after your consent, using the
+[setup instructions](skill/SETUP.md).
 
 ## What happens when you run it
 

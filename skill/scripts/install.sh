@@ -58,7 +58,7 @@ admit_staging() {
   while :; do
     [ -d "$entry" ] && [ ! -L "$entry" ] || staging_error "$entry"
     if [ "$(uname -s)" = Darwin ]; then
-      owner=$(stat -f %u "$entry"); mode=$(stat -f %Lp "$entry")
+      owner=$(stat -f %u "$entry"); mode=$(stat -f %Op "$entry")
       # Reject mutation grants to any principal except this user or root.
       acl=$(LC_ALL=C ls -led "$entry") || staging_error "$entry"
       if printf '%s\n' "$acl" | awk -v u="$(id -un)" '
