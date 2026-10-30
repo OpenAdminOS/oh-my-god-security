@@ -511,9 +511,9 @@ mod tests {
             "omgs-inputs-{}",
             crate::platform::random_nonce().unwrap()
         ));
-        std::fs::create_dir_all(d.join(".git/hooks")).unwrap();
-        std::fs::create_dir_all(d.join(".git/refs/heads")).unwrap();
-        std::fs::create_dir_all(d.join(".git/objects")).unwrap();
+        crate::platform::create_private_tree(&d.join(".git/hooks")).unwrap();
+        crate::platform::create_private_tree(&d.join(".git/refs/heads")).unwrap();
+        crate::platform::create_private_tree(&d.join(".git/objects")).unwrap();
         let names = [
             "source",
             ".git/config",
@@ -525,7 +525,7 @@ mod tests {
         for name in names {
             std::fs::write(d.join(name), b"original").unwrap();
         }
-        std::fs::write(d.join(".git/index"), index()).unwrap();
+        crate::runmeta::write_atomic_bytes(&d.join(".git/index"), &index()).unwrap();
         let original = manifest(&d, None, false).unwrap();
         for name in names {
             std::fs::write(d.join(name), b"changed").unwrap();
@@ -537,7 +537,7 @@ mod tests {
         let raw = index();
         let mut refreshed = raw.clone();
         refreshed[12] ^= 1;
-        std::fs::write(d.join(".git/index"), reseal(refreshed)).unwrap();
+        crate::runmeta::write_atomic_bytes(&d.join(".git/index"), &reseal(refreshed)).unwrap();
         assert_eq!(manifest(&d, None, false).unwrap(), original);
         assert_eq!(manifest(&d, None, true).unwrap(), original);
         assert_eq!(
