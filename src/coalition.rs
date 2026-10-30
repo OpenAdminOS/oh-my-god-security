@@ -659,34 +659,138 @@ fn result_bytes(limits: &Limits) -> io::Result<u64> {
 fn read<T: DeserializeOwned>(dir: &Path, name: &str) -> io::Result<T> {
     read_bounded(dir, name, CONTROL_BYTES)
 }
+/// Leaf admission is lexical. Only the stable directory reaches TCC inspection;
+/// every actual leaf open is relative to its pinned descriptor and no-follow.
+struct JobDirectory(File);
+impl JobDirectory {
+    fn open(dir: &Path) -> io::Result<Self> {
+        // Refuse protected locations before opening even the directory. Repeat
+        // the check with a pinned handle to detect a replacement during admission.
+        admit_job_storage(dir)?;
+        Self::open_with(dir, &mut admit_job_storage)
+    }
+    fn open_with(dir: &Path, admit: &mut impl FnMut(&Path) -> io::Result<()>) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(dir)?;
+        platform::check_private_dir_handle(&file)?;
+        admit(dir)?;
+        // Fail closed if the admitted pathname no longer names our directory.
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        if platform::directory_identity(dir)? != (opened.dev(), opened.ino()) {
+            return Err(io::Error::other("job directory changed during admission"));
+        }
+        Ok(Self(file))
+    }
+    fn name(name: &str) -> io::Result<std::ffi::CString> {
+        // Check raw spelling, since Path components normalize trailing slashes
+        // and dot components. A leaf must never choose another directory.
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(io::Error::other("job leaf must be a plain file name"));
+        }
+        std::ffi::CString::new(name).map_err(io::Error::other)
+    }
+    fn open_leaf(&self, name: &str, flags: i32, mode: libc::mode_t) -> io::Result<File> {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let name = Self::name(name)?;
+        // SAFETY: the pinned directory and NUL-terminated leaf remain live.
+        let fd = unsafe {
+            libc::openat(
+                self.0.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                u32::from(mode),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a newly owned descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
+        platform::check_private_file(&file)?;
+        if !platform::is_single_link_file(&file)?
+            || file.metadata()?.dev() != self.0.metadata()?.dev()
+        {
+            return Err(io::Error::other(
+                "job leaf must be a regular file on its directory volume",
+            ));
+        }
+        Ok(file)
+    }
+    fn create(&self, name: &str, bytes: &[u8], mode: libc::mode_t) -> io::Result<()> {
+        use std::io::Write;
+        let mut file = self.open_leaf(name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, mode)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+    fn rename(&self, source: &str, target: &str) -> io::Result<()> {
+        let source = Self::name(source)?;
+        let target = Self::name(target)?;
+        // SAFETY: both names are single entries in the retained directory.
+        // renameat replaces a destination link itself, never follows it.
+        if unsafe {
+            libc::renameat(
+                self.0.as_raw_fd(),
+                source.as_ptr(),
+                self.0.as_raw_fd(),
+                target.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
 fn read_bounded<T: DeserializeOwned>(dir: &Path, name: &str, limit: u64) -> io::Result<T> {
-    crate::tcc::admit_path(&dir.join(name))?;
-    let bytes = platform::read_private_bounded_in(dir, Path::new(name), limit)?;
+    use std::io::Read;
+    let file = JobDirectory::open(dir)?.open_leaf(name, libc::O_RDONLY, 0)?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::other("file exceeds byte limit"));
+    }
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
+fn leaf_exists(dir: &Path, name: &str) -> io::Result<bool> {
+    match JobDirectory::open(dir)?.open_leaf(name, libc::O_RDONLY, 0) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
 fn write<T: Serialize>(dir: &Path, name: &str, value: &T) -> io::Result<()> {
-    crate::tcc::admit_path(&dir.join(name))?;
-    crate::tcc::admit_path(&dir.join(format!("{name}.tmp")))?;
-    platform::write_private_new(
-        &dir.join(format!("{name}.tmp")),
-        &serde_json::to_vec(value)?,
-    )?;
-    std::fs::rename(dir.join(format!("{name}.tmp")), dir.join(name))
+    JobDirectory::name(name)?;
+    let directory = JobDirectory::open(dir)?;
+    let tmp = format!("{name}.tmp");
+    directory.create(&tmp, &serde_json::to_vec(value)?, 0o600)?;
+    directory.rename(&tmp, name)
 }
 fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    crate::tcc::admit_path(path)?;
-    platform::write_private_new(path, bytes)
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing job directory"))?;
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| io::Error::other("invalid job leaf"))?;
+    JobDirectory::open(dir)?.create(name, bytes, 0o600)
 }
 fn lock(dir: &Path, create: bool) -> io::Result<File> {
-    crate::tcc::admit_path(&dir.join("owner"))?;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(create)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dir.join("owner"))?;
+    let file = JobDirectory::open(dir)?.open_leaf(
+        "owner",
+        libc::O_RDWR
+            | if create {
+                libc::O_CREAT | libc::O_EXCL
+            } else {
+                0
+            },
+        0o600,
+    )?;
     // SAFETY: file owns this descriptor. LOCK_NB never waits on another proof.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::last_os_error());
@@ -744,26 +848,10 @@ fn admit_job_storage_with(
     dir: &Path,
     admit: &mut impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    admit(dir)?; // Also the anchor's working directory, HOME and TMPDIR.
-    for name in [
-        "owner",
-        "omgs",
-        "job.plist",
-        "request",
-        "domain",
-        "ready",
-        "compatible",
-        "start",
-        "result",
-        "error",
-        "cancel",
-        "orphan",
-        "release",
-    ] {
-        admit(&dir.join(name))?;
-        admit(&dir.join(format!("{name}.tmp")))?;
-    }
-    Ok(())
+    // Also the anchor's working directory, HOME and TMPDIR. Leaves cannot
+    // select storage: names are lexical and opens are no-follow beneath this
+    // directory. Never inspect a transient leaf during admission or recheck.
+    admit(dir)
 }
 
 fn domain() -> String {
@@ -921,10 +1009,10 @@ fn recover(root: &Path, api: &Api) -> io::Result<()> {
         }
         // Taking the abandoned lock also tells its anchor that the owner is gone
         // through the explicit cancellation file, even while recovery owns it.
-        if !dir.join("orphan").exists() {
+        if !leaf_exists(&dir, "orphan")? {
             write_file(&dir.join("orphan"), b"")?;
         }
-        if !dir.join("cancel").exists() {
+        if !leaf_exists(&dir, "cancel")? {
             write_file(&dir.join("cancel"), b"")?;
         }
         let start = Instant::now();
@@ -933,12 +1021,12 @@ fn recover(root: &Path, api: &Api) -> io::Result<()> {
                 if empty(api, ready.coalition)? {
                     break;
                 }
-            } else if dir.join("error").exists() {
+            } else if leaf_exists(&dir, "error")? {
                 break;
             }
             std::thread::sleep(POLL);
         }
-        if dir.join("start").exists() {
+        if leaf_exists(&dir, "start")? {
             let _: Ready = read(&dir, "ready")?;
         }
         if let Ok(ready) = read::<Ready>(&dir, "ready") {
@@ -951,7 +1039,7 @@ fn recover(root: &Path, api: &Api) -> io::Result<()> {
             // anchor as well if it could not finish its own bounded cleanup.
             sweep(api, ready.coalition, None, &mut Vec::new())?;
         }
-        if dir.join("domain").exists() {
+        if leaf_exists(&dir, "domain")? {
             remove_job(&dir)?;
         }
         std::fs::remove_dir_all(dir)?;
@@ -1026,19 +1114,22 @@ fn verify_copy(source: &mut File, staged: &mut File, before: &std::fs::Metadata)
 }
 fn stage_binary(source: &Path, target: &Path) -> io::Result<()> {
     use std::io::{Read, Write};
-    use std::os::unix::fs::OpenOptionsExt;
-    crate::tcc::admit_path(target)?;
+    let directory = JobDirectory::open(
+        target
+            .parent()
+            .ok_or_else(|| io::Error::other("missing job directory"))?,
+    )?;
+    let name = target
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| io::Error::other("invalid job leaf"))?;
     let mut source = File::open(source)?;
     let before = source.metadata()?;
     if !before.is_file() {
         return Err(io::Error::other("anchor source is not a regular file"));
     }
-    let mut staged = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o700)
-        .open(target)?;
+    let mut staged =
+        directory.open_leaf(name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o700)?;
     // The trusted source is opened once. Bound copying even if it changes, then
     // compare exact bytes and the source file's identity and modification times.
     let copied = std::io::copy(
@@ -1135,7 +1226,7 @@ pub(crate) fn run(
             if let Ok(error) = read::<String>(&job.dir, "error") {
                 return Err(io::Error::other(error));
             }
-            if ready.is_none() && job.dir.join("compatible").exists() {
+            if ready.is_none() && leaf_exists(&job.dir, "compatible")? {
                 if let Ok(r) = read::<Ready>(&job.dir, "ready") {
                     if r.boot != boot_id()?
                         || r.coalition == request.parent_coalition
@@ -1159,7 +1250,7 @@ pub(crate) fn run(
                     ready = Some(r);
                 }
             }
-            if job.dir.join("result").exists() {
+            if leaf_exists(&job.dir, "result")? {
                 let mut result: Supervised = read_bounded(&job.dir, "result", result_limit)?;
                 let r = ready
                     .as_ref()
@@ -1267,7 +1358,9 @@ impl Drop for Job {
             }
         }
         // Retain recovery state if an error path could leave live members.
-        if self.dir.join("start").exists() && read::<Ready>(&self.dir, "ready").is_err() {
+        if leaf_exists(&self.dir, "start").unwrap_or(true)
+            && read::<Ready>(&self.dir, "ready").is_err()
+        {
             return;
         }
         if let (Ok(api), Ok(r)) = (Api::load(), read::<Ready>(&self.dir, "ready")) {
@@ -1346,13 +1439,13 @@ pub fn anchor(dir: &Path) -> io::Result<()> {
         }
         write_file(&dir.join("compatible"), b"")?;
         let start = Instant::now();
-        while !dir.join("start").exists() {
-            if owner_gone(dir) || dir.join("cancel").exists() || start.elapsed() >= STARTUP {
+        while !leaf_exists(dir, "start")? {
+            if owner_gone(dir) || leaf_exists(dir, "cancel")? || start.elapsed() >= STARTUP {
                 return Ok(());
             }
             std::thread::sleep(POLL);
         }
-        if owner_gone(dir) || dir.join("cancel").exists() {
+        if owner_gone(dir) || leaf_exists(dir, "cancel")? {
             return Ok(());
         }
         let admitted = req.admit(dir)?;
@@ -1362,7 +1455,7 @@ pub fn anchor(dir: &Path) -> io::Result<()> {
             let (stop, done, dir) = (stop.clone(), done.clone(), dir.to_path_buf());
             std::thread::spawn(move || {
                 while !done.load(Ordering::Acquire) {
-                    if dir.join("cancel").exists() || owner_gone(&dir) {
+                    if leaf_exists(&dir, "cancel").unwrap_or(true) || owner_gone(&dir) {
                         stop.store(true, Ordering::Release);
                         return;
                     }
@@ -1392,9 +1485,9 @@ pub fn anchor(dir: &Path) -> io::Result<()> {
         // SEALED: cleanup ran before capture drain. No process is spawned here.
         write(dir, "result", &result)?;
         let start = Instant::now();
-        while !dir.join("release").exists()
+        while !leaf_exists(dir, "release")?
             && !owner_gone(dir)
-            && !dir.join("orphan").exists()
+            && !leaf_exists(dir, "orphan")?
             && start.elapsed() < STARTUP
         {
             std::thread::sleep(POLL);
@@ -1558,7 +1651,9 @@ mod tests {
                 .filter(|path| path.is_absolute()),
         ) {
             assert!(
-                checked.contains(path),
+                (checked.contains(path)
+                    || path.parent() == Some(dir.as_path())
+                        && JobDirectory::name(path.file_name().unwrap().to_str().unwrap()).is_ok()),
                 "unadmitted command path: {}",
                 path.display()
             );
@@ -1586,7 +1681,10 @@ mod tests {
         {
             for path in std::env::split_paths(OsStr::new(value)).filter(|path| path.is_absolute()) {
                 assert!(
-                    checked.contains(&path),
+                    (checked.contains(&path)
+                        || path.parent() == Some(dir.as_path())
+                            && JobDirectory::name(path.file_name().unwrap().to_str().unwrap())
+                                .is_ok()),
                     "unadmitted plist path: {}",
                     path.display()
                 );
@@ -1645,24 +1743,6 @@ mod tests {
             "/private/var/db/xcode_select_link",
         ] {
             expected.insert(path.into());
-        }
-        for name in [
-            "owner",
-            "omgs",
-            "job.plist",
-            "request",
-            "domain",
-            "ready",
-            "compatible",
-            "start",
-            "result",
-            "error",
-            "cancel",
-            "orphan",
-            "release",
-        ] {
-            expected.insert(dir.join(name));
-            expected.insert(dir.join(format!("{name}.tmp")));
         }
         let capture_json = serde_json::to_value(&request.capture).unwrap();
         let capture_root = PathBuf::from(capture_json["root"].as_str().unwrap());
@@ -1888,36 +1968,133 @@ mod tests {
 
         let dir = root.join(platform::random_nonce().unwrap());
         platform::create_private_dir_new(&dir).unwrap();
-        // Model mounts on the working directory and on individual existing
-        // leaves. No real external storage or protected folder is accessed.
-        for leaf in ["", "omgs", "job.plist", "request", "result", "result.tmp"] {
-            let rejected = if leaf.is_empty() {
-                dir.clone()
-            } else {
-                dir.join(leaf)
-            };
-            if !leaf.is_empty() {
-                platform::write_private_new(&rejected, b"").unwrap();
-            }
-            let error = admit_job_storage_with(&dir, &mut |path| {
-                crate::tcc::admit_path_with_volume(path, &mut |existing| {
-                    if existing == rejected {
-                        Err(io::Error::other("injected external job volume"))
-                    } else {
-                        Ok(())
-                    }
-                })
+        // The directory is the storage boundary. Leaf opens separately require
+        // same-device regular files and never follow links.
+        let error = admit_job_storage_with(&dir, &mut |path| {
+            assert_eq!(path, dir);
+            crate::tcc::admit_path_with_volume(path, &mut |_| {
+                Err(io::Error::other("injected external job volume"))
             })
-            .unwrap_err();
-            assert!(
-                error.to_string().contains("external job volume"),
-                "{leaf}: {error}"
-            );
-            if !leaf.is_empty() {
-                std::fs::remove_file(rejected).unwrap();
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("external job volume"));
+        std::fs::remove_dir_all(data).unwrap();
+    }
+    #[test]
+    fn job_leaf_admission_survives_every_publication_transition() {
+        let dir = supervise::capture_root()
+            .unwrap()
+            .join(format!("leaf-race-{}", platform::random_nonce().unwrap()));
+        platform::create_private_dir_new(&dir).unwrap();
+        let names = [
+            "owner",
+            "omgs",
+            "job.plist",
+            "request",
+            "domain",
+            "ready",
+            "compatible",
+            "start",
+            "result",
+            "error",
+            "cancel",
+            "orphan",
+            "release",
+        ];
+        for base in names {
+            for suffix in ["", ".tmp"] {
+                let name = format!("{base}{suffix}");
+                let leaf = dir.join(&name);
+                let moved = dir.join("moved");
+                // Inject each transition before canonicalization, at the volume
+                // inspection (after canonicalization), and after inspection.
+                // No scheduler timing or concurrent test process is involved.
+                for step in 0..3 {
+                    for transition in 0..3 {
+                        if transition != 0 {
+                            platform::write_private_new(&leaf, b"1").unwrap();
+                        }
+                        let inject = || match transition {
+                            0 => platform::write_private_new(&leaf, b"1").unwrap(),
+                            1 => std::fs::rename(&leaf, &moved).unwrap(),
+                            _ => std::fs::remove_file(&leaf).unwrap(),
+                        };
+                        let directory = JobDirectory::open_with(&dir, &mut |path| {
+                            assert_eq!(path, dir);
+                            if step == 0 {
+                                inject();
+                            }
+                            let mut inspected = 0;
+                            admit_job_storage_with(path, &mut |storage| {
+                                assert_eq!(storage, dir, "transient leaf reached path inspection");
+                                inspected += 1;
+                                crate::tcc::admit_path_with_volume(storage, &mut |_| {
+                                    if step == 1 {
+                                        inject();
+                                    }
+                                    Ok(())
+                                })
+                            })?;
+                            assert_eq!(inspected, 1);
+                            if step == 2 {
+                                inject();
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                        // Recheck the same directory while the leaf is absent
+                        // or newly published, then admit its name without I/O.
+                        admit_job_storage(&dir).unwrap();
+                        JobDirectory::name(&name).unwrap();
+                        if transition == 0 {
+                            let value = directory.open_leaf(&name, libc::O_RDONLY, 0).unwrap();
+                            assert_eq!(value.metadata().unwrap().len(), 1);
+                            std::fs::remove_file(&leaf).unwrap();
+                        } else {
+                            assert_eq!(
+                                directory
+                                    .open_leaf(&name, libc::O_RDONLY, 0)
+                                    .unwrap_err()
+                                    .kind(),
+                                io::ErrorKind::NotFound
+                            );
+                            if transition == 1 {
+                                std::fs::rename(&moved, &leaf).unwrap();
+                                directory.open_leaf(&name, libc::O_RDONLY, 0).unwrap();
+                                std::fs::remove_file(&leaf).unwrap();
+                            }
+                        }
+                        directory.create(&name, b"1", 0o600).unwrap();
+                        std::fs::remove_file(&leaf).unwrap();
+                    }
+                }
+                // A symlink is never opened, even when planted after admission.
+                let directory = JobDirectory::open(&dir).unwrap();
+                std::os::unix::fs::symlink("/Users/omgs/Documents/secret", &leaf).unwrap();
+                assert!(directory.open_leaf(&name, libc::O_RDONLY, 0).is_err());
+                assert!(leaf_exists(&dir, &name).is_err());
+                assert!(directory.create(&name, b"changed", 0o600).is_err());
+                std::fs::remove_file(&leaf).unwrap();
             }
         }
-        std::fs::remove_dir_all(data).unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "../request",
+            "a/b",
+            "/request",
+            "request/",
+            "a/./b",
+            "a\0b",
+        ] {
+            assert!(JobDirectory::name(name).is_err(), "{name:?}");
+        }
+        let alias = dir.with_extension("alias");
+        std::os::unix::fs::symlink(&dir, &alias).unwrap();
+        assert!(JobDirectory::open(&alias).is_err());
+        std::fs::remove_file(alias).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn recovery_reclaims_unpublished_ownerless_directories_and_spares_live_jobs() {
