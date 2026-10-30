@@ -7,19 +7,20 @@ intent or authorization.
 
 | Value | Required meaning |
 | --- | --- |
-| `SKILL_DIR` | Absolute directory containing this file and its linked guides. |
+| `SKILL_DIR` | Resolved absolute directory containing this file and its linked guides, with no symlink components. `identity` refuses linked paths. |
 | `TARGET` | Canonical absolute path to the authorized local repository. |
 | `OUTPUT_DIR` | Private run directory outside `TARGET`, including after symlink resolution. All reports, ledger entries, proof drafts, logs, and retained proof artifacts belong here. Runner-managed ephemeral scratch must also remain outside the target. |
 | `SOURCE_REF` | Exact source commit, plus a recorded worktree diff identity if reviewing uncommitted changes. Never silently mix revisions. |
 
 Read `VERSION` beside this file. Resolve `OMGS_BIN` in this order: `omgs` on PATH, then
 `${OMGS_HOME}/bin/omgs` when `OMGS_HOME` is set (Windows: `%OMGS_HOME%\bin\omgs.exe`), then
-`$HOME/.local/share/omgs/bin/omgs` (Windows: `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`). Run
-`--version` on an existing installation and require the exact string `omgs <VERSION>`. On
+`$HOME/.local/share/omgs/bin/omgs` (Windows: `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`).
+Run only `--version` on an existing installation and require the exact string `omgs <VERSION>`. On
 mismatch, stop and report both versions clearly. Do not continue a review with a mismatched binary
 or silently replace it.
 
-Version alone cannot detect same-version skew. Before review, run
+Version alone cannot detect same-version skew. After the version matches, `identity` is the next
+allowed command. Before review, run
 `"<OMGS_BIN>" identity --skill-dir "<SKILL_DIR>"`. Require success and retain its JSON with the
 run notes: `build_revision` is the full build commit (with `+dirty` for local tracked edits), and
 `bundled_skill_sha256` identifies every packaged file, including paths, using `omgs-skill/1`.
@@ -120,6 +121,12 @@ Without either, the binary materializes its embedded bundle in owner-private sto
 and the handoff brief record the absolute directory and exact identity. Load `SKILL.md`, guides and
 role briefs from that directory, even when an older same-version skill is already installed.
 A modified cache fails identity validation rather than being silently replaced.
+
+OMGS treats missing paths differing only by case, or ambiguous Unicode spellings of missing
+components, as possibly the same location and refuses overlap. Existing aliases are compared by
+filesystem identity, including case and Unicode normalization aliases on filesystems that support
+them. Choose clearly distinct locations for the cache, stores, clone root, targets and run output
+when an overlap is refused.
 
 For source archives, packaging may supply a full commit SHA with `OMGS_BUILD_REVISION` or a
 `BUILD-REVISION` file at the source root. Plain source builds without metadata report

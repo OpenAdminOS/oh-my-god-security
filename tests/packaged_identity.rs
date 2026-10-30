@@ -351,20 +351,21 @@ fn clone_progress_has_bounded_start_completion_reuse_and_failure_phases() {
 #[test]
 fn artifact_privacy_preflight_is_content_silent_and_refuses_aliases() {
     let fixture = Fixture::new();
-    let path = fixture.0.join("record.json");
+    let run = fixture.run();
+    let path = run.join("record.json");
     omgs::platform::write_private_new(&path, b"private synthetic evidence").unwrap();
     let out = cli()
         .args(["artifact-check", "--run"])
-        .arg(&fixture.0)
+        .arg(&run)
         .args(["--path", "record.json"])
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     assert!(!String::from_utf8_lossy(&out.stdout).contains("synthetic evidence"));
-    std::fs::hard_link(&path, fixture.0.join("alias")).unwrap();
+    std::fs::hard_link(&path, run.join("alias")).unwrap();
     let out = cli()
         .args(["artifact-check", "--run"])
-        .arg(&fixture.0)
+        .arg(&run)
         .args(["--path", "record.json"])
         .output()
         .unwrap();
@@ -769,7 +770,7 @@ fn batch_checks_planned_target_aliases_before_writing() {
     let cache = home.join("skill-bundles");
     omgs::platform::create_private_tree(&cache).unwrap();
     let clones = fixture.0.join("clones");
-    let owner = clones.join("example.invalid/owner");
+    let owner = clones.join("example.invalid").join("owner");
     std::fs::create_dir_all(&owner).unwrap();
     let target = owner.join("repo");
     #[cfg(unix)]
@@ -805,4 +806,139 @@ fn batch_checks_planned_target_aliases_before_writing() {
     assert_eq!(std::fs::read_dir(&home).unwrap().count(), 1);
     assert_eq!(std::fs::read_dir(&owner).unwrap().count(), 1);
     assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 3);
+}
+
+#[test]
+fn review_refuses_absent_clones_in_cache_or_store_before_writing() {
+    for location in [
+        "cache",
+        "cache-case",
+        "home",
+        "intent",
+        "output-cache",
+        "output-store",
+    ] {
+        let fixture = Fixture::new();
+        let home = fixture.0.join("home");
+        omgs::platform::create_private_dir(&home).unwrap();
+        let clones = match location {
+            "cache" => home.join("skill-bundles"),
+            "cache-case" => home.join("SKILL-BUNDLES"),
+            "home" => home.clone(),
+            "intent" => home.join("intent"),
+            _ => fixture.0.join("clones"),
+        };
+        let out = match location {
+            "output-cache" => home.join("skill-bundles"),
+            "output-store" => home.join("intent"),
+            _ => fixture.0.join("output"),
+        };
+        let result = cli()
+            .env("OMGS_HOME", &home)
+            .args([
+                "review",
+                "--repo-url",
+                "https://example.invalid/owner/repo",
+                "--clone-root",
+            ])
+            .arg(&clones)
+            .arg("--out")
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(2), "{location}: {result:?}");
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(!error.contains("clone phase="), "{error}");
+        assert!(
+            error.contains("skill bundle cache")
+                || error.contains("intent answer store")
+                || error.contains("trusted policy store"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0, "{location}");
+        assert!(!fixture.0.join("clones").exists());
+        assert!(!out.exists());
+    }
+}
+
+#[test]
+fn unicode_cache_aliases_and_run_store_aliases_refuse_before_writing() {
+    for (name, alias) in [("Repo", "repo"), ("Ä", "ä"), ("é", "e\u{301}")] {
+        for location in ["home-in-target", "output-in-target", "store-in-output"] {
+            let fixture = Fixture::new();
+            let named = fixture.0.join(name);
+            omgs::platform::create_private_dir(&named).unwrap();
+            if !fixture.0.join(alias).exists() {
+                continue;
+            }
+            let target = if location == "store-in-output" {
+                let target = fixture.0.join("source");
+                std::fs::create_dir(&target).unwrap();
+                target
+            } else {
+                named.clone()
+            };
+            let home = if location == "home-in-target" {
+                fixture.0.join(alias).join("data")
+            } else if location == "store-in-output" {
+                named.join("data")
+            } else {
+                fixture.0.join("home")
+            };
+            let output = if location == "home-in-target" {
+                fixture.0.join("output")
+            } else {
+                fixture.0.join(alias).join("run")
+            };
+            // Make the proposed output contain the store through the alias.
+            let output = if location == "store-in-output" {
+                fixture.0.join(alias)
+            } else {
+                output
+            };
+            let result = cli()
+                .env("OMGS_HOME", &home)
+                .args(["audit", "init", "--no-sensors", "--target"])
+                .arg(&target)
+                .arg("--out")
+                .arg(&output)
+                .output()
+                .unwrap();
+            assert_eq!(
+                result.status.code(),
+                Some(2),
+                "{name} {location}: {result:?}"
+            );
+            let error = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                error.contains("resolves inside the target")
+                    || error.contains("outside the target tree")
+                    || error.contains("trusted policy store"),
+                "{error}"
+            );
+            assert!(!home.exists(), "{location}: {home:?}");
+            assert_eq!(std::fs::read_dir(&named).unwrap().count(), 0);
+            if location != "store-in-output" {
+                assert!(!output.exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn default_run_for_cache_named_repository_is_refused_before_writing() {
+    let fixture = Fixture::new();
+    let target = fixture.0.join("skill-bundles");
+    std::fs::create_dir(&target).unwrap();
+    let home = fixture.0.join("home");
+    let result = cli()
+        .env("OMGS_HOME", &home)
+        .args(["audit", "init", "--target"])
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2), "{result:?}");
+    assert!(String::from_utf8_lossy(&result.stderr).contains("skill bundle cache"));
+    assert!(!home.exists());
+    assert_eq!(std::fs::read_dir(target).unwrap().count(), 0);
 }

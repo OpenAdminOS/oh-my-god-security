@@ -96,7 +96,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "artifact-check" => ("--run --path", false),
         "review" => ("--skill-dir --repo-url --mode --budget --no-sensors --persona --out --clone-root", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
-            "--skill-dir --target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of",
+            "--skill-dir --target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of --clone-root",
             true,
         ),
         "batch" if args.first().is_some_and(|a| a == "init") => {
@@ -744,8 +744,10 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             };
             let d = std::fs::canonicalize(d)
                 .map_err(|e| format!("--test-from {}: {e}", d.display()))?;
-            if target.as_ref().is_some_and(|base| d.starts_with(base)) {
-                return Err("--test-from must be a draft outside the target; drop it to use a test already in the target".into());
+            if let Some(base) = &target {
+                if omgs::paths::overlaps(&d, base)? {
+                    return Err("--test-from must be a draft outside the target; drop it to use a test already in the target".into());
+                }
             }
             if !d.is_file() {
                 return Err(format!("--test-from {} is not a file", d.display()));
@@ -1890,7 +1892,7 @@ fn trusted_store(target: &Path) -> Result<PathBuf, String> {
     let parent = path.parent().ok_or("intent answer store needs a parent")?;
     let resolved = resolve_existing_prefix(parent)?
         .join(path.file_name().ok_or("intent answer store needs a name")?);
-    if resolved.starts_with(target) {
+    if omgs::paths::overlaps(&resolved, target)? {
         return Err(format!(
             "the intent answer store {} resolves inside the target {}; refusing to use it",
             path.display(),
@@ -1945,7 +1947,7 @@ fn trusted_policy_path(target: &Path, run: &Path) -> Result<PathBuf, String> {
     let store = trusted_store(target)?;
     let parent = store.parent().ok_or("trusted store needs a parent")?;
     let resolved = resolve_existing_prefix(parent)?;
-    if resolved.starts_with(run) {
+    if omgs::paths::overlaps(&resolved, run)? {
         return Err("trusted policy store must live outside the run directory".into());
     }
     let run_hash = omgs::sha256::digest(run.as_os_str().as_encoded_bytes());
@@ -2027,7 +2029,7 @@ fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
         return refuse("run metadata names no existing target");
     };
     let run = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
-    if run.starts_with(&target) {
+    if omgs::paths::overlaps(&run, &target)? {
         return refuse("the run directory is inside the target");
     }
     if Path::new(&answers.target) != target {
@@ -2285,29 +2287,13 @@ fn resolve_existing_prefix(p: &Path) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
-/// Compare physically resolved paths component by component. Missing suffixes
-/// retain their input spelling, so conservatively reject ASCII case aliases on
-/// every filesystem, including case-sensitive volumes. This needs no probe
-/// writes and covers the fixed ASCII cache name and bundle digest.
-fn path_is_within(path: &Path, parent: &Path) -> bool {
-    let mut components = path.components();
-    parent.components().all(|expected| {
-        components.next().is_some_and(|actual| {
-            actual
-                .as_os_str()
-                .as_encoded_bytes()
-                .eq_ignore_ascii_case(expected.as_os_str().as_encoded_bytes())
-        })
-    })
-}
-
-fn paths_overlap(left: &Path, right: &Path) -> bool {
-    path_is_within(left, right) || path_is_within(right, left)
-}
-
 fn admit_bundle_cache(fences: &[PathBuf]) -> Result<(), String> {
     let cache = resolve_existing_prefix(&bundle_cache())?;
-    if let Some(fence) = fences.iter().find(|f| paths_overlap(&cache, f)) {
+    let store_root = data_dir().join("intent");
+    for fence in fences.iter().chain(std::iter::once(&store_root)) {
+        if !omgs::paths::overlaps(&cache, fence)? {
+            continue;
+        }
         return Err(format!(
             "the skill bundle cache {} overlaps {}; set OMGS_HOME outside the target and the run output",
             cache.display(),
@@ -2326,14 +2312,31 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     // particular, a cache must not populate a target or an invalid run output.
     trusted_store(&target)?;
     let mut fences = vec![target.clone()];
-    if let Some(out) = flag(rest, "--out") {
-        let out = resolve_existing_prefix(&std::path::absolute(out).map_err(|e| e.to_string())?)?;
-        trusted_policy_path(&target, &out)?;
-        fences.push(out);
+    let out = flag(rest, "--out").map(PathBuf::from).unwrap_or_else(|| {
+        data_dir().join(
+            target
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("target")),
+        )
+    });
+    trusted_policy_path(&target, &out)?;
+    if omgs::paths::overlaps(&target, &out)? {
+        return Err(
+            "run output must live outside the target tree, so findings never enter git history"
+                .into(),
+        );
     }
+    if has(rest, "--clone-root") {
+        let root = clone_root(rest)?;
+        admit_clone_storage(&root, &target, &out)?;
+        fences.push(root);
+    }
+    fences.push(out);
     admit_bundle_cache(&fences)?;
     let skill = review_skill(rest)?;
+    admit_bundle_cache(&fences)?;
     let run = audit_init_selected(rest)?;
+    admit_bundle_cache(&fences)?;
     omgs::runmeta::update(&run, |meta| {
         meta.insert("skill_dir".into(), serde_json::json!(skill));
         meta.insert("skill_identity".into(), omgs::setup::identity());
@@ -2495,7 +2498,12 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
         None
     };
     let outside = |p: &Path| -> Result<(), String> {
-        if resolve_existing_prefix(p)?.starts_with(&target) {
+        if has(rest, "--clone-root") {
+            admit_clone_storage(&clone_root(rest)?, &target, p)?;
+        }
+        admit_bundle_cache(&[target.clone(), p.to_path_buf()])?;
+        trusted_policy_path(&target, p)?;
+        if omgs::paths::overlaps(p, &target)? {
             Err(
                 "run output must live outside the target tree, so findings never enter git history"
                     .into(),
@@ -2535,6 +2543,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             // Claim run-N with an exclusive create, so parallel inits (batch
             // mode) never share a run directory.
             let base = data_dir().join(&repo);
+            outside(&base)?;
             omgs::platform::create_private_tree(&base).map_err(|e| {
                 format!(
                     "default run storage {}: {e}; see README.md#storage-migration",
@@ -3150,6 +3159,10 @@ fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
     let repo = omgs::batch::parse_repo_url(raw_url)?;
     let targets = clone_root(args)?;
     let dest = targets.join(&repo.host).join(&repo.owner).join(&repo.name);
+    let out = flag(args, "--out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir().join(&repo.name));
+    admit_clone_storage(&targets, &dest, &out)?;
     let git_path = omgs::platform::which("git").ok_or("git not found on an absolute PATH entry")?;
     let git = || {
         let mut c = std::process::Command::new(&git_path);
@@ -3163,6 +3176,7 @@ fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
     };
     let parent = dest.parent().ok_or("invalid clone destination")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    admit_clone_storage(&targets, &dest, &out)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -3228,7 +3242,13 @@ fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
 
 fn init_args(dest: &Path, args: &[String], out: Option<&Path>) -> Vec<String> {
     let mut v = vec!["--target".to_string(), dest.to_string_lossy().to_string()];
-    for name in ["--mode", "--budget", "--persona", "--skill-dir"] {
+    for name in [
+        "--mode",
+        "--budget",
+        "--persona",
+        "--skill-dir",
+        "--clone-root",
+    ] {
         if let Some(value) = flag(args, name) {
             v.push(name.into());
             v.push(value);
@@ -3257,13 +3277,33 @@ fn brief(dest: &Path, run: &Path) -> Result<String, String> {
     Ok(format!("agent brief: load SKILL.md only from skill directory {skill}, with exact identity {identity}; use this directory for every role brief and guide, ignoring other installed skills; follow its pipeline against {} with run directory {}, validate findings with omgs validate, prove only through omgs prove, reconcile with omgs critic, and render with omgs report.", dest.display(), run.display()))
 }
 
+/// Fence the whole clone area before git or directory creation, including a
+/// planned destination that does not exist yet.
+fn admit_clone_storage(root: &Path, target: &Path, out: &Path) -> Result<(), String> {
+    for fence in [root, target] {
+        trusted_policy_path(fence, out)?;
+        if omgs::paths::overlaps(fence, out)? {
+            return Err("run output must live outside the reviewed targets".into());
+        }
+    }
+    admit_bundle_cache(&[root.to_path_buf(), target.to_path_buf(), out.to_path_buf()])
+}
+
 fn cmd_review(args: &[String]) -> Result<(), String> {
     selected_skill(args)?;
     let url = flag(args, "--repo-url").ok_or("review requires --repo-url <url>")?;
     if let Some(p) = flag(args, "--persona") {
         omgs::persona::defaults(&p)?;
     }
+    let repo = omgs::batch::parse_repo_url(&url)?;
+    let root = clone_root(args)?;
+    let planned = root.join(&repo.host).join(&repo.owner).join(&repo.name);
+    let out = flag(args, "--out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir().join(&repo.name));
+    admit_clone_storage(&root, &planned, &out)?;
     let dest = clone_target(&url, args)?;
+    admit_clone_storage(&root, &dest, &out)?;
     let out = flag(args, "--out").map(PathBuf::from);
     let run = audit_init(&init_args(&dest, args, out.as_deref()))?;
     println!("{}", run.display());
@@ -3310,7 +3350,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             };
             let resolved = resolve_existing_prefix(&out_abs)?;
             for t in std::iter::once(&targets_root).chain(&dests) {
-                if path_is_within(&resolved, &resolve_existing_prefix(t)?) {
+                if omgs::paths::overlaps(&resolved, t)? {
                     return Err(format!(
                         "batch output must live outside the reviewed targets, and {} is inside {}",
                         out_abs.display(),
@@ -3350,15 +3390,17 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 .collect::<Result<Vec<_>, String>>()?;
             let contained = |p: &Path| -> Result<(), String> {
                 let p = resolve_existing_prefix(p)?;
-                match resolved_targets.iter().find(|t| path_is_within(&p, t)) {
-                    Some(t) => Err(format!(
-                        "run directory {} resolves inside {}",
-                        p.display(),
-                        t.display()
-                    )),
-                    None => Ok(()),
+                admit_bundle_cache(std::slice::from_ref(&p))?;
+                for t in &resolved_targets {
+                    trusted_policy_path(t, &p)?;
+                    if omgs::paths::overlaps(&p, t)? {
+                        return Err(format!("run directory {} resolves inside {}", p.display(), t.display()));
+                    }
                 }
+                Ok(())
             };
+            contained(&out)?;
+            admit_bundle_cache(&resolved_targets)?;
             // Claim the batch directory exclusively before any work, so two
             // concurrent batch inits sharing --out cannot both proceed and
             // overwrite each other's batch.json.
@@ -3461,14 +3503,13 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 }
             }
             let inside = |p: &Path| -> Result<(), String> {
-                match targets.iter().find(|t| path_is_within(p, t)) {
-                    Some(t) => Err(format!(
-                        "index output must live outside every reviewed target, and {} is inside {}",
-                        out_abs.display(),
-                        t.display()
-                    )),
-                    None => Ok(()),
+                admit_bundle_cache(&[p.to_path_buf()])?;
+                for t in &targets {
+                    if omgs::paths::overlaps(p, t)? {
+                        return Err(format!("index output must live outside every reviewed target, and {} is inside {}", out_abs.display(), t.display()));
+                    }
                 }
+                Ok(())
             };
             inside(&resolve_existing_prefix(&out_abs)?)?;
             std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
@@ -3820,31 +3861,6 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod cli_tests {
-    #[test]
-    fn overlap_comparison_rejects_case_aliases_at_component_boundaries() {
-        use std::path::Path;
-        for (left, right, overlaps) in [
-            ("home/skill-bundles", "home/SKILL-BUNDLES", true),
-            ("home/skill-bundles/digest", "HOME/SKILL-BUNDLES", true),
-            ("home/skill-bundles", "home/SKILL-BUNDLES/digest", true),
-            ("home/skill-bundles", "home/skill-bundles-other", false),
-            ("home/skill-bundles", "home/runs", false),
-        ] {
-            assert_eq!(
-                super::paths_overlap(Path::new(left), Path::new(right)),
-                overlaps
-            );
-        }
-        assert!(super::path_is_within(
-            Path::new("home/SKILL-BUNDLES/digest"),
-            Path::new("home/skill-bundles")
-        ));
-        assert!(!super::path_is_within(
-            Path::new("home/skill-bundles"),
-            Path::new("home/skill-bundles/digest")
-        ));
-    }
-
     #[test]
     fn doctor_overall_deadline_covers_preparation_and_leaves_unchecked_probes() {
         for preparation in [true, false] {
@@ -4284,6 +4300,7 @@ mod cli_tests {
             if cmd == "review" || (cmd == "batch" && sub == "init") {
                 sections.push(("init_args", function(source, "init_args")));
                 sections.push(("clone_root", function(source, "clone_root")));
+                sections.push(("clone_target", function(source, "clone_target")));
             }
             for (name, body) in sections {
                 let names = read_options(body);
