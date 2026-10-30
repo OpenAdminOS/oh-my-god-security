@@ -6,8 +6,10 @@ use std::path::PathBuf;
 fn unit(id: &str, status: &str) -> Unit {
     let mut u = Unit::new(id, "src/decision.ts", &["missing_authz"], status);
     u.evidence = vec!["src/decision.ts".into()];
-    u.extra
-        .insert("scope_paths".into(), json!(["src/decision.ts#GET"]));
+    u.extra.insert(
+        "scope_paths".into(),
+        json!([{"path":"src/decision.ts","operation":"GET"}]),
+    );
     u
 }
 fn ledger(units: Vec<Unit>) -> Ledger {
@@ -58,9 +60,10 @@ fn t10_broad_seeds_require_reconciled_bounded_nonoverlapping_children() {
         "overlapping ownership"
     ));
     let mut other = other;
-    other
-        .extra
-        .insert("scope_paths".into(), json!(["src/decision.ts#POST"]));
+    other.extra.insert(
+        "scope_paths".into(),
+        json!([{"path":"src/decision.ts","operation":"POST"}]),
+    );
     assert!(validate_ledger(&ledger(vec![parent, child, other])).is_empty());
 }
 
@@ -637,16 +640,19 @@ fn parent_classes_survive_nested_partitions_and_reasoned_exclusions() {
 
 #[test]
 fn equivalent_scope_spellings_cannot_duplicate_ownership() {
-    let mut spellings = vec!["src/./decision.ts#GET", "src//decision.ts#GET"];
+    let mut spellings = vec!["src/./decision.ts", "src//decision.ts"];
     if cfg!(windows) {
-        spellings.push(r"src\decision.ts#GET");
+        spellings.push(r"src\decision.ts");
     }
     for spelling in spellings {
         let mut parent = unit("stack:node", "covered");
         parent.extra.insert("child_units".into(), json!(["a", "b"]));
         let a = unit("a", "covered");
         let mut b = unit("b", "covered");
-        b.extra.insert("scope_paths".into(), json!([spelling]));
+        b.extra.insert(
+            "scope_paths".into(),
+            json!([{"path":spelling,"operation":"GET"}]),
+        );
         assert!(
             has(
                 &validate_ledger(&ledger(vec![parent, a, b])),
@@ -684,8 +690,10 @@ fn filesystem_case_aliases_cannot_duplicate_ownership() {
     parent.extra.insert("child_units".into(), json!(["a", "b"]));
     let a = unit("a", "covered");
     let mut b = unit("b", "covered");
-    b.extra
-        .insert("scope_paths".into(), json!(["src/DECISION.ts#GET"]));
+    b.extra.insert(
+        "scope_paths".into(),
+        json!([{"path":"src/DECISION.ts","operation":"GET"}]),
+    );
     let mut l = ledger(vec![parent, a, b]);
     l.extra.insert("scope_root".into(), json!(target));
     if target.join("src/DECISION.ts").exists() {
@@ -697,26 +705,28 @@ fn filesystem_case_aliases_cannot_duplicate_ownership() {
         assert!(validate_ledger(&l).is_empty(), "{:?}", validate_ledger(&l));
     }
     // Operation names are not filesystem names, so their case stays intact.
-    l.units[2]
-        .extra
-        .insert("scope_paths".into(), json!(["src/decision.ts#get"]));
+    l.units[2].extra.insert(
+        "scope_paths".into(),
+        json!([{"path":"src/decision.ts","operation":"get"}]),
+    );
     assert!(validate_ledger(&l).is_empty());
 }
 
 #[test]
 fn legacy_partitions_require_target_context_before_closure() {
-    for scope in [
-        "src/café.ts#GET",
-        "src/cafe\u{301}.ts#GET",
-        "src/nonexistent.ts#GET",
-    ] {
+    for scope in ["src/café.ts", "src/cafe\u{301}.ts", "src/nonexistent.ts"] {
         let mut parent = unit("stack:node", "covered");
         parent.extra.insert("child_units".into(), json!(["a", "b"]));
         let mut a = unit("a", "covered");
-        a.extra
-            .insert("scope_paths".into(), json!(["src/café.ts#GET"]));
+        a.extra.insert(
+            "scope_paths".into(),
+            json!([{"path":"src/café.ts","operation":"GET"}]),
+        );
         let mut b = unit("b", "covered");
-        b.extra.insert("scope_paths".into(), json!([scope]));
+        b.extra.insert(
+            "scope_paths".into(),
+            json!([{"path":scope,"operation":"GET"}]),
+        );
         let mut l = ledger(vec![parent, a, b]);
         l.extra.remove("scope_root");
         assert!(has(
@@ -740,11 +750,15 @@ fn target_context_rejects_absent_scopes_and_resolves_unicode_aliases() {
     let mut parent = unit("stack:node", "covered");
     parent.extra.insert("child_units".into(), json!(["a", "b"]));
     let mut a = unit("a", "covered");
-    a.extra
-        .insert("scope_paths".into(), json!(["src/café.ts#GET"]));
+    a.extra.insert(
+        "scope_paths".into(),
+        json!([{"path":"src/café.ts","operation":"GET"}]),
+    );
     let mut b = unit("b", "covered");
-    b.extra
-        .insert("scope_paths".into(), json!(["src/cafe\u{301}.ts#GET"]));
+    b.extra.insert(
+        "scope_paths".into(),
+        json!([{"path":"src/cafe\u{301}.ts","operation":"GET"}]),
+    );
     let mut l = ledger(vec![parent, a, b]);
     l.extra.insert("scope_root".into(), json!(t.0));
     if t.0.join("src/cafe\u{301}.ts").exists() {
@@ -752,9 +766,10 @@ fn target_context_rejects_absent_scopes_and_resolves_unicode_aliases() {
     } else {
         assert!(has(&validate_ledger(&l), "absent from target"));
     }
-    l.units[2]
-        .extra
-        .insert("scope_paths".into(), json!(["src/nonexistent.ts#GET"]));
+    l.units[2].extra.insert(
+        "scope_paths".into(),
+        json!([{"path":"src/nonexistent.ts","operation":"GET"}]),
+    );
     assert!(has(&validate_ledger(&l), "absent from target"));
 }
 
@@ -790,7 +805,7 @@ fn scope_directory_aliases_never_escape_or_duplicate_target_ownership() {
         let mut b = unit("b", "covered");
         b.extra.insert(
             "scope_paths".into(),
-            json!([format!("{alias}/decision.ts#GET")]),
+            json!([{"path":format!("{alias}/decision.ts"),"operation":"GET"}]),
         );
         let mut l = ledger(vec![parent, a, b]);
         l.extra.insert("scope_root".into(), json!(target));
@@ -859,7 +874,7 @@ fn hash_scope_paths_and_operations_have_separate_ownership_identity() {
     let l = scope_partition(&t.0, &[whole.clone(), op.clone()]);
     assert!(validate_ledger(&l).is_empty(), "{:?}", validate_ledger(&l));
     let l = scope_partition(&t.0, &[op, json!("src/Decision#read")]);
-    assert!(has(&validate_ledger(&l), "overlapping ownership"));
+    assert!(has(&validate_ledger(&l), "migrate to objects"));
     let l = scope_partition(
         &t.0,
         &[
@@ -907,9 +922,92 @@ fn hash_path_case_aliases_follow_the_target_filesystem() {
 }
 
 #[test]
-fn legacy_scope_strings_require_unambiguous_migration_and_valid_operations() {
+fn legacy_hash_strings_are_refused_regardless_of_target_contents() {
+    for (plain_exists, hash_exists) in [(true, false), (false, true), (true, true), (false, false)]
+    {
+        let t = Temp::new();
+        omgs::platform::private_dir(&t.0.join("dir")).unwrap();
+        if plain_exists {
+            std::fs::write(t.0.join("dir/a"), "plain source").unwrap();
+        }
+        if hash_exists {
+            std::fs::write(t.0.join("dir/a#b"), "literal source").unwrap();
+        }
+        let errors = validate_ledger(&scope_partition(&t.0, &[json!("dir/a#b")]));
+        for expected in [
+            "ambiguous",
+            "migrate to objects",
+            r#"{"path":"dir/a#b"}"#,
+            r#"{"path":"dir/a","operation":"b"}"#,
+        ] {
+            assert!(has(&errors, expected), "{errors:?}");
+        }
+        if plain_exists && hash_exists {
+            let explicit = scope_partition(
+                &t.0,
+                &[
+                    json!({"path":"dir/a#b"}),
+                    json!({"path":"dir/a","operation":"b"}),
+                ],
+            );
+            assert!(
+                validate_ledger(&explicit).is_empty(),
+                "{:?}",
+                validate_ledger(&explicit)
+            );
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn legacy_hash_strings_are_refused_even_when_the_literal_path_is_a_link() {
+    let t = Temp::new();
+    omgs::platform::private_dir(&t.0.join("dir")).unwrap();
+    // A directory link also exercises Windows junctions without symlink privileges.
+    let destination = t.0.join("dir").join("a");
+    omgs::platform::private_dir(&destination).unwrap();
+    let link = t.0.join("dir").join("a#b");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&destination, &link).unwrap();
+    #[cfg(windows)]
+    assert!(std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&destination)
+        .status()
+        .unwrap()
+        .success());
+    let errors = validate_ledger(&scope_partition(&t.0, &[json!("dir/a#b")]));
+    assert!(has(&errors, "migrate to objects"), "{errors:?}");
+    let errors = validate_ledger(&scope_partition(&t.0, &[json!({"path":"dir/a#b"})]));
+    assert!(has(&errors, "symlinks or reparse points"), "{errors:?}");
+    #[cfg(unix)]
+    std::fs::remove_file(link).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(link).unwrap();
+}
+
+#[test]
+fn legacy_plain_paths_have_whole_path_ownership() {
+    let t = Temp::new();
+    omgs::platform::private_dir(&t.0.join("dir")).unwrap();
+    std::fs::write(t.0.join("dir/a"), "source").unwrap();
+    let l = scope_partition(&t.0, &[json!("dir/a")]);
+    assert!(validate_ledger(&l).is_empty(), "{:?}", validate_ledger(&l));
+    for other in [
+        json!({"path":"dir/a"}),
+        json!({"path":"dir/a","operation":"b"}),
+    ] {
+        let errors = validate_ledger(&scope_partition(&t.0, &[json!("dir/a"), other]));
+        assert!(has(&errors, "overlapping ownership"), "{errors:?}");
+    }
+}
+
+#[test]
+fn legacy_hash_strings_require_migration_and_object_operations_are_validated() {
     for legacy in [
-        "src/Decision.swift",
+        "dir/a#b",
         "src#ipc/Decision.swift",
         "src#ipc/Decision.swift#read",
         "src/Decision#read.swift#read",
@@ -956,7 +1054,7 @@ fn legacy_scope_strings_require_unambiguous_migration_and_valid_operations() {
     }
     child.extra.insert(
         "scope_paths".into(),
-        json!(["src/decision.ts#GET", {"path":"src/decision.ts","operation":"GET"}]),
+        json!(["src/decision.ts", {"path":"src/decision.ts"}]),
     );
     assert!(has(&validate_ledger(&ledger(vec![child])), "unique"));
 }
@@ -968,8 +1066,8 @@ fn links_beneath_hash_directories_cannot_bypass_scope_validation() {
     for directory in ["src", "src#ipc", "outside"] {
         omgs::platform::private_dir(&t.0.join(directory)).unwrap();
     }
-    std::fs::write(t.0.join("outside/Decision#read.swift"), "source").unwrap();
-    let link = t.0.join("src#ipc/linked");
+    std::fs::write(t.0.join("outside").join("Decision#read.swift"), "source").unwrap();
+    let link = t.0.join("src#ipc").join("linked");
     #[cfg(unix)]
     std::os::unix::fs::symlink(t.0.join("outside"), &link).unwrap();
     #[cfg(windows)]

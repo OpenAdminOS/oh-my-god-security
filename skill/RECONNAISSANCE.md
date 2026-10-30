@@ -132,10 +132,10 @@ Each scope is an object with a required relative `path` and an optional `operati
 path and its descendants. Operation identifiers are case-sensitive ASCII strings matching
 `[A-Za-z_][A-Za-z0-9_.:-]{0,127}` (1 to 128 characters). Use a stable identifier for source
 symbols whose spelling does not fit this grammar. Unknown fields and null operations are refused.
-Legacy string scopes are accepted only with exactly one `#` separating a path without `#`
-from a valid operation. Strings without a separator, with multiple separators, or with invalid
-operations require migration to scope objects. To migrate a whole-path string, use
-`{"path":"src/file.ts"}`; to migrate an operation string, use separate fields as above.
+Legacy string scopes without `#` remain accepted as plain paths with no operation. Any string
+containing `#` is refused because it could name a literal path or a path plus operation. Migrate
+`"dir/a#b"` to `{"path":"dir/a#b"}` for the literal filename or
+`{"path":"dir/a","operation":"b"}` for operation `b` on `dir/a`. No separator is inferred.
 All paths resolve against `scope_root` with existence, containment, link and filesystem alias
 checks before a partition closes. A legacy ledger without `scope_root` requires target context
 before closure.

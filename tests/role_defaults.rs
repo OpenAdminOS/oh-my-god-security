@@ -1122,7 +1122,7 @@ fn build_names_and_txt_configuration_are_code_before_docs_or_data() {
         "--classes",
         &parent_classes,
         "--mapping",
-        r##"{"scope_paths":["CMakeLists.txt#execute_process"]}"##
+        r##"{"scope_paths":[{"path":"CMakeLists.txt","operation":"execute_process"}]}"##
     ])
     .status
     .success());

@@ -107,12 +107,10 @@ fn valid_operation(operation: &str) -> bool {
 
 fn parse_scope(value: &Value) -> Result<Scope, String> {
     let (path, operation) = if let Some(legacy) = value.as_str() {
-        let migration = "legacy scope_paths strings require exactly one # between a path without # and an operation matching [A-Za-z_][A-Za-z0-9_.:-]{0,127}; migrate to objects with path and optional operation";
-        let (path, operation) = legacy.split_once('#').ok_or(migration)?;
-        if operation.contains('#') || !valid_operation(operation) {
-            return Err(migration.into());
+        if legacy.contains('#') {
+            return Err("legacy scope_paths strings containing # are ambiguous: # may be part of the literal path or separate a path from an operation; migrate to objects, using {\"path\":\"dir/a#b\"} for a literal path or {\"path\":\"dir/a\",\"operation\":\"b\"} for an operation".into());
         }
-        (path, Some(operation))
+        (legacy, None)
     } else {
         let object = value
             .as_object()

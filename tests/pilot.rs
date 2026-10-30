@@ -549,7 +549,7 @@ fn unresolved_evaluator_leads_keep_delivery_partial() {
     }
     let parent_classes = ledger["units"][0]["attack_classes"].clone();
     ledger["units"][0]["child_units"] = json!(["function:dummy"]);
-    ledger["units"].as_array_mut().unwrap().push(json!({"id":"function:dummy","surface":"sample.ps1:Get-Dummy","attack_classes":parent_classes,"status":"covered","evidence":["sample.ps1"],"scope_paths":["sample.ps1#Get-Dummy"]}));
+    ledger["units"].as_array_mut().unwrap().push(json!({"id":"function:dummy","surface":"sample.ps1:Get-Dummy","attack_classes":parent_classes,"status":"covered","evidence":["sample.ps1"],"scope_paths":[{"path":"sample.ps1","operation":"Get-Dummy"}]}));
     ledger["units"].as_array_mut().unwrap().push(json!({"id":"late-lead","surface":"sample.ps1","attack_classes":[],"status":"blocked","note":"provider block"}));
     f.put("coverage-ledger.json", ledger.clone());
     f.put("candidates-empty.json", json!({"candidates":[]}));

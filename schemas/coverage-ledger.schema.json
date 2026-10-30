@@ -34,7 +34,7 @@
                     "operation": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])", "description": "Optional case-sensitive operation identifier, 1 to 128 ASCII characters."}
                   }
                 },
-                {"type": "string", "pattern": "^[^#]+#[A-Za-z_][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])", "description": "Legacy only: exactly one # separator. Migrate other strings to objects."}
+                {"type": "string", "pattern": "^[^#]+(?![\\s\\S])", "description": "Legacy plain path with no operation. Strings containing # are ambiguous between a literal path and a path plus operation; use an object with explicit path and optional operation."}
               ]
             },
             "description": "Bounded source scopes with separate path and optional operation. Omitting operation owns the entire path and descendants. Different operations or attack classes may share a file. Paths must resolve inside scope_root without links."
