@@ -17,7 +17,11 @@
       "evidence": "Fixture source trace and archived failing assertion.",
       "hunted_by": "fixture-hunter",
       "verified_by": "fixture-verifier",
-      "severity": "high"
+      "severity": "high",
+      "verification": {
+        "state": "final",
+        "attempt": "fixture-verifier"
+      }
     },
     {
       "attack_class": "tenant_isolation",
@@ -36,7 +40,11 @@
       "evidence": "Fixture source trace and archived failing assertion.",
       "hunted_by": "fixture-hunter",
       "verified_by": "fixture-verifier",
-      "severity": null
+      "severity": null,
+      "verification": {
+        "state": "final",
+        "attempt": "fixture-verifier"
+      }
     },
     {
       "attack_class": "tenant_isolation",
@@ -55,7 +63,11 @@
       "evidence": "Fixture source trace and archived failing assertion.",
       "hunted_by": "fixture-hunter",
       "verified_by": "fixture-verifier",
-      "severity": null
+      "severity": null,
+      "verification": {
+        "state": "final",
+        "attempt": "fixture-verifier"
+      }
     },
     {
       "attack_class": "tenant_isolation",
@@ -74,7 +86,11 @@
       "evidence": "Fixture source trace and archived failing assertion.",
       "hunted_by": "fixture-hunter",
       "verified_by": "fixture-verifier",
-      "severity": "high"
+      "severity": "high",
+      "verification": {
+        "state": "final",
+        "attempt": "fixture-verifier"
+      }
     }
   ]
 }

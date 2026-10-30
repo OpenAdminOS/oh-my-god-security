@@ -56,7 +56,16 @@ pub struct Location {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Verification {
+    pub state: String,
+    pub attempt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<Verification>,
     #[serde(default)]
     pub fingerprint: String,
     pub title: String,
@@ -141,6 +150,15 @@ pub fn is_fingerprint(value: &str) -> bool {
 
 /// Enforce the locked evidence rules. Returns every violation found.
 pub fn validate(file: &FindingsFile) -> Vec<String> {
+    validate_inner(file, true)
+}
+
+/// Publication accepts incomplete verification, while preserving all evidence rules.
+pub fn validate_drafts(file: &FindingsFile) -> Vec<String> {
+    validate_inner(file, false)
+}
+
+fn validate_inner(file: &FindingsFile, finalized: bool) -> Vec<String> {
     let mut errors = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let own: std::collections::HashSet<String> = file
@@ -151,6 +169,21 @@ pub fn validate(file: &FindingsFile) -> Vec<String> {
     let mut absorbed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (i, f) in file.findings.iter().enumerate() {
         let at = format!("findings[{i}] '{}'", f.title);
+        if f.verification.as_ref().is_some_and(|v| {
+            !["draft", "final"].contains(&v.state.as_str()) || v.attempt.trim().is_empty()
+        }) {
+            errors.push(format!(
+                "{at}: verification needs draft or final state and a nonblank attempt"
+            ));
+        }
+        if finalized
+            && !f
+                .verification
+                .as_ref()
+                .is_some_and(|v| v.state == "final" && !v.attempt.trim().is_empty())
+        {
+            errors.push(format!("{at}: verification requires final state and a completed attempt; drafts are not decisions"));
+        }
         let expected = crate::fingerprint(&f.attack_class, &f.entry_point, &f.sink, &f.boundary);
         if f.fingerprint.is_empty() {
             errors.push(format!("{at}: fingerprint is empty, expected {expected}"));

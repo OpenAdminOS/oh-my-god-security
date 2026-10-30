@@ -164,7 +164,7 @@ fn batch_summary_reads_a_run_directory() {
     assert_eq!(s.state, "complete");
     assert_eq!(s.agent_calls, Some(12));
     assert_eq!(s.reroutes, 1);
-    assert!(s.blockers.iter().any(|b| b == "route exhausted"));
+    assert!(s.blockers.iter().any(|b| b.contains("route exhausted")));
     assert!(s.blockers.iter().any(|b| b == "blocked unit u1"));
     assert!(s.blockers.iter().any(|b| b.starts_with("critic")));
     assert_eq!(
@@ -408,7 +408,7 @@ fn route_follows_fallbacks_and_records_reroutes() {
     assert_eq!(meta["reroutes"].as_array().unwrap().len(), 2);
     assert_eq!(meta["reroutes"][0]["to"], "model-b");
     assert!(meta["reroutes"][1]["to"].is_null());
-    assert!(meta["blockers"][0]
+    assert!(meta["blocker_events"][0]["reason"]
         .as_str()
         .unwrap()
         .contains("every model"));
@@ -468,6 +468,10 @@ fn open_record(key: &str, intent_id: Option<&str>, path: &str) -> Finding {
         prerequisites: None,
         hunted_by: Some("red-1".into()),
         verified_by: Some("blue-1".into()),
+        verification: Some(omgs::model::Verification {
+            state: "final".into(),
+            attempt: "verify-1".into(),
+        }),
         candidates: vec![],
         proof_ref: None,
         trace: vec![],
@@ -711,7 +715,8 @@ fn status_log_timestamps_are_strings_per_schema() {
         serde_json::from_str(&std::fs::read_to_string(dir.join("pipeline-status.json")).unwrap())
             .unwrap();
     let ts = v["log"][0]["ts"].as_str().expect("ts is a string");
-    assert_eq!(ts.len(), 8);
+    assert_eq!(ts.len(), 20);
+    assert!(ts.ends_with('Z'));
     assert_eq!(omgs::runmeta::clock(3_723_000), "01:02:03");
     let _ = std::fs::remove_dir_all(&dir);
 }

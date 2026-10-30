@@ -263,10 +263,7 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("invalid refusal history: {e}"))?;
         }
-        if let Some(blocked) = meta.get("blockers").and_then(|v| v.as_array()) {
-            s.blockers
-                .extend(blocked.iter().filter_map(|b| b.as_str()).map(String::from));
-        }
+        s.blockers.extend(crate::attempts::active_blockers(&meta)?);
     }
     if let Some(text) = crate::run_artifact::optional_text(
         dir,

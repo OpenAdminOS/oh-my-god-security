@@ -102,6 +102,11 @@
           "reason"
         ]
       }
+    },
+    "attempt": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Completed independent evaluation attempt. Missing on legacy drafts, which cannot pass reconciliation."
     }
   },
   "required": [

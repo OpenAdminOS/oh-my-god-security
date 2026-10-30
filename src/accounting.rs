@@ -12,7 +12,13 @@ pub struct Usage {
 }
 
 pub type Accounting = BTreeMap<String, Usage>;
-pub const ROLES: [&str; 4] = ["red-hunter", "blue-verifier", "evaluator", "green-fixer"];
+pub const ROLES: [&str; 5] = [
+    "host",
+    "red-hunter",
+    "blue-verifier",
+    "evaluator",
+    "green-fixer",
+];
 
 pub fn read(meta: &Map<String, Value>) -> Result<Accounting, String> {
     let mut values: Accounting = match meta.get("accounting") {
@@ -38,7 +44,13 @@ pub fn read(meta: &Map<String, Value>) -> Result<Accounting, String> {
 }
 
 fn check_role(role: &str) -> Result<(), String> {
-    if !ROLES.contains(&role) {
+    let (base, attempt) = role
+        .split_once('@')
+        .map_or((role, None), |(r, id)| (r, Some(id)));
+    if attempt.is_some_and(|id| id.trim().is_empty() || id.contains('@')) {
+        return Err("accounting attempt id must not be blank or contain @".into());
+    }
+    if !ROLES.contains(&base) {
         return Err(format!(
             "accounting role must be one of {}",
             ROLES.join(", ")
@@ -99,7 +111,25 @@ pub fn lines(values: &Accounting) -> Vec<String> {
         all.insert(role.into(), Usage::default());
     }
     all.extend(values.clone());
-    all.iter()
+    for role in ROLES {
+        let parts: Vec<_> = values
+            .iter()
+            .filter(|(k, _)| k.starts_with(&format!("{role}@")))
+            .collect();
+        if !parts.is_empty() {
+            if let Some(legacy) = all
+                .remove(role)
+                .filter(|u| u.tokens.is_some() || u.cost_usd.is_some() || u.duration_ms.is_some())
+            {
+                all.insert(
+                    format!("{role} (historical role total; excluded from attempt aggregate)"),
+                    legacy,
+                );
+            }
+        }
+    }
+    let mut lines: Vec<String> = all
+        .iter()
         .map(|(role, u)| {
             let show =
                 |v: Option<u64>| v.map(|v| v.to_string()).unwrap_or_else(|| "unknown".into());
@@ -113,5 +143,30 @@ pub fn lines(values: &Accounting) -> Vec<String> {
                 show(u.duration_ms)
             )
         })
-        .collect()
+        .collect();
+    for role in ROLES {
+        let parts: Vec<_> = values
+            .iter()
+            .filter(|(k, _)| k.starts_with(&format!("{role}@")))
+            .map(|(_, u)| u)
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let sum = |get: fn(&Usage) -> Option<u64>| {
+            let total = parts
+                .iter()
+                .filter_map(|u| get(u))
+                .try_fold(0u64, u64::checked_add);
+            let unknown = parts.iter().filter(|u| get(u).is_none()).count();
+            format!(
+                "known subtotal {}, {unknown} unknown attempt(s)",
+                total.map_or_else(|| "overflow".into(), |n| n.to_string())
+            )
+        };
+        let cost: f64 = parts.iter().filter_map(|u| u.cost_usd).sum();
+        let unknown_cost = parts.iter().filter(|u| u.cost_usd.is_none()).count();
+        lines.push(format!("{role}: tokens {}; cost USD known subtotal {cost}, {unknown_cost} unknown attempt(s); duration ms {}. Aggregate {}", sum(|u| u.tokens), sum(|u| u.duration_ms), if parts.iter().all(|u| u.tokens.is_some() && u.cost_usd.is_some() && u.duration_ms.is_some()) { "complete" } else { "incomplete" }));
+    }
+    lines
 }

@@ -437,6 +437,7 @@ fn proof_records_back_confirmed_findings() {
         ],
     );
     assert!(init.status.success(), "{}", text(&init));
+    completed_verifier_fixture(&run, "blue-1");
     let fp = omgs::fingerprint("missing_authz", "GET /x", "db.x", "tenant");
     let out = omgs(
         &home,
@@ -484,7 +485,7 @@ fn proof_records_back_confirmed_findings() {
             "location": {"path": "app/x.ts", "line": 3},
             "evidence": "Proof test fails on the target.",
             "hunted_by": "red-1",
-            "verified_by": "blue-1"
+            "verified_by": "blue-1", "verification":{"state":"final","attempt":"fixture-verifier"}
         });
         if let Some(r) = proof_ref {
             f["proof_ref"] = serde_json::json!(r);
@@ -943,7 +944,7 @@ fn an_mxc_timeout_is_never_a_proof() {
             "fingerprint": fp, "title": "t", "verdict": "confirmed", "severity": "high",
             "proof_tier": "test_proven", "attack_class": "missing_authz", "entry_point": "GET /t",
             "sink": "db.t", "boundary": "tenant", "location": {"path": "a.ts", "line": 1},
-            "evidence": "e", "hunted_by": "red-1", "verified_by": "blue-1",
+            "evidence": "e", "hunted_by": "red-1", "verified_by": "blue-1", "verification":{"state":"final","attempt":"fixture-verifier"},
             "proof_ref": "proofs/1.json"
         }]})
         .to_string(),
@@ -2557,4 +2558,13 @@ fn protected_launchd_storage_is_refused_before_creation_or_executor_discovery() 
         assert!(!d.join("home").exists());
     }
     std::fs::remove_dir_all(d).unwrap();
+}
+
+fn completed_verifier_fixture(run: &std::path::Path, identity: &str) {
+    for value in [
+        serde_json::json!({"event":"start","id":"fixture-verifier","role":"verifier","identity":identity,"context":"fixture-context","inputs":["synthetic-input"],"outputs":["findings.json"],"isolation":"procedural"}),
+        serde_json::json!({"event":"complete","id":"fixture-verifier","actor":"fixture-host","reason":"Synthetic completion fixture"}),
+    ] {
+        omgs::attempts::append(run, serde_json::from_value(value).unwrap()).unwrap();
+    }
 }

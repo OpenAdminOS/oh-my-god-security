@@ -344,6 +344,22 @@ fn critique_dir_inner(
         );
     }
     let mut report = critique(&ledger, names.len(), &candidates, findings);
+    report
+        .gaps
+        .extend(crate::attempts::finding_gaps(dir, findings)?);
+    report
+        .gaps
+        .extend(crate::attempts::ledger_gaps(dir, &ledger)?);
+    let meta = crate::runmeta::read_optional(dir)?.unwrap_or_default();
+    let attempts = crate::attempts::states(&crate::attempts::history(&meta)?)?;
+    for role in ["verifier", "evaluator"] {
+        if !attempts
+            .values()
+            .any(|a| a.role == role && a.state == "complete")
+        {
+            report.gaps.push(format!("{role} completion not recorded"));
+        }
+    }
     if let Some(sensors) = crate::sensors::read_report(dir)? {
         report
             .gaps

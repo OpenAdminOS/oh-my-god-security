@@ -41,6 +41,7 @@ fn every_subcommand_has_help_without_initializing_state() {
         "ledger add",
         "ledger set",
         "critic",
+        "attempt",
         "status",
         "watch",
         "route",
@@ -89,7 +90,8 @@ fn route_without_configuration_uses_host_and_records_refusal() {
         serde_json::from_str(&std::fs::read_to_string(run.join("run-metadata.json")).unwrap())
             .unwrap();
     assert_eq!(meta["reroutes"][0]["from"], "host-default");
-    assert!(meta["blockers"].as_array().unwrap().len() == 1);
+    assert_eq!(meta["blocker_events"].as_array().unwrap().len(), 1);
+    assert_eq!(meta["blocker_events"][0]["state"], "active");
     let out = route()
         .arg("--models")
         .arg(home.join("missing.json"))

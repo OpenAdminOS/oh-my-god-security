@@ -38,6 +38,10 @@ fn record(key: &str) -> Finding {
         prerequisites: None,
         hunted_by: Some("red-1".into()),
         verified_by: Some("blue-1".into()),
+        verification: Some(omgs::model::Verification {
+            state: "final".into(),
+            attempt: "verify-1".into(),
+        }),
         candidates: vec![],
         proof_ref: None,
         trace: vec![],
@@ -278,7 +282,63 @@ fn candidate_json(c: &Candidate) -> serde_json::Value {
 /// A complete run: one unit covered by one verified finding from one candidate.
 /// Write a clean failing-test proof record for every record above traced and
 /// point it there, as `omgs prove --run --finding` would.
+fn record_attempt_fixture(dir: &std::path::Path, id: &str, role: &str, identity: &str) {
+    let mut meta = omgs::runmeta::read_optional(dir)
+        .unwrap()
+        .unwrap_or_default();
+    let mut history = omgs::attempts::history(&meta).unwrap();
+    if omgs::attempts::states(&history).unwrap().contains_key(id) {
+        return;
+    }
+    for record in [
+        omgs::attempts::Event::Start {
+            id: id.into(),
+            role: role.into(),
+            identity: identity.into(),
+            context: format!("fixture-{id}"),
+            inputs: vec!["synthetic-input".into()],
+            outputs: vec!["synthetic-output".into()],
+            isolation: "procedural".into(),
+        },
+        omgs::attempts::Event::Complete {
+            id: id.into(),
+            actor: "fixture-host".into(),
+            reason: "Synthetic completed output".into(),
+        },
+    ] {
+        history.push(omgs::attempts::Record {
+            at: "2026-01-01T00:00:00Z".into(),
+            record,
+        });
+    }
+    meta.insert("attempts".into(), serde_json::to_value(history).unwrap());
+    write_private_fixture(
+        dir.join("run-metadata.json"),
+        serde_json::to_string(&meta).unwrap(),
+    )
+    .unwrap();
+}
+fn record_verifier_fixtures(dir: &std::path::Path, findings: &FindingsFile) {
+    for f in &findings.findings {
+        if let Some(v) = &f.verification {
+            record_attempt_fixture(
+                dir,
+                &v.attempt,
+                "verifier",
+                f.verified_by.as_deref().unwrap_or("blue-1"),
+            );
+        }
+    }
+}
+
 fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
+    for f in &mut findings.findings {
+        f.verification = Some(omgs::model::Verification {
+            state: "final".into(),
+            attempt: "verify-1".into(),
+        });
+    }
+    record_verifier_fixtures(dir, &findings);
     for f in findings.findings.iter_mut() {
         if f.proof_tier == ProofTier::Traced {
             continue;
@@ -431,6 +491,8 @@ fn relocate_replay_fixture(value: &mut serde_json::Value, old: &str, new: &str) 
 }
 
 fn adjudicate_fixture(dir: &std::path::Path, findings: &FindingsFile) {
+    record_verifier_fixtures(dir, findings);
+    record_attempt_fixture(dir, "eval-fixture", "evaluator", "eval-fixture");
     let mut decisions = Vec::new();
     for f in &findings.findings {
         let mut evidence = Vec::new();
@@ -479,7 +541,7 @@ fn adjudicate_fixture(dir: &std::path::Path, findings: &FindingsFile) {
     }
     write_private_fixture(
         dir.join("evaluation.json"),
-        serde_json::json!({"evaluator":"eval-fixture",
+        serde_json::json!({"evaluator":"eval-fixture","attempt":"eval-fixture",
         "source_ref": if dir.join("run-metadata.json").is_file() { omgs::runmeta::read(dir).unwrap().get("source_ref").cloned().unwrap_or(serde_json::json!("synthetic")) } else { serde_json::json!("synthetic") },"decisions":decisions,"gaps":[]})
         .to_string(),
     )
@@ -2602,8 +2664,8 @@ fn report_handoff_and_sarif_golden_contract() {
             .cloned()
             .collect(),
     };
-    assert!(render_markdown(&zero, &meta).contains("Nothing to fix"));
-    assert!(render_html(&zero, &meta).contains("Nothing to fix"));
+    assert!(render_markdown(&zero, &meta).contains("Incomplete review"));
+    assert!(render_html(&zero, &meta).contains("Incomplete review"));
     let short = ReportMeta {
         persona: "builder".into(),
         ..Default::default()
@@ -3276,6 +3338,7 @@ fn report_metadata_defaults_explicit_overrides_and_handoff_cli() {
     let (dir, file) = report_fixture("metadata-defaults");
     let meta = serde_json::json!({"repo":"saved/repo", "source_ref":"saved-ref", "mode":"gate", "sandbox":"saved-sandbox", "persona":"builder", "hunters":7, "agent_calls_used":43, "verifier":"saved-reviewer"});
     write_private_fixture(dir.join("run-metadata.json"), meta.to_string()).unwrap();
+    record_verifier_fixtures(&dir, &file);
     let out_dir = dir.join("rendered");
     let findings_path = dir.join("findings.json");
     let render = |extra: &[&str]| {
@@ -3354,6 +3417,7 @@ fn report_metadata_defaults_explicit_overrides_and_handoff_cli() {
     meta["persona"] = serde_json::Value::Null;
     meta["report_depth"] = "concise".into();
     write_private_fixture(dir.join("run-metadata.json"), meta.to_string()).unwrap();
+    record_verifier_fixtures(&dir, &file);
     let md = render(&[]);
     assert!(
         md.contains("Hunted by:"),

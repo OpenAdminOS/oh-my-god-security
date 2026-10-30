@@ -85,7 +85,7 @@ fn refusal_without_models_survives_report_metadata_and_index() {
     assert_eq!(out.status.code(), Some(1));
     let m = read(f.run.join("run-metadata.json"));
     assert_eq!(m["reroutes"][0]["from"], "fixed-test-provider");
-    assert!(m["blockers"][0]
+    assert!(m["blocker_events"][0]["reason"]
         .as_str()
         .unwrap()
         .contains("provider eligibility block"));
@@ -540,6 +540,17 @@ fn guidance_preserves_probe_and_artifact_rules() {
 #[test]
 fn unresolved_evaluator_leads_keep_delivery_partial() {
     let f = Fixture::new();
+    for (id, role, identity) in [
+        ("verifier-round", "verifier", "verifier"),
+        ("evaluation-round", "evaluator", "independent"),
+    ] {
+        for event in [
+            json!({"event":"start","id":id,"role":role,"identity":identity,"context":id,"inputs":["synthetic-input"],"outputs":["synthetic-output"],"isolation":"procedural"}),
+            json!({"event":"complete","id":id,"actor":"fixture-host","reason":"Synthetic finished review"}),
+        ] {
+            omgs::attempts::append(&f.run, serde_json::from_value(event).unwrap()).unwrap();
+        }
+    }
     let source = read(f.run.join("run-metadata.json"))["source_ref"].clone();
     let mut ledger = read(f.run.join("coverage-ledger.json"));
     for u in ledger["units"].as_array_mut().unwrap() {
@@ -549,7 +560,7 @@ fn unresolved_evaluator_leads_keep_delivery_partial() {
     ledger["units"].as_array_mut().unwrap().push(json!({"id":"late-lead","surface":"sample.ps1","attack_classes":[],"status":"blocked","note":"provider block"}));
     f.put("coverage-ledger.json", ledger.clone());
     f.put("candidates-empty.json", json!({"candidates":[]}));
-    f.put("evaluation.json",json!({"evaluator":"independent","source_ref":source,"decisions":[],"gaps":[],"leads":[{"unit_id":"late-lead","reason":"new boundary"}]}));
+    f.put("evaluation.json",json!({"evaluator":"independent","attempt":"evaluation-round","source_ref":source,"decisions":[],"gaps":[],"leads":[{"unit_id":"late-lead","reason":"new boundary"}]}));
     for status in ["blocked", "deferred"] {
         ledger["units"].as_array_mut().unwrap().last_mut().unwrap()["status"] = status.into();
         f.put("coverage-ledger.json", ledger.clone());

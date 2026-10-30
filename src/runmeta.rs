@@ -143,7 +143,34 @@ pub fn check_numeric_fields(meta: &Map<String, Value>) -> Result<(), String> {
             return Err(format!("{key} must be a non-negative integer or absent"));
         }
     }
-    crate::accounting::read(meta)?;
+    let accounting = crate::accounting::read(meta)?;
+    let attempts = crate::attempts::states(&crate::attempts::history(meta)?)?;
+    for key in accounting.keys() {
+        if let Some((role, id)) = key.split_once('@') {
+            let expected = match role {
+                "red-hunter" => "hunter",
+                "blue-verifier" => "verifier",
+                "green-fixer" => "guard",
+                other => other,
+            };
+            if !attempts.get(id).is_some_and(|a| a.role == expected) {
+                return Err("accounting key must match a recorded attempt and role".into());
+            }
+        }
+    }
+    if let Some(p) = meta.get("publication") {
+        let p = p.as_object().ok_or("publication must be an object")?;
+        for (k, v) in p {
+            if !["repo", "source_ref", "sandbox"].contains(&k.as_str())
+                || !v
+                    .as_str()
+                    .is_some_and(|s| !s.trim().is_empty() && !s.chars().any(char::is_control))
+            {
+                return Err("invalid publication label".into());
+            }
+        }
+    }
+    crate::attempts::active_blockers(meta)?;
     Ok(())
 }
 
@@ -247,4 +274,20 @@ pub fn is_complete(dir: &Path) -> bool {
                 .map(|s| s == "complete" || s == "partial")
         })
         .unwrap_or(false)
+}
+
+/// ISO 8601 UTC, including the date across long-running rounds.
+pub fn timestamp(ms: u64) -> String {
+    let days = (ms / 86_400_000) as i64;
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{}Z", clock(ms))
 }

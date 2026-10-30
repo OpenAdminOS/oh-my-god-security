@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Serialize)]
 pub struct Allowance {
     pub budget_agent_calls: Option<u64>,
+    pub budget_semantics: &'static str,
     pub calls_and_proofs_used: u64,
     pub remaining: Option<u64>,
     pub run_count: usize,
@@ -231,6 +232,7 @@ pub fn allowance(root: &Path) -> Result<Allowance, String> {
     }
     Ok(Allowance {
         budget_agent_calls: cap,
+        budget_semantics: "combined_calls_proofs_replays",
         calls_and_proofs_used: used,
         remaining: cap.map(|cap| cap.saturating_sub(used)),
         run_count: runs.len(),
@@ -371,22 +373,29 @@ pub fn with_family_lock<T>(
 
 /// Charge host-reported calls before dispatch, using the same family lock as proofs.
 pub fn charge_calls(run: &Path, calls: u64) -> Result<(), String> {
-    runmeta::update(run, |m| {
-        let root = original(run)?;
-        let total = allowance(&root)?;
-        if total.remaining.is_some_and(|remaining| calls > remaining) {
-            return Err("run budget exhausted: call charge exceeds remaining allowance".into());
-        }
-        let used = m
-            .get("agent_calls_used")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        m.insert(
-            "agent_calls_used".into(),
-            Value::from(used.checked_add(calls).ok_or("call count overflow")?),
-        );
-        Ok(())
-    })
+    runmeta::update(run, |m| charge_calls_locked(run, m, calls))
+}
+
+/// Caller holds the family lock through the metadata transaction.
+pub(crate) fn charge_calls_locked(
+    run: &Path,
+    m: &mut Map<String, Value>,
+    calls: u64,
+) -> Result<(), String> {
+    let root = original(run)?;
+    let total = allowance(&root)?;
+    if total.remaining.is_some_and(|remaining| calls > remaining) {
+        return Err("run budget exhausted: call charge exceeds remaining allowance".into());
+    }
+    let used = m
+        .get("agent_calls_used")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    m.insert(
+        "agent_calls_used".into(),
+        Value::from(used.checked_add(calls).ok_or("call count overflow")?),
+    );
+    Ok(())
 }
 
 pub fn summary(run: &Path) -> Result<String, String> {

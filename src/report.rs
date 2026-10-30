@@ -9,6 +9,7 @@ fn html_escape(s: &str) -> String {
 #[derive(Default)]
 pub struct ReportMeta {
     pub artifact_base: String,
+    pub review_limits: Vec<String>,
     pub timeline: Vec<TimelineRow>,
     pub accounting: crate::accounting::Accounting,
     pub persona: String,
@@ -87,11 +88,21 @@ fn models_text(meta: &ReportMeta) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(". "))
 }
 
+fn coverage_counts(meta: &ReportMeta) -> (usize, usize) {
+    (
+        meta.coverage
+            .iter()
+            .filter(|s| s.starts_with("blocked:"))
+            .count(),
+        meta.coverage
+            .iter()
+            .filter(|s| s.starts_with("deferred:"))
+            .count(),
+    )
+}
 fn critic_text(meta: &ReportMeta) -> String {
-    meta.critic
-        .as_ref()
-        .map(|c| c.summary())
-        .unwrap_or_else(|| "not run".into())
+    let (blocked, deferred) = coverage_counts(meta);
+    format!("{}; blocked units: {blocked}; deferred units: {deferred}. Reconciliation does not establish complete coverage", meta.critic.as_ref().map(|c| c.summary()).unwrap_or_else(|| "not run".into()))
 }
 
 /// One line describing who ran the review and at what cost. Each unrecorded
@@ -126,6 +137,7 @@ fn confirmed(file: &FindingsFile) -> Vec<&crate::model::Finding> {
 /// A recorded pipeline stage or child, in saved order. Times are UTC.
 #[derive(Default)]
 pub struct TimelineRow {
+    pub historical: bool,
     pub label: String,
     pub state: String,
     pub started: String,
@@ -144,14 +156,15 @@ pub fn timeline(run: &std::path::Path) -> Result<Vec<TimelineRow>, String> {
     };
     let doc = crate::shape::strict_json(&text)?;
     crate::status::check_document(doc.as_object().ok_or("pipeline status must be an object")?)?;
-    fn row(v: &serde_json::Value, parent: &str) -> TimelineRow {
+    fn row(v: &serde_json::Value, parent: &str, historical: bool) -> TimelineRow {
         let clock = |key: &str| {
             v.get(key)
                 .and_then(|v| v.as_u64())
-                .map(crate::runmeta::clock)
+                .map(crate::runmeta::timestamp)
                 .unwrap_or_else(|| "not recorded".into())
         };
         TimelineRow {
+            historical,
             label: format!("{parent}{}", v["label"].as_str().unwrap_or_default()),
             state: v["status"].as_str().unwrap_or_default().into(),
             started: clock("started_ms"),
@@ -162,18 +175,66 @@ pub fn timeline(run: &std::path::Path) -> Result<Vec<TimelineRow>, String> {
     let mut rows = Vec::new();
     if let Some(stages) = doc["stages"].as_array() {
         for v in stages {
-            rows.push(row(v, ""));
+            if let Some(history) = v["history"].as_array() {
+                for old in history {
+                    rows.push(row(old, "", true));
+                }
+            }
+            rows.push(row(v, "", false));
             if let Some(children) = v["children"].as_array() {
                 for child in children {
+                    if let Some(history) = child["history"].as_array() {
+                        for old in history {
+                            rows.push(row(
+                                old,
+                                &format!("{} / ", v["label"].as_str().unwrap_or_default()),
+                                true,
+                            ));
+                        }
+                    }
                     rows.push(row(
                         child,
                         &format!("{} / ", v["label"].as_str().unwrap_or_default()),
+                        false,
                     ));
                 }
             }
         }
     }
     Ok(rows)
+}
+
+pub fn review_state(file: &FindingsFile, meta: &ReportMeta) -> Option<String> {
+    let blocked = meta
+        .review_limits
+        .iter()
+        .any(|s| s.contains("stopped") || s.starts_with("blocker "))
+        || meta.coverage.iter().any(|s| s.starts_with("blocked:"));
+    let unfinished = meta.critic.as_ref().is_none_or(|c| !c.passed())
+        || !meta.review_limits.is_empty()
+        || meta.coverage.iter().any(|s| {
+            ["blocked:", "deferred:", "planned:", "candidate:"]
+                .iter()
+                .any(|prefix| s.starts_with(prefix))
+        })
+        || !crate::model::validate(file).is_empty()
+        || file
+            .findings
+            .iter()
+            .any(|f| f.verdict == Verdict::NeedsValidation)
+        || meta
+            .timeline
+            .iter()
+            .any(|r| !r.historical && r.state != "done");
+    let (blocked_units, deferred_units) = coverage_counts(meta);
+    if blocked_units > 0 || deferred_units > 0 {
+        return Some(format!("Incomplete coverage: {blocked_units} blocked unit(s), {deferred_units} deferred unit(s). Verification and pending work still require review."));
+    }
+    if unfinished {
+        Some(format!("{} review: verification, coverage or pending work remains. {} confirmed finding(s) recorded.{}", if blocked { "Blocked" } else { "Incomplete" }, confirmed(file).len(), if meta.review_limits.is_empty() { String::new() } else { format!(" {}", meta.review_limits.join("; ")) }))
+    } else {
+        None
+    }
 }
 
 fn short(meta: &ReportMeta) -> bool {
@@ -210,8 +271,10 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         .iter()
         .filter(|f| f.verdict == Verdict::Rejected)
         .count();
-    let fix = if conf.is_empty() {
-        "Nothing to fix from this run. No record reached confirmed.".into()
+    let fix = if let Some(state) = review_state(file, meta) {
+        state
+    } else if conf.is_empty() {
+        "Completed review: no confirmed findings.".into()
     } else {
         format!(
             "Review {} and their fix briefs in HANDOFF.md. Obtain authorization before editing.",
@@ -875,8 +938,10 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
         rejected.len(),
     );
 
-    let fix_line = if conf.is_empty() {
-        "Nothing to fix from this run. No record reached confirmed.".to_string()
+    let fix_line = if let Some(state) = review_state(file, meta) {
+        state
+    } else if conf.is_empty() {
+        "Completed review: no confirmed findings.".to_string()
     } else {
         format!(
             "{}, each with the evidence that decided it.",
@@ -1080,15 +1145,15 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
             format!("<details><summary>Coverage details</summary>{coverage_body}</details>");
     }
     let critic_body = match &meta.critic {
-        None => "<p class=\"note\">Coverage critic: not run for this report.</p>".to_string(),
+        None => format!("<p class=\"note\">Coverage critic: {}.</p>", html_escape(&critic_text(meta))),
         Some(c) if c.passed() => format!(
             "<p class=\"note\">Coverage critic: {}. Every candidate was verified by someone other than its hunter, and every unit was examined or closed with a reason.</p>",
-            html_escape(&c.summary())
+            html_escape(&critic_text(meta))
         ),
         Some(c) => {
             let mut items = format!(
                 "<div class=\"callout c-missing\"><h4>Coverage critic: {}</h4><ul class=\"gaps\">",
-                html_escape(&c.summary())
+                html_escape(&critic_text(meta))
             );
             for gap in &c.gaps {
                 items.push_str(&format!("<li>{}</li>", html_escape(gap)));
@@ -1510,13 +1575,10 @@ pub fn publish(
                 "accounting".into(),
                 serde_json::to_value(usage).map_err(|e| e.to_string())?,
             );
+            let complete = completion.complete && crate::attempts::gaps(m)?.is_empty();
             m.insert(
                 "run_status".into(),
-                serde_json::json!(if completion.complete {
-                    "complete"
-                } else {
-                    "partial"
-                }),
+                serde_json::json!(if complete { "complete" } else { "partial" }),
             );
             m.insert(
                 "completed_unix".into(),

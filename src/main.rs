@@ -122,7 +122,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
             ("--ledger --unit --surface --classes --status --note", true)
         }
         "ledger" if args.first().is_some_and(|a| a == "set") => {
-            ("--ledger --unit --status --evidence --note", true)
+            ("--ledger --unit --status --evidence --note --attempt-ref --blocker-ref", true)
         }
         "gate" => ("--target --base --head --run", false),
         "critic" => ("--run", false),
@@ -131,8 +131,9 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
             "--run --stage --state --label --parent --detail --counter --log --accounting",
             false,
         ),
+        "attempt" => ("--run --event --resolve-blocker --actor --reason --replacement", false),
         "watch" => ("--run --max-ms", false),
-        "route" => ("--run --role --refused --reason --models", false),
+        "route" => ("--run --role --refused --reason --models --model", false),
         "intent" if args.first().is_some_and(|a| a == "list") => ("--stack --attack-class", true),
         "intent" if args.first().is_some_and(|a| a == "propose") => ("--run", true),
         "intent" if args.first().is_some_and(|a| a == "answer") => {
@@ -160,7 +161,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
             return Err(format!("unknown option '{option}' for {cmd}"));
         }
         let repeatable = (cmd == "ledger" && option == "--evidence")
-            || (cmd == "status" && option == "--counter")
+            || (cmd == "status" && ["--counter", "--log"].contains(&option))
             || (cmd == "bench" && option == "--runs")
             || (["status", "report"].contains(&cmd) && option == "--accounting")
             || (cmd == "report" && option == "--model");
@@ -249,6 +250,7 @@ fn main() -> ExitCode {
         "critic" => cmd_critic(rest),
         "budget" => cmd_budget(rest),
         "batch" => cmd_batch(rest),
+        "attempt" => cmd_attempt(rest),
         "status" => cmd_status(rest),
         "watch" => cmd_watch(rest),
         "route" => cmd_route(rest),
@@ -368,6 +370,10 @@ fn validate_at(file: &FindingsFile, path: &str) -> Vec<String> {
         .unwrap_or(Path::new("."));
     let mut errors = validate(file);
     errors.extend(omgs::proof::validate_proofs(file, dir));
+    match omgs::attempts::finding_gaps(dir, file) {
+        Ok(gaps) => errors.extend(gaps),
+        Err(e) => errors.push(e),
+    }
     errors
 }
 
@@ -1526,7 +1532,11 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     let path = flag(args, "--findings").ok_or("report requires --findings <path>")?;
     let out = flag(args, "--out").ok_or("report requires --out <dir>")?;
     let file = read_findings(&path)?;
-    let errors = validate_at(&file, &path);
+    let mut errors = omgs::model::validate_drafts(&file);
+    errors.extend(omgs::proof::validate_proofs(
+        &file,
+        Path::new(&path).parent().unwrap_or(Path::new(".")),
+    ));
     if !errors.is_empty() {
         for e in &errors {
             eprintln!("invalid: {e}");
@@ -1614,6 +1624,8 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             }
         }
     }
+    let file =
+        omgs::attempts::publication(findings_dir.as_deref().unwrap_or(Path::new(".")), &file)?;
     // Explicit flags override saved metadata. Verifier identities on findings
     // are a last resort. Never infer hunter counts from the surviving records:
     // hunters that found nothing or were merged into another record would be missed.
@@ -1635,7 +1647,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         .transpose()?
         .flatten();
     let publication_run = findings_dir.as_deref().filter(|_| saved_text.is_some());
-    let saved = publication_run
+    let mut saved = publication_run
         .map(omgs::runmeta::read)
         .transpose()?
         .unwrap_or_default();
@@ -1678,6 +1690,35 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             "warning: run metadata incomplete; pass --hunters <n>, --verifier <id>, and --agent-calls <n>. Unrecorded values render as \"not recorded\"."
         );
     }
+    let mut publication = std::collections::BTreeMap::new();
+    for (option, key) in [
+        ("--repo", "repo"),
+        ("--ref", "source_ref"),
+        ("--sandbox", "sandbox"),
+    ] {
+        if let Some(value) = flag(args, option) {
+            if value.trim().is_empty() || value.chars().any(char::is_control) {
+                return Err(format!(
+                    "{option} needs nonblank publication text without control characters"
+                ));
+            }
+            publication.insert(key, value);
+        }
+    }
+    if let Some(run) = publication_run {
+        omgs::runmeta::update(run, |m| {
+            let p = m
+                .entry("publication")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or("publication must be an object")?;
+            for (key, value) in &publication {
+                p.insert((*key).into(), serde_json::json!(value));
+            }
+            Ok(())
+        })?;
+        saved = omgs::runmeta::read(run)?;
+    }
     let supplied_models = omgs::route::parse_identities(&flags(args, "--model"))?;
     omgs::report::publish(
         publication_run,
@@ -1705,7 +1746,14 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             .to_string();
             let defaulted = |explicit: Option<String>, key: &str, fallback: &str| {
                 explicit
-                    .or_else(|| saved.get(key).and_then(|v| v.as_str()).map(str::to_owned))
+                    .or_else(|| {
+                        saved
+                            .get("publication")
+                            .and_then(|p| p.get(key))
+                            .or_else(|| saved.get(key))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                    })
                     .unwrap_or_else(|| fallback.into())
             };
             let timeline = findings_dir
@@ -1725,6 +1773,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 mode: defaulted(flag(args, "--mode"), "mode", "advisory"),
                 sandbox: defaulted(flag(args, "--sandbox"), "sandbox", "not recorded"),
                 artifact_base: String::new(),
+                review_limits: omgs::attempts::gaps(&saved)?,
                 timeline,
                 coverage,
                 sensors: sensors_summary,
@@ -1758,6 +1807,12 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 findings_dir.as_deref().unwrap_or(Path::new(".")),
                 &file,
             )?;
+            meta.review_limits.extend(
+                evidence
+                    .iter()
+                    .filter(|s| s.starts_with("Unexamined:") || s.starts_with("Adjudication gap:"))
+                    .cloned(),
+            );
             let evidence_md = omgs::adjudication::render_lines(&evidence, false);
             let evidence_html = omgs::adjudication::render_lines(&evidence, true);
             let sensor_md = omgs::report::sensor_section(sensors.as_ref(), false);
@@ -1784,11 +1839,11 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 dir.join("HANDOFF.md").display(),
                 dir.join("handoff.json").display()
             );
-            let completion = omgs::report::Completion {
+            let mut completion = omgs::report::Completion {
                 hunters: meta.hunters,
                 verifier: meta.verifier.clone(),
                 accounting: supplied_usage.clone(),
-                complete: meta.critic.as_ref().is_none_or(|c| c.passed()),
+                complete: omgs::report::review_state(&file, &meta).is_none(),
             };
             let status_run = findings_dir
                 .as_deref()
@@ -1830,6 +1885,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 )
                 .map_err(|e| e.to_string())?;
             }
+            completion.complete = omgs::report::review_state(&file, &meta).is_none();
             Ok(completion)
         },
     )
@@ -2671,10 +2727,14 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
     let mut meta = serde_json::json!({
         "repo": repo, "target": target.to_string_lossy(), "source_ref": source_ref,
         "run_id": omgs::platform::random_nonce().map_err(|e| e.to_string())?,
+        "sandbox": "MXC required; runtime version not recorded",
         "mode": mode, "budget_agent_calls": budget, "execution_profile": "standard",
         "policy": policy,
         "persona": persona.map(|p| p.name), "report_depth": persona.map_or("full", |p| p.report_depth),
-        "budget_profile": persona.map_or("standard", |p| p.budget_profile),
+        "budget_profile": persona.map_or("standard", |p| if budget == Some(p.budget) { p.budget_profile } else { "custom" }),
+        "persona_budget_profile": persona.map(|p| p.budget_profile),
+        "persona_budget_default": persona.map(|p| p.budget),
+        "budget_semantics": "combined_calls_proofs_replays",
         "inventory_gaps": inventory_gaps,
         "inventory_limit": inventory_limit,
         "accounting": omgs::accounting::read(&serde_json::Map::new())?,
@@ -2971,6 +3031,17 @@ fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
                     &d.disposition
                 };
                 set_status(&mut ledger, &d.unit_id, status, &d.evidence, Some(&d.note))?;
+                let unit = ledger.units.iter_mut().find(|u| u.id == d.unit_id).unwrap();
+                unit.extra.remove("attempt_ref");
+                unit.extra.remove("blocker_ref");
+                if let Some(id) = d.attempt_ref {
+                    unit.extra
+                        .insert("attempt_ref".into(), serde_json::json!(id));
+                }
+                if let Some(id) = d.blocker_ref {
+                    unit.extra
+                        .insert("blocker_ref".into(), serde_json::json!(id));
+                }
             }
             write_ledger(&path, &ledger)?;
             println!("ingested dispositions");
@@ -3016,6 +3087,17 @@ fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
             let evidence = flags(rest, "--evidence");
             let note = flag(rest, "--note");
             set_status(&mut ledger, &unit, &status, &evidence, note.as_deref())?;
+            let unit = ledger.units.iter_mut().find(|u| u.id == unit).unwrap();
+            for (flag_name, key) in [
+                ("--attempt-ref", "attempt_ref"),
+                ("--blocker-ref", "blocker_ref"),
+            ] {
+                unit.extra.remove(key);
+                if let Some(id) = flag(rest, flag_name) {
+                    unit.extra.insert(key.into(), serde_json::json!(id));
+                }
+            }
+            let unit = unit.id.clone();
             write_ledger(&path, &ledger)?;
             println!("{status}: {unit}");
             Ok(())
@@ -3377,8 +3459,8 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     let label = flag(args, "--label");
     let parent = flag(args, "--parent");
     let detail = flag(args, "--detail");
-    let log = flag(args, "--log");
-    omgs::status::apply(
+    let logs = flags(args, "--log");
+    omgs::status::apply_with_logs(
         Path::new(&run),
         &omgs::status::Update {
             stage: &stage,
@@ -3387,8 +3469,9 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
             state: &state,
             detail: detail.as_deref(),
             counters: &counters,
-            log: log.as_deref(),
+            log: None,
         },
+        &logs,
     )?;
     let usage = omgs::runmeta::update(Path::new(&run), |m| {
         let mut usage = omgs::accounting::read(m)?;
@@ -3448,6 +3531,26 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
         ));
     }
 
+    if let Some(label) = flag(args, "--model") {
+        if flag(args, "--refused").is_some() || flag(args, "--models").is_some() {
+            return Err("--model records an identity and cannot combine with refusal or routing configuration".into());
+        }
+        let labels = omgs::route::parse_identities(&[format!("{role}={label}")])?;
+        omgs::runmeta::update(&run, |m| {
+            omgs::batch::check_meta_types(m)?;
+            let saved = m
+                .entry("models")
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or("models must be an object")?;
+            for (role, value) in labels {
+                saved.insert(role, serde_json::json!(value));
+            }
+            Ok(())
+        })?;
+        println!("{label}");
+        return Ok(());
+    }
     let newly = flag(args, "--refused");
     let reason = flag(args, "--reason").unwrap_or_default();
     if newly.is_some() && reason.trim().is_empty() {
@@ -3514,6 +3617,13 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
             Err(format!(
                 "no configured fallback for role '{role}' after refusal; keep the blocker recorded"
             ))
+        } else if default_route {
+            Ok(m.get("models")
+                .and_then(|v| v.get(&role))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("host-default")
+                .to_string())
         } else {
             omgs::route::next_model(&models, &role, &refused)
         };
@@ -3544,19 +3654,21 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
                 }
             }
             Err(e) => {
-                if let Some(list) = m
-                    .entry("blockers")
-                    .or_insert_with(|| serde_json::json!([]))
-                    .as_array_mut()
-                {
-                    let e = serde_json::json!(format!(
+                let count = m
+                    .get("blocker_events")
+                    .and_then(|v| v.as_array())
+                    .map_or(0, Vec::len);
+                omgs::attempts::blocker(
+                    m,
+                    &format!("route-{count}"),
+                    "active",
+                    "host-route",
+                    &format!(
                         "{role}: {}: {reason}: {e}",
                         newly.as_deref().unwrap_or("unconfigured")
-                    ));
-                    if !list.contains(&e) {
-                        list.push(e);
-                    }
-                }
+                    ),
+                    None,
+                )?;
             }
         }
         Ok(next)
@@ -3672,6 +3784,37 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err("usage: omgs intent list [--stack <s>] [--attack-class <c>] | omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]".into()),
+    }
+}
+
+fn cmd_attempt(args: &[String]) -> Result<(), String> {
+    let run = PathBuf::from(flag(args, "--run").ok_or("attempt requires --run")?);
+    if flag(args, "--event").is_some() == flag(args, "--resolve-blocker").is_some() {
+        return Err("attempt requires exactly one of --event or --resolve-blocker".into());
+    }
+    if let Some(id) = flag(args, "--resolve-blocker") {
+        let actor = flag(args, "--actor").ok_or("resolution requires --actor")?;
+        let reason = flag(args, "--reason").ok_or("resolution requires --reason")?;
+        let replacement = flag(args, "--replacement").ok_or("resolution requires --replacement")?;
+        omgs::runmeta::update(&run, |m| {
+            omgs::attempts::blocker(m, &id, "resolved", &actor, &reason, Some(&replacement))
+        })
+    } else {
+        let path = flag(args, "--event").ok_or("attempt requires --event <record.json>")?;
+        let text =
+            omgs::run_artifact::text_path(Path::new(&path), omgs::run_artifact::METADATA_BYTES)?;
+        let event =
+            serde_json::from_value(omgs::shape::strict_json(&text)?).map_err(|e| e.to_string())?;
+        let outcome = omgs::attempts::append(&run, event)?;
+        println!(
+            "{}",
+            match outcome {
+                omgs::attempts::AppendOutcome::Recorded => "recorded",
+                omgs::attempts::AppendOutcome::AlreadyRecorded =>
+                    "already recorded; do not dispatch again",
+            }
+        );
+        Ok(())
     }
 }
 
@@ -3988,6 +4131,8 @@ mod cli_tests {
                             .skip(1)
                             .map(|s| s.split('"').next().unwrap())
                             .collect::<Vec<_>>(),
+                        "option" => vec!["--repo", "--ref", "--sandbox"],
+                        "flag_name" => vec!["--attempt-ref", "--blocker-ref"],
                         "k" | "kind" => vec![
                             "--findings",
                             "--candidates",
@@ -4051,6 +4196,7 @@ mod cli_tests {
         ("ledger", "set"),
         ("critic", ""),
         ("budget", ""),
+        ("attempt", ""),
         ("status", ""),
         ("watch", ""),
         ("route", ""),

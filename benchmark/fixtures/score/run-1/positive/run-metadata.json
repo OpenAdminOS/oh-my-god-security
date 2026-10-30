@@ -1,0 +1,30 @@
+{
+  "attempts": [
+    {
+      "at": "2026-01-01T00:00:00Z",
+      "record": {
+        "event": "start",
+        "id": "fixture-verifier",
+        "role": "verifier",
+        "identity": "fixture-verifier",
+        "context": "fixture-context",
+        "inputs": [
+          "synthetic-input"
+        ],
+        "outputs": [
+          "findings.json"
+        ],
+        "isolation": "procedural"
+      }
+    },
+    {
+      "at": "2026-01-01T00:00:01Z",
+      "record": {
+        "event": "complete",
+        "id": "fixture-verifier",
+        "actor": "fixture-host",
+        "reason": "Synthetic archived completion"
+      }
+    }
+  ]
+}

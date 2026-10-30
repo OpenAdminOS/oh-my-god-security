@@ -10,6 +10,7 @@ pub const RULES: &str = "Fix only the listed confirmed items and approved paths,
 
 #[derive(Serialize)]
 pub struct Handoff {
+    pub review_state: String,
     pub schema: &'static str,
     pub trust: Trust,
     pub reading: &'static str,
@@ -178,7 +179,20 @@ pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Hand
     if only.is_some() && records.is_empty() {
         return Err("finding not found in actionable records (use C1, V1 or a fingerprint)".into());
     }
+    let lifecycle = crate::attempts::finding_gaps(run, file)?;
+    let review_state = if !lifecycle.is_empty()
+        || !crate::model::validate(file).is_empty()
+        || file
+            .findings
+            .iter()
+            .any(|f| f.verdict == Verdict::NeedsValidation)
+    {
+        "incomplete"
+    } else {
+        "coverage not established by handoff"
+    };
     Ok(Handoff {
+        review_state: review_state.into(),
         budget: if crate::runmeta::read_optional(run)?.is_some() {
             Some(crate::budget::summary(run)?)
         } else {
@@ -307,8 +321,8 @@ pub fn markdown(h: &Handoff) -> String {
 
 pub fn markdown_at(h: &Handoff, artifact_base: &str) -> String {
     let mut out = format!(
-        "# How to read verdicts and proof tiers\n\n**Trust boundary:** {}\n\n{}\n\n## Green-fixer rules\n\n{}\n\n",
-        h.trust.record_strings, h.reading, h.green_fixer_rules
+        "# How to read verdicts and proof tiers\n\nReview state: {}\n\n**Trust boundary:** {}\n\n{}\n\n## Green-fixer rules\n\n{}\n\n",
+        markdown_inline(&h.review_state), h.trust.record_strings, h.reading, h.green_fixer_rules
     );
     if let Some(budget) = &h.budget {
         out.push_str(&markdown_data("Budget", budget));
@@ -534,6 +548,10 @@ pub fn stage_validated(run: &Path, file: &FindingsFile) -> Result<StagedTests, S
         };
         let mut errors = crate::model::validate(&one);
         errors.extend(crate::proof::validate_proofs(&one, run));
+        match crate::attempts::finding_gaps(run, &one) {
+            Ok(gaps) => errors.extend(gaps),
+            Err(e) => errors.push(e),
+        }
         if errors.is_empty() {
             admitted.findings.push(f.clone());
         } else {

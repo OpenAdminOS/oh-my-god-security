@@ -1065,6 +1065,7 @@ fn build_names_and_txt_configuration_are_code_before_docs_or_data() {
     )
     .unwrap();
     assert_eq!(init(&target, &run, &[])["files_first_party"], 1);
+    completed_review_fixture(&run);
     write_private_fixture(run.join("candidates-red.json"), r#"{"candidates":[]}"#).unwrap();
     let ledger = read(&run.join("coverage-ledger.json"));
     assert!(ledger["units"]
@@ -1149,6 +1150,7 @@ fn every_excluded_class_requires_review_and_reports_the_reason() {
             std::fs::write(file, text).unwrap();
         }
         init(&target, &run, &[]);
+        completed_review_fixture(&run);
         let ledger_path = run.join("coverage-ledger.json");
         let ledger = read(&ledger_path);
         let units = ledger["units"].as_array().unwrap();
@@ -1587,4 +1589,15 @@ fn budget_refuses_storage_writable_by_other_principals() {
     }
     assert!(omgs::budget::charge_proof(&fix).is_ok());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn completed_review_fixture(run: &std::path::Path) {
+    for role in ["verifier", "evaluator"] {
+        for event in [
+            json!({"event":"start","id":role,"role":role,"identity":role,"context":role,"inputs":["synthetic-input"],"outputs":["synthetic-output"],"isolation":"procedural"}),
+            json!({"event":"complete","id":role,"actor":"fixture-host","reason":"Synthetic finished review"}),
+        ] {
+            omgs::attempts::append(run, serde_json::from_value(event).unwrap()).unwrap();
+        }
+    }
 }

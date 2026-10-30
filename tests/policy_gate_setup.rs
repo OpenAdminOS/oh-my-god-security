@@ -215,6 +215,7 @@ fn mxc_ready(root: &Path) -> bool {
 /// An archived, internally consistent runner fixture. It needs no installed
 /// executor and never executes a target. Live runner coverage remains in sandbox.rs.
 fn evidence(run: &Path, target: &Path) {
+    completed_verifier_fixture(run, "blue");
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score/run-1/positive");
     omgs::platform::private_dir(&run.join("proofs/1")).unwrap();
@@ -235,7 +236,7 @@ fn evidence(run: &Path, target: &Path) {
         "fingerprint": proof["finding"], "title":"Boundary read", "verdict":"confirmed", "severity":"high",
         "proof_tier":"test_proven", "attack_class":"idor", "entry_point":"GET /x", "sink":"db.x", "boundary":"tenant",
         "location":{"path":"main.rs","line":1}, "evidence":"Assertion failed after authorized control",
-        "hunted_by":"red", "verified_by":"blue", "proof_ref":"proofs/1.json"
+        "hunted_by":"red", "verified_by":"blue", "verification":{"state":"final","attempt":"fixture-verifier"}, "proof_ref":"proofs/1.json"
     }]});
     // Fixture identity uses its original semantic tuple; recover it from the
     // accompanying findings instead of inventing a different identity.
@@ -2175,4 +2176,13 @@ fn deep_gate_exports_are_cleaned_and_unsupported_depth_exits_three() {
         }
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn completed_verifier_fixture(run: &std::path::Path, identity: &str) {
+    for value in [
+        serde_json::json!({"event":"start","id":"fixture-verifier","role":"verifier","identity":identity,"context":"fixture-context","inputs":["synthetic-input"],"outputs":["findings.json"],"isolation":"procedural"}),
+        serde_json::json!({"event":"complete","id":"fixture-verifier","actor":"fixture-host","reason":"Synthetic completion fixture"}),
+    ] {
+        omgs::attempts::append(run, serde_json::from_value(value).unwrap()).unwrap();
+    }
 }

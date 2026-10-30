@@ -1,6 +1,6 @@
 # What this asks of you
 
-Review 1 confirmed finding and their fix briefs in HANDOFF.md. Obtain authorization before editing.
+Incomplete review: verification, coverage or pending work remains. 1 confirmed finding(s) recorded.
 
 Verify 1 pending record before fixing. 1 lead were rejected after verification and need no action. Answer the intent questions below where recorded.
 
@@ -12,9 +12,9 @@ Confirmed findings: 1
 Needs validation: 1
 Rejected after verification: 1
 
-Run: hunters not recorded, verifier not recorded, agent calls not recorded. Persona unknown, report depth full. Accounting: blue-verifier: tokens unknown, cost USD unknown, duration ms unknown; evaluator: tokens unknown, cost USD unknown, duration ms unknown; green-fixer: tokens unknown, cost USD unknown, duration ms unknown; red-hunter: tokens unknown, cost USD unknown, duration ms unknown
+Run: hunters not recorded, verifier not recorded, agent calls not recorded. Persona unknown, report depth full. Accounting: blue-verifier: tokens unknown, cost USD unknown, duration ms unknown; evaluator: tokens unknown, cost USD unknown, duration ms unknown; green-fixer: tokens unknown, cost USD unknown, duration ms unknown; host: tokens unknown, cost USD unknown, duration ms unknown; red-hunter: tokens unknown, cost USD unknown, duration ms unknown
 
-Coverage critic: not run
+Coverage critic: not run; blocked units: 0; deferred units: 0. Reconciliation does not establish complete coverage
 
 ## Index of records
 
@@ -197,9 +197,9 @@ The lookup does not bind the order to the caller.
 
 | Stage | State | Started (UTC) | Ended (UTC) | Detail |
 | --- | --- | --- | --- | --- |
-| Hunt | done | 00:00:01 | 00:00:03 |  |
-| Hunt / Tenant boundary | done | 00:00:01 | 00:00:02 | One candidate |
-| Verify | done | 00:00:03 | 00:00:05 | Proof retained |
+| Hunt | done | 1970-01-01T00:00:01Z | 1970-01-01T00:00:03Z |  |
+| Hunt / Tenant boundary | done | 1970-01-01T00:00:01Z | 1970-01-01T00:00:02Z | One candidate |
+| Verify | done | 1970-01-01T00:00:03Z | 1970-01-01T00:00:05Z | Proof retained |
 
 ## Coverage
 

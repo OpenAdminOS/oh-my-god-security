@@ -2,6 +2,7 @@ pub mod accounting;
 pub mod adjudication;
 pub mod approval;
 pub mod architecture;
+pub mod attempts;
 pub mod batch;
 pub mod bench;
 pub mod budget;
