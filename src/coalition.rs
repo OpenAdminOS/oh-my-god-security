@@ -659,9 +659,29 @@ fn result_bytes(limits: &Limits) -> io::Result<u64> {
 fn read<T: DeserializeOwned>(dir: &Path, name: &str) -> io::Result<T> {
     read_bounded(dir, name, CONTROL_BYTES)
 }
+const JOB_LEAVES: &[&str] = &[
+    "owner",
+    "omgs",
+    "job.plist",
+    "request",
+    "domain",
+    "ready",
+    "compatible",
+    "start",
+    "result",
+    "error",
+    "cancel",
+    "orphan",
+    "release",
+];
+
 /// Leaf admission is lexical. Only the stable directory reaches TCC inspection;
-/// every actual leaf open is relative to its pinned descriptor and no-follow.
-struct JobDirectory(File);
+/// leaf opens and cleanup use retained descriptors without following links.
+struct JobDirectory {
+    file: File,
+    parent: File,
+    name: std::ffi::CString,
+}
 impl JobDirectory {
     fn open(dir: &Path) -> io::Result<Self> {
         // Refuse protected locations before opening even the directory. Repeat
@@ -670,11 +690,33 @@ impl JobDirectory {
         Self::open_with(dir, &mut admit_job_storage)
     }
     fn open_with(dir: &Path, admit: &mut impl FnMut(&Path) -> io::Result<()>) -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
         use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new()
+        let parent = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(dir)?;
+            .open(
+                dir.parent()
+                    .ok_or_else(|| io::Error::other("missing job parent"))?,
+            )?;
+        let name = Self::name(
+            dir.file_name()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| io::Error::other("invalid job directory name"))?,
+        )?;
+        // SAFETY: the parent descriptor and single-entry name remain live.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a newly owned directory descriptor.
+        let file = unsafe { File::from_raw_fd(fd) };
         platform::check_private_dir_handle(&file)?;
         admit(dir)?;
         // Fail closed if the admitted pathname no longer names our directory.
@@ -683,7 +725,72 @@ impl JobDirectory {
         if platform::directory_identity(dir)? != (opened.dev(), opened.ino()) {
             return Err(io::Error::other("job directory changed during admission"));
         }
-        Ok(Self(file))
+        Ok(Self { file, parent, name })
+    }
+    fn remove_empty(&self) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let mut entry = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: entry is writable and the parent and entry name remain live.
+        // A replacement symlink is inspected itself, never followed.
+        if unsafe {
+            libc::fstatat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                entry.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fstatat succeeded and initialized entry.
+        let entry = unsafe { entry.assume_init() };
+        let opened = self.file.metadata()?;
+        if entry.st_dev as u64 != opened.dev() || entry.st_ino != opened.ino() {
+            return Err(io::Error::other("job directory changed before removal"));
+        }
+        // SAFETY: unlinkat addresses one entry in the retained parent. Even a
+        // swap after the identity check cannot follow a link or recurse into it.
+        if unsafe {
+            libc::unlinkat(
+                self.parent.as_raw_fd(),
+                self.name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    fn remove(&self) -> io::Result<()> {
+        for base in JOB_LEAVES {
+            for suffix in ["", ".tmp"] {
+                let name = Self::name(&format!("{base}{suffix}"))?;
+                // SAFETY: unlinkat removes only this known entry relative to
+                // the pinned directory. Links are unlinked, never followed.
+                if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::NotFound {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        for name in ["executor-home", "executor-temp"] {
+            let name = Self::name(name)?;
+            // SAFETY: only empty, known executor directories may be removed.
+            // Unexpected contents remain available for recovery inspection.
+            if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
+                != 0
+            {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
+        }
+        self.remove_empty()
     }
     fn name(name: &str) -> io::Result<std::ffi::CString> {
         // Check raw spelling, since Path components normalize trailing slashes
@@ -700,7 +807,7 @@ impl JobDirectory {
         // SAFETY: the pinned directory and NUL-terminated leaf remain live.
         let fd = unsafe {
             libc::openat(
-                self.0.as_raw_fd(),
+                self.file.as_raw_fd(),
                 name.as_ptr(),
                 flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
                 u32::from(mode),
@@ -713,7 +820,7 @@ impl JobDirectory {
         let file = unsafe { File::from_raw_fd(fd) };
         platform::check_private_file(&file)?;
         if !platform::is_single_link_file(&file)?
-            || file.metadata()?.dev() != self.0.metadata()?.dev()
+            || file.metadata()?.dev() != self.file.metadata()?.dev()
         {
             return Err(io::Error::other(
                 "job leaf must be a regular file on its directory volume",
@@ -734,9 +841,9 @@ impl JobDirectory {
         // renameat replaces a destination link itself, never follows it.
         if unsafe {
             libc::renameat(
-                self.0.as_raw_fd(),
+                self.file.as_raw_fd(),
                 source.as_ptr(),
-                self.0.as_raw_fd(),
+                self.file.as_raw_fd(),
                 target.as_ptr(),
             )
         } != 0
@@ -955,7 +1062,7 @@ fn registry(root: &Path) -> io::Result<File> {
     }
 }
 fn reclaim_unpublished(dir: &Path) -> io::Result<()> {
-    match std::fs::remove_dir(dir) {
+    match JobDirectory::open(dir).and_then(|directory| directory.remove_empty()) {
         Ok(()) => Ok(()),
         // A published job can retire outside the registry lock. Preserve its
         // remaining state, or accept that it already removed the directory.
@@ -986,6 +1093,11 @@ fn recover(root: &Path, api: &Api) -> io::Result<()> {
         }
         label(&dir)?;
         admit_job_storage(&dir)?;
+        let directory = match JobDirectory::open(&dir) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         let _lock = match lock(&dir, false) {
             Ok(lock) => lock,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
@@ -1003,7 +1115,7 @@ fn recover(root: &Path, api: &Api) -> io::Result<()> {
             // Launchd bootstrap state is not persistent. Neither coalition IDs
             // nor process generations may identify ownership across a reboot.
             if ready.boot != boot {
-                std::fs::remove_dir_all(&dir)?;
+                directory.remove()?;
                 continue;
             }
         }
@@ -1042,7 +1154,7 @@ fn recover(root: &Path, api: &Api) -> io::Result<()> {
         if leaf_exists(&dir, "domain")? {
             remove_job(&dir)?;
         }
-        std::fs::remove_dir_all(dir)?;
+        directory.remove()?;
     }
     Ok(())
 }
@@ -1176,6 +1288,7 @@ pub(crate) fn run(
         let owner = lock(&dir, true)?;
         drop(registry_guard);
         let mut job = Job {
+            directory: JobDirectory::open(&dir)?,
             dir,
             _owner: owner,
             submitted: false,
@@ -1322,6 +1435,7 @@ pub(crate) fn run(
 }
 struct Job {
     dir: PathBuf,
+    directory: JobDirectory,
     _owner: File,
     submitted: bool,
 }
@@ -1337,7 +1451,7 @@ impl Job {
         }
         remove_job(&self.dir)?;
         self.submitted = false;
-        std::fs::remove_dir_all(&self.dir)
+        self.directory.remove()
     }
 }
 impl Drop for Job {
@@ -1368,7 +1482,7 @@ impl Drop for Job {
                 return;
             }
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = self.directory.remove();
     }
 }
 
@@ -1637,6 +1751,12 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        let staged_leaf_admitted = |path: &Path| {
+            path.parent() == Some(dir.as_path())
+                && checked.contains(&dir)
+                && path.file_name() == Some(OsStr::new("omgs"))
+        };
+        assert!(!staged_leaf_admitted(&dir.join("unadmitted")));
         let plist = admitted.plist().unwrap();
         let command = admitted.command();
         for path in [
@@ -1651,9 +1771,7 @@ mod tests {
                 .filter(|path| path.is_absolute()),
         ) {
             assert!(
-                (checked.contains(path)
-                    || path.parent() == Some(dir.as_path())
-                        && JobDirectory::name(path.file_name().unwrap().to_str().unwrap()).is_ok()),
+                checked.contains(path),
                 "unadmitted command path: {}",
                 path.display()
             );
@@ -1681,10 +1799,7 @@ mod tests {
         {
             for path in std::env::split_paths(OsStr::new(value)).filter(|path| path.is_absolute()) {
                 assert!(
-                    (checked.contains(&path)
-                        || path.parent() == Some(dir.as_path())
-                            && JobDirectory::name(path.file_name().unwrap().to_str().unwrap())
-                                .is_ok()),
+                    (checked.contains(&path) || staged_leaf_admitted(&path)),
                     "unadmitted plist path: {}",
                     path.display()
                 );
@@ -2095,6 +2210,138 @@ mod tests {
         assert!(JobDirectory::open(&alias).is_err());
         std::fs::remove_file(alias).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn job_cleanup_unlinks_only_known_leaves_without_following_links() {
+        let root = supervise::capture_root()
+            .unwrap()
+            .join(format!("cleanup-{}", platform::random_nonce().unwrap()));
+        platform::create_private_dir_new(&root).unwrap();
+        let dir = root.join(platform::random_nonce().unwrap());
+        platform::create_private_dir_new(&dir).unwrap();
+        let directory = JobDirectory::open(&dir).unwrap();
+        let sentinel = root.join("sentinel");
+        platform::write_private_new(&sentinel, b"preserved").unwrap();
+        for base in JOB_LEAVES {
+            for suffix in ["", ".tmp"] {
+                // Every known leaf, including a temporary sibling, can be
+                // replaced by a link without redirecting cleanup to its target.
+                std::os::unix::fs::symlink(&sentinel, dir.join(format!("{base}{suffix}"))).unwrap();
+            }
+        }
+        for name in ["executor-home", "executor-temp", "unknown"] {
+            platform::create_private_dir_new(&dir.join(name)).unwrap();
+        }
+        platform::write_private_new(&dir.join("unknown/evidence"), b"retained").unwrap();
+        assert_eq!(
+            directory.remove().unwrap_err().kind(),
+            io::ErrorKind::DirectoryNotEmpty
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserved");
+        assert_eq!(
+            std::fs::read(dir.join("unknown/evidence")).unwrap(),
+            b"retained"
+        );
+        for base in JOB_LEAVES {
+            for suffix in ["", ".tmp"] {
+                assert!(std::fs::symlink_metadata(dir.join(format!("{base}{suffix}"))).is_err());
+            }
+        }
+        std::fs::remove_file(dir.join("unknown/evidence")).unwrap();
+        std::fs::remove_dir(dir.join("unknown")).unwrap();
+        directory.remove().unwrap();
+        assert!(!dir.exists());
+        std::fs::remove_file(sentinel).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+    #[test]
+    fn job_cleanup_stays_pinned_across_job_and_parent_path_replacement() {
+        let root = supervise::capture_root().unwrap().join(format!(
+            "cleanup-swap-{}",
+            platform::random_nonce().unwrap()
+        ));
+        platform::create_private_dir_new(&root).unwrap();
+        let parent = root.join("parent");
+        platform::create_private_dir_new(&parent).unwrap();
+        let dir = parent.join(platform::random_nonce().unwrap());
+        platform::create_private_dir_new(&dir).unwrap();
+        let directory = JobDirectory::open(&dir).unwrap();
+        directory.create("request", b"original", 0o600).unwrap();
+        let moved = parent.join("moved");
+        std::fs::rename(&dir, &moved).unwrap();
+        platform::create_private_dir_new(&dir).unwrap();
+        platform::write_private_new(&dir.join("request"), b"replacement").unwrap();
+        assert!(directory
+            .remove()
+            .unwrap_err()
+            .to_string()
+            .contains("changed"));
+        assert!(!moved.join("request").exists());
+        assert_eq!(std::fs::read(dir.join("request")).unwrap(), b"replacement");
+        std::fs::remove_file(dir.join("request")).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&moved, &dir).unwrap();
+        assert!(directory
+            .remove()
+            .unwrap_err()
+            .to_string()
+            .contains("changed"));
+        assert!(std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::rename(&moved, &dir).unwrap();
+        let moved_parent = root.join("moved-parent");
+        std::fs::rename(&parent, &moved_parent).unwrap();
+        platform::create_private_dir_new(&parent).unwrap();
+        let replacement = parent.join(dir.file_name().unwrap());
+        platform::create_private_dir_new(&replacement).unwrap();
+        platform::write_private_new(&replacement.join("request"), b"other parent").unwrap();
+        directory.remove().unwrap();
+        assert!(!moved_parent.join(dir.file_name().unwrap()).exists());
+        assert_eq!(
+            std::fs::read(replacement.join("request")).unwrap(),
+            b"other parent"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn recovery_removes_previous_boot_job_leaves_and_temporary_siblings() {
+        let root = supervise::capture_root().unwrap().join(format!(
+            "cleanup-recover-{}",
+            platform::random_nonce().unwrap()
+        ));
+        platform::create_private_dir_new(&root).unwrap();
+        let dir = root.join(platform::random_nonce().unwrap());
+        platform::create_private_dir_new(&dir).unwrap();
+        drop(lock(&dir, true).unwrap());
+        write(
+            &dir,
+            "ready",
+            &Ready {
+                boot: format!("{}-previous", boot_id().unwrap()),
+                coalition: 0,
+                pid: 0,
+                generation: 0,
+            },
+        )
+        .unwrap();
+        let directory = JobDirectory::open(&dir).unwrap();
+        for base in JOB_LEAVES {
+            directory
+                .create(&format!("{base}.tmp"), b"partial", 0o600)
+                .unwrap();
+        }
+        for name in ["executor-home", "executor-temp"] {
+            platform::create_private_dir_new(&dir.join(name)).unwrap();
+        }
+        let guard = registry(&root).unwrap();
+        recover(&root, &Api::load().unwrap()).unwrap();
+        assert!(!dir.exists());
+        drop(guard);
+        std::fs::remove_file(root.join("registry")).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
     #[test]
     fn recovery_reclaims_unpublished_ownerless_directories_and_spares_live_jobs() {
