@@ -497,3 +497,43 @@ fn dashboard_announces_summary_only_when_it_changes() {
     // No other assignment may bypass the change guard on each two-second poll.
     assert_eq!(render.matches("summary.textContent=").count(), 1);
 }
+
+#[test]
+fn role_reading_uses_one_contract_and_preserves_full_safety_context() {
+    let entry = normalized(include_str!("../skill/SKILL.md"));
+    let pipeline = normalized(include_str!("../skill/PIPELINE.md"));
+    let red = normalized(include_str!("../skill/agents/red-hunter.md"));
+    let safety = normalized(include_str!("../skill/EXECUTION-SAFETY.md"));
+    let setup = normalized(include_str!("../skill/SETUP.md"));
+    assert!(entry.contains("required reading matrix"));
+    for rule in [
+        "Required reading by role",
+        "once per fresh role context",
+        "Every role reads all of",
+        "authoritative proof contract",
+        "Required safety content",
+        "role separation, independent replay",
+    ] {
+        assert!(pipeline.contains(rule), "missing {rule}");
+    }
+    assert!(!red.contains("the full pipeline"));
+    for rule in [
+        "plus all of",
+        "execution safety",
+        "decision rules",
+        "when planning a recipe",
+        "omgs validate --candidates OUTPUT_DIR/candidates-HUNTER.json",
+        "omgs validate --dispositions OUTPUT_DIR/dispositions-HUNTER.json",
+    ] {
+        assert!(red.contains(rule), "missing {rule}");
+    }
+    assert!(safety.contains("outer-directory containment, not automatic permission repair"));
+    assert!(safety.contains("moving individual artifacts loses its containment guarantee"));
+    assert!(setup.contains("identity --skill-dir"));
+    assert!(setup.contains("Never bypass a mismatch with version equality"));
+    assert!(entry.contains("bundled digest matching"));
+    assert!(!pipeline.contains("A recipe contract requires exit 1"));
+    assert!(
+        include_str!("../skill/PROOF-CONTRACT.md").contains("A recipe contract requires exit 1")
+    );
+}

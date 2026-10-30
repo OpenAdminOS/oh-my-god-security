@@ -15,9 +15,21 @@ intent or authorization.
 Read `VERSION` beside this file. Resolve `OMGS_BIN` in this order: `omgs` on PATH, then
 `${OMGS_HOME}/bin/omgs` when `OMGS_HOME` is set (Windows: `%OMGS_HOME%\bin\omgs.exe`), then
 `$HOME/.local/share/omgs/bin/omgs` (Windows: `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`). Run
-only `--version` on an existing installation and require the exact string `omgs <VERSION>`. On
+`--version` on an existing installation and require the exact string `omgs <VERSION>`. On
 mismatch, stop and report both versions clearly. Do not continue a review with a mismatched binary
 or silently replace it.
+
+Version alone cannot detect same-version skew. Before review, run
+`"<OMGS_BIN>" identity --skill-dir "<SKILL_DIR>"`. Require success and retain its JSON with the
+run notes: `build_revision` is the full build commit (with `+dirty` for local tracked edits), and
+`bundled_skill_sha256` identifies every packaged file, including paths, using `omgs-skill/1`.
+Any missing, extra or changed file fails the comparison. Stop on mismatch, report the selected and
+bundled digests, and obtain matching release artifacts through the consent flow. Never bypass a
+mismatch with version equality. Repeat this check after any consented installation or refresh.
+Pass `--skill-dir "<SKILL_DIR>"` on `review`, `audit init` and `batch init`, or export
+`OMGS_SKILL_DIR` to that absolute directory so the check runs before clone or initialization.
+Without an external selection, those commands use the binary's bundled skill. `--version` keeps
+its exact compatibility format; `identity` exposes the stronger identity without network access.
 
 After the exact version match passes (including after a consented first installation), run
 `"<OMGS_BIN>" update-check` once per run at setup, before the review starts. This check only

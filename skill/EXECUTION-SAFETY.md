@@ -59,6 +59,17 @@ with mode 0600, including candidates, dispositions and draft proofs. On Windows 
 ACLs consistent with the initialized run. The private outer directory protects nested artifacts,
 but it is not permission to export them into shared locations. Never copy secrets into tool notes.
 
+The chosen admission guarantee is outer-directory containment, not automatic permission repair.
+An owner-held 0644 file or 0755 nested directory may be admitted inside an owner-private 0700 run
+root. Run `omgs artifact-check --run OUTPUT_DIR --path drafts/test` for each role-written file
+before handoff. This preflight rejects a shared run root, linked components, hardlinked evidence and
+writable leaves. It does not normalize role output modes. Before publication outside the run,
+create a separate owner-private destination, copy only reviewed nonsecret content with 0600 files
+and 0700
+directories (owner-only ACLs on Windows), and check the destination permissions before sharing.
+Do not export a permissive nested tree directly. Keep the private run root in place for its entire
+lifetime, including archival; moving individual artifacts loses its containment guarantee.
+
 On macOS a sealed trusted launchd anchor must be the only active coalition task
 before cleanup can be complete. Survivors are named and killed using PID-version
 bound audit tokens, and their presence fails the run. An empty process list is
