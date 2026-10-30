@@ -333,7 +333,13 @@ mod overlap_tests {
         std::fs::hard_link(f.0.join("file"), f.0.join("hardlink")).unwrap();
         f.check("file", "hardlink", true);
         assert!(overlaps(&f.0.join("file/child"), &f.0).is_err());
+        // Unix refuses '..' after a missing directory. Win32 path parsing
+        // removes it lexically before the filesystem sees it, which is exact
+        // there because a missing component cannot be a link.
+        #[cfg(unix)]
         assert!(overlaps(&f.0.join("missing/../other"), &f.0).is_err());
+        #[cfg(windows)]
+        assert!(overlaps(&f.0.join("missing/../other"), &f.0).unwrap());
     }
 
     #[test]

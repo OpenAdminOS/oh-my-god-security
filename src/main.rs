@@ -3502,8 +3502,12 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                     targets.push(resolve_existing_prefix(Path::new(t))?);
                 }
             }
+            let store = resolve_existing_prefix(&data_dir().join("intent"))?;
             let inside = |p: &Path| -> Result<(), String> {
                 admit_bundle_cache(&[p.to_path_buf()])?;
+                if omgs::paths::overlaps(p, &store)? {
+                    return Err(format!("index output must live outside the trusted intent and policy store, and {} overlaps {}", out_abs.display(), store.display()));
+                }
                 for t in &targets {
                     if omgs::paths::overlaps(p, t)? {
                         return Err(format!("index output must live outside every reviewed target, and {} is inside {}", out_abs.display(), t.display()));

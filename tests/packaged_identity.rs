@@ -462,6 +462,39 @@ fn default_review_binds_embedded_bundle_despite_stale_installed_skill() {
 }
 
 #[test]
+fn batch_index_output_is_fenced_from_the_trusted_store() {
+    let fixture = Fixture::new();
+    let home = fixture.0.join("home");
+    omgs::platform::create_private_dir(&home).unwrap();
+    let target = fixture.0.join("target");
+    std::fs::create_dir(&target).unwrap();
+    let batch = fixture.0.join("batch.json");
+    std::fs::write(
+        &batch,
+        serde_json::json!({"runs": [{"url": "https://github.com/a/b",
+            "target": target.to_string_lossy(), "run_dir": null,
+            "status": "failed", "error": "x"}]})
+        .to_string(),
+    )
+    .unwrap();
+    let out = home.join("intent").join("idx");
+    let output = cli()
+        .env("OMGS_HOME", &home)
+        .args(["batch", "index", "--batch"])
+        .arg(&batch)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("trusted intent and policy store"),
+        "{output:?}"
+    );
+    assert!(!out.exists());
+}
+
+#[test]
 fn bundle_cache_overlapping_the_target_or_output_is_refused_before_writing() {
     let fixture = Fixture::new();
     let home = fixture.0.join("home");
