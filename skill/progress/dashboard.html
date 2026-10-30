@@ -130,13 +130,13 @@ function activeStage(stages){
   return null;
 }
 function happening(stages,active,reviewState,reviewComplete){
-  if(reviewComplete===false)return reviewState||"The review is incomplete.";
-  if(stages.some(st=>st.status==="failed"||(st.children||[]).some(c=>c.status==="failed")))return "The review has stopped. Check the steps below for details.";
   if(active){
     const st=active.stage,info=stageInfo(st),detail=(st.detail||"").trim();
     if(detail)return stageLabel(st)+": "+detail.replace(/[.!?]+$/,"")+".";
     return info?info.detail:stageLabel(st)+" is in progress.";
   }
+  if(reviewComplete===false)return reviewState||"The review is incomplete.";
+  if(stages.some(st=>st.status==="failed"||(st.children||[]).some(c=>c.status==="failed")))return "The review has stopped. Check the steps below for details.";
   if(!stages.length)return "No updates yet. Waiting for the review to start.";
   if(reviewComplete===true)return "Reporting has finished. Your report is ready in the run folder.";
   return "Waiting for the next review step.";

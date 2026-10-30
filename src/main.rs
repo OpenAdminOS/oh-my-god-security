@@ -2,7 +2,7 @@ use omgs::architecture::{
     render_architecture_html, render_architecture_markdown, validate_architecture, ArchitectureFile,
 };
 use omgs::ledger::{add_unit, coverage_lines, set_status, validate_ledger, Ledger, Unit, STATUSES};
-use omgs::model::{identity, validate, FindingsFile};
+use omgs::model::{identity, FindingsFile};
 use omgs::report::{render_html, render_markdown, render_sarif, ReportMeta};
 use omgs::sandbox::{prove, ProveOutcome, ProveRequest, Tier};
 use omgs::sensors::run_sensors;
@@ -362,22 +362,6 @@ fn read_findings(path: &str) -> Result<FindingsFile, String> {
     omgs::shape::findings(&text).map_err(|e| format!("parse {path}: {e}"))
 }
 
-/// Evidence rules plus proof records, which live in `proofs/` beside the
-/// findings file.
-fn validate_at(file: &FindingsFile, path: &str) -> Vec<String> {
-    let dir = Path::new(path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut errors = validate(file);
-    errors.extend(omgs::proof::validate_proofs(file, dir));
-    match omgs::attempts::finding_gaps(dir, file) {
-        Ok(gaps) => errors.extend(gaps),
-        Err(e) => errors.push(e),
-    }
-    errors
-}
-
 fn cmd_validate(args: &[String]) -> Result<(), String> {
     let path = [
         "--findings",
@@ -433,26 +417,26 @@ fn cmd_validate_locked(args: &[String]) -> Result<(), String> {
     }
     let path = flag(args, "--findings").unwrap();
     let file = read_findings(&path)?;
-    let errors = validate_at(&file, &path);
+    let dir = Path::new(&path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let view = omgs::review::View::for_publication_locked(
+        dir,
+        &file,
+        &omgs::runmeta::read_optional(dir)?.unwrap_or_default(),
+    )?;
+    let errors = view.validation_errors();
     if errors.is_empty() {
-        let dir = Path::new(&path)
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let view = omgs::review::View::for_publication_locked(
-            dir,
-            &file,
-            &omgs::runmeta::read_optional(dir)?.unwrap_or_default(),
-        )?;
         println!(
             "valid: {} finding(s); review {}",
             view.findings.findings.len(),
-            view.state.as_deref().unwrap_or("complete")
+            omgs::platform::escape_controls(view.state.as_deref().unwrap_or("complete"))
         );
         Ok(())
     } else {
         for e in &errors {
-            eprintln!("invalid: {e}");
+            eprintln!("invalid: {}", omgs::platform::escape_controls(e));
         }
         Err("__EXIT1__".into())
     }
@@ -476,7 +460,7 @@ fn cmd_architecture(args: &[String]) -> Result<(), String> {
         let errors = validate_architecture(&file);
         if !errors.is_empty() {
             for e in &errors {
-                eprintln!("invalid: {e}");
+                eprintln!("invalid: {}", omgs::platform::escape_controls(e));
             }
             return Err("__EXIT1__".into());
         }
@@ -1512,17 +1496,16 @@ fn write_handoff(
     handoff: &omgs::handoff::Handoff,
     artifact_base: &str,
 ) -> Result<(), String> {
-    omgs::runmeta::write_atomic(
-        &dir.join("HANDOFF.md"),
-        &omgs::handoff::markdown_at(handoff, artifact_base),
-    )?;
-    omgs::runmeta::write_atomic(
-        &dir.join("handoff.json"),
-        &format!(
-            "{}\n",
-            serde_json::to_string_pretty(handoff).map_err(|e| e.to_string())?
-        ),
-    )
+    let mut writes = omgs::runmeta::Transaction::default();
+    writes.text(
+        dir.join("HANDOFF.md"),
+        omgs::handoff::markdown_at(handoff, artifact_base),
+    );
+    writes.text(
+        dir.join("handoff.json"),
+        serde_json::to_string_pretty(handoff).map_err(|e| e.to_string())?,
+    );
+    writes.commit()
 }
 
 fn cmd_handoff(args: &[String]) -> Result<(), String> {
@@ -1551,11 +1534,11 @@ fn cmd_stage_locked(run: &Path) -> Result<(), String> {
     let file = read_findings(&run.join("findings.json").to_string_lossy())?;
     let staged = omgs::handoff::stage_validated(run, &file)?;
     for reason in &staged.excluded {
-        eprintln!("{reason}");
+        eprintln!("{}", omgs::platform::escape_controls(reason));
     }
     omgs::runmeta::write_atomic(&run.join("proposed-tests.patch"), &staged.patch)?;
     println!("wrote {}", run.join("proposed-tests.patch").display());
-    // Legacy runs can still export retained tests. Policy-aware runs also
+    // Only finalized findings export retained tests. Policy-aware runs also
     // produce the owner-reviewable registry and intent proposal.
     if omgs::run_artifact::optional_text(
         run,
@@ -1574,17 +1557,6 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
     let path = flag(args, "--findings").ok_or("report requires --findings <path>")?;
     let out = flag(args, "--out").ok_or("report requires --out <dir>")?;
     let file = read_findings(&path)?;
-    let mut errors = omgs::model::validate_drafts(&file);
-    errors.extend(omgs::proof::validate_proofs(
-        &file,
-        Path::new(&path).parent().unwrap_or(Path::new(".")),
-    ));
-    if !errors.is_empty() {
-        for e in &errors {
-            eprintln!("invalid: {e}");
-        }
-        return Err("__EXIT1__".into());
-    }
     let findings_dir = Path::new(&path)
         .parent()
         .map(|p| {
@@ -1615,11 +1587,6 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             return Err("candidates files but no coverage-ledger.json; restore the ledger so the critic can run".into());
         }
     }
-    let file = omgs::review::View::with_findings(
-        findings_dir.as_deref().unwrap_or(Path::new(".")),
-        &file,
-    )?
-    .findings;
     // Explicit flags override saved metadata. Verifier identities on findings
     // are a last resort. Never infer hunter counts from the surviving records:
     // hunters that found nothing or were merged into another record would be missed.
@@ -1701,27 +1668,18 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         }
     }
     let supplied_models = omgs::route::parse_identities(&flags(args, "--model"))?;
-    omgs::report::publish(
+    omgs::report::publish_prepared(
         findings_dir.as_deref(),
         explicit_agent_calls,
         &supplied_models,
         &publication,
-        |saved| {
+        |saved, writes| {
             submission.apply(saved)?;
-            if let Some(run) = findings_dir
-                .as_deref()
-                .filter(|run| run.join(omgs::runmeta::FILE).exists())
-            {
-                saved.insert("run_status".into(), serde_json::json!("partial"));
-                omgs::runmeta::write_atomic(
-                    &run.join(omgs::runmeta::FILE),
-                    &serde_json::to_string_pretty(&saved).map_err(|e| e.to_string())?,
-                )?;
-            }
+            omgs::runmeta::check_numeric_fields(saved)?;
             let saved = saved.clone();
             let run = findings_dir.as_deref().unwrap_or(Path::new("."));
-            if run.join(omgs::status::FILE).exists() {
-                omgs::status::apply_with_logs_locked(
+            let proposed_progress = if run.join(omgs::status::FILE).exists() {
+                Some(omgs::status::propose_locked(
                     run,
                     &omgs::status::Update {
                         stage: "report",
@@ -1733,14 +1691,36 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                         log: None,
                     },
                     &[],
-                )?;
-            }
+                )?)
+            } else {
+                None
+            };
             let fresh = read_findings(&path)?;
             let errors = omgs::model::validate_drafts(&fresh);
             if !errors.is_empty() {
-                return Err(errors.join("; "));
+                for error in &errors {
+                    eprintln!("invalid: {}", omgs::platform::escape_controls(error));
+                }
+                return Err("__EXIT1__".into());
             }
-            let view = omgs::review::View::for_publication_locked(run, &fresh, &saved)?;
+            let view = omgs::review::View::for_report_locked(
+                run,
+                &fresh,
+                &saved,
+                proposed_progress.as_ref(),
+            )?;
+            if proposed_progress.is_some() {
+                writes.text(
+                    run.join(omgs::status::FILE),
+                    serde_json::to_string_pretty(&view.progress).map_err(|e| e.to_string())?,
+                );
+            }
+            if !view.proof_errors.is_empty() {
+                for error in &view.proof_errors {
+                    eprintln!("invalid: {}", omgs::platform::escape_controls(error));
+                }
+                return Err("__EXIT1__".into());
+            }
             let accounting = view.accounting.clone();
             let hunters = flag(args, "--hunters")
                 .and_then(|s| s.parse::<u32>().ok())
@@ -1848,35 +1828,28 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 if rep.tools_run.is_empty() { "no tools".into() } else { rep.tools_run.join(", ") },
                 rep.hits.len(), rep.hits.iter().filter(|h| h.vendored).count()
             ));
-            let evidence = omgs::adjudication::report_lines_locked(
-                findings_dir.as_deref().unwrap_or(Path::new(".")),
-                &file,
-            )?;
+            let evidence = omgs::adjudication::report_lines_view(run, &view)?;
             let evidence_md = omgs::adjudication::render_lines(&evidence, false);
             let evidence_html = omgs::adjudication::render_lines(&evidence, true);
             let sensor_md = omgs::report::sensor_section(sensors.as_ref(), false);
             let sensor_html = omgs::report::sensor_section(sensors.as_ref(), true);
-            write_out(
+            writes.text(
                 dir.join("REPORT.md"),
                 format!("{}{sensor_md}{evidence_md}", render_markdown(&file, &meta)),
-            )
-            .map_err(|e| e.to_string())?;
-            write_out(
+            );
+            writes.text(
                 dir.join("REPORT.html"),
                 render_html(&file, &meta)
                     .replace("</body>", &format!("{sensor_html}{evidence_html}</body>")),
-            )
-            .map_err(|e| e.to_string())?;
-            write_out(dir.join("findings.sarif.json"), render_sarif(&file, &meta))
-                .map_err(|e| e.to_string())?;
-            write_handoff(dir, &handoff, &meta.artifact_base)?;
-            println!(
-                "wrote {}, {}, {}, {}, {}",
-                dir.join("REPORT.md").display(),
-                dir.join("REPORT.html").display(),
-                dir.join("findings.sarif.json").display(),
-                dir.join("HANDOFF.md").display(),
-                dir.join("handoff.json").display()
+            );
+            writes.text(dir.join("findings.sarif.json"), render_sarif(&file, &meta));
+            writes.text(
+                dir.join("HANDOFF.md"),
+                omgs::handoff::markdown_at(&handoff, &meta.artifact_base),
+            );
+            writes.text(
+                dir.join("handoff.json"),
+                serde_json::to_string_pretty(&handoff).map_err(|e| e.to_string())?,
             );
             let completion = omgs::report::Completion {
                 hunters: meta.hunters,
@@ -1886,7 +1859,17 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
 
             Ok(completion)
         },
-    )
+    )?;
+    let dir = Path::new(&out);
+    println!(
+        "wrote {}, {}, {}, {}, {}",
+        dir.join("REPORT.md").display(),
+        dir.join("REPORT.html").display(),
+        dir.join("findings.sarif.json").display(),
+        dir.join("HANDOFF.md").display(),
+        dir.join("handoff.json").display()
+    );
+    Ok(())
 }
 
 /// The reviewer's answer store for `target`, only when it physically lives
@@ -2934,11 +2917,8 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
         })
         .count();
     println!("committed proof tests found: {proofs}");
-    let scratch = flag(args, "--out")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| data_dir().join("prove-scratch"));
-    std::fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
-    let sensors = run_sensors(&target, &scratch);
+    let scratch = omgs::scratch::Scratch::create("sensor")?;
+    let sensors = run_sensors(&target, &scratch.path());
     for tool in &sensors.tools_run {
         let hits: Vec<_> = sensors.hits.iter().filter(|h| &h.tool == tool).collect();
         let vendored = hits.iter().filter(|h| h.vendored).count();
@@ -2962,17 +2942,8 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
     }
     if let Some(out) = flag(args, "--out") {
         let dir = PathBuf::from(out);
-        write_out(
-            dir.join("sensor-hits.json"),
-            serde_json::to_string_pretty(&sensors.hits).unwrap(),
-        )
-        .map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        write_out(
-            dir.join("sensors.json"),
-            serde_json::to_string_pretty(&sensors).unwrap_or_default(),
-        )
-        .map_err(|e| e.to_string())?;
+        omgs::sensors::publish_report(&dir, &sensors)?;
     }
     println!("check is deterministic and executes no target code. Run proof tests through: omgs prove --cmd <test command>");
     Ok(())
@@ -2986,8 +2957,18 @@ fn read_ledger(path: &str) -> Result<Ledger, String> {
 fn write_ledger(path: &str, ledger: &Ledger) -> Result<(), String> {
     let text = serde_json::to_string_pretty(ledger).map_err(|e| e.to_string())?;
     let path = Path::new(path);
-    omgs::runmeta::invalidate_completion_locked(path.parent().unwrap_or(Path::new(".")))?;
-    omgs::runmeta::write_atomic(path, &format!("{text}\n"))
+    let errors = validate_ledger(ledger);
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let mut writes = omgs::runmeta::Transaction::default();
+    writes.text(path, format!("{text}\n"));
+    if let Some(mut saved) = omgs::runmeta::read_optional(dir)? {
+        saved.insert("run_status".into(), serde_json::json!("in_progress"));
+        writes.metadata(dir, &saved)?;
+    }
+    writes.commit()
 }
 
 /// Every value given for a repeatable flag, in order.
@@ -3003,12 +2984,15 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
     let sub = args.first().map(|s| s.as_str()).ok_or(usage)?;
     let rest = &args[1..];
     let path = flag(rest, "--ledger").ok_or("ledger requires --ledger <file>")?;
-    let lock = Path::new(&path)
+    let dir = Path::new(&path)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."))
-        .join(".omgs-run.lock");
-    omgs::runmeta::with_lock_file(&lock, || ledger_locked(sub, rest, &path))
+        .unwrap_or(Path::new("."));
+    if omgs::runmeta::read_optional(dir)?.is_some() {
+        omgs::budget::with_family_lock(dir, || ledger_locked(sub, rest, &path))
+    } else {
+        omgs::runmeta::with_lock(dir, || ledger_locked(sub, rest, &path))
+    }
 }
 
 fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
@@ -3053,7 +3037,7 @@ fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
             }
             let errors = validate_ledger(&ledger);
             for e in &errors {
-                eprintln!("invalid: {e}");
+                eprintln!("invalid: {}", omgs::platform::escape_controls(e));
             }
             if errors.is_empty() {
                 Ok(())
@@ -3111,7 +3095,7 @@ fn cmd_critic(args: &[String]) -> Result<(), String> {
     omgs::runmeta::with_lock(Path::new(&run), || {
         let report = omgs::critic::critique_run_locked(Path::new(&run))?;
         for gap in &report.gaps {
-            eprintln!("gap: {gap}");
+            eprintln!("gap: {}", omgs::platform::escape_controls(gap));
         }
         println!("critic: {}", report.summary());
         if report.passed() {
@@ -3450,8 +3434,8 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     let stage = flag(args, "--stage").ok_or("status requires --stage <id>")?;
     let state = flag(args, "--state").ok_or("status requires --state <state>")?;
     let supplied_usage = omgs::accounting::parse(&flags(args, "--accounting"))?;
-    let observed = omgs::review::View::load(Path::new(&run))?;
-    let submission = omgs::accounting::Submission::observe(&observed.saved, supplied_usage)?;
+    let observed = omgs::runmeta::read(Path::new(&run))?;
+    let submission = omgs::accounting::Submission::observe(&observed, supplied_usage)?;
     let mut counters = Vec::new();
     for c in flags(args, "--counter") {
         let (k, v) = c
@@ -3466,14 +3450,14 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     let parent = flag(args, "--parent");
     let detail = flag(args, "--detail");
     let logs = flags(args, "--log");
-    omgs::runmeta::update(Path::new(&run), |m| {
+    omgs::budget::with_family_lock(Path::new(&run), || {
+        let mut saved = omgs::runmeta::read(Path::new(&run))?;
+        let m = &mut saved;
         submission.apply(m)?;
-        omgs::runmeta::write_atomic(
-            &Path::new(&run).join(omgs::runmeta::FILE),
-            &serde_json::to_string_pretty(m).map_err(|e| e.to_string())?,
-        )?;
-        omgs::status::apply_with_logs_locked(
+        omgs::runmeta::check_numeric_fields(m)?;
+        let (writes, view) = omgs::status::prepare_locked(
             Path::new(&run),
+            m,
             &omgs::status::Update {
                 stage: &stage,
                 label: label.as_deref(),
@@ -3485,11 +3469,11 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
             },
             &logs,
         )?;
-        *m = omgs::runmeta::read(Path::new(&run))?;
-        let view = omgs::review::View::load_locked(Path::new(&run))?;
+        writes.commit()?;
         println!(
-            "{stage}: {state}; review {}",
-            view.state.as_deref().unwrap_or("complete")
+            "{}: {state}; review {}",
+            omgs::platform::escape_controls(&stage),
+            omgs::platform::escape_controls(view.state.as_deref().unwrap_or("complete"))
         );
         if !flags(args, "--accounting").is_empty() {
             for line in omgs::accounting::lines(&view.accounting) {

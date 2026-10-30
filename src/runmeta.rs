@@ -44,7 +44,21 @@ fn write_atomic_content(
     bytes: &[u8],
     permissions: Option<std::fs::Permissions>,
 ) -> std::io::Result<()> {
+    let temporary = prepare_atomic_content(path, bytes, permissions)?;
+    std::fs::rename(&temporary, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temporary);
+    })
+}
+
+fn prepare_atomic_content(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write;
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+        return Err(std::io::Error::other("destination is a directory"));
+    }
     #[cfg(windows)]
     if let Some(file) = crate::platform::open_single_link(path)? {
         crate::platform::check_private_file(&file)
@@ -103,14 +117,144 @@ fn write_atomic_content(
         )));
     }
     drop(file);
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    Ok(tmp)
 }
 
 /// `write_atomic_bytes` for text, with the error as a message.
 pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     write_atomic_bytes(path, text.as_bytes()).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// A locked publication: construct every byte first, admit and stage every
+/// destination, then replace artifacts followed by metadata and status.
+/// Backup directory entries permit rollback if a rename fails during commit.
+#[derive(Default)]
+pub struct Transaction {
+    files: Vec<(std::path::PathBuf, Vec<u8>)>,
+}
+
+impl Transaction {
+    pub fn text(&mut self, path: impl Into<std::path::PathBuf>, text: impl Into<String>) {
+        self.files.push((path.into(), text.into().into_bytes()));
+    }
+
+    pub fn metadata(&mut self, dir: &Path, meta: &Map<String, Value>) -> Result<(), String> {
+        check_numeric_fields(meta)?;
+        self.text(
+            dir.join(FILE),
+            serde_json::to_string_pretty(meta).map_err(|e| e.to_string())?,
+        );
+        Ok(())
+    }
+
+    pub fn commit(self) -> Result<(), String> {
+        self.commit_prepared(
+            #[cfg(test)]
+            || {},
+        )
+    }
+
+    fn commit_prepared(mut self, #[cfg(test)] before_commit: impl FnOnce()) -> Result<(), String> {
+        self.files
+            .sort_by_key(|(p, _)| match p.file_name().and_then(|s| s.to_str()) {
+                Some(FILE) => 1,
+                Some(crate::status::FILE) => 2,
+                _ => 0,
+            });
+        let mut unique = std::collections::BTreeSet::new();
+        let mut staged = Vec::new();
+        for (path, bytes) in &self.files {
+            if !unique.insert(path.clone()) {
+                return Err(format!(
+                    "duplicate transaction destination: {}",
+                    path.display()
+                ));
+            }
+            if path.file_name().and_then(|s| s.to_str()) == Some(FILE) {
+                parse(path, std::str::from_utf8(bytes).map_err(|e| e.to_string())?)?;
+            }
+            if path.file_name().and_then(|s| s.to_str()) == Some(crate::status::FILE) {
+                let value = crate::shape::strict_json(
+                    std::str::from_utf8(bytes).map_err(|e| e.to_string())?,
+                )?;
+                crate::status::check_document(
+                    value.as_object().ok_or("status must be an object")?,
+                )?;
+            }
+        }
+        // All temporary and backup entries live in a private sibling directory.
+        // No existing entry is changed until all staging succeeds.
+        let mut backups = Vec::new();
+        let result = (|| {
+            for (path, bytes) in &self.files {
+                let tmp = prepare_atomic_content(path, bytes, None)
+                    .map_err(|e| format!("prepare {}: {e}", path.display()))?;
+                staged.push(tmp);
+                let backup = path.with_file_name(format!(
+                    ".omgs-transaction-{}",
+                    crate::platform::random_nonce().map_err(|e| e.to_string())?
+                ));
+                crate::platform::create_private_dir_new(&backup).map_err(|e| e.to_string())?;
+                backups.push(backup);
+            }
+            #[cfg(test)]
+            before_commit();
+            for (i, (path, _)) in self.files.iter().enumerate() {
+                let previous = backups[i].join("previous");
+                let replaced = (|| {
+                    match std::fs::symlink_metadata(path) {
+                        Ok(_) => std::fs::rename(path, &previous)?,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
+                    std::fs::rename(&staged[i], path)
+                })();
+                if let Err(error) = replaced {
+                    let mut recovery = Vec::new();
+                    for j in (0..=i).rev() {
+                        let dest = &self.files[j].0;
+                        let old = backups[j].join("previous");
+                        if j < i {
+                            if let Err(e) = std::fs::remove_file(dest) {
+                                recovery.push(format!("remove {}: {e}", dest.display()));
+                            }
+                        }
+                        if std::fs::symlink_metadata(&old).is_ok() {
+                            if let Err(e) = std::fs::rename(&old, dest) {
+                                recovery.push(format!(
+                                    "restore {} from {}: {e}",
+                                    dest.display(),
+                                    old.display()
+                                ));
+                            }
+                        }
+                    }
+                    return Err(format!(
+                        "commit {}: {error}{}",
+                        path.display(),
+                        if recovery.is_empty() {
+                            String::new()
+                        } else {
+                            format!("; recovery required: {}", recovery.join("; "))
+                        }
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        for path in staged {
+            let _ = std::fs::remove_file(path);
+        }
+        for path in backups {
+            if result.is_ok() {
+                let _ = std::fs::remove_dir_all(path);
+            } else {
+                // Retain any original that an OS error prevented restoring.
+                let _ = std::fs::remove_dir(path);
+            }
+        }
+        result
+    }
 }
 
 pub fn read(dir: &Path) -> Result<Map<String, Value>, String> {
@@ -240,7 +384,7 @@ pub fn with_lock<T>(dir: &Path, f: impl FnOnce() -> Result<T, String>) -> Result
 
 /// Hold all input locks through a multi-run publication. Never wait for one
 /// lock while holding another: family writers acquire parent before child.
-/// Read-only archives without a lock are frozen inputs, as in with_archive_lock.
+/// Establish absent locks before reading; read-only archives must already have locks.
 pub fn with_run_locks<T>(
     dirs: &[std::path::PathBuf],
     archive: bool,
@@ -263,9 +407,7 @@ pub fn with_run_locks<T>(
         let mut held = Vec::new();
         let mut blocked = false;
         for path in &paths {
-            let file = if archive {
-                crate::platform::open_single_link(path).map_err(|e| e.to_string())?
-            } else {
+            let file = {
                 // Create and admit the lock without retaining any other lock.
                 if !path.try_exists().map_err(|e| e.to_string())? {
                     blocked = true;
@@ -273,7 +415,10 @@ pub fn with_run_locks<T>(
                 }
                 crate::platform::open_single_link(path).map_err(|e| e.to_string())?
             };
-            let Some(file) = file else { continue };
+            let Some(file) = file else {
+                blocked = true;
+                break;
+            };
             crate::platform::check_private_file(&file).map_err(|e| e.to_string())?;
             match file.try_lock_shared() {
                 Ok(()) => held.push(file),
@@ -292,7 +437,7 @@ pub fn with_run_locks<T>(
         }
         drop(held);
         // No lock remains held during creation or waiting.
-        if !archive {
+        {
             for path in &paths {
                 if !path.try_exists().map_err(|e| e.to_string())? {
                     with_lock_file(path, || Ok(()))?;
@@ -306,39 +451,10 @@ pub fn with_run_locks<T>(
     }
 }
 
-/// Read archived data without creating a lock file or requiring write access.
-/// If a writer creates the lock during an unlocked read, retry under that lock.
+/// Read archived data under an enforceable shared lock. Establish an absent
+/// lock while no other lock is held, or refuse an archive that cannot be locked.
 pub fn with_archive_lock<T>(dir: &Path, read: impl Fn() -> Result<T, String>) -> Result<T, String> {
-    let path = dir.join(LOCK);
-    for _ in 0..3 {
-        match crate::platform::open_single_link(&path).map_err(|e| e.to_string())? {
-            Some(file) => {
-                crate::platform::check_private_file(&file).map_err(|e| e.to_string())?;
-                let start = std::time::Instant::now();
-                loop {
-                    match file.try_lock_shared() {
-                        Ok(()) => break,
-                        Err(std::fs::TryLockError::WouldBlock)
-                            if start.elapsed().as_secs() < 30 =>
-                        {
-                            std::thread::sleep(std::time::Duration::from_millis(5));
-                        }
-                        Err(e) => return Err(format!("archive lock: {e}")),
-                    }
-                }
-                let result = read();
-                let _ = file.unlock();
-                return result;
-            }
-            None => {
-                let result = read();
-                if !path.try_exists().map_err(|e| e.to_string())? {
-                    return result;
-                }
-            }
-        }
-    }
-    Err("archive changed while reading; retry with a frozen archive".into())
+    with_run_locks(&[dir.to_path_buf()], true, read)
 }
 
 /// Apply `change` to the run metadata in `dir` under the run lock and write
@@ -352,7 +468,9 @@ pub fn update<T>(
         let out = change(&mut meta)?;
         check_numeric_fields(&meta)?;
         let text = serde_json::to_string_pretty(&Value::Object(meta)).map_err(|e| e.to_string())?;
-        write_atomic(&dir.join(FILE), &format!("{text}\n"))?;
+        let mut transaction = Transaction::default();
+        transaction.text(dir.join(FILE), format!("{text}\n"));
+        transaction.commit()?;
         Ok(out)
     })
 }
@@ -396,4 +514,59 @@ pub fn timestamp(ms: u64) -> String {
     let month = mp + if mp < 10 { 3 } else { -9 };
     year += i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}T{}Z", clock(ms))
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    #[test]
+    fn rename_failure_restores_all_previously_committed_destinations() {
+        let dir = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-transaction-test-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&dir).unwrap();
+        for name in ["first", "second", super::FILE] {
+            super::write_atomic(
+                &dir.join(name),
+                if name == super::FILE {
+                    "{}"
+                } else {
+                    "previous"
+                },
+            )
+            .unwrap();
+        }
+        let mut transaction = super::Transaction::default();
+        transaction.text(dir.join("first"), "replacement");
+        transaction.text(dir.join("second"), "replacement");
+        transaction.metadata(&dir, &serde_json::Map::new()).unwrap();
+        let result = transaction.commit_prepared(|| {
+            let staged = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".second.")
+                })
+                .unwrap();
+            std::fs::remove_file(staged).unwrap();
+        });
+        assert!(result.unwrap_err().contains("commit"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("first")).unwrap(),
+            "previous"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("second")).unwrap(),
+            "previous"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(super::FILE)).unwrap(),
+            "{}"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

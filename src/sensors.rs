@@ -59,6 +59,51 @@ pub fn run_sensors(target: &Path, artifacts: &Path) -> SensorsReport {
     report
 }
 
+/// Publish both sensor projections together and reopen any saved completion.
+/// Scanning must finish before this function acquires family/run locks.
+pub fn publish_report(dir: &Path, report: &SensorsReport) -> Result<(), String> {
+    let publish = || {
+        let mut writes = crate::runmeta::Transaction::default();
+        writes.text(
+            dir.join("sensor-hits.json"),
+            serde_json::to_string_pretty(&report.hits).map_err(|e| e.to_string())?,
+        );
+        writes.text(
+            dir.join("sensors.json"),
+            serde_json::to_string_pretty(report).map_err(|e| e.to_string())?,
+        );
+        let mut saved = crate::runmeta::read_optional(dir)?.unwrap_or_default();
+        saved.insert("run_status".into(), serde_json::json!("in_progress"));
+        if crate::runmeta::read_optional(dir)?.is_some() {
+            writes.metadata(dir, &saved)?;
+        }
+        let progress = crate::status::propose_locked(
+            dir,
+            &crate::status::Update {
+                stage: "sensors",
+                label: Some("Reconcile sensor export"),
+                parent: None,
+                state: "pending",
+                detail: Some("New sensor artifacts require coverage reconciliation"),
+                counters: &[],
+                log: None,
+            },
+            &[],
+        )?;
+        let view = crate::review::View::for_sensors_locked(dir, &saved, &progress, report)?;
+        writes.text(
+            dir.join(crate::status::FILE),
+            serde_json::to_string_pretty(&view.progress).map_err(|e| e.to_string())?,
+        );
+        writes.commit()
+    };
+    if crate::runmeta::read_optional(dir)?.is_some() {
+        crate::budget::with_family_lock(dir, publish)
+    } else {
+        crate::runmeta::with_lock(dir, publish)
+    }
+}
+
 /// Extract rule/file/line metadata from a semgrep JSON report. Split out so the
 /// parser is unit-testable without a semgrep install.
 pub fn parse_semgrep(text: &str, target: &Path, report: &mut SensorsReport) {
@@ -517,7 +562,7 @@ pub fn read_report(dir: &Path) -> Result<Option<SensorsReport>, String> {
         Path::new("sensors.json"),
         crate::run_artifact::SENSORS_BYTES,
     )? {
-        Some(text) => Some(crate::shape::sensors(&text)?),
+        Some(text) => Some(crate::shape::sensors(&text).map_err(|e| format!("sensors.json: {e}"))?),
         None => None,
     };
     if let Some(text) = crate::run_artifact::optional_text(

@@ -375,11 +375,18 @@ pub fn finding_gaps(
     findings: &crate::model::FindingsFile,
 ) -> Result<Vec<String>, String> {
     let meta = crate::runmeta::read_optional(run)?.unwrap_or_default();
-    let mut gaps = gaps(&meta)?;
+    finding_gaps_for(&meta, findings)
+}
+
+pub(crate) fn finding_gaps_for(
+    meta: &Map<String, Value>,
+    findings: &crate::model::FindingsFile,
+) -> Result<Vec<String>, String> {
+    let mut gaps = Vec::new();
     for f in &findings.findings {
         if let Some(v) = &f.verification {
             if let Err(e) = final_for(
-                &meta,
+                meta,
                 &v.attempt,
                 "verifier",
                 f.verified_by.as_deref().unwrap_or(""),

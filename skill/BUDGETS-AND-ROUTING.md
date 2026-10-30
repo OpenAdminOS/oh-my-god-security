@@ -46,7 +46,7 @@ until that reservation is reconciled.
 
 Host accounting is optional and cumulative per role. Supply `--accounting
 red-hunter=12000,0.32,45000` on `omgs status` or `omgs report`, repeating the option for
-blue-verifier, evaluator and green-fixer. Values are tokens, USD cost and duration in milliseconds.
+host, blue-verifier, evaluator and green-fixer. Values are tokens, USD cost and duration in milliseconds.
 Use `unknown` or an empty field for unavailable values. Omitted roles and values stay unknown, never
 zero; resubmission replaces that role's totals. Report reads saved status accounting. Never estimate
 missing usage from stage clocks.

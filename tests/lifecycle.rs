@@ -1718,8 +1718,21 @@ console.log(JSON.stringify(elements));
         headline.contains("report is ready"),
         data["review_complete"] == true
     );
+    let active = data["stages"].as_array().is_some_and(|stages| {
+        stages.iter().any(|stage| {
+            stage["status"] == "active"
+                || stage["children"].as_array().is_some_and(|children| {
+                    children.iter().any(|child| child["status"] == "active")
+                })
+        })
+    });
     if data["review_complete"] == false {
-        assert_eq!(headline, data["review_state"].as_str().unwrap());
+        if active {
+            assert_ne!(headline, data["review_state"].as_str().unwrap());
+            assert!(headline.contains("round detail") || headline.contains("in progress"));
+        } else {
+            assert_eq!(headline, data["review_state"].as_str().unwrap());
+        }
     }
 }
 
@@ -2072,4 +2085,411 @@ fn batch_publication_pins_all_inputs_through_both_index_writes() {
     .unwrap();
     mutation.unwrap().join().unwrap();
     assert!(!omgs::review::View::load(&a.0).unwrap().complete());
+}
+
+fn publish_report(run: &Run, extra: &[&str], out: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", run.0.join("state"))
+        .args(["report", "--findings"])
+        .arg(run.0.join("findings.json"))
+        .arg("--out")
+        .arg(out)
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+fn publication_bytes(run: &Run) -> Vec<Option<Vec<u8>>> {
+    [
+        "run-metadata.json",
+        "pipeline-status.json",
+        "REPORT.md",
+        "REPORT.html",
+        "HANDOFF.md",
+        "handoff.json",
+        "findings.sarif.json",
+    ]
+    .iter()
+    .map(|name| std::fs::read(run.0.join(name)).ok())
+    .collect()
+}
+
+#[test]
+fn rejected_accounting_preserves_metadata_progress_and_all_publications() {
+    for command in ["status", "report"] {
+        let run = finished_review();
+        assert!(publish_report(&run, &[], &run.0).status.success());
+        let before = publication_bytes(&run);
+        let result = if command == "status" {
+            cli(
+                &run,
+                &[
+                    "status",
+                    "--stage",
+                    "report",
+                    "--state",
+                    "failed",
+                    "--accounting",
+                    "blue-verifier@unknown=1,0,1",
+                ],
+            )
+        } else {
+            publish_report(
+                &run,
+                &["--accounting", "blue-verifier@unknown=1,0,1"],
+                &run.0,
+            )
+        };
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(publication_bytes(&run), before, "{command}");
+        assert!(cli(&run, &["budget"]).status.success());
+    }
+}
+
+#[test]
+fn publication_prepares_all_outputs_before_committing_any_state() {
+    for failure in ["output", "sensor"] {
+        let run = finished_review();
+        stage(&run, "report", None, "active", None).unwrap();
+        if failure == "sensor" {
+            run.put("sensors.json", json!({"malformed":true}));
+        }
+        let out = run.1.join("output");
+        omgs::platform::create_private_dir(&out).unwrap();
+        omgs::runmeta::write_atomic(&out.join("REPORT.md"), "previous report").unwrap();
+        if failure == "output" {
+            omgs::platform::create_private_dir(&out.join("REPORT.html")).unwrap();
+        }
+        let before = publication_bytes(&run);
+        let result = publish_report(&run, &["--accounting", "host=1,0,1"], &out);
+        assert!(!result.status.success());
+        assert_eq!(publication_bytes(&run), before, "{failure}");
+        assert_eq!(
+            std::fs::read_to_string(out.join("REPORT.md")).unwrap(),
+            "previous report"
+        );
+        assert!(!out.join("HANDOFF.md").exists());
+        assert!(!omgs::review::View::load(&run.0).unwrap().complete());
+        assert!(std::fs::read_dir(&out).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with('.')));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unwritable_report_directory_preserves_stage_and_accounting() {
+    use std::os::unix::fs::PermissionsExt;
+    let run = finished_review();
+    stage(&run, "report", None, "active", None).unwrap();
+    let out = run.1.join("output");
+    omgs::platform::create_private_dir(&out).unwrap();
+    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let before = publication_bytes(&run);
+    let result = publish_report(&run, &["--accounting", "host=1,0,1"], &out);
+    std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!result.status.success());
+    assert_eq!(publication_bytes(&run), before);
+}
+
+#[test]
+fn failed_handoff_and_sensor_export_leave_every_previous_byte() {
+    let run = finished_review();
+    assert!(publish_report(&run, &[], &run.0).status.success());
+    std::fs::remove_file(run.0.join("handoff.json")).unwrap();
+    omgs::platform::create_private_dir(&run.0.join("handoff.json")).unwrap();
+    let before = publication_bytes(&run);
+    assert!(!cli(&run, &["handoff"]).status.success());
+    assert_eq!(publication_bytes(&run), before);
+    let report = omgs::sensors::SensorsReport {
+        tools_run: vec![],
+        tools_unavailable: vec![],
+        hits: vec![],
+        gaps: vec![],
+    };
+    omgs::platform::create_private_dir(&run.0.join("sensors.json")).unwrap();
+    omgs::runmeta::write_atomic(&run.0.join("sensor-hits.json"), "previous hits").unwrap();
+    assert!(omgs::sensors::publish_report(&run.0, &report).is_err());
+    assert_eq!(publication_bytes(&run), before);
+    assert_eq!(
+        std::fs::read_to_string(run.0.join("sensor-hits.json")).unwrap(),
+        "previous hits"
+    );
+}
+
+#[test]
+fn sensor_export_waits_for_publication_and_invalidates_completion() {
+    use std::sync::mpsc;
+    let run = finished_review();
+    assert!(publish_report(&run, &[], &run.0).status.success());
+    let (started, ready) = mpsc::channel();
+    let (done, result) = mpsc::channel();
+    let worker = omgs::runmeta::with_lock(&run.0, || {
+        let path = run.0.clone();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let report = omgs::sensors::SensorsReport {
+                tools_run: vec![],
+                tools_unavailable: vec!["gitleaks".into()],
+                hits: vec![],
+                gaps: vec!["New scan needs reconciliation".into()],
+            };
+            done.send(omgs::sensors::publish_report(&path, &report))
+                .unwrap();
+        });
+        ready.recv().unwrap();
+        assert!(result.try_recv().is_err());
+        assert!(!run.0.join("sensors.json").exists());
+        assert_eq!(run.meta()["run_status"], "complete");
+        Ok(worker)
+    })
+    .unwrap();
+    result
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(run.meta()["run_status"], "in_progress");
+    assert!(!omgs::review::View::load(&run.0).unwrap().complete());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&std::fs::read(run.0.join("sensor-hits.json")).unwrap())
+            .unwrap(),
+        json!([])
+    );
+    assert!(omgs::sensors::read_report(&run.0).unwrap().is_some());
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(run.0.join(omgs::status::FILE)).unwrap()).unwrap();
+    assert_eq!(saved, omgs::review::View::load(&run.0).unwrap().progress);
+}
+
+#[test]
+fn first_archive_publication_establishes_input_locks_before_reading() {
+    let run = finished_review();
+    std::fs::remove_file(run.0.join(".omgs-run.lock")).unwrap();
+    omgs::runmeta::with_run_locks(std::slice::from_ref(&run.0), true, || {
+        assert!(run.0.join(".omgs-run.lock").is_file());
+        let path = run.0.clone();
+        std::thread::spawn(move || {
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path.join(".omgs-run.lock"))
+                .unwrap();
+            assert!(matches!(
+                lock.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+        })
+        .join()
+        .unwrap();
+        assert!(omgs::review::View::load_archive_locked(&run.0)?.complete());
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn malformed_review_artifacts_allow_failed_status_and_safe_dashboard() {
+    for name in [
+        "findings.json",
+        "candidates-empty.json",
+        "coverage-ledger.json",
+        "architecture.json",
+        "evaluation.json",
+        "sensors.json",
+    ] {
+        let run = finished_review();
+        omgs::runmeta::write_atomic(&run.0.join(name), "{invalid").unwrap();
+        let result = cli(&run, &["status", "--stage", "report", "--state", "failed"]);
+        assert!(
+            result.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let view = omgs::review::View::load(&run.0).unwrap();
+        assert!(!view.complete());
+        assert!(
+            view.meta
+                .review_limits
+                .iter()
+                .any(|s| s.starts_with("artifact unreadable:") && s.contains(name)),
+            "{name}: {:?}",
+            view.meta.review_limits
+        );
+        let response = omgs::watch::respond(
+            "GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:4000\r\n\r\n",
+            4000,
+            &run.0,
+        );
+        assert_eq!(response.status, 200);
+        let value: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(value["stages"][0]["status"], "failed");
+        assert_eq!(value["review_complete"], false);
+    }
+}
+
+#[test]
+fn critic_gap_text_is_escaped_at_markdown_html_sarif_and_cli_sinks() {
+    let run = finished_review();
+    let mut file = finding();
+    file.findings[0].title = "<script>attack()</script>\n::error::hostile [link](bad)".into();
+    let fp = file.findings[0].fingerprint.clone();
+    // An unverified candidate takes its hostile title through the coverage critic.
+    let f = &file.findings[0];
+    run.put("candidates-hostile.json", json!({"candidates":[{"hunter":"red", "unit_ids":["surface"], "source_ref":"synthetic", "title":f.title, "attack_class":f.attack_class, "entry_point":f.entry_point, "sink":f.sink, "boundary":f.boundary, "location":f.location, "attacker_capability":"input", "trace":"entry to sink", "concrete_result":"synthetic", "counterevidence":"unknown", "proof_plan":"inspect", "fingerprint":fp}]}));
+    let view = omgs::review::View::load(&run.0).unwrap();
+    assert!(view.state.as_ref().unwrap().contains("<script>"));
+    assert_eq!(
+        view.meta.review_limits.len(),
+        view.meta
+            .review_limits
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    );
+    let result = publish_report(&run, &[], &run.0);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for name in ["REPORT.md", "REPORT.html"] {
+        let text = std::fs::read_to_string(run.0.join(name)).unwrap();
+        assert!(!text.contains("<script>attack()</script>"), "{name}");
+        if name.ends_with(".md") {
+            assert!(!text.contains("\n::error::"), "{name}");
+        }
+    }
+    let sarif: Value =
+        serde_json::from_slice(&std::fs::read(run.0.join("findings.sarif.json")).unwrap()).unwrap();
+    assert!(sarif.to_string().contains("hostile"));
+    let result = cli(&run, &["status", "--stage", "report", "--state", "failed"]);
+    assert!(result.status.success());
+    let stdout = String::from_utf8(result.stdout).unwrap();
+    assert!(stdout.contains("hostile"));
+    assert!(!stdout.contains("\n::error::"));
+    let lines = omgs::policy::advisory_lines(&run.0, &Default::default()).unwrap();
+    assert!(lines.iter().all(|line| !line.contains('\n')));
+}
+
+#[test]
+fn legacy_verification_demotion_is_visible_and_does_not_export_tests() {
+    let run = finished_review();
+    let mut file = confirmed_fixture(&run);
+    file.findings[0].verification = None;
+    run.put("findings.json", json!(file));
+    let view = omgs::review::View::load(&run.0).unwrap();
+    assert_eq!(view.confirmed, 0);
+    assert_eq!(view.needs_validation, 1);
+    assert!(view
+        .state
+        .as_ref()
+        .unwrap()
+        .contains("Legacy confirmed finding"));
+    assert!(publish_report(&run, &[], &run.0).status.success());
+    for name in ["REPORT.md", "REPORT.html"] {
+        assert!(std::fs::read_to_string(run.0.join(name))
+            .unwrap()
+            .contains("Legacy confirmed finding"));
+    }
+    let target = run.1.join("target");
+    omgs::platform::create_private_dir(&target).unwrap();
+    omgs::runmeta::update(&run.0, |meta| {
+        meta.insert("target".into(), json!(target));
+        Ok(())
+    })
+    .unwrap();
+    let staged = omgs::handoff::stage_validated(&run.0, &file).unwrap();
+    assert!(staged.patch.is_empty());
+    assert!(!staged.excluded.is_empty());
+}
+
+#[test]
+fn accounting_defaults_are_display_only_and_host_is_optional_until_reported() {
+    let run = Run::new();
+    run.event(start("blue", "verifier")).unwrap();
+    run.event(json!({"event":"dispatch", "id":"blue", "turn":"initial", "actor":"host", "reason":"Authorized"})).unwrap();
+    assert!(run.meta()["accounting"].get("host").is_none());
+    let submission = omgs::accounting::Submission::observe(
+        &run.meta(),
+        omgs::accounting::parse(&["blue-verifier@blue=1,0,1".into()]).unwrap(),
+    )
+    .unwrap();
+    omgs::runmeta::update(&run.0, |meta| submission.apply(meta)).unwrap();
+    assert_eq!(run.meta()["accounting"].as_object().unwrap().len(), 1);
+    assert_eq!(
+        omgs::accounting::aggregate(&run.meta()).unwrap()["tokens"],
+        1
+    );
+    let submission = omgs::accounting::Submission::observe(
+        &run.meta(),
+        omgs::accounting::parse(&["host=unknown,unknown,unknown".into()]).unwrap(),
+    )
+    .unwrap();
+    omgs::runmeta::update(&run.0, |meta| submission.apply(meta)).unwrap();
+    assert!(omgs::accounting::aggregate(&run.meta()).unwrap()["tokens"].is_null());
+}
+
+#[test]
+fn invalid_status_and_ledger_proposals_preserve_saved_completion() {
+    let run = finished_review();
+    assert!(publish_report(&run, &[], &run.0).status.success());
+    let before = publication_bytes(&run);
+    let result = cli(
+        &run,
+        &[
+            "status",
+            "--stage",
+            "report",
+            "--state",
+            "unknown",
+            "--accounting",
+            "host=1,0,1",
+        ],
+    );
+    assert!(!result.status.success());
+    assert_eq!(publication_bytes(&run), before);
+    let ledger = std::fs::read(run.0.join("coverage-ledger.json")).unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["ledger", "set", "--ledger"])
+        .arg(run.0.join("coverage-ledger.json"))
+        .args(["--unit", "surface", "--status", "blocked"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert_eq!(
+        std::fs::read(run.0.join("coverage-ledger.json")).unwrap(),
+        ledger
+    );
+    assert_eq!(publication_bytes(&run), before);
+}
+
+#[test]
+fn report_renders_the_proposed_budget_without_persisting_during_rendering() {
+    let run = finished_review();
+    omgs::runmeta::update(&run.0, |meta| {
+        meta.insert("budget_agent_calls".into(), json!(12));
+        Ok(())
+    })
+    .unwrap();
+    let result = publish_report(&run, &["--agent-calls", "5"], &run.0);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(run.meta()["agent_calls_used"], 5);
+    for name in ["REPORT.md", "REPORT.html", "HANDOFF.md"] {
+        let text = std::fs::read_to_string(run.0.join(name)).unwrap();
+        assert!(text.contains("5 used of 12; 7 remaining"), "{name}");
+        assert!(!text.contains("0 used of 12; 12 remaining"), "{name}");
+    }
+    assert!(omgs::accounting::aggregate(&serde_json::Map::new()).unwrap()["tokens"].is_null());
 }

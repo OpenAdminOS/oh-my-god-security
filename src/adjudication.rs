@@ -334,18 +334,23 @@ pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String>
 }
 
 pub fn report_lines(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String> {
-    report_lines_inner(run, findings, false)
+    report_lines_inner(run, findings, false, None)
 }
 
 /// Caller holds the family and run locks through artifact publication.
 pub fn report_lines_locked(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String> {
-    report_lines_inner(run, findings, true)
+    report_lines_inner(run, findings, true, None)
+}
+
+pub fn report_lines_view(run: &Path, view: &crate::review::View) -> Result<Vec<String>, String> {
+    report_lines_inner(run, &view.findings, true, Some(view))
 }
 
 fn report_lines_inner(
     run: &Path,
     findings: &FindingsFile,
     locked: bool,
+    checked: Option<&crate::review::View>,
 ) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     if let Some(e) = load(run)? {
@@ -373,9 +378,12 @@ fn report_lines_inner(
         lines.push("Evaluator: not recorded; adjudication not established".into());
     }
     lines.extend(
-        check(run, findings)?
-            .into_iter()
-            .map(|g| format!("Adjudication gap: {g}")),
+        match checked {
+            Some(view) => view.adjudication_gaps.clone(),
+            None => check(run, findings)?,
+        }
+        .into_iter()
+        .map(|g| format!("Adjudication gap: {g}")),
     );
     if crate::run_artifact::optional_text(
         run,
@@ -395,11 +403,15 @@ fn report_lines_inner(
             lines.push(format!("Attempt history {}: {:?}", event.at, event.record));
         }
         lines.push("Context isolation is procedural unless the host enforces private views. Separate identities do not attest separate contexts. The same model across roles limits adversarial independence.".into());
-        lines.push(if locked {
-            crate::budget::summary_locked(run)?
+        if let Some(view) = checked {
+            lines.extend(view.budget.clone());
         } else {
-            crate::budget::summary(run)?
-        });
+            lines.push(if locked {
+                crate::budget::summary_locked(run)?
+            } else {
+                crate::budget::summary(run)?
+            });
+        }
     }
     if let Some(text) = crate::run_artifact::optional_text(
         run,

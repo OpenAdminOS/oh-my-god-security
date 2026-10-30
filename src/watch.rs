@@ -45,8 +45,7 @@ fn text(status: u16) -> Response {
 /// Answer one raw request. Pure apart from reading the status file, so the
 /// routing and Host rules are testable without a socket.
 pub fn respond(raw: &str, port: u16, run_dir: &Path) -> Response {
-    crate::runmeta::with_lock(run_dir, || Ok(respond_locked(raw, port, run_dir)))
-        .unwrap_or_else(|_| text(500))
+    respond_locked(raw, port, run_dir)
 }
 
 fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
@@ -81,8 +80,17 @@ fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
             body: DASHBOARD.as_bytes().to_vec(),
         },
         "/pipeline-status.json" => {
-            let body = match crate::review::View::load_locked(run_dir)
-                .and_then(|view| serde_json::to_vec(&view.progress).map_err(|e| e.to_string()))
+            let body = match crate::runmeta::with_lock(run_dir, || {
+                // Unsafe file types are refused. Parse errors in regular artifacts
+                // become review limits in the canonical progress document.
+                crate::run_artifact::optional_text(
+                    run_dir,
+                    Path::new(crate::status::FILE),
+                    crate::run_artifact::STATUS_BYTES,
+                )?;
+                crate::review::View::load_locked(run_dir)
+            })
+            .and_then(|view| serde_json::to_vec(&view.progress).map_err(|e| e.to_string()))
             {
                 Ok(bytes) => bytes,
                 Err(_) => {
@@ -139,7 +147,22 @@ fn write_response(stream: &mut TcpStream, r: &Response, deadline: Instant) {
 /// trickles bytes cannot hold the single server thread.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
 
-fn handle(mut stream: TcpStream, port: u16, run_dir: &Path) {
+fn handle(stream: TcpStream, port: u16, run_dir: &Path) {
+    handle_inner(
+        stream,
+        port,
+        run_dir,
+        #[cfg(test)]
+        || {},
+    );
+}
+
+fn handle_inner(
+    mut stream: TcpStream,
+    port: u16,
+    run_dir: &Path,
+    #[cfg(test)] before_write: impl FnOnce(),
+) {
     // One absolute deadline covers reading the request and writing the reply.
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let mut buf = Vec::new();
@@ -164,11 +187,10 @@ fn handle(mut stream: TcpStream, port: u16, run_dir: &Path) {
         }
     }
     let raw = String::from_utf8_lossy(&buf);
-    // Retain the input lock until the bounded socket write has completed.
-    let _ = crate::runmeta::with_lock(run_dir, || {
-        write_response(&mut stream, &respond_locked(&raw, port, run_dir), deadline);
-        Ok(())
-    });
+    let response = respond(&raw, port, run_dir);
+    #[cfg(test)]
+    before_write();
+    write_response(&mut stream, &response, deadline);
 }
 
 /// Bind loopback and return the listener with its port, so callers can print
@@ -179,6 +201,14 @@ pub fn bind() -> Result<(TcpListener, u16), String> {
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     Ok((listener, port))
+}
+
+fn update_completion(completed_at: &mut Option<Instant>, complete: bool, now: Instant) {
+    if complete {
+        completed_at.get_or_insert(now);
+    } else {
+        *completed_at = None;
+    }
 }
 
 /// Serve until the run is complete (plus a short grace) or `max` elapses.
@@ -197,13 +227,73 @@ pub fn serve(listener: TcpListener, port: u16, run_dir: &Path, max: Duration) {
         }
         if last_check.elapsed() >= Duration::from_millis(500) {
             last_check = Instant::now();
-            if completed_at.is_none() && crate::runmeta::is_complete(run_dir) {
-                completed_at = Some(Instant::now());
-            }
+            update_completion(
+                &mut completed_at,
+                crate::runmeta::is_complete(run_dir),
+                Instant::now(),
+            );
         }
         if completed_at.is_some_and(|t| t.elapsed() >= COMPLETE_GRACE) || start.elapsed() >= max {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn completion_grace_restarts_after_reopened_work() {
+        let now = super::Instant::now();
+        let mut completed = None;
+        super::update_completion(&mut completed, true, now);
+        super::update_completion(&mut completed, true, now + super::Duration::from_secs(2));
+        assert_eq!(completed, Some(now));
+        super::update_completion(&mut completed, false, now + super::Duration::from_secs(3));
+        assert_eq!(completed, None);
+        let later = now + super::Duration::from_secs(20);
+        super::update_completion(&mut completed, true, later);
+        assert_eq!(completed, Some(later));
+    }
+}
+
+#[cfg(test)]
+mod lock_tests {
+    #[test]
+    fn socket_output_and_static_dashboard_do_not_hold_the_run_lock() {
+        use std::io::Write;
+        let dir = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-watch-lock-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&dir).unwrap();
+        crate::runmeta::with_lock(&dir, || {
+            let response =
+                super::respond("GET / HTTP/1.1\r\nHost: localhost:4000\r\n\r\n", 4000, &dir);
+            assert_eq!(response.status, 200);
+            Ok(())
+        })
+        .unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .write_all(
+                format!("GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        super::handle_inner(server, port, &dir, || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(dir.join(".omgs-run.lock"))
+                .unwrap();
+            file.try_lock()
+                .expect("socket writes must begin after releasing the run lock");
+        });
+        drop(client);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

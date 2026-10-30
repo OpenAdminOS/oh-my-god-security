@@ -405,7 +405,28 @@ pub fn summary(run: &Path) -> Result<String, String> {
 
 /// Caller holds the family lock, or is reading a frozen archive snapshot.
 pub fn summary_locked(run: &Path) -> Result<String, String> {
-    let a = allowance(&original(run)?)?;
+    summary_proposed_locked(run, &read_run(&run_path(run)?)?)
+}
+
+/// Account for the proposed run counters without persisting them during rendering.
+pub fn summary_proposed_locked(
+    run: &Path,
+    proposed: &Map<String, Value>,
+) -> Result<String, String> {
+    let mut a = allowance(&original(run)?)?;
+    let saved = read_run(&run_path(run)?)?;
+    for key in ["agent_calls_used", "proof_runs_used"] {
+        a.calls_and_proofs_used = a
+            .calls_and_proofs_used
+            .checked_sub(saved.get(key).and_then(Value::as_u64).unwrap_or(0))
+            .and_then(|used| {
+                used.checked_add(proposed.get(key).and_then(Value::as_u64).unwrap_or(0))
+            })
+            .ok_or("cumulative budget usage overflow")?;
+    }
+    a.remaining = a
+        .budget_agent_calls
+        .map(|cap| cap.saturating_sub(a.calls_and_proofs_used));
     Ok(format!(
         "Cumulative budget: {} used of {}; {} remaining across {} run(s)",
         a.calls_and_proofs_used,

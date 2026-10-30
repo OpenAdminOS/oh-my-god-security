@@ -840,7 +840,10 @@ fn advisory_lines_locked(run: &Path, p: &Policy) -> Result<Vec<String>, String> 
     let view = crate::review::View::load_locked(run)?;
     let mut lines = Vec::new();
     if let Some(state) = &view.state {
-        lines.push(format!("advisory: {state}"));
+        lines.push(format!(
+            "advisory: {}",
+            crate::platform::escape_controls(state)
+        ));
     }
     for f in view
         .findings
@@ -867,7 +870,7 @@ fn advisory_findings(run: &Path, p: &Policy) {
         match advisory_lines_locked(run, p) {
             Ok(lines) => {
                 for line in lines {
-                    println!("{line}");
+                    println!("{}", crate::platform::escape_controls(&line));
                 }
             }
             Err(e) => println!(

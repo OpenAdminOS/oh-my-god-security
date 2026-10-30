@@ -156,6 +156,11 @@ pub fn timeline(run: &std::path::Path) -> Result<Vec<TimelineRow>, String> {
     };
     let doc = crate::shape::strict_json(&text)?;
     crate::status::check_document(doc.as_object().ok_or("pipeline status must be an object")?)?;
+    timeline_document(&doc)
+}
+
+pub fn timeline_document(doc: &serde_json::Value) -> Result<Vec<TimelineRow>, String> {
+    crate::status::check_document(doc.as_object().ok_or("pipeline status must be an object")?)?;
     fn row(v: &serde_json::Value, parent: &str, historical: bool) -> TimelineRow {
         let clock = |key: &str| {
             v.get(key)
@@ -255,6 +260,7 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
             plural(conf.len(), "confirmed finding", "confirmed findings")
         )
     };
+    let fix = markdown_inline(&fix);
     let mut out = format!("# What this asks of you\n\n{fix}\n\nVerify {} before fixing. {} were rejected after verification and need no action. Answer the intent questions below where recorded.\n\nRepository: {} at {}\nMode: {}\nSandbox: {}\n\nConfirmed findings: {}\nNeeds validation: {pending}\nRejected after verification: {rejected}\n\n", plural(pending, "pending record", "pending records"), plural(rejected, "lead", "leads"), markdown_inline(&meta.repo), markdown_inline(&meta.source_ref), markdown_inline(&meta.mode), markdown_inline(&meta.sandbox), conf.len());
     if let Some(sensors) = &meta.sensors {
         out.push_str(&format!("Sensors: {}\n\n", markdown_inline(sensors)));
@@ -839,7 +845,7 @@ fn render_section(id: &str, title: &str, intro: &str, body: &str) -> String {
     let intro = if intro.is_empty() {
         String::new()
     } else {
-        format!("<p class=\"intro\">{intro}</p>")
+        format!("<p class=\"intro\">{}</p>", html_escape(intro))
     };
     format!("<section class=\"sec sec-{id}\" id=\"{id}\" aria-labelledby=\"{id}-h\"><h2 id=\"{id}-h\">{title}</h2>{intro}{body}</section>")
 }
@@ -922,6 +928,7 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
             plural(conf.len(), "confirmed finding", "confirmed findings")
         )
     };
+    let fix_line = html_escape(&fix_line);
     let decide_line = if groups.is_empty() {
         "No open questions about intended behavior.".to_string()
     } else {
@@ -1516,7 +1523,21 @@ pub fn publish(
     publication: &std::collections::BTreeMap<&str, String>,
     render: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<Completion, String>,
 ) -> Result<(), String> {
+    publish_prepared(run, calls, models, publication, |meta, _| render(meta))
+}
+
+pub fn publish_prepared(
+    run: Option<&std::path::Path>,
+    calls: Option<u32>,
+    models: &std::collections::BTreeMap<String, String>,
+    publication: &std::collections::BTreeMap<&str, String>,
+    render: impl FnOnce(
+        &mut serde_json::Map<String, serde_json::Value>,
+        &mut crate::runmeta::Transaction,
+    ) -> Result<Completion, String>,
+) -> Result<(), String> {
     let transaction = |m: &mut serde_json::Map<String, serde_json::Value>| {
+        let mut writes = crate::runmeta::Transaction::default();
         if let Some(n) = calls {
             let old = m
                 .get("agent_calls_used")
@@ -1549,7 +1570,8 @@ pub fn publish(
             }
             labels.insert((*key).into(), serde_json::json!(value));
         }
-        let completion = render(m)?;
+        crate::runmeta::check_numeric_fields(m)?;
+        let completion = render(m, &mut writes)?;
         if let Some(n) = completion.hunters {
             m.insert("hunters".into(), serde_json::json!(n));
         }
@@ -1568,11 +1590,17 @@ pub fn publish(
             "completed_unix".into(),
             serde_json::json!(crate::runmeta::now_unix()),
         );
-        Ok(())
+        crate::runmeta::check_numeric_fields(m)?;
+        if let Some(run) = run {
+            if crate::runmeta::read_optional(run)?.is_some() {
+                writes.metadata(run, m)?;
+            }
+        }
+        writes.commit()
     };
     if let Some(run) = run {
         if crate::runmeta::read_optional(run)?.is_some() {
-            crate::runmeta::update(run, transaction)
+            crate::budget::with_family_lock(run, || transaction(&mut crate::runmeta::read(run)?))
         } else {
             crate::runmeta::with_lock(run, || {
                 if crate::runmeta::read_optional(run)?.is_some() {

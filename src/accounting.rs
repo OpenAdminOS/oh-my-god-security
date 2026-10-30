@@ -51,9 +51,6 @@ pub fn read(meta: &Map<String, Value>) -> Result<Accounting, String> {
             }
         }
     }
-    for role in ROLES {
-        values.entry(role.into()).or_default();
-    }
     Ok(values)
 }
 
@@ -296,7 +293,7 @@ pub fn aggregate(meta: &Map<String, Value>) -> Result<Value, String> {
     ] {
         let mut total = 0u64;
         let mut cost = 0.0;
-        let mut unknown = 0;
+        let mut unknown = usize::from(entries.is_empty());
         for usage in &entries {
             let known = match field {
                 "cost_usd" => {

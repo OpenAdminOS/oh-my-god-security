@@ -89,8 +89,7 @@ pub fn publish<T>(
             Path::new("findings.json"),
             crate::run_artifact::FINDINGS_BYTES,
         )?)?;
-        let mut errors = crate::model::validate_drafts(&file);
-        errors.extend(crate::proof::validate_proofs(&file, &run));
+        let errors = crate::model::validate_drafts(&file);
         if !errors.is_empty() {
             return Err(errors.join("\n"));
         }
@@ -99,6 +98,9 @@ pub fn publish<T>(
             &file,
             &crate::runmeta::read_optional(&run)?.unwrap_or_default(),
         )?;
+        if !view.proof_errors.is_empty() {
+            return Err(view.proof_errors.join("; "));
+        }
         write(&build_view(&run, &view, only)?)
     };
     if crate::runmeta::read_optional(&run)?.is_some() {
