@@ -92,13 +92,15 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "setup" => ("--yes --from --dry-run --install-skills --replace --verify-mxc --write-policy --mode", false),
         "coalition-anchor" => ("--directory", false),
         "install-self" => ("--to --staging --binary --binary-sha256 --mxc --mxc-sha256 --license --license-sha256", false),
-        "review" => ("--repo-url --mode --budget --no-sensors --persona --out --clone-root", false),
+        "identity" => ("--skill-dir", false),
+        "artifact-check" => ("--run --path", false),
+        "review" => ("--skill-dir --repo-url --mode --budget --no-sensors --persona --out --clone-root", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
-            "--target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of",
+            "--skill-dir --target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of",
             true,
         ),
         "batch" if args.first().is_some_and(|a| a == "init") => {
-            ("--list --out --mode --budget --no-sensors --persona --clone-root", true)
+            ("--skill-dir --list --out --mode --budget --no-sensors --persona --clone-root", true)
         }
         "batch" if args.first().is_some_and(|a| a == "index") => ("--batch --out", true),
         "bench" if args.first().is_some_and(|a| a == "score") => ("--cases --runs", true),
@@ -229,6 +231,8 @@ fn main() -> ExitCode {
             println!("omgs {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        "identity" => cmd_identity(rest),
+        "artifact-check" => cmd_artifact_check(rest),
         "update-check" => cmd_update_check(),
         "coalition-anchor" => cmd_coalition_anchor(rest),
         "install-self" => cmd_install_self(rest),
@@ -270,6 +274,31 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+fn cmd_identity(args: &[String]) -> Result<(), String> {
+    selected_skill(args)?;
+    println!("{}", omgs::setup::identity());
+    Ok(())
+}
+
+fn cmd_artifact_check(args: &[String]) -> Result<(), String> {
+    let run = flag(args, "--run").ok_or("artifact-check requires --run")?;
+    let path = flag(args, "--path").ok_or("artifact-check requires relative --path")?;
+    omgs::run_artifact::check_containment(Path::new(&run), Path::new(&path))?;
+    println!("artifact containment checked: {path}");
+    Ok(())
+}
+
+/// Validate external selection before cloning, scanning or creating a run.
+fn selected_skill(args: &[String]) -> Result<(), String> {
+    let selected = flag(args, "--skill-dir")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("OMGS_SKILL_DIR").map(PathBuf::from));
+    if let Some(path) = selected {
+        omgs::setup::check_identity(&path)?;
+    }
+    Ok(())
 }
 
 fn cmd_update_check() -> Result<(), String> {
@@ -2238,6 +2267,7 @@ fn resolve_existing_prefix(p: &Path) -> Result<PathBuf, String> {
 
 /// Initialize a run and return its directory.
 fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
+    selected_skill(rest)?;
     let Some(parent) = flag(rest, "--fix-of") else {
         return audit_init_limited(rest, omgs::stacks::INVENTORY_LIMIT);
     };
@@ -3093,25 +3123,37 @@ fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
                     repo.url
                 ));
             }
+            eprintln!("clone phase=reused destination={}", dest.display());
             return Ok(dest.clone());
         }
+        eprintln!("clone phase=start depth=1 destination={}", dest.display());
+        // Two bounded phase lines replace carriage-return Git progress for hosts.
         let status = git()
-            .args(["clone", "--depth", "1", "--no-recurse-submodules", "--"])
+            .args([
+                "clone",
+                "--quiet",
+                "--depth",
+                "1",
+                "--no-recurse-submodules",
+                "--",
+            ])
             .arg(&repo.url)
             .arg(&dest)
             .status()
             .map_err(|e| e.to_string())?;
         if !status.success() {
             let _ = std::fs::remove_dir_all(&dest);
+            eprintln!("clone phase=failed destination={}", dest.display());
             return Err(format!("git clone failed for {}", repo.url));
         }
+        eprintln!("clone phase=complete destination={}", dest.display());
         Ok(dest.clone())
     })
 }
 
 fn init_args(dest: &Path, args: &[String], out: Option<&Path>) -> Vec<String> {
     let mut v = vec!["--target".to_string(), dest.to_string_lossy().to_string()];
-    for name in ["--mode", "--budget", "--persona"] {
+    for name in ["--mode", "--budget", "--persona", "--skill-dir"] {
         if let Some(value) = flag(args, name) {
             v.push(name.into());
             v.push(value);
@@ -3132,6 +3174,7 @@ fn brief(dest: &Path, run: &Path) -> String {
 }
 
 fn cmd_review(args: &[String]) -> Result<(), String> {
+    selected_skill(args)?;
     let url = flag(args, "--repo-url").ok_or("review requires --repo-url <url>")?;
     if let Some(p) = flag(args, "--persona") {
         omgs::persona::defaults(&p)?;
@@ -3149,6 +3192,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
     let rest = args.get(1..).unwrap_or_default();
     match sub {
         Some("init") => {
+            selected_skill(rest)?;
             let list = flag(rest, "--list").ok_or("batch init requires --list <file>")?;
             let out = PathBuf::from(flag(rest, "--out").ok_or("batch init requires --out <dir>")?);
             let text = std::fs::read_to_string(&list).map_err(|e| format!("read {list}: {e}"))?;
@@ -3399,13 +3443,18 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         );
         Ok(usage)
     })?;
-    println!("{stage}: {state}");
+    let mut output = format!("{stage}: {state}\n");
     if !flags(args, "--accounting").is_empty() {
         for line in omgs::accounting::lines(&usage) {
-            println!("{line}");
+            output.push_str(&format!("{line}\n"));
         }
     }
-    Ok(())
+    use std::io::Write;
+    match std::io::stdout().lock().write_all(output.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(format!("status saved, but output failed: {e}")),
+    }
 }
 
 fn cmd_watch(args: &[String]) -> Result<(), String> {
@@ -4027,6 +4076,8 @@ mod cli_tests {
     }
 
     const COMMANDS: &[(&str, &str)] = &[
+        ("identity", ""),
+        ("artifact-check", ""),
         ("setup", ""),
         ("install-self", ""),
         ("coalition-anchor", ""),
@@ -4073,12 +4124,16 @@ mod cli_tests {
             let name = format!("cmd_{}", cmd.replace('-', "_"));
             let mut sections = vec![(name.as_str(), function(source, &name))];
             match (cmd, sub) {
+                ("identity" | "review" | "audit", _) | ("batch", "init") => {
+                    sections.push(("selected_skill", function(source, "selected_skill")));
+                    if cmd == "audit" {
+                        sections.push(("audit_init", function(source, "audit_init")));
+                        sections
+                            .push(("audit_init_limited", function(source, "audit_init_limited")));
+                    }
+                }
                 ("handoff" | "stage", _) => {
                     sections.push(("actionable_run", function(source, "actionable_run")));
-                }
-                ("audit", _) => {
-                    sections.push(("audit_init", function(source, "audit_init")));
-                    sections.push(("audit_init_limited", function(source, "audit_init_limited")));
                 }
                 ("doctor", _) => {
                     sections.push(("cmd_doctor_inner", function(source, "cmd_doctor_inner")));

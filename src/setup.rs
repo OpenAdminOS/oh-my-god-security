@@ -27,6 +27,59 @@ pub fn detected(home: &Path) -> Vec<PathBuf> {
 // lookup is used for the default installation.
 include!(concat!(env!("OUT_DIR"), "/skill.rs"));
 
+/// SHA-256 over sorted UTF-8 relative paths and bytes, with u64 big-endian
+/// lengths and a domain separator. Modes and timestamps do not affect identity.
+fn digest<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> String {
+    let mut files: Vec<_> = files.into_iter().collect();
+    files.sort_by_key(|(path, _)| *path);
+    let mut hash = crate::sha256::Sha256::new();
+    hash.update(b"omgs-skill/1\0");
+    for (path, bytes) in files {
+        hash.update(&(path.len() as u64).to_be_bytes());
+        hash.update(path.as_bytes());
+        hash.update(&(bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    crate::sha256::hex(&hash.finish())
+}
+
+pub fn bundled_digest() -> String {
+    digest(BUNDLED.iter().copied())
+}
+
+pub fn check_identity(root: &Path) -> Result<String, String> {
+    let files = manifest(root)?;
+    let names: Vec<_> = files
+        .keys()
+        .map(|p| {
+            p.components()
+                .map(|c| c.as_os_str().to_str().expect("validated UTF-8"))
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect();
+    let actual = digest(
+        names
+            .iter()
+            .zip(files.values())
+            .map(|(p, b)| (p.as_str(), b.as_slice())),
+    );
+    let expected = bundled_digest();
+    if actual != expected {
+        return Err(format!("skill identity mismatch at {}: selected sha256 {actual}, bundled sha256 {expected}, binary revision {}; stop and use matching release artifacts", root.display(), env!("OMGS_BUILD_REVISION")));
+    }
+    Ok(actual)
+}
+
+pub fn identity() -> serde_json::Value {
+    let text = ARTIFACT_IDENTITY
+        .strip_prefix("OMGS_IDENTITY_V1:")
+        .unwrap()
+        .strip_suffix(":OMGS_IDENTITY_END")
+        .unwrap();
+    serde_json::from_str(text).expect("build-generated identity")
+}
+
 fn unlinked(path: &Path) -> Result<(), String> {
     for parent in path.ancestors() {
         match std::fs::symlink_metadata(parent) {
