@@ -90,8 +90,17 @@ Selections allow 1 to 256 canonical relative non-overlapping paths; scoped trees
 links. Include the actual decision code, enforcement chain, configuration and required local
 dependencies. Omitted dependencies must block the proof, never be replaced with fabricated
 security behavior. Disclose the selection and challenge its sufficiency during evaluation.
-The retained identity is capped at 100000 entries and 16 MiB; use a selection if a full tree
-exceeds either bound. Copy and hash start/completion phases report elapsed time and entry count.
+Target names containing backslashes or colons are refused with the canonical relative path
+error before copying, including on Unix. Git indexes are normalized during fresh create-new
+staging with their identity-bound modes, including group-writable 0664 indexes. Manifest
+construction never rewrites the source tree. Index input remains capped at 16 MiB.
+The retained identity shares the gate hard maximum of 2,000,000 entries and is capped at
+12,800,065,536 serialized bytes (6,400 per allowed entry plus 65,536 bytes of overhead); use a
+selection if a full tree exceeds either bound. The serialized bound covers maximally escaped
+1024-byte paths at the hard entry cap. Digest calculation streams JSON into SHA-256 without a
+second full serialized buffer. The entry list and retained JSON reads/writes still require
+memory proportional to the admitted manifest. Copy and hash start/completion phases report
+elapsed time and entry count.
 Each execution receives a fresh disposable copy; no mutable workspace cache is reused.
 
 `--test-from` accepts a regular file or a directory outside the target. A directory's files are

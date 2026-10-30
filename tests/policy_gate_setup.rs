@@ -229,7 +229,7 @@ fn evidence(run: &Path, target: &Path) {
     }
     let mut proof = read(&run.join("proofs/1.json"));
     proof["target"] = json!(target);
-    let manifest = omgs::proof_inputs::manifest(target, None, false).unwrap();
+    let manifest = omgs::proof_inputs::manifest(target, None).unwrap();
     let digest = manifest.digest().unwrap();
     proof["target_sha256"] = json!(digest);
     proof["execution_inputs"] = json!({"version": omgs::proof_inputs::VERSION, "sha256": digest});

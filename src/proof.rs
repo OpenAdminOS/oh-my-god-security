@@ -520,7 +520,6 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
                     match crate::proof_inputs::manifest(
                         Path::new(target),
                         manifest.selection.clone(),
-                        false,
                     ) {
                         Ok(current) if current == manifest => {}
                         Ok(current) => errors.push(format!(
@@ -826,56 +825,6 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
 /// Content identity of the copied target before staging the proof test.
 /// Links are hashed as links, never followed into outside content. All .git
 /// content is included because config and hooks can change execution.
-pub fn tree_digest(root: &Path) -> std::io::Result<String> {
-    fn field(h: &mut crate::sha256::Sha256, bytes: &[u8]) {
-        h.update(&(bytes.len() as u64).to_le_bytes());
-        h.update(bytes);
-    }
-    fn walk(root: &Path, dir: &Path, h: &mut crate::sha256::Sha256) -> std::io::Result<()> {
-        let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            crate::supervise::check_interrupted()?;
-            let path = entry.path();
-            let rel = path.strip_prefix(root).map_err(std::io::Error::other)?;
-            let meta = std::fs::symlink_metadata(&path)?;
-            if crate::platform::contentless(&meta) {
-                continue;
-            }
-            field(h, rel.as_os_str().as_encoded_bytes());
-            if crate::platform::is_link(&meta) {
-                field(h, b"link");
-                let link = std::fs::canonicalize(&path)
-                    .ok()
-                    .and_then(|p| p.strip_prefix(root).ok().map(PathBuf::from))
-                    .map(|p| PathBuf::from("@workspace").join(p))
-                    .unwrap_or(std::fs::read_link(&path)?);
-                field(h, link.as_os_str().as_encoded_bytes());
-            } else {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    field(h, &(meta.permissions().mode() & 0o777).to_le_bytes());
-                }
-                if meta.is_dir() {
-                    field(h, b"dir");
-                    walk(root, &path, h)?;
-                } else if meta.is_file() {
-                    field(h, b"file");
-                    field(h, crate::sha256::digest_file(&path)?.as_bytes());
-                } else {
-                    return Err(std::io::Error::other(format!("unsupported target file type at {}; only regular files, directories and symlinks are supported", path.display())));
-                }
-            }
-        }
-        Ok(())
-    }
-    let root = std::fs::canonicalize(root)?;
-    let mut h = crate::sha256::Sha256::new();
-    walk(&root, &root, &mut h)?;
-    Ok(crate::sha256::hex(&h.finish()))
-}
-
 /// The checkout's commit, read from `.git` as data. Git itself is never run
 /// against the target, since repository config can execute programs.
 pub fn git_head(target: &Path) -> Option<String> {
@@ -1611,7 +1560,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_digest_includes_dirty_changes_and_git_behavior() {
+    fn manifest_includes_dirty_changes_and_git_behavior() {
         let d = crate::platform::temp_root()
             .unwrap()
             .join(format!("omgs-digest-{}", std::process::id()));
@@ -1620,15 +1569,23 @@ mod tests {
         for name in ["a", "nested/.git/config", "nested/.git/hooks/pre-commit"] {
             std::fs::write(d.join(name), b"one").unwrap();
         }
-        let first = tree_digest(&d).unwrap();
+        let first = crate::proof_inputs::manifest(&d, None).unwrap();
         for name in ["a", "nested/.git/config", "nested/.git/hooks/pre-commit"] {
             std::fs::write(d.join(name), b"two").unwrap();
-            assert_ne!(tree_digest(&d).unwrap(), first, "{name}");
+            assert_ne!(
+                crate::proof_inputs::manifest(&d, None).unwrap(),
+                first,
+                "{name}"
+            );
             std::fs::write(d.join(name), b"one").unwrap();
-            assert_eq!(tree_digest(&d).unwrap(), first, "{name}");
+            assert_eq!(
+                crate::proof_inputs::manifest(&d, None).unwrap(),
+                first,
+                "{name}"
+            );
         }
         std::fs::create_dir(d.join("empty")).unwrap();
-        assert_ne!(tree_digest(&d).unwrap(), first);
+        assert_ne!(crate::proof_inputs::manifest(&d, None).unwrap(), first);
         let _ = std::fs::remove_dir_all(d);
     }
 

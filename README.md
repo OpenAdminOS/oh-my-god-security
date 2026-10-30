@@ -238,6 +238,17 @@ These checks catch mistakes and hand-edited records. They do not defend against 
 See [proof record mechanics](docs/internals.md#what-a-proof-record-does-and-does-not-prove)
 for contracts, markers, validation, replay requirements, redaction and schema compatibility.
 
+Proof execution inputs share the gate hard maximum of 2,000,000 files and directories
+(links also count for proof identities). Gate export defaults to 200,000 entries and
+4 GiB; base-policy `gate_limits` can raise these to 2,000,000 entries and 64 GiB.
+Execution manifests allow 12,800,065,536 serialized bytes, scaled to cover canonical
+paths up to 1024 bytes at the entry maximum. Digests stream serialized JSON;
+entry lists and retained JSON still require proportional memory. Git indexes are
+limited to 16 MiB and normalized during fresh staging, preserving bound modes
+including 0664. Target names containing backslashes or colons are refused before
+copying on every platform. Use `--inputs-from` to scope an ordinary proof; gate
+exports must fit their base-policy limits and do not accept that option.
+
 ## Releases and verifying your download
 
 The tag-only [release workflow](.github/workflows/release.yml) signs and notarizes

@@ -3,8 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const VERSION: u32 = 3;
-pub const MAX_ENTRIES: usize = 100_000;
-pub const MAX_MANIFEST_BYTES: u64 = 16 << 20;
+// Shared with gate export policy. Six JSON bytes per path byte plus entry
+// fields covers even maximally escaped canonical 1024-byte paths.
+pub const MAX_ENTRIES: usize = crate::policy::GateLimits::MAX_ENTRIES;
+pub const MAX_MANIFEST_BYTES: u64 = MAX_ENTRIES as u64 * 6400 + 65536;
+pub(crate) const MAX_INDEX_BYTES: u64 = 16 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -79,15 +82,43 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn bytes(&self) -> Result<Vec<u8>, String> {
+        check_entry_count(self.entries.len())?;
         let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
         if bytes.len() as u64 > MAX_MANIFEST_BYTES {
-            return Err("execution input manifest exceeds 16 MiB; use --inputs-from".into());
+            return Err(
+                "execution input manifest exceeds serialized byte limit; use --inputs-from".into(),
+            );
         }
         Ok(bytes)
     }
 
     pub fn digest(&self) -> Result<String, String> {
-        Ok(crate::sha256::digest(&self.bytes()?))
+        struct DigestWriter {
+            hash: crate::sha256::Sha256,
+            bytes: u64,
+        }
+        impl std::io::Write for DigestWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes += bytes.len() as u64;
+                if self.bytes > MAX_MANIFEST_BYTES {
+                    return Err(std::io::Error::other(
+                        "execution input manifest exceeds serialized byte limit",
+                    ));
+                }
+                self.hash.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        check_entry_count(self.entries.len())?;
+        let mut writer = DigestWriter {
+            hash: crate::sha256::Sha256::new(),
+            bytes: 0,
+        };
+        serde_json::to_writer(&mut writer, self).map_err(|e| e.to_string())?;
+        Ok(crate::sha256::hex(&writer.hash.finish()))
     }
 
     pub fn differences(&self, other: &Self) -> String {
@@ -111,6 +142,15 @@ impl Manifest {
             names.join(", ")
         )
     }
+}
+
+fn check_entry_count(count: usize) -> Result<(), String> {
+    if count > MAX_ENTRIES {
+        return Err(format!(
+            "execution input manifest exceeds {MAX_ENTRIES} entries; use --inputs-from"
+        ));
+    }
+    Ok(())
 }
 
 /// Windows reparse links cannot be materialized with portable exact semantics.
@@ -159,30 +199,25 @@ pub fn permissions(mode: u32, current: std::fs::Permissions) -> std::fs::Permiss
 }
 
 /// Hash normalized index bytes as well as all other Git state. The same index
-/// normalization is applied to the disposable workspace before execution.
-pub fn manifest(
-    root: &Path,
-    selection: Option<Selection>,
-    normalize: bool,
-) -> Result<Manifest, String> {
+/// normalization is applied while freshly staging the disposable workspace.
+pub fn manifest(root: &Path, selection: Option<Selection>) -> Result<Manifest, String> {
     if let Some(s) = &selection {
         s.validate()?;
     }
     let mut entries = Vec::new();
-    walk(root, root, normalize, selection.as_ref(), &mut entries)?;
+    walk(root, root, selection.as_ref(), &mut entries)?;
     let manifest = Manifest {
         version: VERSION,
         selection,
         entries,
     };
-    manifest.bytes()?;
+    manifest.digest()?;
     Ok(manifest)
 }
 
 fn walk(
     root: &Path,
     dir: &Path,
-    normalize: bool,
     selection: Option<&Selection>,
     out: &mut Vec<Entry>,
 ) -> Result<(), String> {
@@ -211,11 +246,7 @@ fn walk(
         if crate::platform::contentless(&meta) {
             continue;
         }
-        if out.len() >= MAX_ENTRIES {
-            return Err(
-                "execution input manifest exceeds 100000 entries; use --inputs-from".into(),
-            );
-        }
+        check_entry_count(out.len() + 1)?;
         let (kind, digest) = if crate::platform::is_link(&meta) {
             admit_link(&path)?;
             let link = std::fs::read_link(&path).map_err(|e| e.to_string())?;
@@ -227,18 +258,9 @@ fn walk(
             ("dir", crate::sha256::digest(b""))
         } else if meta.is_file() {
             if canonical_git_index(rel) {
-                let bytes = crate::platform::read_bounded_in(root, rel, MAX_MANIFEST_BYTES)
+                let bytes = crate::platform::read_bounded_in(root, rel, MAX_INDEX_BYTES)
                     .map_err(|e| e.to_string())?;
                 let bytes = normalize_index(&bytes).map_err(|e| format!("{name}: {e}"))?;
-                if normalize {
-                    // Replace rather than modifying a possible hardlink to source.
-                    crate::runmeta::write_atomic_bytes_with_permissions(
-                        &path,
-                        &bytes,
-                        meta.permissions(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
                 ("file", crate::sha256::digest(&bytes))
             } else {
                 (
@@ -256,7 +278,7 @@ fn walk(
             sha256: digest,
         });
         if meta.is_dir() && !crate::platform::is_link(&meta) {
-            walk(root, &path, normalize, selection, out)?;
+            walk(root, &path, selection, out)?;
         }
     }
     Ok(())
@@ -347,7 +369,7 @@ fn set_timestamp(path: &Path) -> std::io::Result<()> {
 
 // Git owns these names directly inside a .git directory. Hook data and
 // auxiliary metadata remain byte-bound, even when a leaf is named index.
-fn canonical_git_index(path: &Path) -> bool {
+pub(crate) fn canonical_git_index(path: &Path) -> bool {
     path.parent()
         .and_then(Path::file_name)
         .is_some_and(|p| p == ".git")
@@ -356,7 +378,7 @@ fn canonical_git_index(path: &Path) -> bool {
 
 /// Index v2/v3 with SHA-1 object IDs. Unknown formats fail closed. Preserve
 /// modes, object IDs, paths, stages, flags and supported semantic extensions.
-fn normalize_index(input: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn normalize_index(input: &[u8]) -> Result<Vec<u8>, String> {
     let invalid = || {
         "unsupported or malformed Git index; only SHA-1 index versions 2 and 3 are supported"
             .to_string()
@@ -562,7 +584,7 @@ mod tests {
         let mut identities = std::collections::BTreeSet::new();
         for text in ["source", "./source", "@workspace/source", "missing"] {
             std::os::unix::fs::symlink(text, d.join("selected")).unwrap();
-            let identity = manifest(&d, None, false).unwrap();
+            let identity = manifest(&d, None).unwrap();
             assert_eq!(
                 identity
                     .entries
@@ -602,6 +624,72 @@ mod tests {
             assert!(!d.join("missing").exists());
         }
         std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn gate_manifest_limits_cover_export_boundary_and_stream_identical_json() {
+        assert_eq!(MAX_ENTRIES, crate::policy::GateLimits::MAX_ENTRIES);
+        check_entry_count(crate::scratch::GATE_EXPORT_ENTRIES).unwrap();
+        check_entry_count(MAX_ENTRIES).unwrap();
+        assert!(check_entry_count(MAX_ENTRIES + 1).is_err());
+        // Synthetic entries exercise the former entry and serialized byte caps
+        // without creating hundreds of thousands of filesystem objects in CI.
+        let manifest = Manifest {
+            version: VERSION,
+            selection: None,
+            entries: (0..100_001)
+                .map(|i| Entry {
+                    path: format!("{:0200}", i),
+                    kind: "dir".into(),
+                    mode: 0,
+                    sha256: crate::sha256::digest(b""),
+                })
+                .collect(),
+        };
+        let bytes = manifest.bytes().unwrap();
+        assert!(bytes.len() > 16 << 20);
+        assert_eq!(manifest.digest().unwrap(), crate::sha256::digest(&bytes));
+        // Worst-case JSON escaping for each admitted path still fits the scaled
+        // cap at the gate hard maximum, including all fields and the header.
+        let entry = Entry {
+            path: "\u{1}".repeat(1024),
+            kind: "file".into(),
+            mode: 0o777,
+            sha256: "f".repeat(64),
+        };
+        safe_path(&entry.path).unwrap();
+        let size = serde_json::to_vec(&entry).unwrap().len() as u64 + 1;
+        assert!(size * MAX_ENTRIES as u64 + 65536 <= MAX_MANIFEST_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_index_is_normalized_during_fresh_staging() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("shared-index");
+        let src = root.join("source");
+        let dst = root.join("copy");
+        std::fs::create_dir_all(src.join(".git")).unwrap();
+        let raw = index();
+        std::fs::write(src.join(".git/index"), &raw).unwrap();
+        std::fs::set_permissions(
+            src.join(".git/index"),
+            std::fs::Permissions::from_mode(0o664),
+        )
+        .unwrap();
+        let before = manifest(&src, None).unwrap();
+        crate::sandbox::copy_tree(&src, &dst).unwrap();
+        assert_eq!(manifest(&dst, None).unwrap(), before);
+        assert_eq!(std::fs::read(src.join(".git/index")).unwrap(), raw);
+        assert_eq!(
+            std::fs::read(dst.join(".git/index")).unwrap(),
+            normalize_index(&raw).unwrap()
+        );
+        assert_eq!(
+            mode(&std::fs::metadata(dst.join(".git/index")).unwrap()),
+            0o664
+        );
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
 
     fn index() -> Vec<u8> {
@@ -715,14 +803,14 @@ mod tests {
             std::fs::write(d.join(name), b"original").unwrap();
         }
         crate::runmeta::write_atomic_bytes(&d.join(".git/index"), &index()).unwrap();
-        let original = manifest(&d, None, false).unwrap();
+        let original = manifest(&d, None).unwrap();
         for name in names {
             std::fs::write(d.join(name), b"changed").unwrap();
-            let next = manifest(&d, None, false).unwrap();
+            let next = manifest(&d, None).unwrap();
             assert_ne!(next.digest().unwrap(), original.digest().unwrap());
             assert!(original.differences(&next).contains(name));
             if name.contains("hooks/") || name.ends_with("sharedindex.fixture") {
-                assert_eq!(manifest(&d, None, true).unwrap(), next);
+                assert_eq!(manifest(&d, None).unwrap(), next);
                 assert_eq!(std::fs::read(d.join(name)).unwrap(), b"changed");
             }
             std::fs::write(d.join(name), b"original").unwrap();
@@ -730,13 +818,10 @@ mod tests {
         let raw = index();
         let mut refreshed = raw.clone();
         refreshed[12] ^= 1;
-        crate::runmeta::write_atomic_bytes(&d.join(".git/index"), &reseal(refreshed)).unwrap();
-        assert_eq!(manifest(&d, None, false).unwrap(), original);
-        assert_eq!(manifest(&d, None, true).unwrap(), original);
-        assert_eq!(
-            std::fs::read(d.join(".git/index")).unwrap(),
-            normalize_index(&raw).unwrap()
-        );
+        let refreshed = reseal(refreshed);
+        crate::runmeta::write_atomic_bytes(&d.join(".git/index"), &refreshed).unwrap();
+        assert_eq!(manifest(&d, None).unwrap(), original);
+        assert_eq!(std::fs::read(d.join(".git/index")).unwrap(), refreshed);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -746,7 +831,7 @@ mod tests {
                 std::fs::Permissions::from_mode(permissions.mode() ^ 0o100),
             )
             .unwrap();
-            assert_ne!(manifest(&d, None, false).unwrap(), original);
+            assert_ne!(manifest(&d, None).unwrap(), original);
         }
         std::fs::remove_dir_all(d).unwrap();
     }
@@ -765,12 +850,12 @@ mod tests {
             version: 1,
             paths: vec!["source".into()],
         });
-        let first = manifest(&d, selection.clone(), false).unwrap();
+        let first = manifest(&d, selection.clone()).unwrap();
         assert!(first.entries.iter().any(|e| e.path == ".git/config"));
         std::fs::write(d.join("asset"), b"changed").unwrap();
-        assert_eq!(manifest(&d, selection.clone(), false).unwrap(), first);
+        assert_eq!(manifest(&d, selection.clone()).unwrap(), first);
         std::fs::write(d.join(".git/config"), b"changed").unwrap();
-        assert_ne!(manifest(&d, selection, false).unwrap(), first);
+        assert_ne!(manifest(&d, selection).unwrap(), first);
         for paths in [
             vec!["../a"],
             vec!["a", "a/b"],

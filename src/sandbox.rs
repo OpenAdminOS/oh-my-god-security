@@ -992,6 +992,13 @@ fn inspect_target(
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         supervise::check_interrupted().map_err(|e| e.to_string())?;
         let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let relative = path.strip_prefix(root).map_err(|e| e.to_string())?;
+        let name = relative
+            .to_str()
+            .ok_or("execution input paths must be UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        crate::proof_inputs::safe_path(&name)?;
         let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
         if platform::is_link(&meta) {
             crate::proof_inputs::admit_link(&entry.path())?;
@@ -1078,6 +1085,7 @@ fn copy_recursive(
         }) {
             continue;
         }
+        crate::proof_inputs::safe_path(&name)?;
         let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
         let to = dst.join(entry.file_name());
         if platform::is_link(&meta) {
@@ -1093,15 +1101,32 @@ fn copy_recursive(
         } else if meta.is_file() {
             // stage_file uses create_new and dense writes, with no clone/copy
             // operation that could retain xattrs, ACLs, flags or sparse holes.
-            stage_file(
-                dst,
-                entry
-                    .file_name()
-                    .to_str()
-                    .ok_or("execution input paths must be UTF-8")?,
-                &path,
-            )
-            .map_err(|e| e.to_string())?;
+            if crate::proof_inputs::canonical_git_index(rel) {
+                let bytes =
+                    platform::read_bounded_in(&roots.0, rel, crate::proof_inputs::MAX_INDEX_BYTES)
+                        .map_err(|e| e.to_string())?;
+                let bytes = crate::proof_inputs::normalize_index(&bytes)?;
+                stage_content(
+                    dst,
+                    entry
+                        .file_name()
+                        .to_str()
+                        .ok_or("execution input paths must be UTF-8")?,
+                    std::io::Cursor::new(bytes),
+                    meta.permissions(),
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                stage_file(
+                    dst,
+                    entry
+                        .file_name()
+                        .to_str()
+                        .ok_or("execution input paths must be UTF-8")?,
+                    &path,
+                )
+                .map_err(|e| e.to_string())?;
+            }
         } else if !platform::contentless(&meta) {
             return Err(format!(
                 "unsupported target file type at {}; devices are refused",
@@ -1224,7 +1249,12 @@ fn stage_content(
         out.write_all(&bytes[..n])?;
     }
     let mode = crate::proof_inputs::permission_mode(&permissions);
-    out.set_permissions(crate::proof_inputs::permissions(mode, permissions))
+    // Windows Permissions also carries file attributes. Never transfer directory
+    // attributes from a harness root onto a newly created regular file.
+    out.set_permissions(crate::proof_inputs::permissions(
+        mode,
+        out.metadata()?.permissions(),
+    ))
 }
 
 /// Admit the entire harness before writing any file. A harness owns fresh
@@ -1415,7 +1445,7 @@ fn stage_workspace(
     let manifest = req
         .target
         .as_ref()
-        .map(|_| crate::proof_inputs::manifest(workspace, req.inputs.clone(), true))
+        .map(|_| crate::proof_inputs::manifest(workspace, req.inputs.clone()))
         .transpose()?;
     let digest = manifest
         .as_ref()
@@ -2289,13 +2319,13 @@ mod tests {
                     "windows",
                     &workspace,
                     "echo fixture",
-                    "fixture-nonce",
+                    "wrapper-fixture-nonce",
                     req.test.as_deref(),
                 )
                 .unwrap();
                 let wrapper = workspace.join(format!(
                     "{}.cmd",
-                    wrapper_name("echo fixture", "fixture-nonce", req.test.as_deref())
+                    wrapper_name("echo fixture", "wrapper-fixture-nonce", req.test.as_deref())
                 ));
                 assert_eq!(
                     crate::proof_inputs::mode(&std::fs::metadata(&wrapper).unwrap()),
@@ -2303,7 +2333,7 @@ mod tests {
                 );
                 assert!(std::fs::read_to_string(wrapper)
                     .unwrap()
-                    .contains("OMGS_START_fixture-nonce"));
+                    .contains("OMGS_START_wrapper-fixture-nonce"));
                 // Read-only Windows fixtures must be restored before cleanup.
                 set_input_permissions(&file, fixed_file_mode()).unwrap();
             }
@@ -2414,13 +2444,10 @@ mod tests {
         drop(sparse);
         std::fs::set_permissions(src.join("a"), std::fs::Permissions::from_mode(0o6755)).unwrap();
         std::fs::set_permissions(src.join("dir"), std::fs::Permissions::from_mode(0o3775)).unwrap();
-        let before = crate::proof_inputs::manifest(&src, None, false).unwrap();
+        let before = crate::proof_inputs::manifest(&src, None).unwrap();
         let first = d.join("first");
         copy_tree(&src, &first).unwrap();
-        assert_eq!(
-            crate::proof_inputs::manifest(&first, None, false).unwrap(),
-            before
-        );
+        assert_eq!(crate::proof_inputs::manifest(&first, None).unwrap(), before);
         for name in ["a", "b"] {
             let meta = std::fs::metadata(first.join(name)).unwrap();
             assert_eq!(meta.nlink(), 1);
@@ -2443,14 +2470,11 @@ mod tests {
         std::fs::set_permissions(src.join("b"), std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::set_permissions(src.join("dir"), std::fs::Permissions::from_mode(0o775)).unwrap();
         std::fs::write(src.join("zeros"), vec![0; 2 << 20]).unwrap();
-        assert_eq!(
-            crate::proof_inputs::manifest(&src, None, false).unwrap(),
-            before
-        );
+        assert_eq!(crate::proof_inputs::manifest(&src, None).unwrap(), before);
         let second = d.join("second");
         copy_tree(&src, &second).unwrap();
         assert_eq!(
-            crate::proof_inputs::manifest(&second, None, false).unwrap(),
+            crate::proof_inputs::manifest(&second, None).unwrap(),
             before
         );
         assert_eq!(
@@ -2497,7 +2521,7 @@ mod tests {
             };
             assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
         }
-        let before = crate::proof_inputs::manifest(&src, None, false).unwrap();
+        let before = crate::proof_inputs::manifest(&src, None).unwrap();
         for (n, value) in [b"BEFORE".as_slice(), b"AFTER".as_slice()]
             .iter()
             .enumerate()
@@ -2525,10 +2549,7 @@ mod tests {
                 )
             };
             assert_eq!(result, 0);
-            assert_eq!(
-                crate::proof_inputs::manifest(&src, None, false).unwrap(),
-                before
-            );
+            assert_eq!(crate::proof_inputs::manifest(&src, None).unwrap(), before);
             let dst = d.join(format!("copy-{n}"));
             copy_tree(&src, &dst).unwrap();
             for path in [&dst, &dst.join("file")] {
@@ -2555,10 +2576,7 @@ mod tests {
                 };
                 assert_eq!(result, -1, "source xattr must be absent");
             }
-            assert_eq!(
-                crate::proof_inputs::manifest(&dst, None, false).unwrap(),
-                before
-            );
+            assert_eq!(crate::proof_inputs::manifest(&dst, None).unwrap(), before);
         }
         std::fs::remove_dir_all(d).unwrap();
     }
@@ -2575,7 +2593,7 @@ mod tests {
         let src = d.join("source");
         std::fs::create_dir_all(src.join("dir")).unwrap();
         std::fs::write(src.join("file"), b"bytes").unwrap();
-        let before = crate::proof_inputs::manifest(&src, None, false).unwrap();
+        let before = crate::proof_inputs::manifest(&src, None).unwrap();
         let acl_listing = |path: &Path| {
             let out = Command::new("/bin/ls")
                 .arg("-lde")
@@ -2600,20 +2618,14 @@ mod tests {
             let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
             assert_eq!(unsafe { libc::chflags(cpath.as_ptr(), libc::UF_HIDDEN) }, 0);
         }
-        assert_eq!(
-            crate::proof_inputs::manifest(&src, None, false).unwrap(),
-            before
-        );
+        assert_eq!(crate::proof_inputs::manifest(&src, None).unwrap(), before);
         let dst = d.join("copy");
         copy_tree(&src, &dst).unwrap();
         for path in [&dst, &dst.join("dir"), &dst.join("file")] {
             assert!(!acl_listing(path));
             assert_eq!(std::fs::metadata(path).unwrap().st_flags(), 0);
         }
-        assert_eq!(
-            crate::proof_inputs::manifest(&dst, None, false).unwrap(),
-            before
-        );
+        assert_eq!(crate::proof_inputs::manifest(&dst, None).unwrap(), before);
         std::fs::remove_dir_all(d).unwrap();
     }
 
@@ -2645,7 +2657,7 @@ mod tests {
                 }
                 panic!("{kind}: {e}");
             }
-            let validation = crate::proof_inputs::manifest(&src, None, false).unwrap_err();
+            let validation = crate::proof_inputs::manifest(&src, None).unwrap_err();
             let staging = copy_tree(&src, &d.join(format!("copy-{kind}"))).unwrap_err();
             assert_eq!(staging, validation);
             assert!(staging.contains("unsupported execution input link on Windows"));
@@ -2656,6 +2668,28 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noncanonical_target_names_are_refused_before_copying() {
+        let base = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-names-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let src = base.join("target");
+        std::fs::create_dir_all(&src).unwrap();
+        for name in [r"a\b", "a:b"] {
+            let path = src.join(name);
+            std::fs::write(&path, b"fixture").unwrap();
+            let expected = crate::proof_inputs::manifest(&src, None).unwrap_err();
+            assert!(expected.contains("canonical relative paths"));
+            let dst = base.join("copy");
+            assert_eq!(copy_tree(&src, &dst).unwrap_err(), expected);
+            assert!(!dst.exists());
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(unix)]
@@ -2686,9 +2720,9 @@ mod tests {
             std::os::unix::fs::symlink(target, src.join(name)).unwrap();
         }
         std::fs::write(d.join("outside"), "outside").unwrap();
-        let digest = crate::proof::tree_digest(&src).unwrap();
+        let digest = crate::proof_inputs::manifest(&src, None).unwrap();
         copy_tree(&src, &dst).unwrap();
-        let copied_digest = crate::proof::tree_digest(&dst).unwrap();
+        let copied_digest = crate::proof_inputs::manifest(&dst, None).unwrap();
         assert_eq!(std::fs::read(dst.join("large")).unwrap(), data);
         assert_ne!(
             std::fs::metadata(dst.join("a")).unwrap().ino(),
@@ -2722,9 +2756,9 @@ mod tests {
             assert!(gaps.iter().any(|gap| gap.ends_with(name)), "{gaps:?}");
             assert!(!special_copy.join(name).exists());
         }
-        assert_eq!(crate::proof::tree_digest(&src).unwrap(), digest);
+        assert_eq!(crate::proof_inputs::manifest(&src, None).unwrap(), digest);
         assert_eq!(
-            crate::proof::tree_digest(&special_copy).unwrap(),
+            crate::proof_inputs::manifest(&special_copy, None).unwrap(),
             copied_digest
         );
         assert!(crate::sha256::digest_file(&fifo).is_err());

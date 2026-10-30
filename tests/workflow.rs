@@ -391,7 +391,7 @@ fn bind_execution_inputs(
     target: &std::path::Path,
     record: &mut omgs::proof::ProofRecord,
 ) {
-    let manifest = omgs::proof_inputs::manifest(target, None, false).unwrap();
+    let manifest = omgs::proof_inputs::manifest(target, None).unwrap();
     let digest = manifest.digest().unwrap();
     record.target_sha256 = Some(digest.clone());
     record.execution_inputs = Some(omgs::proof::ExecutionInputs {
@@ -2775,7 +2775,7 @@ fn stage_patch_applies_without_touching_target_and_rejects_bad_inputs() {
     let target = dir.with_extension("target");
     omgs::platform::create_private_tree(&target).unwrap();
     std::fs::write(target.join("source.txt"), "unchanged\n").unwrap();
-    let before = omgs::proof::tree_digest(&target).unwrap();
+    let before = omgs::proof_inputs::manifest(&target, None).unwrap();
     let mut p = omgs::proof::load(&dir, "proofs/1.json").unwrap();
     p.target = Some(target.to_string_lossy().into());
     bind_execution_inputs(&dir, &target, &mut p);
@@ -2806,7 +2806,7 @@ fn stage_patch_applies_without_touching_target_and_rejects_bad_inputs() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(omgs::proof::tree_digest(&target).unwrap(), before);
+    assert_eq!(omgs::proof_inputs::manifest(&target, None).unwrap(), before);
     let copy = dir.with_extension("copy");
     std::fs::create_dir(&copy).unwrap();
     std::fs::copy(target.join("source.txt"), copy.join("source.txt")).unwrap();
@@ -3546,7 +3546,7 @@ fn stage_includes_only_validated_confirmed_proofs_and_reports_exclusions() {
     let dir = scratch("stage-admission");
     let target = dir.with_extension("target");
     omgs::platform::create_private_tree(&target).unwrap();
-    let snapshot = omgs::proof::tree_digest(&target).unwrap();
+    let snapshot = omgs::proof_inputs::manifest(&target, None).unwrap();
     write_private_fixture(
         dir.join("run-metadata.json"),
         serde_json::json!({"target":target}).to_string(),
@@ -3633,7 +3633,10 @@ fn stage_includes_only_validated_confirmed_proofs_and_reports_exclusions() {
         diagnostic.contains(&file.findings[2].fingerprint)
             && diagnostic.contains("did not finish cleanly")
     );
-    assert_eq!(omgs::proof::tree_digest(&target).unwrap(), snapshot);
+    assert_eq!(
+        omgs::proof_inputs::manifest(&target, None).unwrap(),
+        snapshot
+    );
     std::fs::remove_dir_all(dir).unwrap();
     std::fs::remove_dir_all(target).unwrap();
 }

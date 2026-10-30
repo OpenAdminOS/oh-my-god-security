@@ -2088,7 +2088,7 @@ fn socket_and_fifo_gaps_survive_validation_and_replay() {
         assert_eq!(
             record.target_sha256.as_deref(),
             Some(
-                omgs::proof_inputs::manifest(&target, None, false)
+                omgs::proof_inputs::manifest(&target, None)
                     .unwrap()
                     .digest()
                     .unwrap()
@@ -2833,7 +2833,21 @@ fn incidental_git_status_refresh_replays_but_staged_index_changes_do_not() {
     // These commands only construct a synthetic repository. No audited source
     // or repository-supplied configuration is executed on the host.
     let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        // Git refreshes replace the index. Keep its mode stable at 0664 for
+        // every fixture operation without changing this test process's umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: umask is async-signal-safe and affects only the child.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::umask(0o002);
+                    Ok(())
+                });
+            }
+        }
+        let out = command
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args([
@@ -2857,6 +2871,18 @@ fn incidental_git_status_refresh_replays_but_staged_index_changes_do_not() {
     )
     .unwrap();
     git(&["add", "--", "source", "test.sh"]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(target.join(".git/index"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o664
+        );
+    }
     omgs::platform::private_dir(&run).unwrap();
     write_private_fixture(
         run.join(omgs::runmeta::FILE),
@@ -2883,7 +2909,8 @@ fn incidental_git_status_refresh_replays_but_staged_index_changes_do_not() {
     let after = std::fs::read(target.join(".git/index")).unwrap();
     assert_ne!(before, after, "fixture must exercise a real index refresh");
     let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
-    assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+    let evidence_errors = omgs::proof::runner_evidence(&run, &record);
+    assert!(evidence_errors.is_empty(), "{evidence_errors:?}");
     let replay = omgs(
         &d,
         &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
