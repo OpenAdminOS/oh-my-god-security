@@ -16,7 +16,6 @@ const MAX_REQUEST: usize = 8 * 1024;
 /// How long the page keeps updating after the run completes, so the final
 /// state is visible before the server goes away.
 const COMPLETE_GRACE: Duration = Duration::from_secs(10);
-const EMPTY_STATUS: &str = "{\"stages\":[],\"updated_ms\":0}";
 
 pub struct Response {
     pub status: u16,
@@ -77,15 +76,10 @@ pub fn respond(raw: &str, port: u16, run_dir: &Path) -> Response {
             body: DASHBOARD.as_bytes().to_vec(),
         },
         "/pipeline-status.json" => {
-            let body = match crate::run_artifact::read(
-                run_dir,
-                Path::new(crate::status::FILE),
-                crate::run_artifact::DASHBOARD_STATUS_BYTES,
-            ) {
+            let body = match crate::review::View::load(run_dir)
+                .and_then(|view| serde_json::to_vec(&view.progress).map_err(|e| e.to_string()))
+            {
                 Ok(bytes) => bytes,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    EMPTY_STATUS.as_bytes().to_vec()
-                }
                 Err(_) => {
                     return Response {
                         status: 500,

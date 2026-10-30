@@ -101,7 +101,11 @@ pub fn apply_with_logs(dir: &Path, u: &Update, logs: &[String]) -> Result<(), St
         if u.state != "done" {
             crate::runmeta::invalidate_completion_locked(dir)?;
         }
-        Ok(())
+        let view = crate::review::View::load_locked(dir)?;
+        write_atomic(
+            &dir.join(FILE),
+            &serde_json::to_string_pretty(&view.progress).map_err(|e| e.to_string())?,
+        )
     })
 }
 

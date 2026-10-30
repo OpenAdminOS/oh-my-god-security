@@ -273,19 +273,36 @@ pub fn critique(
 /// Load a run directory's `findings.json` and critique it together with the
 /// ledger and candidates beside it.
 pub fn critique_run(dir: &Path) -> Result<CriticReport, String> {
-    let findings = crate::shape::findings(&crate::run_artifact::text(
-        dir,
-        Path::new("findings.json"),
-        crate::run_artifact::FINDINGS_BYTES,
-    )?)
-    .map_err(|e| format!("parse findings.json: {e}"))?;
-    critique_dir(dir, &findings)
+    published_report(crate::review::View::load(dir)?)
 }
 
-/// Critique the given findings against the ledger and every
-/// `candidates*.json` in `dir`. Used by `omgs report`, so the critic result
-/// always describes the exact findings being rendered.
+/// Critique exactly the supplied findings through the publication view.
 pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport, String> {
+    published_report(crate::review::View::with_findings(dir, findings)?)
+}
+
+fn published_report(view: crate::review::View) -> Result<CriticReport, String> {
+    let mut report = view.meta.critic.ok_or("coverage-ledger.json missing")?;
+    for reason in view.meta.review_limits {
+        if !report.gaps.contains(&reason) {
+            report.gaps.push(reason);
+        }
+    }
+    // Preserve distinct diagnostics without counting the same failure again
+    // through the summary. A passing reconciliation still cannot certify an
+    // unfinished review, including deferred coverage and reopened stages.
+    if report.passed() {
+        if let Some(state) = view.state {
+            report.gaps.push(state);
+        }
+    }
+    Ok(report)
+}
+
+pub(crate) fn critique_dir_raw(
+    dir: &Path,
+    findings: &FindingsFile,
+) -> Result<CriticReport, String> {
     critique_dir_inner(
         dir,
         findings,

@@ -1116,7 +1116,7 @@ fn batch_completion_matches_report_for_reopened_work_and_reasoned_deferrals() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(run.meta()["run_status"], "in_progress");
-    assert!(omgs::critic::critique_dir(&run.0, &file).unwrap().passed());
+    assert!(!omgs::critic::critique_dir(&run.0, &file).unwrap().passed());
     omgs::runmeta::update(&run.0, |m| {
         m.insert("run_status".into(), json!("complete"));
         Ok(())
@@ -1129,4 +1129,357 @@ fn batch_completion_matches_report_for_reopened_work_and_reasoned_deferrals() {
         .contains("1 deferred"));
     report();
     assert_eq!(run.meta()["run_status"], "partial");
+}
+
+fn finished_review() -> Run {
+    let run = Run::new();
+    for (id, role) in [("blue", "verifier"), ("independent", "evaluator")] {
+        run.event(start(id, role)).unwrap();
+        run.event(complete(id)).unwrap();
+    }
+    run.put("findings.json", json!({"findings":[]}));
+    run.put("candidates-empty.json", json!({"candidates":[]}));
+    run.put("coverage-ledger.json", json!({"units":[{"id":"surface","surface":"source.rs","attack_classes":[],"status":"covered","evidence":["source.rs"]}]}));
+    run.put("evaluation.json", json!({"evaluator":"independent","attempt":"independent","source_ref":"synthetic","decisions":[],"gaps":[]}));
+    stage(&run, "report", None, "done", None).unwrap();
+    run
+}
+
+#[test]
+fn publication_rechecks_reopened_stages_and_deferred_coverage_under_lock() {
+    for change in ["stage", "coverage"] {
+        let run = finished_review();
+        assert!(omgs::review::View::load(&run.0).unwrap().complete());
+        omgs::report::publish(Some(&run.0), None, &Default::default(), || {
+            // The renderer has finished with a complete snapshot. A separate
+            // writer now changes the review before the publication transaction.
+            let path = run.0.clone();
+            std::thread::spawn(move || {
+                if change == "stage" {
+                    omgs::status::apply(
+                        &path,
+                        &omgs::status::Update {
+                            stage: "hunt",
+                            label: None,
+                            parent: None,
+                            state: "active",
+                            detail: None,
+                            counters: &[],
+                            log: None,
+                        },
+                    )
+                    .unwrap();
+                } else {
+                    omgs::runmeta::with_lock(&path, || {
+                        let text = omgs::run_artifact::text(
+                            &path,
+                            std::path::Path::new("coverage-ledger.json"),
+                            omgs::run_artifact::LEDGER_BYTES,
+                        )?;
+                        let mut ledger: Value = serde_json::from_str(&text).unwrap();
+                        ledger["units"][0]["status"] = json!("deferred");
+                        ledger["units"][0]["note"] = json!("Awaiting authorized review");
+                        omgs::runmeta::invalidate_completion_locked(&path)?;
+                        omgs::runmeta::write_atomic(
+                            &path.join("coverage-ledger.json"),
+                            &ledger.to_string(),
+                        )
+                    })
+                    .unwrap();
+                }
+            })
+            .join()
+            .unwrap();
+            Ok(omgs::report::Completion {
+                hunters: None,
+                verifier: None,
+                accounting: Default::default(),
+                complete: true,
+            })
+        })
+        .unwrap();
+        assert_eq!(run.meta()["run_status"], "partial", "{change}");
+        assert!(!omgs::review::View::load(&run.0).unwrap().complete());
+    }
+}
+
+#[test]
+fn published_consumers_agree_on_review_matrix() {
+    for scenario in [
+        "complete",
+        "active",
+        "stopped",
+        "deferred",
+        "evaluator_gap",
+        "reopened",
+        "zero",
+        "draft",
+    ] {
+        let run = finished_review();
+        if scenario != "zero" {
+            let mut file = finding();
+            file.findings[0].verification = Some(omgs::model::Verification {
+                state: if scenario == "draft" {
+                    "draft"
+                } else {
+                    "final"
+                }
+                .into(),
+                attempt: "blue".into(),
+            });
+            let fp = file.findings[0].fingerprint.clone();
+            run.put("findings.json", serde_json::to_value(&file).unwrap());
+            run.put("candidates-red.json", json!({"candidates":[{"hunter":"red","unit_ids":["surface"],"source_ref":"synthetic","title":"Synthetic claim","attack_class":"input_validation","entry_point":"entry","sink":"sink","boundary":"boundary","location":{"path":"source.rs"},"attacker_capability":"untrusted input","trace":"entry to sink","concrete_result":"counterexample","counterevidence":"boundary enforced","proof_plan":"inspect boundary","fingerprint":fp}]}));
+            run.put("coverage-ledger.json", json!({"units":[{"id":"surface","surface":"source.rs","attack_classes":[],"status":"covered","evidence":["source.rs",fp]}]}));
+            run.put("evaluation.json", json!({"evaluator":"independent","attempt":"independent","source_ref":"synthetic","decisions":[{"fingerprint":fp,"decision":"uphold","reason":"Reviewed counterevidence","evidence":["source.rs"],"required_changes":[]}],"gaps":if scenario == "evaluator_gap" {json!(["Unresolved boundary"])} else {json!([])}}));
+        }
+        match scenario {
+            "active" => {
+                run.event(json!({"event":"dispatch","id":"blue","turn":"continued","actor":"host","reason":"Authorized continuation"})).unwrap();
+            }
+            "stopped" => {
+                run.event(stop("blue", "policy")).unwrap();
+            }
+            "deferred" => {
+                let mut ledger: Value = serde_json::from_str(
+                    &std::fs::read_to_string(run.0.join("coverage-ledger.json")).unwrap(),
+                )
+                .unwrap();
+                ledger["units"][0]["status"] = json!("deferred");
+                ledger["units"][0]["note"] = json!("Awaiting review");
+                run.put("coverage-ledger.json", ledger);
+            }
+            "reopened" => stage(&run, "hunt", None, "active", None).unwrap(),
+            _ => {}
+        }
+        // Legacy counters and completion flags must never override evidence.
+        let mut progress: Value = serde_json::from_str(
+            &std::fs::read_to_string(run.0.join("pipeline-status.json")).unwrap(),
+        )
+        .unwrap();
+        progress["counters"] = json!({"confirmed":99,"rejected":99,"needs_validation":0});
+        run.put("pipeline-status.json", progress);
+        omgs::runmeta::update(&run.0, |m| {
+            m.insert("run_status".into(), json!("complete"));
+            Ok(())
+        })
+        .unwrap();
+        let view = omgs::review::View::load(&run.0).unwrap();
+        let complete = matches!(scenario, "complete" | "zero");
+        assert_eq!(view.complete(), complete, "{scenario}: {:?}", view.state);
+        let pending = matches!(scenario, "active" | "stopped" | "draft");
+        assert_eq!(view.confirmed, 0);
+        assert_eq!(view.needs_validation, usize::from(pending));
+        assert_eq!(view.rejected, usize::from(!pending && scenario != "zero"));
+        assert_eq!(omgs::runmeta::is_complete(&run.0), complete);
+        let gate = omgs::policy::advisory_lines(&run.0, &Default::default()).unwrap();
+        assert_eq!(
+            gate.iter()
+                .any(|line| line.starts_with("advisory: Incomplete")
+                    || line.starts_with("advisory: Blocked")),
+            !complete
+        );
+        assert!(!gate
+            .iter()
+            .any(|line| line.contains("advisory: confirmed finding")));
+        assert_eq!(
+            omgs::critic::critique_run(&run.0).unwrap().passed(),
+            complete
+        );
+        let raw =
+            omgs::shape::findings(&std::fs::read_to_string(run.0.join("findings.json")).unwrap())
+                .unwrap();
+        let handoff = omgs::handoff::build(&run.0, &raw, None).unwrap();
+        assert_eq!(handoff.review_state == "complete", complete);
+        assert_eq!(handoff.records.len(), usize::from(pending));
+        let summary = omgs::batch::summarize(
+            &omgs::batch::BatchRun {
+                run_dir: Some(run.0.to_string_lossy().into()),
+                ..Default::default()
+            },
+            &run.0,
+        )
+        .unwrap();
+        assert_eq!(summary.state == "complete", complete);
+        assert_eq!(
+            (
+                summary.confirmed,
+                summary.needs_validation,
+                summary.rejected
+            ),
+            (view.confirmed, view.needs_validation, view.rejected)
+        );
+        let response = omgs::watch::respond(
+            "GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:4000\r\n\r\n",
+            4000,
+            &run.0,
+        );
+        assert_eq!(response.status, 200);
+        let dashboard: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(dashboard["review_complete"], complete);
+        assert_eq!(dashboard["counters"]["confirmed"], 0);
+        assert_eq!(
+            dashboard["counters"]["needs_validation"],
+            view.needs_validation
+        );
+        assert_eq!(dashboard["counters"]["rejected"], view.rejected);
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .args(["report", "--findings"])
+            .arg(run.0.join("findings.json"))
+            .arg("--out")
+            .arg(&run.0)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(run.meta()["run_status"] == "complete", complete);
+        for name in ["REPORT.md", "REPORT.html"] {
+            let report = std::fs::read_to_string(run.0.join(name)).unwrap();
+            assert_eq!(
+                report.contains("Completed review: no confirmed findings."),
+                complete,
+                "{scenario}: {name}"
+            );
+        }
+        let sarif: Value = serde_json::from_str(
+            &std::fs::read_to_string(run.0.join("findings.sarif.json")).unwrap(),
+        )
+        .unwrap();
+        let invocation = &sarif["runs"][0]["invocations"][0];
+        assert_eq!(invocation["executionSuccessful"], complete, "{scenario}");
+        assert_eq!(
+            invocation["toolExecutionNotifications"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            complete
+        );
+        let validation = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .args(["validate", "--findings"])
+            .arg(run.0.join("findings.json"))
+            .output()
+            .unwrap();
+        if matches!(scenario, "active" | "stopped" | "draft") {
+            assert!(!validation.status.success());
+        } else {
+            assert!(
+                validation.status.success(),
+                "{scenario}: {}",
+                String::from_utf8_lossy(&validation.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&validation.stdout).contains("review complete"),
+                complete
+            );
+        }
+        let status = cli(&run, &["status", "--stage", "report", "--state", "done"]);
+        assert!(status.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&status.stdout).contains("review complete"),
+            complete
+        );
+        let out = cli(&run, &["handoff"]);
+        assert!(
+            out.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn zero_finding_sarif_preserves_active_stopped_and_deferred_review_state() {
+    for state in ["active", "stopped", "deferred"] {
+        let run = finished_review();
+        if state == "deferred" {
+            run.put("coverage-ledger.json", json!({"units":[{"id":"surface","surface":"source.rs","attack_classes":[],"status":"deferred","note":"Awaiting review"}]}));
+        } else {
+            run.event(start("next", "hunter")).unwrap();
+            if state == "stopped" {
+                run.event(stop("next", "policy")).unwrap();
+            }
+        }
+        let view = omgs::review::View::load(&run.0).unwrap();
+        let sarif: Value =
+            serde_json::from_str(&omgs::report::render_sarif(&view.findings, &view.meta)).unwrap();
+        assert!(sarif["runs"][0]["results"].as_array().unwrap().is_empty());
+        assert_eq!(
+            sarif["runs"][0]["invocations"][0]["executionSuccessful"],
+            false
+        );
+        assert!(
+            sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"][0]["message"]["text"]
+                .as_str()
+                .unwrap()
+                .contains(state)
+        );
+    }
+}
+
+#[test]
+fn status_publishes_view_counts_and_dashboard_requires_its_completion_verdict() {
+    let run = finished_review();
+    omgs::status::apply(
+        &run.0,
+        &omgs::status::Update {
+            stage: "verify",
+            label: None,
+            parent: None,
+            state: "failed",
+            detail: None,
+            counters: &[("confirmed".into(), 99)],
+            log: None,
+        },
+    )
+    .unwrap();
+    let status: Value =
+        serde_json::from_str(&std::fs::read_to_string(run.0.join("pipeline-status.json")).unwrap())
+            .unwrap();
+    assert_eq!(status["counters"]["confirmed"], 0);
+    assert_eq!(status["review_complete"], false);
+    let dashboard = include_str!("../skill/progress/dashboard.html");
+    let headline = dashboard
+        .split_once("function happening(")
+        .unwrap()
+        .1
+        .split_once("function renderNode(")
+        .unwrap()
+        .0;
+    assert!(
+        headline.find("reviewComplete===false").unwrap()
+            < headline.find("reviewComplete===true").unwrap()
+    );
+    assert!(
+        headline.find("st.status===\"failed\"").unwrap()
+            < headline.find("reviewComplete===true").unwrap()
+    );
+    assert!(!headline.contains("st.id===\"report\""));
+}
+
+#[test]
+fn publication_consumers_depend_on_the_canonical_view() {
+    for (name, source) in [
+        ("report and CLI", include_str!("../src/main.rs")),
+        ("publication", include_str!("../src/report.rs")),
+        ("handoff", include_str!("../src/handoff.rs")),
+        ("gate advisory", include_str!("../src/policy.rs")),
+        ("batch index", include_str!("../src/batch.rs")),
+        ("benchmark", include_str!("../src/bench.rs")),
+        ("status", include_str!("../src/status.rs")),
+        ("watch", include_str!("../src/watch.rs")),
+        ("critic", include_str!("../src/critic.rs")),
+        ("completion query", include_str!("../src/runmeta.rs")),
+    ] {
+        assert!(
+            source.contains("review::View::"),
+            "{name} bypasses the review view"
+        );
+        assert!(
+            !source.contains("attempts::publication("),
+            "{name} uses findings without the completion view"
+        );
+    }
 }

@@ -98,7 +98,7 @@ fn golden_hand_computed_metrics() {
         json!({"numerator":1,"denominator":1,"value":1.0})
     );
     for r in c["runs"].as_array().unwrap() {
-        assert_eq!(r["blocked_or_exhausted"].as_array().unwrap().len(), 1);
+        assert_eq!(r["blocked_or_exhausted"].as_array().unwrap().len(), 3);
         assert_eq!(r["paired_outcomes"].as_array().unwrap().len(), 8);
     }
 }
@@ -605,6 +605,16 @@ fn archived_verifier_lifecycle_controls_scoring() {
                 }
             });
         }
+        let score = saved.score();
+        let result = &score["cohorts"][0]["runs"][0];
+        let source = saved.0.join("run-1/positive");
+        let view = omgs::review::View::load(&source).unwrap();
+        let fixed = omgs::review::View::load(&saved.0.join("run-1/fixed")).unwrap();
+        assert_eq!(
+            result["needs_validation"]["numerator"],
+            view.needs_validation + fixed.needs_validation
+        );
+        assert_eq!(result["verifier_false_rejection_rate"]["numerator"], 0);
         assert_invalid_positive(
             &saved,
             if state == "missing" {
@@ -671,4 +681,102 @@ fn benchmark_accounting_uses_host_attempt_subtotals_and_cumulative_turns() {
         meta["accounting"]["host"] = json!({"tokens":null,"cost_usd":null,"duration_ms":null});
     });
     assert_eq!(usage(saved.score())["unknown_usage"]["cost_usd"], 2);
+}
+
+#[test]
+fn empty_observations_reconcile_shared_lifecycle_stages_coverage_and_evaluation() {
+    for state in [
+        "complete",
+        "active",
+        "stopped",
+        "deferred",
+        "reopened",
+        "evaluator_gap",
+    ] {
+        let saved = SavedRuns::new();
+        let run = saved.0.join("run-1/fixed");
+        let put = |name: &str, value: Value| {
+            omgs::runmeta::write_atomic(&run.join(name), &value.to_string()).unwrap()
+        };
+        saved.edit("run-1/benchmark-run.json", |r| {
+            let o = &mut r["observations"][1];
+            o["findings"] = json!([]);
+            o["adjudications"] = json!([]);
+            o["status"] = json!("complete");
+        });
+        put("findings.json", json!({"findings":[]}));
+        put("candidates-empty.json", json!({"candidates":[]}));
+        put(
+            "coverage-ledger.json",
+            json!({"units":[{"id":"surface","surface":"source.rs","attack_classes":[],"status":if state == "deferred" {"deferred"} else {"covered"},"evidence":["source.rs"],"note":"Awaiting review"}]}),
+        );
+        for event in [
+            json!({"event":"start","id":"independent","role":"evaluator","identity":"independent","context":"independent","inputs":["synthetic"],"outputs":["synthetic"],"isolation":"procedural"}),
+            json!({"event":"complete","id":"independent","actor":"host","reason":"Reviewed output"}),
+        ] {
+            omgs::attempts::append(&run, serde_json::from_value(event).unwrap()).unwrap();
+        }
+        put(
+            "evaluation.json",
+            json!({"evaluator":"independent","attempt":"independent","source_ref":"synthetic","decisions":[],"gaps":if state == "evaluator_gap" {json!(["Unresolved boundary"])} else {json!([])}}),
+        );
+        if matches!(state, "active" | "stopped") {
+            omgs::attempts::append(&run,serde_json::from_value(json!({"event":"dispatch","id":"fixture-verifier","turn":"continued","actor":"host","reason":"Authorized continuation"})).unwrap()).unwrap();
+            if state == "stopped" {
+                omgs::attempts::append(&run,serde_json::from_value(json!({"event":"stop","id":"fixture-verifier","actor":"host","kind":"policy","reason":"Stopped output","artifacts":["findings.json"],"disposition":"quarantined"})).unwrap()).unwrap();
+            }
+        }
+        if state == "reopened" {
+            omgs::status::apply(
+                &run,
+                &omgs::status::Update {
+                    stage: "hunt",
+                    label: None,
+                    parent: None,
+                    state: "active",
+                    detail: None,
+                    counters: &[],
+                    log: None,
+                },
+            )
+            .unwrap();
+        }
+        let view = omgs::review::View::load(&run).unwrap();
+        assert_eq!(
+            view.complete(),
+            state == "complete",
+            "{state}: {:?}",
+            view.state
+        );
+        let score = saved.score();
+        let r = &score["cohorts"][0]["runs"][0];
+        let context = r["snapshot_context"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["snapshot_id"] == "fixed")
+            .unwrap();
+        assert_eq!(
+            context["status"],
+            if view.complete() {
+                "complete"
+            } else {
+                "incomplete"
+            }
+        );
+        assert_eq!(
+            r["blocked_or_exhausted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["snapshot_id"] == "fixed"),
+            !view.complete()
+        );
+        assert!(r["paired_outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["snapshot_id"] == "fixed")
+            .all(|o| o["status"] == context["status"]));
+    }
 }

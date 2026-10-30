@@ -2523,7 +2523,14 @@ fn persona_never_changes_validation_critic_or_verdicts() {
                 "{}",
                 String::from_utf8_lossy(&check.stderr)
             );
-            assert_eq!(critic(), Some(0));
+            assert_eq!(
+                critic(),
+                Some(if verdict == Verdict::NeedsValidation {
+                    1
+                } else {
+                    0
+                })
+            );
             let proof_path = run.join(proven.findings[0].proof_ref.as_ref().unwrap());
             let mut proof: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&proof_path).unwrap()).unwrap();

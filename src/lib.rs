@@ -21,6 +21,7 @@ pub mod platform;
 pub mod policy;
 pub mod proof;
 pub mod report;
+pub mod review;
 pub mod route;
 pub mod run_artifact;
 pub mod runmeta;

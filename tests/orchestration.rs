@@ -253,7 +253,7 @@ fn watch_routes_and_host_rules() {
         r#"{"stages":[],"updated_ms":5}"#,
     )
     .unwrap();
-    write_private_fixture(dir.join("findings.json"), "secret").unwrap();
+    write_private_fixture(dir.join("findings.json"), r#"{"findings":[]}"#).unwrap();
     let req = |line: &str, host: &str| format!("{line}\r\nHost: {host}\r\n\r\n");
     let r = respond(&req("GET / HTTP/1.1", "127.0.0.1:4000"), 4000, &dir);
     assert_eq!(r.status, 200);
@@ -263,10 +263,10 @@ fn watch_routes_and_host_rules() {
         4000,
         &dir,
     );
-    assert_eq!(
-        (r.status, r.body.as_slice()),
-        (200, br#"{"stages":[],"updated_ms":5}"#.as_slice())
-    );
+    assert_eq!(r.status, 200);
+    let progress: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(progress["updated_ms"], 5);
+    assert_eq!(progress["review_complete"], false);
     for path in [
         "/findings.json",
         "/../findings.json",
@@ -328,12 +328,27 @@ fn watch_serves_loopback_and_stops_when_the_run_completes() {
     assert!(resp.starts_with("HTTP/1.1 200 OK"));
     assert!(resp.contains("Cache-Control: no-store"));
     assert!(resp.contains("X-Content-Type-Options: nosniff"));
-    assert!(resp.ends_with(r#"{"stages":[],"updated_ms":0}"#));
+    assert!(resp.contains("\"review_complete\":false"));
     write_private_fixture(
         dir.join("run-metadata.json"),
         r#"{"run_status":"complete"}"#,
     )
     .unwrap();
+    for (id, role) in [("blue", "verifier"), ("independent", "evaluator")] {
+        for event in [
+            serde_json::json!({"event":"start","id":id,"role":role,"identity":id,"context":id,"inputs":["synthetic"],"outputs":["synthetic"],"isolation":"procedural"}),
+            serde_json::json!({"event":"complete","id":id,"actor":"host","reason":"Reviewed output"}),
+        ] {
+            omgs::attempts::append(&dir, serde_json::from_value(event).unwrap()).unwrap();
+        }
+    }
+    for (name, text) in [
+        ("findings.json", r#"{"findings":[]}"#),
+        ("coverage-ledger.json", r#"{"units":[]}"#),
+        ("candidates-empty.json", r#"{"candidates":[]}"#),
+    ] {
+        write_private_fixture(dir.join(name), text).unwrap();
+    }
     let start = std::time::Instant::now();
     server.join().unwrap();
     assert!(
@@ -574,7 +589,7 @@ fn answer_scopes_match_path_prefixes_only_at_boundaries() {
 }
 
 #[test]
-fn report_marks_the_run_complete_and_records_metadata() {
+fn report_records_metadata_without_completing_unexamined_coverage() {
     let dir = scratch("complete");
     write_private_fixture(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
     write_private_fixture(
@@ -598,7 +613,7 @@ fn report_marks_the_run_complete_and_records_metadata() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(omgs::runmeta::is_complete(Path::new(&dir)));
+    assert!(!omgs::runmeta::is_complete(Path::new(&dir)));
     let meta = omgs::runmeta::read(&dir).unwrap();
     assert_eq!(meta["hunters"], 3);
     assert_eq!(meta["agent_calls_used"], 41);

@@ -219,27 +219,7 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
         return Ok(s);
     };
     let at = |name: &str, e: String| format!("{}: {name}: {e}", dir.display());
-    let mut findings = crate::model::FindingsFile::default();
-    match crate::run_artifact::optional_text(
-        dir,
-        Path::new("findings.json"),
-        crate::run_artifact::FINDINGS_BYTES,
-    )? {
-        Some(text) => {
-            use crate::model::Verdict;
-            let f = crate::shape::findings(&text).map_err(|e| at("findings.json", e))?;
-            let f = crate::attempts::publication(dir, &f)?;
-            findings = f.clone();
-            for x in &f.findings {
-                match x.verdict {
-                    Verdict::Confirmed => s.confirmed += 1,
-                    Verdict::NeedsValidation => s.needs_validation += 1,
-                    Verdict::Rejected => s.rejected += 1,
-                }
-            }
-        }
-        None => s.blockers.push("findings.json missing".into()),
-    }
+    let view = crate::review::View::load(dir)?;
     if crate::run_artifact::optional_text(
         dir,
         Path::new(crate::runmeta::FILE),
@@ -249,9 +229,6 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
     {
         let meta = crate::runmeta::read(dir)?;
         check_meta_types(&meta).map_err(|e| at(crate::runmeta::FILE, e))?;
-        if let Some(st) = meta.get("run_status").and_then(|v| v.as_str()) {
-            s.state = st.to_string();
-        }
         s.budget = Some(crate::budget::summary(dir)?);
         s.agent_calls = meta.get("agent_calls_used").and_then(|v| v.as_u64());
         s.reroutes = meta
@@ -266,23 +243,6 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("invalid refusal history: {e}"))?;
         }
-        s.blockers.extend(crate::attempts::gaps(&meta)?);
-    }
-    if let Some(text) = crate::run_artifact::optional_text(
-        dir,
-        Path::new("coverage-ledger.json"),
-        crate::run_artifact::LEDGER_BYTES,
-    )? {
-        let ledger = crate::shape::ledger(&text).map_err(|e| at("coverage-ledger.json", e))?;
-        for u in ledger.units.iter().filter(|u| u.status == "blocked") {
-            s.blockers.push(format!("blocked unit {}", u.id));
-        }
-        let c = crate::critic::critique_run(dir)?;
-        if !c.passed() {
-            s.blockers.push(format!("critic: {}", c.summary()));
-        }
-    } else {
-        s.blockers.push("coverage-ledger.json missing".into());
     }
     if dir.join("REPORT.html").is_file() {
         s.report_href = dir
@@ -290,12 +250,18 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
             .ok()
             .map(|rel| format!("{}/REPORT.html", rel.to_string_lossy()));
     }
-    if let Some(state) = crate::report::run_review_state(dir, &findings)? {
-        s.blockers.push(state);
+    s.confirmed = view.confirmed;
+    s.needs_validation = view.needs_validation;
+    s.rejected = view.rejected;
+    s.state = if view.complete() {
+        "complete"
+    } else if s.state == "failed" {
+        "failed"
+    } else {
+        "partial"
     }
-    if s.state == "complete" && (s.needs_validation > 0 || !s.blockers.is_empty()) {
-        s.state = "partial".into();
-    }
+    .into();
+    s.blockers.extend(view.reasons);
     Ok(s)
 }
 

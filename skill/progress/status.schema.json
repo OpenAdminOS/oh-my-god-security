@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "OMGS pipeline progress status",
-  "description": "Optional live-progress state the orchestrator writes at each pipeline milestone; dashboard.html polls it. Never changes a verdict; the deterministic findings.json and REPORT.html remain the record.",
+  "description": "Optional live progress. Published verdict counts and review completion come from the canonical review view; stage completion alone never establishes review completion.",
   "type": "object",
   "required": [
     "stages",
@@ -217,6 +217,14 @@
           }
         }
       }
+    },
+    "review_complete": {
+      "type": "boolean",
+      "description": "Canonical completion verdict, reconciled with attempts, stages, coverage and adjudication."
+    },
+    "review_state": {
+      "type": "string",
+      "description": "Canonical completion summary. Read incomplete or stopped state before any stage headline."
     }
   }
 }

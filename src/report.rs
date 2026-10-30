@@ -135,7 +135,7 @@ fn confirmed(file: &FindingsFile) -> Vec<&crate::model::Finding> {
 }
 
 /// A recorded pipeline stage or child, in saved order. Times are UTC.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TimelineRow {
     pub historical: bool,
     pub label: String,
@@ -204,61 +204,11 @@ pub fn run_review_state(
     run: &std::path::Path,
     file: &FindingsFile,
 ) -> Result<Option<String>, String> {
-    let published = crate::attempts::publication(run, file)?;
-    let saved = crate::runmeta::read_optional(run)?.unwrap_or_default();
-    let mut meta = ReportMeta {
-        review_limits: crate::attempts::gaps(&saved)?,
-        timeline: timeline(run)?,
-        ..Default::default()
-    };
-    if let Some(text) = crate::run_artifact::optional_text(
-        run,
-        std::path::Path::new("coverage-ledger.json"),
-        crate::run_artifact::LEDGER_BYTES,
-    )? {
-        let ledger = crate::shape::ledger(&text)?;
-        meta.coverage = crate::ledger::coverage_lines(&ledger);
-        meta.critic = Some(crate::critic::critique_run(run)?);
-    }
-    meta.review_limits.extend(
-        crate::adjudication::report_lines(run, &published)?
-            .into_iter()
-            .filter(|s| s.starts_with("Unexamined:") || s.starts_with("Adjudication gap:")),
-    );
-    Ok(review_state(&published, &meta))
+    Ok(crate::review::View::with_findings(run, file)?.state)
 }
 
 pub fn review_state(file: &FindingsFile, meta: &ReportMeta) -> Option<String> {
-    let blocked = meta
-        .review_limits
-        .iter()
-        .any(|s| s.contains("stopped") || s.starts_with("blocker "))
-        || meta.coverage.iter().any(|s| s.starts_with("blocked:"));
-    let unfinished = meta.critic.as_ref().is_none_or(|c| !c.passed())
-        || !meta.review_limits.is_empty()
-        || meta.coverage.iter().any(|s| {
-            ["blocked:", "deferred:", "planned:", "candidate:"]
-                .iter()
-                .any(|prefix| s.starts_with(prefix))
-        })
-        || !crate::model::validate(file).is_empty()
-        || file
-            .findings
-            .iter()
-            .any(|f| f.verdict == Verdict::NeedsValidation)
-        || meta
-            .timeline
-            .iter()
-            .any(|r| !r.historical && r.state != "done");
-    let (blocked_units, deferred_units) = coverage_counts(meta);
-    if blocked_units > 0 || deferred_units > 0 {
-        return Some(format!("Incomplete coverage: {blocked_units} blocked unit(s), {deferred_units} deferred unit(s). Verification and pending work still require review."));
-    }
-    if unfinished {
-        Some(format!("{} review: verification, coverage or pending work remains. {} confirmed finding(s) recorded.{}", if blocked { "Blocked" } else { "Incomplete" }, confirmed(file).len(), if meta.review_limits.is_empty() { String::new() } else { format!(" {}", meta.review_limits.join("; ")) }))
-    } else {
-        None
-    }
+    crate::review::completion_state(file, meta)
 }
 
 fn short(meta: &ReportMeta) -> bool {
@@ -1376,8 +1326,13 @@ a{color:inherit;text-decoration:none}
 }
 "#;
 
-pub fn render_sarif(file: &FindingsFile, _meta: &ReportMeta) -> String {
+pub fn render_sarif(file: &FindingsFile, meta: &ReportMeta) -> String {
     use crate::model::Severity;
+    let state = review_state(file, meta);
+    let notifications: Vec<_> = state
+        .iter()
+        .map(|reason| serde_json::json!({"level":"warning", "message":{"text":reason}}))
+        .collect();
     let actionable: Vec<_> = file
         .findings
         .iter()
@@ -1414,6 +1369,7 @@ pub fn render_sarif(file: &FindingsFile, _meta: &ReportMeta) -> String {
         "version": "2.1.0",
         "runs": [{
             "tool": { "driver": { "name": "omgs", "informationUri": "https://github.com/OpenAdminOS/oh-my-god-security", "version": env!("CARGO_PKG_VERSION"), "rules": rules } },
+            "invocations": [{"executionSuccessful": state.is_none(), "toolExecutionNotifications": notifications}],
             "results": results
         }]
     })).unwrap())
@@ -1599,7 +1555,7 @@ pub fn publish(
                 "accounting".into(),
                 serde_json::to_value(usage).map_err(|e| e.to_string())?,
             );
-            let complete = completion.complete && crate::attempts::gaps(m)?.is_empty();
+            let complete = completion.complete && crate::review::View::load_locked(run)?.complete();
             m.insert(
                 "run_status".into(),
                 serde_json::json!(if complete { "complete" } else { "partial" }),
@@ -1641,7 +1597,7 @@ mod publication_tests {
         })
         .unwrap();
         let meta = crate::runmeta::read(&run).unwrap();
-        assert_eq!(meta["run_status"], "complete");
+        assert_eq!(meta["run_status"], "partial");
         assert_eq!(meta["agent_calls_used"], 6);
         assert!(crate::budget::summary(&run)
             .unwrap()

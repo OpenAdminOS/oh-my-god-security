@@ -276,14 +276,7 @@ pub fn clock(ms: u64) -> String {
 }
 
 pub fn is_complete(dir: &Path) -> bool {
-    read(dir)
-        .ok()
-        .and_then(|m| {
-            m.get("run_status")
-                .and_then(|s| s.as_str())
-                .map(|s| s == "complete" || s == "partial")
-        })
-        .unwrap_or(false)
+    crate::review::View::load(dir).is_ok_and(|view| view.complete())
 }
 
 /// ISO 8601 UTC, including the date across long-running rounds.

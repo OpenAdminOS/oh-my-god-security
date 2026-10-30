@@ -129,15 +129,16 @@ function activeStage(stages){
   for(const st of stages){const child=(st.children||[]).find(c=>c.status==="active");if(child)return {stage:child,owner:st};}
   return null;
 }
-function happening(stages,active){
+function happening(stages,active,reviewState,reviewComplete){
+  if(reviewComplete===false)return reviewState||"The review is incomplete.";
+  if(stages.some(st=>st.status==="failed"||(st.children||[]).some(c=>c.status==="failed")))return "The review has stopped. Check the steps below for details.";
   if(active){
     const st=active.stage,info=stageInfo(st),detail=(st.detail||"").trim();
     if(detail)return stageLabel(st)+": "+detail.replace(/[.!?]+$/,"")+".";
     return info?info.detail:stageLabel(st)+" is in progress.";
   }
   if(!stages.length)return "No updates yet. Waiting for the review to start.";
-  if(stages.some(st=>st.id==="report"&&st.status==="done"))return "Reporting has finished. Your report is ready in the run folder.";
-  if(stages.some(st=>st.status==="failed"||(st.children||[]).some(c=>c.status==="failed")))return "The review has stopped. Check the steps below for details.";
+  if(reviewComplete===true)return "Reporting has finished. Your report is ready in the run folder.";
   return "Waiting for the next review step.";
 }
 function renderNode(st){
@@ -160,7 +161,7 @@ function render(d){
   document.getElementById("c-needs").textContent=c.needs_validation??0;
   document.getElementById("c-rej").textContent=c.rejected??0;
   const stages=d.stages||[],active=activeStage(stages);
-  const summary=document.getElementById("happening"),sentence=happening(stages,active);
+  const summary=document.getElementById("happening"),sentence=happening(stages,active,d.review_state,d.review_complete);
   if(summary.textContent!==sentence)summary.textContent=sentence;
   const info=active&&stageInfo(active.owner);
   for(const area of ["agent","omgs","sandbox"]){

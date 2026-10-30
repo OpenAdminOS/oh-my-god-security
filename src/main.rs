@@ -1,7 +1,7 @@
 use omgs::architecture::{
     render_architecture_html, render_architecture_markdown, validate_architecture, ArchitectureFile,
 };
-use omgs::critic::{critique_dir, critique_run};
+use omgs::critic::critique_run;
 use omgs::ledger::{add_unit, coverage_lines, set_status, validate_ledger, Ledger, Unit, STATUSES};
 use omgs::model::{identity, validate, FindingsFile};
 use omgs::report::{render_html, render_markdown, render_sarif, ReportMeta};
@@ -414,7 +414,16 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
     let file = read_findings(&path)?;
     let errors = validate_at(&file, &path);
     if errors.is_empty() {
-        println!("valid: {} finding(s)", file.findings.len());
+        let dir = Path::new(&path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let view = omgs::review::View::with_findings(dir, &file)?;
+        println!(
+            "valid: {} finding(s); review {}",
+            view.findings.findings.len(),
+            view.state.as_deref().unwrap_or("complete")
+        );
         Ok(())
     } else {
         for e in &errors {
@@ -1484,19 +1493,14 @@ fn write_handoff(
     )
 }
 
-fn actionable_run(args: &[String]) -> Result<(PathBuf, FindingsFile), String> {
-    let run = PathBuf::from(flag(args, "--run").ok_or("command requires --run <dir>")?);
-    let path = run.join("findings.json");
-    let file = read_findings(&path.to_string_lossy())?;
-    let errors = validate_at(&file, &path.to_string_lossy());
+fn cmd_handoff(args: &[String]) -> Result<(), String> {
+    let run = PathBuf::from(flag(args, "--run").ok_or("handoff requires --run <dir>")?);
+    let file = read_findings(&run.join("findings.json").to_string_lossy())?;
+    let mut errors = omgs::model::validate_drafts(&file);
+    errors.extend(omgs::proof::validate_proofs(&file, &run));
     if !errors.is_empty() {
         return Err(errors.join("\n"));
     }
-    Ok((run, file))
-}
-
-fn cmd_handoff(args: &[String]) -> Result<(), String> {
-    let (run, file) = actionable_run(args)?;
     let only = flag(args, "--finding");
     let h = omgs::handoff::build(&run, &file, only.as_deref())?;
     write_handoff(&run, &h, "")?;
@@ -1553,49 +1557,24 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             }
         })
         .map(|p| p.to_path_buf());
-    let mut coverage: Vec<String> = Vec::new();
-    let mut critic = None;
+    // Admission refuses candidate artifacts without their coverage record.
     if let Some(dir) = &findings_dir {
-        // An absent ledger means the critic does not apply; a ledger or
-        // candidates file that exists but does not parse is an error, so a
-        // malformed run can never render as a clean report.
-        let ledger_path = dir.join("coverage-ledger.json");
-        let ledger_text = omgs::run_artifact::optional_text(
+        if omgs::run_artifact::optional_text(
             dir,
             Path::new("coverage-ledger.json"),
             omgs::run_artifact::LEDGER_BYTES,
-        )?;
-        let present = ledger_text.is_some();
-        if !present {
-            // Without a ledger the critic does not apply, but candidate files
-            // mean a pipeline ran: refuse rather than report over them.
-            let has_candidates = std::fs::read_dir(dir)
-                .map_err(|e| format!("read {}: {e}", dir.display()))?
+        )?
+        .is_none()
+            && std::fs::read_dir(dir)
+                .map_err(|e| e.to_string())?
                 .flatten()
                 .any(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
                     name.starts_with("candidates") && name.ends_with(".json")
-                });
-            if has_candidates {
-                return Err(format!(
-                    "{} has candidates files but no coverage-ledger.json; restore the ledger so the critic can run",
-                    dir.display()
-                ));
-            }
-        }
-        if let Some(text) = ledger_text {
-            let ledger = omgs::shape::ledger(&text)
-                .map_err(|e| format!("parse {}: {e}", ledger_path.display()))?;
-            coverage = coverage_lines(&ledger);
-            let c = critique_dir(dir, &file)?;
-            if !c.passed() {
-                eprintln!(
-                    "warning: coverage critic found {} gap(s); they are listed in the report. Run omgs critic --run {} for detail.",
-                    c.gaps.len(),
-                    dir.display()
-                );
-            }
-            critic = Some(c);
+                })
+        {
+            return Err("candidates files but no coverage-ledger.json; restore the ledger so the critic can run".into());
         }
     }
     let mut sensors_summary: Option<String> = None;
@@ -1624,8 +1603,12 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             }
         }
     }
-    let file =
-        omgs::attempts::publication(findings_dir.as_deref().unwrap_or(Path::new(".")), &file)?;
+    let raw_file = file;
+    let file = omgs::review::View::with_findings(
+        findings_dir.as_deref().unwrap_or(Path::new(".")),
+        &raw_file,
+    )?
+    .findings;
     // Explicit flags override saved metadata. Verifier identities on findings
     // are a last resort. Never infer hunter counts from the surviving records:
     // hunters that found nothing or were merged into another record would be missed.
@@ -1756,11 +1739,6 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                     })
                     .unwrap_or_else(|| fallback.into())
             };
-            let timeline = findings_dir
-                .as_deref()
-                .map(omgs::report::timeline)
-                .transpose()?
-                .unwrap_or_default();
             let mut models = run_models(findings_dir.as_deref())?;
             for (role, model) in &supplied_models {
                 models.retain(|line| !line.starts_with(&format!("{role}:")));
@@ -1773,14 +1751,14 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 mode: defaulted(flag(args, "--mode"), "mode", "advisory"),
                 sandbox: defaulted(flag(args, "--sandbox"), "sandbox", "not recorded"),
                 artifact_base: String::new(),
-                review_limits: omgs::attempts::gaps(&saved)?,
-                timeline,
-                coverage,
+                review_limits: Vec::new(),
+                timeline: Vec::new(),
+                coverage: Vec::new(),
                 sensors: sensors_summary,
                 hunters,
                 verifier,
                 agent_calls,
-                critic,
+                critic: None,
                 models,
                 reroutes: run_reroutes(findings_dir.as_deref())?,
                 intent_answers: run_answers(findings_dir.as_deref())?,
@@ -1788,9 +1766,15 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 persona,
                 report_depth,
             };
-            let handoff = omgs::handoff::build(
+            let view = omgs::review::View::with_findings(
                 findings_dir.as_deref().unwrap_or(Path::new(".")),
-                &file,
+                &raw_file,
+            )?;
+            view.apply(&mut meta);
+            let file = view.findings.clone();
+            let handoff = omgs::handoff::build_view(
+                findings_dir.as_deref().unwrap_or(Path::new(".")),
+                &view,
                 None,
             )?;
             let dir = Path::new(&out);
@@ -1807,12 +1791,6 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 findings_dir.as_deref().unwrap_or(Path::new(".")),
                 &file,
             )?;
-            meta.review_limits.extend(
-                evidence
-                    .iter()
-                    .filter(|s| s.starts_with("Unexamined:") || s.starts_with("Adjudication gap:"))
-                    .cloned(),
-            );
             let evidence_md = omgs::adjudication::render_lines(&evidence, false);
             let evidence_html = omgs::adjudication::render_lines(&evidence, true);
             let sensor_md = omgs::report::sensor_section(sensors.as_ref(), false);
@@ -1843,7 +1821,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 hunters: meta.hunters,
                 verifier: meta.verifier.clone(),
                 accounting: supplied_usage.clone(),
-                complete: omgs::report::review_state(&file, &meta).is_none(),
+                complete: view.complete(),
             };
             let status_run = findings_dir
                 .as_deref()
@@ -1872,20 +1850,30 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 )?;
             }
             if let Some(run) = status_run {
-                meta.timeline = omgs::report::timeline(run)?;
+                let view = omgs::review::View::with_findings(run, &raw_file)?;
+                view.apply(&mut meta);
+                let file = &view.findings;
+                completion.complete = view.complete();
+                write_handoff(
+                    dir,
+                    &omgs::handoff::build_view(run, &view, None)?,
+                    &meta.artifact_base,
+                )?;
+                write_out(dir.join("findings.sarif.json"), render_sarif(file, &meta))
+                    .map_err(|e| e.to_string())?;
                 write_out(
                     dir.join("REPORT.md"),
-                    format!("{}{sensor_md}{evidence_md}", render_markdown(&file, &meta)),
+                    format!("{}{sensor_md}{evidence_md}", render_markdown(file, &meta)),
                 )
                 .map_err(|e| e.to_string())?;
                 write_out(
                     dir.join("REPORT.html"),
-                    render_html(&file, &meta)
+                    render_html(file, &meta)
                         .replace("</body>", &format!("{sensor_html}{evidence_html}</body>")),
                 )
                 .map_err(|e| e.to_string())?;
             }
-            completion.complete = omgs::report::review_state(&file, &meta).is_none();
+
             Ok(completion)
         },
     )
@@ -3484,7 +3472,11 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         );
         Ok(usage)
     })?;
-    println!("{stage}: {state}");
+    let view = omgs::review::View::load(Path::new(&run))?;
+    println!(
+        "{stage}: {state}; review {}",
+        view.state.as_deref().unwrap_or("complete")
+    );
     if !flags(args, "--accounting").is_empty() {
         for line in omgs::accounting::lines(&usage) {
             println!("{line}");
@@ -4221,9 +4213,6 @@ mod cli_tests {
             let name = format!("cmd_{}", cmd.replace('-', "_"));
             let mut sections = vec![(name.as_str(), function(source, &name))];
             match (cmd, sub) {
-                ("handoff" | "stage", _) => {
-                    sections.push(("actionable_run", function(source, "actionable_run")));
-                }
                 ("audit", _) => {
                     sections.push(("audit_init", function(source, "audit_init")));
                     sections.push(("audit_init_limited", function(source, "audit_init_limited")));

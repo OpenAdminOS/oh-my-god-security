@@ -436,13 +436,19 @@ pub fn publication(
     run: &Path,
     file: &crate::model::FindingsFile,
 ) -> Result<crate::model::FindingsFile, String> {
-    let meta = crate::runmeta::read_optional(run)?.unwrap_or_default();
+    Ok(crate::review::View::with_findings(run, file)?.findings)
+}
+
+pub(crate) fn project(
+    meta: &Map<String, Value>,
+    file: &crate::model::FindingsFile,
+) -> crate::model::FindingsFile {
     let mut out = file.clone();
     for f in &mut out.findings {
         let finalized = f.verification.as_ref().is_some_and(|v| {
             v.state == "final"
                 && final_for(
-                    &meta,
+                    meta,
                     &v.attempt,
                     "verifier",
                     f.verified_by.as_deref().unwrap_or(""),
@@ -463,5 +469,5 @@ pub fn publication(
             }
         }
     }
-    Ok(out)
+    out
 }

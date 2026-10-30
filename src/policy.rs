@@ -832,39 +832,43 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
     dir.cleanup()?;
     Ok(blocked)
 }
-fn advisory_findings(run: &Path, p: &Policy) {
-    let display = || -> Result<(), String> {
-        let bytes = crate::run_artifact::read(
-            run,
-            Path::new("findings.json"),
-            crate::run_artifact::FINDINGS_BYTES,
-        )
-        .map_err(|e| e.to_string())?;
-        let f = crate::shape::findings(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)?;
-        let f = crate::attempts::publication(run, &f)?;
-        for f in f
-            .findings
+pub fn advisory_lines(run: &Path, p: &Policy) -> Result<Vec<String>, String> {
+    let view = crate::review::View::load(run)?;
+    let mut lines = Vec::new();
+    if let Some(state) = &view.state {
+        lines.push(format!("advisory: {state}"));
+    }
+    for f in view
+        .findings
+        .findings
+        .iter()
+        .filter(|f| f.verdict == Verdict::Confirmed)
+    {
+        if !p
+            .gate_tests
             .iter()
-            .filter(|f| f.verdict == Verdict::Confirmed)
+            .any(|t| t.fingerprint.as_deref() == Some(&f.fingerprint))
         {
-            if !p
-                .gate_tests
-                .iter()
-                .any(|t| t.fingerprint.as_deref() == Some(&f.fingerprint))
-            {
-                println!(
-                    "advisory: confirmed finding {} is not yet a registered gate test",
-                    f.fingerprint
-                );
+            lines.push(format!(
+                "advisory: confirmed finding {} is not yet a registered gate test",
+                f.fingerprint
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+fn advisory_findings(run: &Path, p: &Policy) {
+    match advisory_lines(run, p) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{line}");
             }
         }
-        Ok(())
-    };
-    if let Err(e) = display() {
-        println!(
+        Err(e) => println!(
             "advisory run unavailable: {}",
             crate::platform::escape_controls(&e)
-        );
+        ),
     }
 }
 

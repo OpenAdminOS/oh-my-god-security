@@ -115,7 +115,7 @@ fn refusal_without_models_survives_report_metadata_and_index() {
         read(f.run.join("run-metadata.json"))["run_status"],
         "partial"
     );
-    assert!(omgs::runmeta::is_complete(&f.run));
+    assert!(!omgs::runmeta::is_complete(&f.run));
     let summary = omgs::batch::summarize(
         &omgs::batch::BatchRun {
             url: "https://example.com/team/synthetic".into(),

@@ -78,8 +78,16 @@ fn quote(s: &str) -> String {
 pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Handoff, String> {
     let canonical_run = std::fs::canonicalize(run).map_err(|e| format!("run directory: {e}"))?;
     let run = canonical_run.as_path();
-    let published = crate::attempts::publication(run, file)?;
-    let file = &published;
+    let view = crate::review::View::with_findings(run, file)?;
+    build_view(run, &view, only)
+}
+
+pub fn build_view(
+    run: &Path,
+    view: &crate::review::View,
+    only: Option<&str>,
+) -> Result<Handoff, String> {
+    let file = &view.findings;
     let mut records = Vec::new();
     for (verdict, prefix) in [(Verdict::Confirmed, 'C'), (Verdict::NeedsValidation, 'V')] {
         for (i, f) in file
@@ -181,17 +189,10 @@ pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Hand
     if only.is_some() && records.is_empty() {
         return Err("finding not found in actionable records (use C1, V1 or a fingerprint)".into());
     }
-    let lifecycle = crate::attempts::finding_gaps(run, file)?;
-    let review_state = if !lifecycle.is_empty()
-        || !crate::model::validate(file).is_empty()
-        || file
-            .findings
-            .iter()
-            .any(|f| f.verdict == Verdict::NeedsValidation)
-    {
-        "incomplete"
+    let review_state = if view.complete() {
+        "complete"
     } else {
-        "coverage not established by handoff"
+        "incomplete"
     };
     Ok(Handoff {
         review_state: review_state.into(),
