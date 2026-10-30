@@ -15,12 +15,18 @@ Exit 2 is a harness or usage error and never supports a proof.
 
 For an original `omgs prove`, outer exit 0 means clean command success, outer exit 1 means a
 supported assertion, outer exit 2 means a harness, usage or execution error, and outer exit 3
-means unavailable tier 2. These outer codes are distinct from `record.exit_code`, the inner
+means execution was blocked before the command ran, including unavailable tier 2. These outer codes
+are distinct from `record.exit_code`, the inner
 harness code. For a recipe, require outer exit 1 AND inner `exit_code: 1`, both contract flags
 and the clean fields below. Never use the outer exit alone to confirm a finding.
+With a recipe contract, an inner usage code such as 64 without the required markers yields outer
+exit 2. It is a harness error, not assertion support. Without a declared contract, the existing
+assertion convention accepts inner exits 1 or 3 through 125; every recipe must declare its contract.
+
 
 For `--replay`, outer exit 0 means reproduced, 1 means mismatch, 2 means setup error, and 3
-means unavailable tier 2. Keep `proof_ref` on the original; cite replay paths in evaluator
+means execution was blocked before the command ran. Keep `proof_ref` on the original; cite replay
+paths in evaluator
 evidence. Replay numbering shares the proof sequence and `replays` names the original number.
 
 A clean record has `command_started`, `command_finished`, `capture_complete` and

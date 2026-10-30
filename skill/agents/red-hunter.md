@@ -79,6 +79,13 @@ Hand the minimal proof plan and external test draft to the independent verifier.
 runs the initial proof; the evaluator independently replays it. Hunters do not run proof commands or
 award verdicts.
 
+Proof plans must use the full workspace-relative `--test` path in `--cmd`. The sandbox working
+directory is the workspace root, never the test's parent directory. A draft staged with
+`--test checks/entry.ps1 --test-from OUTPUT_DIR/draft.ps1` must be referenced as
+`checks/entry.ps1`, including the directory, in the proof command. The draft's external path or
+basename does not change that location. Include the recipe's `--expect-marker` contract and the
+exit rules from [the proof contract](../PROOF-CONTRACT.md#cli-exits-and-record-cleanliness).
+
 ## Never do
 
 Never run target code outside omgs prove, including imports, discovery, hooks, setup and builds.

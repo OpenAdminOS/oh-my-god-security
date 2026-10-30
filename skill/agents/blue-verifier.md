@@ -36,9 +36,19 @@ proof JSON.
 omgs intent list --attack-class CLASS
 omgs fingerprint --attack-class CLASS --entry-point ENTRY --sink SINK --boundary BOUNDARY
 omgs validate --findings OUTPUT_DIR/findings.json
-omgs prove --run OUTPUT_DIR --finding FINGERPRINT --test RELATIVE_TEST --test-from OUTPUT_DIR/DRAFT --cmd COMMAND
+omgs prove --run OUTPUT_DIR --finding FINGERPRINT --test RELATIVE_TEST --test-from OUTPUT_DIR/DRAFT --expect-marker BOUNDARY_ASSERTION_FAILED --cmd COMMAND
 omgs validate --findings OUTPUT_DIR/findings.json
 ```
+
+Use the full workspace-relative `--test` path in `--cmd`. The sandbox working directory is the
+workspace root, never the test's parent directory. For `--test checks/entry.ps1`, use
+`pwsh -NoProfile -NonInteractive -File checks/entry.ps1`, including the directory. The runner
+prints `proof harness: PATH (relative to workspace root WORKSPACE)` before execution; check it
+against the plan. `--test-from` is an external source, not the command's working directory.
+Original outer exit 0 is clean success, 1 supported assertion, 2 a harness, usage or execution
+error, and 3 a blocked execution before the command runs. With a recipe contract, inner 64
+without the required markers yields outer 2. Check `record.exit_code`, the contract flags and
+cleanliness; never interpret a missing-file or control failure as assertion support.
 
 Use the target's own runner or a disclosed equivalent harness over unmodified target code. Assert
 the security invariant and include an authorized success control. Inspect the actual assertion and

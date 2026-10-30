@@ -16,6 +16,22 @@ build errors, and exhausted budgets remain blockers with `needs_validation`, nev
 
 All commands below run from the reviewer's shell. Replace `RUN`, `FP` and `DRAFT` with the resolved
 external run directory, fingerprint and draft file. Staged test paths are relative to the target.
+The sandbox working directory is the workspace root, never the test's parent directory.
+Use the full workspace-relative `--test` path in `--cmd`. For example,
+`--test checks/entry.ps1 --test-from OUTPUT_DIR/draft.ps1` needs
+`--cmd "pwsh -NoProfile -NonInteractive -File checks/entry.ps1"`, including the directory.
+The external draft's basename and directory do not determine its staged location. The runner
+prints `proof harness: PATH (relative to workspace root WORKSPACE)` before execution.
+For directory drafts, see the retained file mapping in [the proof contract](PROOF-CONTRACT.md).
+
+Original outer exits are 0 for clean success, 1 for supported assertion, 2 for a harness, usage or
+execution error, and 3 for execution blocked before the command runs. Replay outer exits are 0 for
+reproduction, 1 for mismatch, 2 for invalid input or execution setup error, and 3 for a blocked
+execution. The inner code is `record.exit_code`. With a recipe contract, inner 64 without the
+required markers is outer 2; it is not supported assertion exit 1. A recipe requires inner 1,
+both marker flags and clean execution. Always inspect the record and [the precise exit
+contract](PROOF-CONTRACT.md#cli-exits-and-record-cleanliness).
+
 Every recipe invocation must include `--expect-marker BOUNDARY_ASSERTION_FAILED`. OMGS supplies a
 fresh per-run `OMGS_PROOF_NONCE` and the declared label as `OMGS_PROOF_CONTRACT` through the
 allowlisted MXC environment. Print `OMGS_CONTROL_<nonce>` only after the authorized control

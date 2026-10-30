@@ -2776,3 +2776,59 @@ fn incidental_git_status_refresh_replays_but_staged_index_changes_do_not() {
     );
     std::fs::remove_dir_all(d).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn staged_harness_paths_and_outer_harness_errors_are_explicit() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("harness-location");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("source"), "synthetic\n").unwrap();
+    let draft = d.join("external.sh");
+    std::fs::write(&draft, "test \"$(cat source)\" = synthetic || exit 2\nprintf 'OMGS_CONTROL_%s\\nOMGS_BOUNDARY_%s_%s\\n' \"$OMGS_PROOF_NONCE\" \"$OMGS_PROOF_NONCE\" \"$OMGS_PROOF_CONTRACT\"\nexit 1\n").unwrap();
+    omgs::platform::private_dir(&run).unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    for (command, inner, outer) in [
+        ("test -f entry.sh || exit 64; sh entry.sh", 64, 2),
+        ("sh checks/entry.sh", 1, 1),
+    ] {
+        let out = omgs(
+            &d,
+            &[
+                "prove",
+                "--run",
+                run.to_str().unwrap(),
+                "--test",
+                "checks/entry.sh",
+                "--test-from",
+                draft.to_str().unwrap(),
+                "--expect-marker",
+                "BOUNDARY_ASSERTION_FAILED",
+                "--cmd",
+                command,
+            ],
+        );
+        assert_eq!(out.status.code(), Some(outer), "{}", text(&out));
+        assert!(
+            text(&out).contains("proof harness: checks/entry.sh (relative to workspace root "),
+            "{}",
+            text(&out)
+        );
+        let n = if inner == 64 { 1 } else { 2 };
+        let record = omgs::proof::load(&run, &format!("proofs/{n}.json")).unwrap();
+        assert_eq!(record.exit_code, Some(inner));
+        assert_eq!(record.test_reachable, Some(true));
+        assert!(record.clean());
+        assert_eq!(record.assertion_failure(), inner == 1);
+    }
+    assert!(!target.join("checks/entry.sh").exists());
+    std::fs::remove_dir_all(d).unwrap();
+}

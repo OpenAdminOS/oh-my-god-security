@@ -497,3 +497,29 @@ fn dashboard_announces_summary_only_when_it_changes() {
     // No other assignment may bypass the change guard on each two-second poll.
     assert_eq!(render.matches("summary.textContent=").count(), 1);
 }
+
+#[test]
+fn proof_locations_and_recipe_exit_codes_are_explicit_in_role_guidance() {
+    for (name, text) in [
+        ("recipes", include_str!("../skill/PROOF-RECIPES.md")),
+        ("hunter", include_str!("../skill/agents/red-hunter.md")),
+        ("verifier", include_str!("../skill/agents/blue-verifier.md")),
+    ] {
+        let text = normalized(text);
+        for required in [
+            "workspace root",
+            "full workspace-relative `--test` path in `--cmd`",
+            "checks/entry.ps1",
+        ] {
+            assert!(text.contains(required), "{name}: missing {required}");
+        }
+    }
+    for text in [
+        include_str!("../skill/PROOF-RECIPES.md"),
+        include_str!("../skill/PROOF-CONTRACT.md"),
+    ] {
+        let text = normalized(text);
+        assert!(text.contains("inner 64") || text.contains("inner usage code such as 64"));
+        assert!(text.contains("outer 2") || text.contains("outer exit 2"));
+    }
+}

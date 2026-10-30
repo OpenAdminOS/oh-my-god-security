@@ -919,6 +919,13 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             .map(|h| h.files.clone())
             .unwrap_or_default(),
     };
+    if let Some(test) = &request.test {
+        eprintln!(
+            "proof harness: {} (relative to workspace root {})",
+            omgs::platform::escape_controls(test),
+            omgs::platform::escape_controls(&run_dir.join("workspace").to_string_lossy())
+        );
+    }
     let started_at_ms = omgs::runmeta::now_ms();
     let result = match prove(&request) {
         ProveOutcome::Blocked { reason } => {
