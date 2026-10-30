@@ -428,7 +428,10 @@ fn default_review_binds_embedded_bundle_despite_stale_installed_skill() {
     let brief = String::from_utf8(out.stderr).unwrap();
     assert!(brief.contains(&selected.display().to_string()));
     // The path is printed verbatim, never as an escaped JSON string.
-    assert!(!brief.contains(&format!("\"{}", selected.display())), "{brief}");
+    assert!(
+        !brief.contains(&format!("\"{}", selected.display())),
+        "{brief}"
+    );
     assert!(brief.contains(&omgs::setup::bundled_digest()));
     assert!(brief.contains("ignoring other installed skills"));
     #[cfg(unix)]
@@ -660,4 +663,146 @@ fn review_and_batch_admit_storage_before_materializing_bundles() {
             );
         }
     }
+}
+
+#[test]
+fn batch_cache_overlap_is_refused_before_any_storage_is_written() {
+    for location in [
+        "output-cache",
+        "output-digest",
+        "clone-root",
+        "clone-descendant",
+    ] {
+        let fixture = Fixture::new();
+        let home = fixture.0.join("home");
+        omgs::platform::create_private_dir(&home).unwrap();
+        let cache = home.join("skill-bundles");
+        let clones = match location {
+            "clone-root" => cache.clone(),
+            "clone-descendant" => cache.join("clones"),
+            _ => fixture.0.join("clones"),
+        };
+        let output = match location {
+            "output-cache" => cache.clone(),
+            "output-digest" => cache.join(omgs::setup::bundled_digest()),
+            _ => fixture.0.join("output"),
+        };
+        let list = fixture.0.join("repos.txt");
+        std::fs::write(&list, "https://example.invalid/owner/repo\n").unwrap();
+        let result = cli()
+            .env("OMGS_HOME", &home)
+            .args(["batch", "init", "--no-sensors", "--list"])
+            .arg(&list)
+            .arg("--clone-root")
+            .arg(&clones)
+            .arg("--out")
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(2), "{location}: {result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("skill bundle cache"),
+            "{location}: {result:?}"
+        );
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0, "{location}");
+        assert!(!clones.exists(), "{location}");
+        assert!(!output.exists(), "{location}");
+        // Only the original home and input list may exist in the fixture.
+        assert_eq!(
+            std::fs::read_dir(&fixture.0).unwrap().count(),
+            2,
+            "{location}"
+        );
+    }
+}
+
+#[test]
+fn nonexistent_cache_case_alias_is_refused_on_case_insensitive_filesystems() {
+    let fixture = Fixture::new();
+    let home = fixture.0.join("home");
+    omgs::platform::create_private_dir(&home).unwrap();
+    // Detect case behavior using an existing fixture directory, without
+    // populating the cache or the proposed run output.
+    if !fixture.0.join("HOME").is_dir() {
+        return;
+    }
+    let target = fixture.0.join("source");
+    std::fs::create_dir(&target).unwrap();
+    let list = fixture.0.join("repos.txt");
+    std::fs::write(&list, "https://example.invalid/owner/repo\n").unwrap();
+    for batch in [false, true] {
+        let output = home.join("SKILL-BUNDLES");
+        let clones = fixture.0.join("clones");
+        let mut command = cli();
+        command.env("OMGS_HOME", &home);
+        if batch {
+            command
+                .args(["batch", "init", "--list"])
+                .arg(&list)
+                .arg("--clone-root")
+                .arg(&clones);
+        } else {
+            command.args(["audit", "init", "--target"]).arg(&target);
+        }
+        let result = command
+            .arg("--no-sensors")
+            .arg("--out")
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(2), "{batch}: {result:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("skill bundle cache"),
+            "{batch}: {result:?}"
+        );
+        assert!(!output.exists());
+        assert!(!home.join("skill-bundles").exists());
+        assert_eq!(std::fs::read_dir(&home).unwrap().count(), 0);
+        assert!(!clones.exists());
+    }
+}
+
+#[test]
+fn batch_checks_planned_target_aliases_before_writing() {
+    let fixture = Fixture::new();
+    let home = fixture.0.join("home");
+    let cache = home.join("skill-bundles");
+    omgs::platform::create_private_tree(&cache).unwrap();
+    let clones = fixture.0.join("clones");
+    let owner = clones.join("example.invalid/owner");
+    std::fs::create_dir_all(&owner).unwrap();
+    let target = owner.join("repo");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&cache, &target).unwrap();
+    #[cfg(windows)]
+    assert!(Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&target)
+        .arg(&cache)
+        .status()
+        .unwrap()
+        .success());
+    let output = fixture.0.join("output");
+    let list = fixture.0.join("repos.txt");
+    std::fs::write(&list, "https://example.invalid/owner/repo\n").unwrap();
+    let result = cli()
+        .env("OMGS_HOME", &home)
+        .args(["batch", "init", "--list"])
+        .arg(&list)
+        .arg("--clone-root")
+        .arg(&clones)
+        .arg("--out")
+        .arg(&output)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2), "{result:?}");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("skill bundle cache"),
+        "{result:?}"
+    );
+    assert!(!output.exists());
+    assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&home).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(&owner).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 3);
 }

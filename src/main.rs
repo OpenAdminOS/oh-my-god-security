@@ -2285,6 +2285,38 @@ fn resolve_existing_prefix(p: &Path) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
+/// Compare physically resolved paths component by component. Missing suffixes
+/// retain their input spelling, so conservatively reject ASCII case aliases on
+/// every filesystem, including case-sensitive volumes. This needs no probe
+/// writes and covers the fixed ASCII cache name and bundle digest.
+fn path_is_within(path: &Path, parent: &Path) -> bool {
+    let mut components = path.components();
+    parent.components().all(|expected| {
+        components.next().is_some_and(|actual| {
+            actual
+                .as_os_str()
+                .as_encoded_bytes()
+                .eq_ignore_ascii_case(expected.as_os_str().as_encoded_bytes())
+        })
+    })
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    path_is_within(left, right) || path_is_within(right, left)
+}
+
+fn admit_bundle_cache(fences: &[PathBuf]) -> Result<(), String> {
+    let cache = resolve_existing_prefix(&bundle_cache())?;
+    if let Some(fence) = fences.iter().find(|f| paths_overlap(&cache, f)) {
+        return Err(format!(
+            "the skill bundle cache {} overlaps {}; set OMGS_HOME outside the target and the run output",
+            cache.display(),
+            fence.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Initialize a run and return its directory.
 fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     selected_skill(rest)?;
@@ -2299,17 +2331,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
         trusted_policy_path(&target, &out)?;
         fences.push(out);
     }
-    let cache = resolve_existing_prefix(&bundle_cache())?;
-    if let Some(fence) = fences
-        .iter()
-        .find(|f| cache.starts_with(f) || f.starts_with(&cache))
-    {
-        return Err(format!(
-            "the skill bundle cache {} overlaps {}; set OMGS_HOME outside the target and the run output",
-            cache.display(),
-            fence.display()
-        ));
-    }
+    admit_bundle_cache(&fences)?;
     let skill = review_skill(rest)?;
     let run = audit_init_selected(rest)?;
     omgs::runmeta::update(&run, |meta| {
@@ -3288,7 +3310,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             };
             let resolved = resolve_existing_prefix(&out_abs)?;
             for t in std::iter::once(&targets_root).chain(&dests) {
-                if resolved.starts_with(resolve_existing_prefix(t)?) {
+                if path_is_within(&resolved, &resolve_existing_prefix(t)?) {
                     return Err(format!(
                         "batch output must live outside the reviewed targets, and {} is inside {}",
                         out_abs.display(),
@@ -3298,9 +3320,14 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             }
             // Admit shared cache and policy storage against every target and
             // the whole batch output before creating either directory.
+            let mut fences = vec![resolved.clone()];
+            for target in std::iter::once(&targets_root).chain(&dests) {
+                fences.push(resolve_existing_prefix(target)?);
+            }
             for target in std::iter::once(&targets_root).chain(&dests) {
                 trusted_policy_path(&resolve_existing_prefix(target)?, &resolved)?;
             }
+            admit_bundle_cache(&fences)?;
             // The batch directory must be new or empty: anything already in it
             // (a planted symlink at <host>/<owner> for example) could redirect
             // a run into a target.
@@ -3323,7 +3350,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 .collect::<Result<Vec<_>, String>>()?;
             let contained = |p: &Path| -> Result<(), String> {
                 let p = resolve_existing_prefix(p)?;
-                match resolved_targets.iter().find(|t| p.starts_with(t)) {
+                match resolved_targets.iter().find(|t| path_is_within(&p, t)) {
                     Some(t) => Err(format!(
                         "run directory {} resolves inside {}",
                         p.display(),
@@ -3434,7 +3461,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 }
             }
             let inside = |p: &Path| -> Result<(), String> {
-                match targets.iter().find(|t| p.starts_with(t)) {
+                match targets.iter().find(|t| path_is_within(p, t)) {
                     Some(t) => Err(format!(
                         "index output must live outside every reviewed target, and {} is inside {}",
                         out_abs.display(),
@@ -3793,6 +3820,31 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
 
 #[cfg(test)]
 mod cli_tests {
+    #[test]
+    fn overlap_comparison_rejects_case_aliases_at_component_boundaries() {
+        use std::path::Path;
+        for (left, right, overlaps) in [
+            ("home/skill-bundles", "home/SKILL-BUNDLES", true),
+            ("home/skill-bundles/digest", "HOME/SKILL-BUNDLES", true),
+            ("home/skill-bundles", "home/SKILL-BUNDLES/digest", true),
+            ("home/skill-bundles", "home/skill-bundles-other", false),
+            ("home/skill-bundles", "home/runs", false),
+        ] {
+            assert_eq!(
+                super::paths_overlap(Path::new(left), Path::new(right)),
+                overlaps
+            );
+        }
+        assert!(super::path_is_within(
+            Path::new("home/SKILL-BUNDLES/digest"),
+            Path::new("home/skill-bundles")
+        ));
+        assert!(!super::path_is_within(
+            Path::new("home/skill-bundles"),
+            Path::new("home/skill-bundles/digest")
+        ));
+    }
+
     #[test]
     fn doctor_overall_deadline_covers_preparation_and_leaves_unchecked_probes() {
         for preparation in [true, false] {
