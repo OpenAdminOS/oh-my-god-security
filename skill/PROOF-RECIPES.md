@@ -138,6 +138,49 @@ in the harness through the target's own cleanup API (for example `server.close()
 `clearInterval`) before `check()` returns, and record the timeout as the blocker if the target
 offers no way to release them.
 
+### TypeScript and Next.js decision imports
+
+Use the already available Node runtime only when its built-in type stripping supports the actual
+source syntax. No installation, transpiler download or package fetching is allowed. Type stripping
+does not implement TypeScript path aliases, decorators, arbitrary compiler transforms or framework
+initialization. Unsupported syntax or missing enforcement dependencies is a blocker, not a failed
+security invariant. Keep exit 2 for import, control, compilation or invocation errors.
+
+Import the real decision file from a staged `.mjs` harness. A fixed local import hook may resolve
+`@/` to an explicit workspace-relative source root using `node:module` `registerHooks`. Permit only
+listed local aliases, reject traversal outside that root, and delegate other imports to the normal
+resolver. Register before dynamic `await import('./src/decision.ts')`; static imports run before
+hook registration. Retain the hook in the same harness or as an explicitly staged input so replay
+uses the same bytes. Do not load target-supplied loaders or run framework build scripts.
+
+For example, when the reviewed tree already uses explicit `.ts` alias targets, the harness can
+register this fixed mapping before importing the real decision:
+
+```js
+import { registerHooks } from 'node:module';
+const sourceRoot = new URL('./src/', import.meta.url);
+registerHooks({ resolve(specifier, context, nextResolve) {
+  if (!specifier.startsWith('@/')) return nextResolve(specifier, context);
+  const suffix = specifier.slice(2);
+  if (!suffix.endsWith('.ts') || suffix.split('/').some(p => !p || p === '..' || p === '.')) {
+    throw new Error('UNSUPPORTED_ALIAS');
+  }
+  const resolved = new URL(suffix, sourceRoot);
+  if (!resolved.href.startsWith(sourceRoot.href)) throw new Error('ALIAS_ESCAPE');
+  return nextResolve(resolved.href, context);
+}});
+const { canRead } = await import('./src/decision.ts');
+```
+
+Do not guess extension resolution for a different tree; map its exact imports explicitly or leave
+it blocked. Use the Node invariant/control and nonce markers above after the import. A harness
+must test the real guard, identity/resource binding and relevant dependency behavior. Unrelated
+logging or presentation dependencies may have minimal disclosed stubs. List every stub, its
+replaced symbol, source dependency, reason, and effect on the claim. Never stub authorization,
+cryptographic verification, database policy or another decision being claimed. Missing Next.js,
+identity or storage semantics keep those effects `needs_validation`, even if a smaller real
+pure decision can be tested. Never infer real backend enforcement from an in-memory substitute.
+
 ### Python
 
 Use `test.py` with the authorized assertion followed by the boundary assertion. Run isolated mode;
@@ -243,6 +286,16 @@ do {
 ```sh
 omgs prove --run RUN --finding FP --test main.swift --test-from DRAFT --expect-marker BOUNDARY_ASSERTION_FAILED --cmd "swiftc target.swift main.swift -o fixture || exit 2; ./fixture"
 ```
+
+For an Xcode tree without a usable package, select the minimal real source set containing the
+decision and its full enforcement chain. Name every compiled source file and explain why omitted
+files cannot alter that decision. Compile those files unchanged inside the sandbox with the
+invariant harness. An unrelated logger or presentation/configuration dependency may use a minimal
+stub only when it cannot supply authorization, identity, secret policy, path validation, signer
+checks or another condition of the claim. Document each stub's symbol, original dependency,
+substitution and limitation. If configuration controls enforcement, it is part of the real source
+set or a missing prerequisite, never an unrelated stub. Evaluators reject replaced enforcement.
+A proven pure decision does not establish live XPC identity, keychain access or privileged effects.
 
 For modules needing a library, use `swiftc -emit-library` inside the same proof and link an explicit
 workspace-relative library path. Common blockers: `swiftc not on host PATH` or `swiftc on host PATH
