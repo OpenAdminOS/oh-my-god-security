@@ -53,10 +53,17 @@ free-form reports. Return structured records with these fields and no severity:
 | `proof_plan` | Minimum synthetic fixture, safe invariant assertion, expected vulnerable failure and control success, local prerequisites, and stop condition. |
 | `fingerprint` | Output from `omgs fingerprint` using the four identity inputs below. |
 
-Use stable attack class names across runs, starting from the ones `omgs audit init` seeds into the
-ledger (such as `missing_authz`, `idor_tenant_isolation`, `client_only_auth`, `webhook_signature`,
-`generated_script_injection`, `feed_to_policy_write`, `privileged_local_ops`). Apply the installed
-CLI's canonicalization and accepted schema; this vocabulary does not invent extra schema fields.
+Use the shared [class registry](intent/classes.json) for attack classes across seeds, packs,
+candidates and intent filters. It includes `ssrf`, `artifact_poisoning`, `ipc_authorization` and
+`secret_disclosure`. New public classes are added to that registry with tests and relevant intent
+questions. Stable lowercase extension identifiers (at most 96 characters) remain possible in
+candidates and ledger units. They do not change accountability or exclusion rules. An intent
+filter accepts every registered class and explicitly reports when it has no questions.
+
+A partially examined unit declares `partial: true` and references separate `residual_units` before
+closure. Preserve every unexamined operation there. Stack and operation checklists use explicit
+`child_units`; never assign their broad scope as duplicate candidate ownership. Read the source to
+complete operation enumeration; unknown syntax remains blocked.
 
 ## Identity and deduplication
 

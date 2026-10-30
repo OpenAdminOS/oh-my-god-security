@@ -90,7 +90,7 @@ fn classifier_table_covers_every_class_and_stack_conventions() {
         ("data/export.json", Class::Code),
         ("export.csv", Class::Code),
         ("package.json", Class::Code),
-        ("assets/icon.png", Class::Code),
+        ("assets/icon.png", Class::Asset),
         ("contest/main.rs", Class::Code),
     ] {
         assert_eq!(classify(path), class, "{path}");
@@ -1077,6 +1077,36 @@ fn build_names_and_txt_configuration_are_code_before_docs_or_data() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("project:.:generic"));
     assert!(cli(&[
         "ledger",
+        "add",
+        "--ledger",
+        run.join("coverage-ledger.json").to_str().unwrap(),
+        "--unit",
+        "build:command",
+        "--surface",
+        "CMakeLists.txt:execute_process",
+        "--classes",
+        "command_injection",
+        "--mapping",
+        r##"{"scope_paths":["CMakeLists.txt#execute_process"]}"##
+    ])
+    .status
+    .success());
+    assert!(cli(&[
+        "ledger",
+        "set",
+        "--ledger",
+        run.join("coverage-ledger.json").to_str().unwrap(),
+        "--unit",
+        "build:command",
+        "--status",
+        "covered",
+        "--evidence",
+        "CMakeLists.txt"
+    ])
+    .status
+    .success());
+    assert!(cli(&[
+        "ledger",
         "set",
         "--ledger",
         run.join("coverage-ledger.json").to_str().unwrap(),
@@ -1085,7 +1115,9 @@ fn build_names_and_txt_configuration_are_code_before_docs_or_data() {
         "--status",
         "covered",
         "--evidence",
-        "CMakeLists.txt"
+        "CMakeLists.txt",
+        "--mapping",
+        r#"{"child_units":["build:command"]}"#
     ])
     .status
     .success());
@@ -1121,6 +1153,14 @@ fn every_excluded_class_requires_review_and_reports_the_reason() {
             (0..26)
                 .rev()
                 .map(|i| format!("vendor/item{i:02}.unknown"))
+                .collect(),
+        ),
+        (
+            "asset",
+            "assets:excluded",
+            (0..26)
+                .rev()
+                .map(|i| format!("public/icon{i:02}.png"))
                 .collect(),
         ),
         (

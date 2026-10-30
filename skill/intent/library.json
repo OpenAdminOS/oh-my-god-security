@@ -129,6 +129,30 @@
       "question": "Must an unavailable or unsupported security decision stop the protected operation?",
       "why": "Error handling can widen authority when unknown is treated as permission.",
       "answers": ["stop the operation", "use a reviewed restricted fallback"]
+    },
+    {
+      "id": "native.accepted-callers",
+      "stacks": ["swift"],
+      "attack_classes": ["ipc_authorization", "missing_authz"],
+      "question": "Which callers may connect to each IPC listener and invoke each exported operation?",
+      "why": "Connection admission and operation authorization can have different allowed populations.",
+      "answers": ["expected signed application only", "explicit authorized local principals", "any local caller"]
+    },
+    {
+      "id": "native.secret-disclosure",
+      "stacks": ["swift"],
+      "attack_classes": ["secret_disclosure", "credential_handling"],
+      "question": "Which callers may receive each stored secret, and may credentials leave the privileged service?",
+      "why": "Permission to request an operation does not imply permission to read its credentials.",
+      "answers": ["never return secrets", "authorized owner only", "explicit caller allowlist"]
+    },
+    {
+      "id": "native.privileged-operations",
+      "stacks": ["swift"],
+      "attack_classes": ["ipc_authorization", "privileged_local_ops"],
+      "question": "Which privileged operations may each caller perform and on which resources?",
+      "why": "An admitted connection still needs per-operation and resource authorization.",
+      "answers": ["operation and resource allowlist", "all operations for trusted callers"]
     }
   ]
 }

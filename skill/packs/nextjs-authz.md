@@ -1,6 +1,6 @@
 # Route and action authorization
 
-Use for `missing_authorization` and `idor` units. Hunt a concrete private read or privileged write by the wrong principal, not the mere absence of an inline guard.
+Use for `missing_authz` and `idor` units. Hunt a concrete private read or privileged write by the wrong principal, not the mere absence of an inline guard.
 
 ## What to hunt
 

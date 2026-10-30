@@ -1,6 +1,6 @@
 # Client-only authorization and middleware gaps
 
-Use for `client_only_authorization` units. Hunt a server effect that remains reachable by an unauthorized principal despite a UI guard or an incomplete middleware rule.
+Use for `client_only_auth` units. Hunt a server effect that remains reachable by an unauthorized principal despite a UI guard or an incomplete middleware rule.
 
 ## What to hunt
 

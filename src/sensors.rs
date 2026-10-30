@@ -444,6 +444,25 @@ fn simple_hits(tool: &str, output: &str, target: &Path) -> Result<Vec<SensorHit>
 /// Every code hit has its own candidate unit so one resolution cannot hide
 /// another hit from the same tool. Excluded classes retain their group review.
 pub fn seed_units(report: &SensorsReport, ledger: &mut crate::ledger::Ledger) {
+    for (i, gap) in report
+        .gaps
+        .iter()
+        .enumerate()
+        .filter(|(_, gap)| gap.contains("input entries/subtrees skipped"))
+    {
+        let id = format!("inventory:sensor-input:{i}");
+        if !ledger.units.iter().any(|u| u.id == id) {
+            let mut unit = crate::ledger::Unit::new(&id, "bounded sensor input", &[], "blocked");
+            unit.note = Some(gap.clone());
+            unit.extra.insert(
+                "inventory_gap_reason".into(),
+                serde_json::json!(
+                    "sensor input skipped; reconcile retained path/reason manifest in sensors.json"
+                ),
+            );
+            ledger.units.push(unit);
+        }
+    }
     for hit in report
         .hits
         .iter()
@@ -461,12 +480,11 @@ pub fn seed_units(report: &SensorsReport, ledger: &mut crate::ledger::Ledger) {
     }
     // A scanner may see a file omitted by inventory limits or link handling.
     // It still needs an exclusion group even when inventory never seeded one.
-    for (class, id) in [
-        (crate::paths::Class::Test, "tests:excluded"),
-        (crate::paths::Class::Docs, "docs:excluded"),
-        (crate::paths::Class::Data, "data:excluded"),
-        (crate::paths::Class::Vendored, "vendored:excluded"),
-    ] {
+    let classes: std::collections::BTreeSet<_> = report.hits.iter().map(|h| h.class).collect();
+    for class in classes {
+        let Some((id, _)) = crate::paths::exclusion_group(class) else {
+            continue;
+        };
         let paths: std::collections::BTreeSet<_> = report
             .hits
             .iter()

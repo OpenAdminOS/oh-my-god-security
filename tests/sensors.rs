@@ -288,7 +288,13 @@ fn offline_tools_feed_redacted_artifacts_reports_and_critic() {
     {
         u["status"] = json!("covered");
         u["evidence"] = json!(["reviewed source"]);
+        if u["id"].as_str().unwrap().starts_with("stack:")
+            || u["id"].as_str().unwrap().starts_with("project:")
+        {
+            u["child_units"] = json!(["mapped:source"]);
+        }
     }
+    units.push(json!({"id":"mapped:source","surface":"src/main.rs","attack_classes":["input_validation"],"status":"covered","evidence":["src/main.rs"],"scope_paths":["src/main.rs"]}));
     write_private_fixture(run.join("coverage-ledger.json"), ledger.to_string()).unwrap();
     write_private_fixture(run.join("candidates-empty.json"), r#"{"candidates":[]}"#).unwrap();
     let critic = omgs::critic::critique_run(&run).unwrap();
@@ -609,9 +615,19 @@ fn oversized_and_linked_inputs_remain_explicit_gaps() {
     let run = f.init("bounded-input");
     let r = read(&run.join("sensors.json"));
     assert!(
-        r["gaps"].to_string().contains("input entries skipped"),
+        r["gaps"]
+            .to_string()
+            .contains("input entries/subtrees skipped"),
         "{r}"
     );
+    assert!(r["gaps"].to_string().contains("oversized.bin"));
+    assert!(r["gaps"].to_string().contains("file byte limit"));
+    let ledger = read(&run.join("coverage-ledger.json"));
+    assert!(ledger["units"].as_array().unwrap().iter().any(|u| u["id"]
+        .as_str()
+        .unwrap()
+        .starts_with("inventory:sensor-input:")
+        && u["status"] == "blocked"));
     assert_eq!(r["hits"].as_array().unwrap().len(), 1, "{r}");
 }
 

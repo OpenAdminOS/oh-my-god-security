@@ -119,10 +119,10 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "ledger" if args.first().is_some_and(|a| a == "ingest") => ("--ledger --dispositions", true),
         "ledger" if args.first().is_some_and(|a| a == "list") => ("--ledger", true),
         "ledger" if args.first().is_some_and(|a| a == "add") => {
-            ("--ledger --unit --surface --classes --status --note", true)
+            ("--ledger --unit --surface --classes --status --note --mapping", true)
         }
         "ledger" if args.first().is_some_and(|a| a == "set") => {
-            ("--ledger --unit --status --evidence --note", true)
+            ("--ledger --unit --status --evidence --note --mapping", true)
         }
         "gate" => ("--target --base --head --run", false),
         "critic" => ("--run", false),
@@ -2511,14 +2511,18 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             || rel.starts_with("pages/api/")
             || rel.contains("/pages/api/");
         if is_route {
-            units.push(Unit::new(
+            let mut unit = Unit::new(
                 &format!("route:{rel}"),
                 rel,
                 &["missing_authz", "idor_tenant_isolation", "client_only_auth"],
                 "planned",
-            ));
+            );
+            unit.extra
+                .insert("checklist".into(), serde_json::json!("operations"));
+            units.push(unit);
         }
     }
+    units.extend(omgs::mapping::native_units(&target, &native_paths));
     for project in &projects {
         for stack in &project.stacks {
             let id = if project.root == "." {
@@ -2532,6 +2536,8 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
                 &omgs::stack_attack_classes(stack),
                 "planned",
             );
+            unit.extra
+                .insert("checklist".into(), serde_json::json!("partition"));
             unit.note = Some("Mapping placeholder: split into bounded surface/boundary/class units before hunter dispatch; cite those unit ids when closing this checklist. Never use it to duplicate candidate ownership.".into());
             units.push(unit);
         }
@@ -2544,24 +2550,10 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             "planned",
         ));
     }
-    for (class, id, label) in [
-        (
-            omgs::paths::Class::Vendored,
-            "vendored:excluded",
-            "vendored or generated",
-        ),
-        (omgs::paths::Class::Docs, "docs:excluded", "documentation"),
-        (
-            omgs::paths::Class::Data,
-            "data:excluded",
-            "large structured data",
-        ),
-        (
-            omgs::paths::Class::Test,
-            "tests:excluded",
-            "test or fixture",
-        ),
-    ] {
+    for class in counts.keys().copied() {
+        let Some((id, label)) = omgs::paths::exclusion_group(class) else {
+            continue;
+        };
         let count = counts.get(&class).copied().unwrap_or(0);
         if count > 0 {
             let mut unit = Unit::new(id, &format!("{count} {label} file(s)"), &[], "planned");
@@ -3002,6 +2994,9 @@ fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
             let status = flag(rest, "--status").unwrap_or_else(|| "planned".into());
             let mut new = Unit::new(&unit, &surface, &classes, &status);
             new.note = flag(rest, "--note").filter(|n| !n.trim().is_empty());
+            if let Some(mapping) = flag(rest, "--mapping") {
+                omgs::mapping::apply_metadata(&mut new, &mapping)?;
+            }
             add_unit(&mut ledger, new)?;
             write_ledger(&path, &ledger)?;
             println!("{status}: {unit}");
@@ -3015,6 +3010,14 @@ fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
             }
             let evidence = flags(rest, "--evidence");
             let note = flag(rest, "--note");
+            if let Some(mapping) = flag(rest, "--mapping") {
+                let target = ledger
+                    .units
+                    .iter_mut()
+                    .find(|u| u.id == unit)
+                    .ok_or("ledger unit not found")?;
+                omgs::mapping::apply_metadata(target, &mapping)?;
+            }
             set_status(&mut ledger, &unit, &status, &evidence, note.as_deref())?;
             write_ledger(&path, &ledger)?;
             println!("{status}: {unit}");
@@ -3613,10 +3616,11 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
             let class = flag(rest, "--attack-class").map(|c| c.replace('-', "_"));
             let class = class.map(|c| if c == "fail_closed" { "fail_closed_semantics".into() } else { c });
             if let Some(c) = &class {
-                let valid: std::collections::BTreeSet<_> = omgs::intent::list(None, None).iter().flat_map(|q| q.attack_classes.iter().cloned()).collect();
-                if !valid.contains(c) { return Err(format!("unknown attack class {c}; expected {}", valid.into_iter().collect::<Vec<_>>().join(", "))); }
+                if !omgs::classes::known(c) { return Err(format!("unknown attack class {c}; expected {}", omgs::classes::all().join(", "))); }
             }
-            for q in omgs::intent::list(stack.as_deref(), class.as_deref()) {
+            let questions = omgs::intent::list(stack.as_deref(), class.as_deref());
+            if questions.is_empty() { println!("no intent questions for this class/stack; record unresolved owner intent explicitly"); }
+            for q in questions {
                 println!("{}: {}", q.id, q.question);
                 if !q.answers.is_empty() {
                     println!("  answers: {}", q.answers.join(" | "));

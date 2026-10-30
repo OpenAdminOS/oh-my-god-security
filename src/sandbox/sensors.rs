@@ -86,7 +86,14 @@ pub fn run_sensor(mut req: SensorRequest<'_>) -> Result<(String, i32, Vec<String
     if scratch.cleanup().is_err() {
         return Err("private sensor scratch cleanup failed; raw scanner data may remain in the OMGS data directory".into());
     }
-    result.map(|(output, code)| (output, code, gaps))
+    match result {
+        Ok((output, code)) => Ok((output, code, gaps)),
+        Err(reason) if gaps.is_empty() => Err(reason),
+        Err(reason) => Err(format!(
+            "{reason}; retained input coverage: {}",
+            gaps.join("; ")
+        )),
+    }
 }
 
 fn run_in_scratch(
@@ -112,10 +119,16 @@ fn run_in_scratch(
     let mut readonly = req.readonly;
     let target = root.join("target");
     platform::create_private_dir_new(&target).map_err(|_| "cannot create sensor workspace")?;
-    let mut budget = InputBudget::default();
+    let mut budget = InputBudget {
+        semgrep: req.semgrep,
+        ..Default::default()
+    };
     copy_input(req.target, Path::new(""), &target, &mut budget)?;
     if budget.skipped > 0 {
-        gaps.push(format!("{} input entries skipped: links, special files, unreadable files or input bounds (16 MiB/file, 64 MiB total, 10000 entries, 64 directory levels)", budget.skipped));
+        gaps.push(format!("{} input entries/subtrees skipped; {} manifest records omitted (16 MiB/file, 64 MiB total, 10000 staged files, 100000 enumerated entries, 64 directory levels)", budget.skipped, budget.skipped.saturating_sub(budget.manifest.len())));
+        for record in &budget.manifest {
+            gaps.push(format!("input skip: {record}"));
+        }
     }
     if req.semgrep {
         if budget.semgrep_oversized > 0 {
@@ -347,8 +360,31 @@ fn translate_paths(output: &str, target: &Path) -> String {
 struct InputBudget {
     bytes: u64,
     entries: usize,
+    staged: usize,
     skipped: usize,
     semgrep_oversized: usize,
+    semgrep: bool,
+    manifest: Vec<String>,
+}
+impl InputBudget {
+    fn skip(&mut self, path: &Path, reason: &str) {
+        self.skipped += 1;
+        if self.manifest.len() < 128 {
+            let path = if path.as_os_str().is_empty() {
+                ".".into()
+            } else {
+                crate::paths::display(path)
+            };
+            let shortened: String = path.chars().take(1024).collect();
+            self.manifest.push(
+                serde_json::json!({
+                    "path": shortened, "path_truncated": path.chars().count() > 1024,
+                    "reason": reason,
+                })
+                .to_string(),
+            );
+        }
+    }
 }
 fn copy_input(
     root: &Path,
@@ -356,55 +392,132 @@ fn copy_input(
     dest: &Path,
     budget: &mut InputBudget,
 ) -> Result<(), String> {
-    supervise::check_interrupted().map_err(|_| "sensor input copy interrupted")?;
+    let mut files = Vec::new();
+    inventory_input(root, rel, budget, &mut files)?;
+    files.sort_by_key(|(path, _)| {
+        let class = crate::paths::classify_file(root, path);
+        (
+            class != crate::paths::Class::Code,
+            !crate::paths::is_source(&crate::paths::display(path)),
+            path.clone(),
+        )
+    });
+    for (path, size) in files {
+        supervise::check_interrupted().map_err(|_| "sensor input copy interrupted")?;
+        let reason = if size > 16 << 20 {
+            Some("file byte limit")
+        } else if budget.staged >= 10000 {
+            Some("staged file limit")
+        } else if budget.bytes + size > 64 << 20 {
+            Some("total byte limit")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            budget.skip(&path, reason);
+            continue;
+        }
+        match platform::read_bounded_in(root, &path, (16 << 20).min((64 << 20) - budget.bytes)) {
+            Ok(bytes) => {
+                if bytes.len() > crate::sensors::SEMGREP_MAX_TARGET_BYTES {
+                    budget.semgrep_oversized += 1;
+                    if budget.semgrep {
+                        budget.skip(
+                            &path,
+                            "Semgrep target byte limit; file staged but not scanned",
+                        );
+                    }
+                }
+                budget.bytes += bytes.len() as u64;
+                budget.staged += 1;
+                if let Some(parent) = dest.join(&path).parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|_| "cannot create sensor input directory")?;
+                }
+                std::fs::write(dest.join(&path), bytes).map_err(|_| "cannot copy sensor input")?;
+            }
+            Err(_) => budget.skip(&path, "unreadable, changed or unsafe file"),
+        }
+    }
+    Ok(())
+}
+fn inventory_input(
+    root: &Path,
+    rel: &Path,
+    budget: &mut InputBudget,
+    files: &mut Vec<(PathBuf, u64)>,
+) -> Result<(), String> {
+    supervise::check_interrupted().map_err(|_| "sensor input inventory interrupted")?;
     if rel.components().count() > 64 {
-        budget.skipped += 1;
+        budget.skip(rel, "directory depth limit; subtree unenumerated");
         return Ok(());
     }
-    for entry in std::fs::read_dir(root.join(rel)).map_err(|_| "cannot enumerate sensor input")? {
-        budget.entries += 1;
-        if budget.entries > 10000 {
-            budget.skipped += 1;
+    if budget.entries >= 100000 {
+        budget.skip(rel, "enumeration limit; subtree unenumerated");
+        return Ok(());
+    }
+    let entries = match std::fs::read_dir(root.join(rel)) {
+        Ok(entries) => entries,
+        Err(_) => {
+            budget.skip(rel, "unreadable directory; subtree unenumerated");
+            return Ok(());
+        }
+    };
+    let mut dirs = Vec::new();
+    for entry in entries {
+        if budget.entries >= 100000 {
+            budget.skip(
+                rel,
+                "enumeration limit; remaining directory entries unenumerated",
+            );
             break;
         }
+        budget.entries += 1;
         let Ok(entry) = entry else {
-            budget.skipped += 1;
+            budget.skip(rel, "unreadable directory entry; identity unavailable");
             continue;
         };
         let path = rel.join(entry.file_name());
         let meta = match std::fs::symlink_metadata(entry.path()) {
             Ok(meta) => meta,
             Err(_) => {
-                budget.skipped += 1;
+                budget.skip(&path, "unreadable metadata");
                 continue;
             }
         };
         if platform::is_link(&meta) {
-            budget.skipped += 1;
-            continue;
-        }
-        if meta.is_dir() {
-            std::fs::create_dir(dest.join(&path))
-                .map_err(|_| "cannot create sensor input directory")?;
-            copy_input(root, &path, dest, budget)?;
-        } else if meta.is_file() && meta.len() <= 16 << 20 && budget.bytes + meta.len() <= 64 << 20
-        {
-            // The no-follow bounded read refuses link swaps and growing files.
-            match platform::read_bounded_in(root, &path, (16 << 20).min((64 << 20) - budget.bytes))
-            {
-                Ok(bytes) => {
-                    if bytes.len() > crate::sensors::SEMGREP_MAX_TARGET_BYTES {
-                        budget.semgrep_oversized += 1;
-                    }
-                    budget.bytes += bytes.len() as u64;
-                    std::fs::write(dest.join(&path), bytes)
-                        .map_err(|_| "cannot copy sensor input")?;
-                }
-                Err(_) => budget.skipped += 1,
-            }
+            budget.skip(&path, "link; not followed");
+        } else if meta.is_dir() {
+            dirs.push(path);
+        } else if meta.is_file() {
+            files.push((path, meta.len()));
         } else {
-            budget.skipped += 1;
+            budget.skip(&path, "special file");
         }
+    }
+    // Defer conventional bulk containers during bounded discovery. Staging then
+    // sorts all discovered first-party code before assets and exclusions.
+    dirs.sort_by_key(|p| {
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        (
+            [
+                "public",
+                "assets",
+                "images",
+                "node_modules",
+                "vendor",
+                ".git",
+            ]
+            .contains(&name.as_str()),
+            p.clone(),
+        )
+    });
+    for dir in dirs {
+        inventory_input(root, &dir, budget, files)?;
     }
     Ok(())
 }
@@ -881,5 +994,106 @@ mod tests {
         let runtime = scanner_runtime_roots(&scanner, true).unwrap();
         assert!(runtime.python.unwrap().venv.is_none());
         assert!(!runtime.roots.contains(&prefix));
+    }
+}
+
+#[cfg(test)]
+mod bounded_input_tests {
+    use super::*;
+    struct Temp(PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn t47_source_stages_before_assets_and_skips_keep_bounded_reasons() {
+        let root = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-input-{}", platform::random_nonce().unwrap()));
+        let _cleanup = Temp(root.clone());
+        let input = root.join("input");
+        let dest = root.join("dest");
+        std::fs::create_dir_all(input.join("public")).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(input.join("public/a.png"), b"image").unwrap();
+        std::fs::write(input.join("public/z.ts"), b"export const decision = true;").unwrap();
+        let mut budget = InputBudget {
+            staged: 9999,
+            ..Default::default()
+        };
+        copy_input(&input, Path::new(""), &dest, &mut budget).unwrap();
+        assert!(dest.join("public/z.ts").is_file());
+        assert!(!dest.join("public/a.png").exists());
+        let skipped: serde_json::Value = serde_json::from_str(&budget.manifest[0]).unwrap();
+        assert_eq!(skipped["path"], "public/a.png");
+        assert_eq!(skipped["reason"], "staged file limit");
+        for n in 0..200 {
+            budget.skip(Path::new(&format!("public/{n}.png")), "file byte limit");
+        }
+        assert_eq!(budget.skipped, 201);
+        assert_eq!(budget.manifest.len(), 128);
+        let mut full = InputBudget {
+            entries: 100000,
+            ..Default::default()
+        };
+        inventory_input(&input, Path::new("public"), &mut full, &mut Vec::new()).unwrap();
+        assert!(full.manifest[0].contains("subtree unenumerated"));
+        assert!(full.manifest[0].contains("public"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn t47_links_have_path_reasons_without_following_them() {
+        let root = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-link-input-{}",
+            platform::random_nonce().unwrap()
+        ));
+        let _cleanup = Temp(root.clone());
+        std::fs::create_dir_all(root.join("input")).unwrap();
+        std::fs::create_dir_all(root.join("dest")).unwrap();
+        std::os::unix::fs::symlink("/never/read", root.join("input/link")).unwrap();
+        let mut budget = InputBudget::default();
+        copy_input(
+            &root.join("input"),
+            Path::new(""),
+            &root.join("dest"),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(budget.skipped, 1);
+        assert!(budget.manifest[0].contains("link; not followed"));
+        assert_eq!(std::fs::read_dir(root.join("dest")).unwrap().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod semgrep_input_tests {
+    use super::*;
+    #[test]
+    fn t47_semgrep_size_skips_retain_the_source_identity() {
+        let root = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-semgrep-bound-{}",
+            platform::random_nonce().unwrap()
+        ));
+        let input = root.join("input");
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(
+            input.join("large.ts"),
+            vec![b' '; crate::sensors::SEMGREP_MAX_TARGET_BYTES + 1],
+        )
+        .unwrap();
+        let mut budget = InputBudget {
+            semgrep: true,
+            ..Default::default()
+        };
+        copy_input(&input, Path::new(""), &dest, &mut budget).unwrap();
+        assert!(dest.join("large.ts").is_file());
+        assert_eq!(budget.skipped, 1);
+        assert_eq!(budget.semgrep_oversized, 1);
+        assert!(budget.manifest[0].contains("large.ts"));
+        assert!(budget.manifest[0].contains("Semgrep target byte limit"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

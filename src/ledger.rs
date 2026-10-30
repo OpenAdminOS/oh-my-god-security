@@ -52,6 +52,7 @@ pub fn is_exclusion(u: &Unit) -> bool {
         "tests:excluded",
         "docs:excluded",
         "data:excluded",
+        "assets:excluded",
         "vendored:excluded",
     ]
     .contains(&u.id.as_str())
@@ -122,6 +123,7 @@ fn unit_errors(u: &Unit) -> Vec<String> {
     if NEEDS_NOTE.contains(&u.status.as_str()) && !u.has_note() {
         errors.push(format!("{} requires a note giving the reason", u.status));
     }
+    errors.extend(crate::mapping::unit_errors(u));
     errors
 }
 
@@ -141,6 +143,7 @@ pub fn validate_ledger(ledger: &Ledger) -> Vec<String> {
             errors.push(format!("units[{i}] '{}': {e}", u.id));
         }
     }
+    errors.extend(crate::mapping::partition_errors(ledger));
     errors
 }
 
@@ -156,7 +159,13 @@ pub fn add_unit(ledger: &mut Ledger, unit: Unit) -> Result<(), String> {
     if !errors.is_empty() {
         return Err(format!("{}: {}", unit.id, errors.join("; ")));
     }
-    ledger.units.push(unit);
+    let mut trial = ledger.clone();
+    trial.units.push(unit);
+    let errors = crate::mapping::partition_errors(&trial);
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    *ledger = trial;
     Ok(())
 }
 
@@ -169,11 +178,12 @@ pub fn set_status(
     evidence: &[String],
     note: Option<&str>,
 ) -> Result<(), String> {
-    let unit = ledger
+    let position = ledger
         .units
-        .iter_mut()
-        .find(|u| u.id == id)
+        .iter()
+        .position(|u| u.id == id)
         .ok_or_else(|| format!("ledger unit not found: {id}"))?;
+    let unit = &ledger.units[position];
     let mut next = unit.clone();
     next.status = status.into();
     for e in evidence {
@@ -189,7 +199,13 @@ pub fn set_status(
     if !errors.is_empty() {
         return Err(format!("{id}: {}", errors.join("; ")));
     }
-    *unit = next;
+    let mut trial = ledger.clone();
+    trial.units[position] = next;
+    let errors = crate::mapping::partition_errors(&trial);
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    *ledger = trial;
     Ok(())
 }
 

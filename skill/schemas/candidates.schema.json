@@ -41,7 +41,7 @@
           },
           "source_ref": { "type": "string", "description": "Exact reviewed source identity." },
           "title": { "type": "string", "description": "Concrete claimed unauthorized result." },
-          "attack_class": { "type": "string", "description": "Stable class identifier, reused across runs." },
+          "attack_class": {"type": "string", "description": "Prefer the shared intent/classes.json registry. Stable lowercase extension identifiers remain allowed; they never remove ledger accountability.", "pattern": "^[a-z0-9_]{1,96}$"},
           "entry_point": { "type": "string", "description": "Repo-relative path plus HTTP method/route or exported action symbol." },
           "sink": { "type": "string", "description": "Repo-relative module and stable effect-producing symbol." },
           "boundary": { "type": "string", "description": "Principal/resource boundary and invariant allegedly violated." },

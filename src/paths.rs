@@ -28,7 +28,20 @@ pub enum Class {
     Test,
     Docs,
     Data,
+    Asset,
     Vendored,
+}
+
+/// Exhaustive mapping: adding a class requires choosing its accountable unit.
+pub fn exclusion_group(class: Class) -> Option<(&'static str, &'static str)> {
+    match class {
+        Class::Code => None,
+        Class::Test => Some(("tests:excluded", "test or fixture")),
+        Class::Docs => Some(("docs:excluded", "documentation")),
+        Class::Data => Some(("data:excluded", "large structured data")),
+        Class::Asset => Some(("assets:excluded", "binary asset")),
+        Class::Vendored => Some(("vendored:excluded", "vendored or generated")),
+    }
 }
 
 /// Source recognition supplements exclusion disclosure, never accountability.
@@ -126,6 +139,17 @@ pub fn classify_with_size(path: &str, size: u64) -> Class {
     {
         return Class::Test;
     }
+    if is_source(file) {
+        return Class::Code;
+    }
+    if [
+        "png", "jpg", "jpeg", "gif", "webp", "ico", "icns", "avif", "woff", "woff2", "ttf", "otf",
+        "mp3", "mp4", "pdf",
+    ]
+    .contains(&ext)
+    {
+        return Class::Asset;
+    }
     if executable_filename(file) {
         return Class::Code;
     }
@@ -142,10 +166,18 @@ pub fn classify_with_size(path: &str, size: u64) -> Class {
 }
 
 pub fn classify_file(target: &Path, relative: &Path) -> Class {
-    let size = std::fs::symlink_metadata(target.join(relative))
+    let meta = std::fs::symlink_metadata(target.join(relative))
         .ok()
-        .filter(|m| m.is_file())
-        .map_or(0, |m| m.len());
+        .filter(|m| m.is_file());
+    #[cfg(unix)]
+    if meta.as_ref().is_some_and(|m| {
+        use std::os::unix::fs::PermissionsExt;
+        m.permissions().mode() & 0o111 != 0
+    }) && classify_with_size(&display(relative), 0) == Class::Asset
+    {
+        return Class::Code;
+    }
+    let size = meta.map_or(0, |m| m.len());
     classify_with_size(&display(relative), size)
 }
 
