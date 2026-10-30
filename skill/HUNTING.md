@@ -64,7 +64,10 @@ and explicitly reports when it has no questions.
 A partially examined unit declares `partial: true` and references separate `residual_units` before
 closure. Preserve every unexamined operation there. Stack and operation checklists use explicit
 `child_units`; never assign their broad scope as duplicate candidate ownership. Read the source to
-complete operation enumeration; unknown syntax remains blocked.
+complete operation enumeration; unknown syntax remains blocked. Declare ownership using
+`scope_paths: [{"path":"src#ipc/Decision.swift","operation":"read"}]`. The optional operation
+matches `[A-Za-z_][A-Za-z0-9_.:-]{0,127}`; omit it for whole-path ownership. Literal `#`
+characters belong in `path`. Migrate ambiguous legacy strings as described in RECONNAISSANCE.md.
 
 ## Identity and deduplication
 

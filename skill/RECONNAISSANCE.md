@@ -121,9 +121,24 @@ trace caller capabilities and validation before each sensitive return or side ef
 Seeded stack units are mapping checklists, not hunter assignments. Before dispatch, create bounded
 surface/boundary/class units. A covered checklist requires `child_units` with 1 to 256 existing
 unit ids, all covered or explicitly out of scope. Each child declares `scope_paths`, such as
-`["app/api/items/route.ts#GET"]`, with one attack class per bounded decision. The critic rejects
-shared or overlapping path scopes for the same class across different children. Split a large
-partition into nested checklists. Parent checklists describe the partition and own no candidates.
+`[{"path":"app/api/items/route.ts","operation":"GET"}]`, with one attack class per bounded
+decision. The critic rejects shared or overlapping path scopes for the same class across different
+children. Split a large partition into nested checklists. Parent checklists describe the partition
+and own no candidates.
+
+Each scope is an object with a required relative `path` and an optional `operation`. Literal
+`#` characters in directory and file names stay in `path`, for example
+`{"path":"src#ipc/Decision#read.swift","operation":"read"}`. Omit `operation` to own the whole
+path and its descendants. Operation identifiers are case-sensitive ASCII strings matching
+`[A-Za-z_][A-Za-z0-9_.:-]{0,127}` (1 to 128 characters). Use a stable identifier for source
+symbols whose spelling does not fit this grammar. Unknown fields and null operations are refused.
+Legacy string scopes are accepted only with exactly one `#` separating a path without `#`
+from a valid operation. Strings without a separator, with multiple separators, or with invalid
+operations require migration to scope objects. To migrate a whole-path string, use
+`{"path":"src/file.ts"}`; to migrate an operation string, use separate fields as above.
+All paths resolve against `scope_root` with existence, containment, link and filesystem alias
+checks before a partition closes. A legacy ledger without `scope_root` requires target context
+before closure.
 
 Route file checklists require `operations`, an object mapping every method/operation name to its
 child unit id, and `syntax_review: "complete"`. Enumerate methods by reading source only. Include
@@ -134,7 +149,8 @@ method from a text search or a failed parse. Keep native operation lists to the 
 
 Use `ledger add` or `ledger set` with `--mapping '<json-object>'` to merge mapping fields under
 the ledger lock. For example, add a child with
-`--mapping '{"scope_paths":["src/route.ts#GET"]}'`, then close its parent with
+`--mapping '{"scope_paths":[{"path":"src/route.ts","operation":"GET"}]}'`, then close its parent
+with
 
 ```sh
 --mapping '{"child_units":["route-get"],"operations":{"GET":"route-get"},"syntax_review":"complete"}'

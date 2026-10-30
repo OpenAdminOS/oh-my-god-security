@@ -304,7 +304,7 @@ fn offline_tools_feed_redacted_artifacts_reports_and_critic() {
             u["child_units"] = json!(["mapped:source"]);
         }
     }
-    units.push(json!({"id":"mapped:source","surface":"src/main.rs","attack_classes":mapped_classes,"status":"covered","evidence":["src/main.rs"],"scope_paths":["src/main.rs"]}));
+    units.push(json!({"id":"mapped:source","surface":"src/main.rs","attack_classes":mapped_classes,"status":"covered","evidence":["src/main.rs"],"scope_paths":[{"path":"src/main.rs"}]}));
     write_private_fixture(run.join("coverage-ledger.json"), ledger.to_string()).unwrap();
     write_private_fixture(run.join("candidates-empty.json"), r#"{"candidates":[]}"#).unwrap();
     let critic = omgs::critic::critique_run(&run).unwrap();

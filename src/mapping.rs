@@ -76,20 +76,8 @@ pub fn unit_errors(u: &Unit) -> Vec<String> {
         errors.push("checklist must be partition or operations".into());
     }
     if let Some(value) = u.extra.get("scope_paths") {
-        let paths = value.as_array();
-        if !paths.is_some_and(|paths| {
-            let mut seen = BTreeSet::new();
-            !paths.is_empty()
-                && paths.len() <= 256
-                && paths.iter().all(|p| {
-                    p.as_str().is_some_and(|p| {
-                        !p.trim().is_empty()
-                            && crate::paths::safe_relative(Path::new(p))
-                            && seen.insert(p)
-                    })
-                })
-        }) {
-            errors.push("scope_paths requires 1 to 256 unique relative source scopes".into());
+        if let Err(e) = parse_scopes(value) {
+            errors.push(e);
         }
     }
     if u.extra
@@ -101,20 +89,90 @@ pub fn unit_errors(u: &Unit) -> Vec<String> {
     errors
 }
 
-fn normalized_scope(scope: &str, root: Option<&Path>) -> Result<String, String> {
-    let (path, operation) = scope.split_once('#').unwrap_or((scope, ""));
-    let root = root.ok_or("closing partitions requires scope_root target context; migrate the legacy ledger before closure")?;
-    let mut normalized = canonical_scope_path(root, Path::new(path))?;
-    if scope.contains('#') {
-        normalized.push('#');
-        normalized.push_str(operation);
+// Keep path identity separate from operation identity, including after resolution.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Scope {
+    path: String,
+    operation: Option<String>,
+}
+
+fn valid_operation(operation: &str) -> bool {
+    let mut bytes = operation.bytes();
+    (1..=128).contains(&operation.len())
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+}
+
+fn parse_scope(value: &Value) -> Result<Scope, String> {
+    let (path, operation) = if let Some(legacy) = value.as_str() {
+        let migration = "legacy scope_paths strings require exactly one # between a path without # and an operation matching [A-Za-z_][A-Za-z0-9_.:-]{0,127}; migrate to objects with path and optional operation";
+        let (path, operation) = legacy.split_once('#').ok_or(migration)?;
+        if operation.contains('#') || !valid_operation(operation) {
+            return Err(migration.into());
+        }
+        (path, Some(operation))
+    } else {
+        let object = value
+            .as_object()
+            .ok_or("scope_paths entries require path and optional operation")?;
+        if object
+            .keys()
+            .any(|key| !["path", "operation"].contains(&key.as_str()))
+        {
+            return Err("scope_paths entries allow only path and operation".into());
+        }
+        let path = object
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or("scope path must be a string")?;
+        let operation = object
+            .get("operation")
+            .map(|v| {
+                v.as_str()
+                    .filter(|op| valid_operation(op))
+                    .ok_or("scope operation must match [A-Za-z_][A-Za-z0-9_.:-]{0,127}")
+            })
+            .transpose()?;
+        (path, operation)
+    };
+    if path.trim().is_empty() || !crate::paths::safe_relative(Path::new(path)) {
+        return Err("scope path must be a nonempty relative source path".into());
     }
-    Ok(normalized)
+    Ok(Scope {
+        path: path.into(),
+        operation: operation.map(String::from),
+    })
+}
+
+fn parse_scopes(value: &Value) -> Result<Vec<Scope>, String> {
+    let values = value
+        .as_array()
+        .filter(|v| !v.is_empty() && v.len() <= 256)
+        .ok_or("scope_paths requires 1 to 256 unique relative source scopes")?;
+    let mut seen = BTreeSet::new();
+    values
+        .iter()
+        .map(|value| {
+            let scope = parse_scope(value)?;
+            if !seen.insert(scope.clone()) {
+                return Err("scope_paths requires unique relative source scopes".into());
+            }
+            Ok(scope)
+        })
+        .collect()
+}
+
+fn normalized_scope(mut scope: Scope, root: Option<&Path>) -> Result<Scope, String> {
+    let root = root.ok_or("closing partitions requires scope_root target context; migrate the legacy ledger before closure")?;
+    scope.path = canonical_scope_path(root, Path::new(&scope.path))?;
+    Ok(scope)
 }
 
 // Resolve each component using the target filesystem, rather than realpath's
 // caller-supplied casing on APFS. Exact names on case-sensitive volumes remain
-// distinct. Directory scopes and operation suffixes retain their hierarchy.
+// distinct. Directory scopes retain their hierarchy; operations remain separate identifiers.
 fn canonical_scope_path(root: &Path, path: &Path) -> Result<String, String> {
     if !root.is_absolute() || !crate::paths::safe_relative(path) {
         return Err("scope target and relative path are invalid".into());
@@ -194,10 +252,19 @@ fn same_object(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn overlap(a: &str, b: &str) -> bool {
-    a == b
-        || a.strip_prefix(b).is_some_and(|s| s.starts_with(['/', '#']))
-        || b.strip_prefix(a).is_some_and(|s| s.starts_with(['/', '#']))
+fn overlap(a: &Scope, b: &Scope) -> bool {
+    if a.path == b.path {
+        return a.operation.is_none() || b.operation.is_none() || a.operation == b.operation;
+    }
+    // Only an entire directory scope owns descendant paths.
+    (b.operation.is_none()
+        && a.path
+            .strip_prefix(&b.path)
+            .is_some_and(|s| s.starts_with('/')))
+        || (a.operation.is_none()
+            && b.path
+                .strip_prefix(&a.path)
+                .is_some_and(|s| s.starts_with('/')))
 }
 
 /// Validate links even on open units, so a later transition cannot conceal an
@@ -214,7 +281,7 @@ pub fn partition_errors(ledger: &Ledger) -> Vec<String> {
     }
     let index: BTreeMap<_, _> = ledger.units.iter().map(|u| (u.id.as_str(), u)).collect();
     let mut edges: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    let mut owners: BTreeMap<(String, &str), &str> = BTreeMap::new();
+    let mut owners: BTreeMap<(Scope, &str), &str> = BTreeMap::new();
     for u in &ledger.units {
         for key in ["child_units", "residual_units"] {
             if !u.extra.contains_key(key) {
@@ -258,21 +325,13 @@ pub fn partition_errors(ledger: &Ledger) -> Vec<String> {
                     if !["covered", "out_of_scope"].contains(&child.status.as_str()) {
                         errors.push(format!("{}: child '{id}' remains {}", u.id, child.status));
                     }
-                    let scopes = child.extra.get("scope_paths").and_then(Value::as_array);
-                    if !scopes.is_some_and(|s| {
-                        !s.is_empty()
-                            && s.len() <= 256
-                            && s.iter().all(|v| {
-                                v.as_str().is_some_and(|p| {
-                                    !p.trim().is_empty()
-                                        && crate::paths::safe_relative(Path::new(p))
-                                })
-                            })
-                    }) {
-                        errors.push(format!(
-                            "{}: child '{id}' needs bounded relative scope_paths",
-                            u.id
-                        ));
+                    let scopes = child
+                        .extra
+                        .get("scope_paths")
+                        .ok_or_else(|| "needs bounded relative scope_paths".to_string())
+                        .and_then(parse_scopes);
+                    if let Err(e) = &scopes {
+                        errors.push(format!("{}: child '{id}' {e}", u.id));
                     }
                     if child.extra.contains_key("child_units") {
                         continue;
@@ -280,8 +339,8 @@ pub fn partition_errors(ledger: &Ledger) -> Vec<String> {
                     if child.attack_classes.is_empty() && !u.attack_classes.is_empty() {
                         errors.push(format!("{}: child '{id}' must name its attack class", u.id));
                     }
-                    if let Some(scopes) = scopes {
-                        for scope in scopes.iter().filter_map(Value::as_str) {
+                    if let Ok(scopes) = scopes {
+                        for scope in scopes {
                             let scope = match normalized_scope(scope, root) {
                                 Ok(scope) => scope,
                                 Err(e) => {
@@ -295,7 +354,7 @@ pub fn partition_errors(ledger: &Ledger) -> Vec<String> {
                                         && *prior_class == class
                                         && overlap(&scope, prior_scope)
                                     {
-                                        errors.push(format!("overlapping ownership: '{prior_id}' and '{id}' for {scope} class {class}"));
+                                        errors.push(format!("overlapping ownership: '{prior_id}' and '{id}' for {scope:?} class {class}"));
                                     }
                                 }
                                 owners.insert((scope.clone(), class), id);

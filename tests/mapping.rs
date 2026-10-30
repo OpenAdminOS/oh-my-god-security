@@ -384,7 +384,7 @@ fn t10_t48_cli_mapping_updates_are_atomic_and_route_seeds_need_methods() {
         "--classes",
         "missing_authz,idor_tenant_isolation,client_only_auth",
         "--mapping",
-        r##"{"scope_paths":["app/api/items/route.ts#GET"]}"##
+        r#"{"scope_paths":[{"path":"app/api/items/route.ts","operation":"GET"}]}"#
     ])
     .status
     .success());
@@ -801,4 +801,195 @@ fn scope_directory_aliases_never_escape_or_duplicate_target_ownership() {
         #[cfg(windows)]
         std::fs::remove_dir(link).unwrap();
     }
+}
+
+fn scope_partition(target: &std::path::Path, scopes: &[serde_json::Value]) -> Ledger {
+    let mut parent = unit("stack:node", "covered");
+    let ids: Vec<_> = (0..scopes.len()).map(|i| format!("child:{i}")).collect();
+    parent.extra.insert("child_units".into(), json!(ids));
+    let mut units = vec![parent];
+    for (id, scope) in ids.iter().zip(scopes) {
+        let mut child = unit(id, "covered");
+        child.extra.insert("scope_paths".into(), json!([scope]));
+        units.push(child);
+    }
+    let mut l = ledger(units);
+    l.extra.insert("scope_root".into(), json!(target));
+    l
+}
+
+#[test]
+fn literal_hash_paths_validate_the_entire_directory_and_filename() {
+    let t = Temp::new();
+    for directory in ["src", "src#ipc"] {
+        omgs::platform::private_dir(&t.0.join(directory)).unwrap();
+    }
+    for path in ["src#ipc/Decision.swift", "src/Decision#read.swift"] {
+        std::fs::write(t.0.join(path), "source").unwrap();
+        for operation in [None, Some("read")] {
+            let mut scope = json!({"path":path});
+            if let Some(operation) = operation {
+                scope["operation"] = json!(operation);
+            }
+            let l = scope_partition(&t.0, &[scope.clone()]);
+            assert!(validate_ledger(&l).is_empty(), "{:?}", validate_ledger(&l));
+            let duplicate = scope_partition(&t.0, &[scope.clone(), scope.clone()]);
+            assert!(has(&validate_ledger(&duplicate), "overlapping ownership"));
+            let mut missing = scope.clone();
+            missing["path"] = json!(format!("{path}.absent"));
+            assert!(has(
+                &validate_ledger(&scope_partition(&t.0, &[missing])),
+                "absent from target"
+            ));
+            std::fs::remove_file(t.0.join(path)).unwrap();
+            assert!(has(&validate_ledger(&l), "absent from target"));
+            std::fs::write(t.0.join(path), "source").unwrap();
+        }
+    }
+}
+
+#[test]
+fn hash_scope_paths_and_operations_have_separate_ownership_identity() {
+    let t = Temp::new();
+    omgs::platform::private_dir(&t.0.join("src")).unwrap();
+    std::fs::write(t.0.join("src/Decision"), "source").unwrap();
+    std::fs::write(t.0.join("src/Decision#read"), "other source").unwrap();
+    let whole = json!({"path":"src/Decision#read"});
+    let op = json!({"path":"src/Decision","operation":"read"});
+    let l = scope_partition(&t.0, &[whole.clone(), op.clone()]);
+    assert!(validate_ledger(&l).is_empty(), "{:?}", validate_ledger(&l));
+    let l = scope_partition(&t.0, &[op, json!("src/Decision#read")]);
+    assert!(has(&validate_ledger(&l), "overlapping ownership"));
+    let l = scope_partition(
+        &t.0,
+        &[
+            whole,
+            json!({"path":"src/Decision#read","operation":"read"}),
+        ],
+    );
+    assert!(has(&validate_ledger(&l), "overlapping ownership"));
+    let l = scope_partition(
+        &t.0,
+        &[
+            json!({"path":"src"}),
+            json!({"path":"src/Decision#read","operation":"read"}),
+        ],
+    );
+    assert!(has(&validate_ledger(&l), "overlapping ownership"));
+}
+
+#[test]
+fn hash_path_case_aliases_follow_the_target_filesystem() {
+    let t = Temp::new();
+    for directory in ["src", "src#ipc"] {
+        omgs::platform::private_dir(&t.0.join(directory)).unwrap();
+    }
+    for (path, alias) in [
+        ("src#ipc/Decision.swift", "SRC#IPC/DECISION.swift"),
+        ("src/Decision#read.swift", "src/DECISION#READ.swift"),
+    ] {
+        std::fs::write(t.0.join(path), "source").unwrap();
+        for operation in [None, Some("read")] {
+            let mut a = json!({"path":path});
+            let mut b = json!({"path":alias});
+            if let Some(operation) = operation {
+                a["operation"] = json!(operation);
+                b["operation"] = json!(operation);
+            }
+            let l = scope_partition(&t.0, &[a, b]);
+            if t.0.join(alias).exists() {
+                assert!(has(&validate_ledger(&l), "overlapping ownership"));
+            } else {
+                assert!(has(&validate_ledger(&l), "absent from target"));
+            }
+        }
+    }
+}
+
+#[test]
+fn legacy_scope_strings_require_unambiguous_migration_and_valid_operations() {
+    for legacy in [
+        "src/Decision.swift",
+        "src#ipc/Decision.swift",
+        "src#ipc/Decision.swift#read",
+        "src/Decision#read.swift#read",
+        "src/Decision.swift#",
+        "src/Decision.swift#read/write",
+        "src/Decision.swift#read#write",
+        "src/Decision.swift#read\n",
+    ] {
+        let mut child = unit("legacy", "planned");
+        child.extra.insert("scope_paths".into(), json!([legacy]));
+        assert!(
+            has(&validate_ledger(&ledger(vec![child])), "migrate to objects"),
+            "{legacy}"
+        );
+    }
+    let mut child = unit("valid", "planned");
+    for operation in ["GET", "read", "_", "Service.read:arg-1", &"a".repeat(128)] {
+        child.extra.insert(
+            "scope_paths".into(),
+            json!([{"path":"src#ipc/Decision#read.swift","operation":operation}]),
+        );
+        assert!(validate_ledger(&ledger(vec![child.clone()])).is_empty());
+    }
+    for scope in [
+        json!({"path":"src/file","operation":""}),
+        json!({"path":"src/file","operation":"1read"}),
+        json!({"path":"src/file","operation":"read#write"}),
+        json!({"path":"src/file","operation":"réad"}),
+        json!({"path":"src/file","operation":"a".repeat(129)}),
+        json!({"path":"src/file","operation":null}),
+        json!({"path":"src/file","extra":true}),
+        json!({"path":"../outside"}),
+        json!({"path":"/absolute"}),
+        json!({"path":""}),
+        json!({"operation":"read"}),
+    ] {
+        child
+            .extra
+            .insert("scope_paths".into(), json!([scope.clone()]));
+        assert!(
+            !validate_ledger(&ledger(vec![child.clone()])).is_empty(),
+            "{scope}"
+        );
+    }
+    child.extra.insert(
+        "scope_paths".into(),
+        json!(["src/decision.ts#GET", {"path":"src/decision.ts","operation":"GET"}]),
+    );
+    assert!(has(&validate_ledger(&ledger(vec![child])), "unique"));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn links_beneath_hash_directories_cannot_bypass_scope_validation() {
+    let t = Temp::new();
+    for directory in ["src", "src#ipc", "outside"] {
+        omgs::platform::private_dir(&t.0.join(directory)).unwrap();
+    }
+    std::fs::write(t.0.join("outside/Decision#read.swift"), "source").unwrap();
+    let link = t.0.join("src#ipc/linked");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(t.0.join("outside"), &link).unwrap();
+    #[cfg(windows)]
+    assert!(std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(t.0.join("outside"))
+        .status()
+        .unwrap()
+        .success());
+    for operation in [None, Some("read")] {
+        let mut scope = json!({"path":"src#ipc/linked/Decision#read.swift"});
+        if let Some(operation) = operation {
+            scope["operation"] = json!(operation);
+        }
+        let l = scope_partition(&t.0, &[scope]);
+        assert!(has(&validate_ledger(&l), "symlinks or reparse points"));
+    }
+    #[cfg(unix)]
+    std::fs::remove_file(link).unwrap();
+    #[cfg(windows)]
+    std::fs::remove_dir(link).unwrap();
 }

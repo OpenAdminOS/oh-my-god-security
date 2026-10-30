@@ -4,7 +4,7 @@
   "type": "object",
   "required": ["units"],
   "properties": {
-    "scope_root": {"type": "string", "description": "Absolute target root used to resolve filesystem spelling of scope paths. Unavailable paths fail mapping validation; legacy ledgers compare conservatively on macOS and Windows."},
+    "scope_root": {"type": "string", "description": "Absolute target root used to resolve filesystem spelling of scope paths. Unavailable paths fail mapping validation; legacy ledgers without scope_root must migrate before closing partitions."},
     "units": {
       "type": "array",
       "items": {
@@ -23,7 +23,22 @@
           "note": { "type": "string", "description": "Why the unit was deferred, blocked, or put out of scope. Exclusion units require reviewed, not security relevant: followed by a nonempty reason when out_of_scope." },
           "child_units": {"type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": {"type": "string", "minLength": 1}, "description": "Bounded partition references. Covered checklists require existing, reconciled children with non-overlapping scope_paths per attack class."},
           "residual_units": {"type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": {"type": "string", "minLength": 1}, "description": "Required when partial is true and covered. Residuals remain independent accountable units; dangling, duplicate, self and cyclic references fail validation."},
-          "scope_paths": {"type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": {"type": "string", "minLength": 1}, "description": "Relative source scopes, optionally suffixed with #method-or-symbol. Different operations or attack classes may share a file."},
+          "scope_paths": {
+            "type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true,
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object", "required": ["path"], "additionalProperties": false,
+                  "properties": {
+                    "path": {"type": "string", "minLength": 1, "description": "Relative target path. Literal # characters are part of the path."},
+                    "operation": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])", "description": "Optional case-sensitive operation identifier, 1 to 128 ASCII characters."}
+                  }
+                },
+                {"type": "string", "pattern": "^[^#]+#[A-Za-z_][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])", "description": "Legacy only: exactly one # separator. Migrate other strings to objects."}
+              ]
+            },
+            "description": "Bounded source scopes with separate path and optional operation. Omitting operation owns the entire path and descendants. Different operations or attack classes may share a file. Paths must resolve inside scope_root without links."
+          },
           "partial": {"type": "boolean", "description": "Declare partial examination before closure; preserve unexamined scope in residual_units."},
           "checklist": {"enum": ["partition", "operations"]},
           "syntax_review": {"enum": ["complete", "uncertain"], "description": "Source-only enumeration reviewed completely. Reexports, computed handlers and uncertain syntax require manual mapping or remain blocked."},
