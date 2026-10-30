@@ -114,23 +114,63 @@ Host credentials and broad home access stay outside the grants. Linux explicitly
 grants read-only `/usr/include` for local compiler headers; MXC does not mount
 that system directory by default.
 
-On macOS the survivor sweep identifies each run by its distinct allowed and
-denied marker paths. Kernel process creation counters exclude services that
-predate the executor, even if their policy happens to match those paths.
-The identity query includes retained zombies; their first observation requires
-another scan before cleanup can be complete. If the executor's creation identity
-cannot be established, cleanup fails closed. It skips unsandboxed processes
-before path-policy queries
-and checks the denied path before the allowed path. A process exiting or
-entering another sandbox during inspection cannot turn an earlier unrestricted
-read into evidence that it belongs to this run. Concurrent proofs retain their
-own process groups, workspaces, scratch directories and markers. Live doctor
-runs also use distinct temporary directories, including when they share
-`OMGS_HOME`.
-Older OMGS binaries still use the unsafe query order. Running an older binary
-alongside a fixed binary on the same Mac can still interrupt the fixed run.
-Upgrade every concurrently running OMGS installation before relying on this
-isolation guarantee.
+### macOS proof ownership and storage
+
+On macOS every proof and sensor workload runs below a unique one-shot launchd
+job. Its trusted anchor is a private copy of this executable, verified by SHA-256.
+The job has `KeepAlive=false`, `RunAtLoad=false`, no demand triggers, and starts
+only after an explicit kickstart. The parent admits the fresh resource coalition
+before permitting target execution through the pinned executor. Existing process
+group cleanup, limits and output capture still apply.
+
+After waiting for the executor, the anchor permanently stops spawning. Cleanup
+is complete only when coalition `tasks_started - tasks_exited == 1`, meaning
+only that sealed anchor remains. Member enumeration locates survivors to record
+and kill with PID-version-bound audit tokens. An empty member list is never a
+certificate. A fork then exit chain cannot hide behind a later empty scan: its
+remaining task keeps the count above one. Unrelated same-user processes and
+independent proofs belong to other coalitions and are never counted or signalled.
+Observed survivors fail the proof even when cleanup succeeds. Unidentified owned
+activity or failure to obtain the certificate also leaves the proof unclean.
+
+The required controls are `launchd_resource_coalition` and
+`launchd_tcc_path_admission`. Records missing either control must be rerun. Each invocation checks the private Darwin
+interfaces, including a trusted child probe for inheritance, enumeration,
+accounting and audit-token signalling, before target execution. A usable
+`gui/<uid>` launchd domain is preferred, otherwise `user/<uid>` is attempted.
+Unavailable launchd submission or coalition interfaces cause a clear refusal;
+there is no sweep or unsandboxed fallback. CI explicitly runs this capability
+check on the macOS 15 arm64 runner and fails if the domain is unavailable.
+
+The anchor, job plist and handshake files live in admitted, owner-private
+`OMGS_HOME/launchd/<nonce>` storage (default `~/.local/share/omgs`). The binary is
+copied and hash-verified by the invoking process before launchd starts it.
+Launchd receives an explicit unprotected working directory. The executor,
+configuration, workspace, scratch, environment paths and readable grants are
+checked before submission. Anonymous capture pipes still use the OS-selected
+private Darwin temp directory. Neither private location may overlap a grant.
+
+Launchd processes have their own TCC responsible identity and do not inherit a
+terminal's Files and Folders access. OMGS therefore refuses launchd inputs under
+Desktop, Documents, Downloads, cloud storage, user Library and media folders,
+and removable, external or network volumes, including case aliases and resolved
+links. Parent traversal is refused before filesystem inspection. Volume
+properties must establish local, internal, non-removable storage. The error names
+the path and the fix: move the run or tool, or set `OMGS_HOME` to an unprotected
+local directory. A target in a protected location may be copied by the invoking
+process into an unprotected workspace; the launchd side never reads that source.
+A staging or admission failure blocks execution. OMGS does not request TCC
+consent, reset privacy settings or treat an executor access failure as clean.
+This avoids Files and Folders prompts even when the executable was built on
+Desktop or its ad hoc signing identity changes after a rebuild.
+
+The parent holds a per-job lock. Parent death cancels execution,
+and the anchor cleans its coalition before exiting. The next proof or sensor invocation recovers
+abandoned jobs before starting work. Normal success, failure, timeout and
+interruption remove the launchd job and verify its removal. A killed invocation
+cannot produce a final clean record. Recovery errors block the next proof and
+retain state for diagnosis. Arbitrary file access by another process as the same
+OS user remains outside the local trust boundary described in DECISIONS.md.
 
 ## What a proof record does and does not prove
 
@@ -142,7 +182,7 @@ On Windows, OMGS first calls the pinned `wxc-exec.exe --probe`. Only a supported
 
 Windows doctor also reads the full OS build, including the update revision, and compares it with Microsoft's published ProcessContainer minimums. Windows Server 2025 shares build 26100 with Windows 11 24H2; Microsoft publishes no separate Server minimum. A build below the minimum or absent from that table is reported plainly; the capability probe and config validation decide whether a proof can run. The [MXC build reference](https://github.com/microsoft/mxc/blob/main/docs/backends/process-container/os-version-support.md) supplies these minimums.
 
-With `--finding`, `--test` is required and its full path or file name must be a token of the command. Runner-generated start and end markers contain a fresh random nonce. Both markers must appear for a clean record, even if the saved output is capped. Missing start means executor error unless the executor was killed or the run interrupted. Missing end means incomplete execution; timeout, signal death and executor errors are recorded separately. On macOS and Linux, SIGINT, SIGTERM and SIGHUP during copy, hashing or staging remove the proof directory and release a charged reservation. Once execution begins, those signals trigger process group cleanup, plus the survivor sweep on macOS and PID namespace teardown on Linux, before an interrupted run is recorded as unclean and keeps its budget charge. Before running the command, the wrapper checks that the named test is a file it can read inside the sandbox and records `test_reachable`. An unreachable test stops execution with exit 126. Missing or false reachability evidence cannot support any proven verdict, including a rejected finding backed by a passing control. This checks readability, not that the command executed the intended assertion. The recorded exit code comes from the end marker. The markers catch accidents such as executor failure, truncation and timeout. They do not establish integrity against a hostile target: the nonce is visible to sandboxed code, so the target can print a forged end marker. Replay and the independent evaluator provide the stronger check that the real target and intended assertion ran. The independent evaluator must check that the command exercised the real target and the intended assertion. Records from `omgs-proof/1`, including records written before `RUSTUP_AUTO_INSTALL=0` became part of the execution policy, predate the current policy and must be rerun with `omgs prove`. Validation and replay reject them with a rerun diagnostic. There is no format migration or compatibility allowlist.
+With `--finding`, `--test` is required and its full path or file name must be a token of the command. Runner-generated start and end markers contain a fresh random nonce. Both markers must appear for a clean record, even if the saved output is capped. Missing start means executor error unless the executor was killed or the run interrupted. Missing end means incomplete execution; timeout, signal death and executor errors are recorded separately. On macOS and Linux, SIGINT, SIGTERM and SIGHUP during copy, hashing or staging remove the proof directory and release a charged reservation. Once execution begins, those signals trigger process group cleanup, plus coalition cleanup on macOS and PID namespace teardown on Linux, before an interrupted run is recorded as unclean and keeps its budget charge. Before running the command, the wrapper checks that the named test is a file it can read inside the sandbox and records `test_reachable`. An unreachable test stops execution with exit 126. Missing or false reachability evidence cannot support any proven verdict, including a rejected finding backed by a passing control. This checks readability, not that the command executed the intended assertion. The recorded exit code comes from the end marker. The markers catch accidents such as executor failure, truncation and timeout. They do not establish integrity against a hostile target: the nonce is visible to sandboxed code, so the target can print a forged end marker. Replay and the independent evaluator provide the stronger check that the real target and intended assertion ran. The independent evaluator must check that the command exercised the real target and the intended assertion. Records from `omgs-proof/1`, including records written before `RUSTUP_AUTO_INSTALL=0` became part of the execution policy, predate the current policy and must be rerun with `omgs prove`. Validation and replay reject them with a rerun diagnostic. There is no format migration or compatibility allowlist.
 
 These checks catch mistakes and hand-edited records. They do not defend against a program running as you that sets out to forge every file, because nothing on your own machine can. The defence is that every proof is reproducible: anyone can rerun a record with `omgs prove --run <run-dir> --replay <n>`, and the independent evaluator stage does exactly that before a verdict stands. Replay requires the recorded `timeout_ms` and rejects `--timeout-ms` overrides, consumes one proof-run budget unit, checks the marker-derived inner exit code and cleanliness, and refuses if either the target commit or the digest of the copied target tree (including all `.git` content and dirty changes) differs from the original snapshot. In the same way, `omgs approve` records your consent to tier 2; it is not a lock an agent could not pick, and the app under test stays inside MXC either way.
 

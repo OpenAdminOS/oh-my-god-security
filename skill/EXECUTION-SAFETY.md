@@ -10,8 +10,9 @@ Reading source as text does not require executing it.
 declared minimum set for the OS (DECISIONS.md, Sandbox requirements): deny by default filesystem
 with the target copied into a per-run workspace, external network denied, an environment cleared to
 an allowlist with scratch home, temp and cache, a wall clock, and on macOS and Linux process group
-cleanup plus CPU time, file size and open file limits; macOS adds a survivor sweep, Linux uses MXC
-PID namespace teardown and adds memory and task limits where a systemd user scope exists. On Windows
+cleanup plus CPU time, file size and open file limits; macOS requires a dedicated launchd resource
+coalition certificate. Linux uses MXC PID namespace teardown and adds memory and task limits where a
+systemd user scope exists. On Windows
 expiry OMGS sends the executor Ctrl+Break, waits up to 5 seconds for MXC cleanup, then forces
 termination; an OMGS-owned kill-on-close job ends every descendant if OMGS dies, which can skip MXC
 ACL restoration. Windows has no per-process limits, and Windows tiers whose MXC probe reports DACL
@@ -57,3 +58,18 @@ On Unix set `umask 077` before writing role artifacts, create directories with m
 with mode 0600, including candidates, dispositions and draft proofs. On Windows use owner-private
 ACLs consistent with the initialized run. The private outer directory protects nested artifacts,
 but it is not permission to export them into shared locations. Never copy secrets into tool notes.
+
+On macOS a sealed trusted launchd anchor must be the only active coalition task
+before cleanup can be complete. Survivors are named and killed using PID-version
+bound audit tokens, and their presence fails the run. An empty process list is
+not evidence of cleanup. Records require `launchd_resource_coalition`; rerun older
+marker-sweep records. Unavailable launchd domains or private coalition interfaces
+block execution without a fallback. Parent death cancels and cleans the workload;
+the next proof or sensor invocation recovers abandoned jobs. Normal success, failure, timeout and
+interruption remove and verify removal of the one-shot launchd job.
+
+On macOS launchd starts only the hash-verified private anchor under OMGS_HOME/launchd, with an
+unprotected working directory. Workspace, scratch, configuration, environment paths and grants must
+be outside TCC protected folders and external/network volumes. Protected source may be staged by
+the invoking process; launchd never reads it. Refusal names the path and the fix. No Files and
+Folders consent is requested. Records also require launchd_tcc_path_admission.
