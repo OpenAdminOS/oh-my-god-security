@@ -25,6 +25,8 @@ def skill_digest(root):
 
 
 def verify(binary, skill, revision):
+    if not re.fullmatch(r'[0-9a-fA-F]{40}(?:\+dirty)?', revision):
+        raise ValueError('release verification requires an exact commit revision')
     expected = dict(version=(skill / 'VERSION').read_text().strip(),
                     build_revision=revision, skill_digest_format='omgs-skill/1',
                     bundled_skill_sha256=skill_digest(skill))

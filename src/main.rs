@@ -301,6 +301,21 @@ fn selected_skill(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn review_skill(args: &[String]) -> Result<PathBuf, String> {
+    selected_skill(args)?;
+    if let Some(path) = flag(args, "--skill-dir")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("OMGS_SKILL_DIR").map(PathBuf::from))
+    {
+        return std::fs::canonicalize(path).map_err(|e| e.to_string());
+    }
+    omgs::setup::materialize(
+        &data_dir()
+            .join("skill-bundles")
+            .join(omgs::setup::bundled_digest()),
+    )
+}
+
 fn cmd_update_check() -> Result<(), String> {
     if let Some(line) = omgs::update::check() {
         println!("{line}");
@@ -2232,6 +2247,12 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
         return Err("usage: omgs audit init --target <repo>".into());
     }
     let run = audit_init(&args[1..])?;
+    let meta = omgs::runmeta::read(&run)?;
+    let target = meta
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or("run lacks target")?;
+    eprintln!("{}", brief(Path::new(target), &run)?);
     println!("{}", run.display());
     Ok(())
 }
@@ -2268,6 +2289,26 @@ fn resolve_existing_prefix(p: &Path) -> Result<PathBuf, String> {
 /// Initialize a run and return its directory.
 fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     selected_skill(rest)?;
+    let target = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
+    let target = std::fs::canonicalize(&target).map_err(|e| format!("target {target}: {e}"))?;
+    // Admit storage boundaries before materializing the default bundle. In
+    // particular, a cache must not populate a target or an invalid run output.
+    trusted_store(&target)?;
+    if let Some(out) = flag(rest, "--out") {
+        let out = std::path::absolute(out).map_err(|e| e.to_string())?;
+        trusted_policy_path(&target, &resolve_existing_prefix(&out)?)?;
+    }
+    let skill = review_skill(rest)?;
+    let run = audit_init_selected(rest)?;
+    omgs::runmeta::update(&run, |meta| {
+        meta.insert("skill_dir".into(), serde_json::json!(skill));
+        meta.insert("skill_identity".into(), omgs::setup::identity());
+        Ok(())
+    })?;
+    Ok(run)
+}
+
+fn audit_init_selected(rest: &[String]) -> Result<PathBuf, String> {
     let Some(parent) = flag(rest, "--fix-of") else {
         return audit_init_limited(rest, omgs::stacks::INVENTORY_LIMIT);
     };
@@ -3169,12 +3210,22 @@ fn init_args(dest: &Path, args: &[String], out: Option<&Path>) -> Vec<String> {
     v
 }
 
-fn brief(dest: &Path, run: &Path) -> String {
-    format!("agent brief: load the omgs skill, follow its pipeline against {} with run directory {}, validate findings with omgs validate, prove only through omgs prove, reconcile with omgs critic, and render with omgs report.", dest.display(), run.display())
+fn brief(dest: &Path, run: &Path) -> Result<String, String> {
+    let meta = omgs::runmeta::read(run)?;
+    let skill = meta
+        .get("skill_dir")
+        .ok_or("run lacks authoritative skill path")?;
+    let identity = meta
+        .get("skill_identity")
+        .ok_or("run lacks skill identity")?;
+    Ok(format!("agent brief: load SKILL.md only from skill directory {skill}, with exact identity {identity}; use this directory for every role brief and guide, ignoring other installed skills; follow its pipeline against {} with run directory {}, validate findings with omgs validate, prove only through omgs prove, reconcile with omgs critic, and render with omgs report.", dest.display(), run.display()))
 }
 
 fn cmd_review(args: &[String]) -> Result<(), String> {
-    selected_skill(args)?;
+    let skill = review_skill(args)?;
+    let mut resolved = args.to_vec();
+    resolved.extend(["--skill-dir".into(), skill.to_string_lossy().into_owned()]);
+    let args = resolved.as_slice();
     let url = flag(args, "--repo-url").ok_or("review requires --repo-url <url>")?;
     if let Some(p) = flag(args, "--persona") {
         omgs::persona::defaults(&p)?;
@@ -3183,7 +3234,7 @@ fn cmd_review(args: &[String]) -> Result<(), String> {
     let out = flag(args, "--out").map(PathBuf::from);
     let run = audit_init(&init_args(&dest, args, out.as_deref()))?;
     println!("{}", run.display());
-    println!("{}", brief(&dest, &run));
+    println!("{}", brief(&dest, &run)?);
     Ok(())
 }
 
@@ -3192,7 +3243,10 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
     let rest = args.get(1..).unwrap_or_default();
     match sub {
         Some("init") => {
-            selected_skill(rest)?;
+            let skill = review_skill(rest)?;
+            let mut resolved = rest.to_vec();
+            resolved.extend(["--skill-dir".into(), skill.to_string_lossy().into_owned()]);
+            let rest = resolved.as_slice();
             let list = flag(rest, "--list").ok_or("batch init requires --list <file>")?;
             let out = PathBuf::from(flag(rest, "--out").ok_or("batch init requires --out <dir>")?);
             let text = std::fs::read_to_string(&list).map_err(|e| format!("read {list}: {e}"))?;
@@ -3301,7 +3355,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 });
                 match attempt {
                     Ok((dest, run)) => {
-                        println!("{}", brief(&dest, &run));
+                        println!("{}", brief(&dest, &run)?);
                         batch.runs.push(omgs::batch::BatchRun {
                             url,
                             target: Some(dest.to_string_lossy().to_string()),
@@ -4126,8 +4180,13 @@ mod cli_tests {
             match (cmd, sub) {
                 ("identity" | "review" | "audit", _) | ("batch", "init") => {
                     sections.push(("selected_skill", function(source, "selected_skill")));
+                    sections.push(("review_skill", function(source, "review_skill")));
                     if cmd == "audit" {
                         sections.push(("audit_init", function(source, "audit_init")));
+                        sections.push((
+                            "audit_init_selected",
+                            function(source, "audit_init_selected"),
+                        ));
                         sections
                             .push(("audit_init_limited", function(source, "audit_init_limited")));
                     }

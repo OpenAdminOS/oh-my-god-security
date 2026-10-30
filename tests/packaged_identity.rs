@@ -60,7 +60,7 @@ fn same_version_skill_skew_fails_before_review_side_effects() {
         omgs::setup::bundled_digest()
     );
     let revision = identity["build_revision"].as_str().unwrap();
-    assert!(revision.trim_end_matches("+dirty").len() == 40);
+    assert!(revision == "unknown revision" || revision.trim_end_matches("+dirty").len() == 40);
     for mutation in ["changed", "missing", "extra"] {
         let path = skill.join("agents/red-hunter.md");
         match mutation {
@@ -216,7 +216,8 @@ fn packaging_verifier_accepts_final_binary_and_rejects_wrong_revision_and_bundle
         .unwrap()
         .to_string();
     for (rev, valid) in [
-        (&revision[..], true),
+        (&revision[..], revision != "unknown revision"),
+        ("unknown revision", false),
         ("0000000000000000000000000000000000000000", false),
     ] {
         let out = Command::new(if cfg!(windows) { "python" } else { "python3" })
@@ -270,6 +271,9 @@ fn clone_progress_has_bounded_start_completion_reuse_and_failure_phases() {
     let home = fixture.0.join("home");
     let first = invoke(&home, false);
     assert!(first.status.success(), "{first:?}");
+    let brief = String::from_utf8_lossy(&first.stdout);
+    assert!(brief.contains(&skill.display().to_string()));
+    assert!(brief.contains(&omgs::setup::bundled_digest()));
     let text = String::from_utf8(first.stderr).unwrap();
     let phases: Vec<_> = text
         .lines()
@@ -279,6 +283,53 @@ fn clone_progress_has_bounded_start_completion_reuse_and_failure_phases() {
     assert!(phases[0].contains("phase=start depth=1 destination="));
     assert!(phases[1].contains("phase=complete destination="));
     assert!(!text.contains('\r'));
+    // A same-version installation must not choose the default review bundle.
+    let stale = fixture.0.join(".agents/skills/omgs-security-review");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("SKILL.md"), "stale installed brief").unwrap();
+    std::fs::write(stale.join("VERSION"), "0.1.0").unwrap();
+    let default_review = cli()
+        .env("HOME", &fixture.0)
+        .env("OMGS_HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args([
+            "review",
+            "--repo-url",
+            "https://example.invalid/owner/repo",
+            "--no-sensors",
+        ])
+        .output()
+        .unwrap();
+    assert!(default_review.status.success(), "{default_review:?}");
+    let default_brief = String::from_utf8(default_review.stdout).unwrap();
+    let bundle = std::fs::canonicalize(
+        home.join("skill-bundles")
+            .join(omgs::setup::bundled_digest()),
+    )
+    .unwrap();
+    assert!(default_brief.contains(&bundle.display().to_string()));
+    assert!(default_brief.contains(&omgs::setup::bundled_digest()));
+    assert!(!default_brief.contains(&stale.display().to_string()));
+    assert_eq!(
+        omgs::setup::check_identity(&bundle).unwrap(),
+        omgs::setup::bundled_digest()
+    );
+    let list = fixture.0.join("repos.txt");
+    std::fs::write(&list, "https://example.invalid/owner/repo\n").unwrap();
+    let batch = cli()
+        .env("HOME", &fixture.0)
+        .env("OMGS_HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args(["batch", "init", "--no-sensors", "--list"])
+        .arg(&list)
+        .arg("--out")
+        .arg(fixture.0.join("batch"))
+        .output()
+        .unwrap();
+    assert!(batch.status.success(), "{batch:?}");
+    let batch_brief = String::from_utf8(batch.stdout).unwrap();
+    assert!(batch_brief.contains(&bundle.display().to_string()));
+    assert!(batch_brief.contains(&omgs::setup::bundled_digest()));
     let reused = invoke(&home, false);
     assert!(reused.status.success(), "{reused:?}");
     assert!(String::from_utf8_lossy(&reused.stderr).contains("clone phase=reused destination="));
@@ -314,4 +365,113 @@ fn artifact_privacy_preflight_is_content_silent_and_refuses_aliases() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
+}
+
+#[path = "../build_revision.rs"]
+mod build_revision;
+
+#[test]
+fn source_archive_revision_supports_metadata_and_unknown_without_git() {
+    let fixture = Fixture::new();
+    assert!(!fixture.0.join(".git").exists());
+    assert_eq!(
+        build_revision::resolve(&fixture.0, None).unwrap(),
+        "unknown revision"
+    );
+    let revision = "1234567890abcdef1234567890abcdef12345678";
+    std::fs::write(fixture.0.join("BUILD-REVISION"), format!("{revision}\n")).unwrap();
+    assert_eq!(build_revision::resolve(&fixture.0, None).unwrap(), revision);
+    let supplied = "abcdef1234567890abcdef1234567890abcdef12";
+    assert_eq!(
+        build_revision::resolve(&fixture.0, Some(supplied.into())).unwrap(),
+        supplied
+    );
+    assert!(build_revision::resolve(&fixture.0, Some("unknown revision".into())).is_err());
+    std::fs::write(fixture.0.join("BUILD-REVISION"), "bad metadata").unwrap();
+    assert!(build_revision::resolve(&fixture.0, None).is_err());
+}
+
+#[test]
+fn default_review_binds_embedded_bundle_despite_stale_installed_skill() {
+    let fixture = Fixture::new();
+    let stale = fixture.0.join(".agents/skills/omgs-security-review");
+    std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("SKILL.md"), "stale brief").unwrap();
+    std::fs::write(stale.join("VERSION"), "0.1.0").unwrap();
+    let target = fixture.0.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("sample.rs"), "fn example() {}\n").unwrap();
+    let run = fixture.0.join("runs/review");
+    let out = cli()
+        .env("HOME", &fixture.0)
+        .env("OMGS_HOME", fixture.0.join("data"))
+        .args(["audit", "init", "--no-sensors", "--target"])
+        .arg(&target)
+        .arg("--out")
+        .arg(&run)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let meta = omgs::runmeta::read(&run).unwrap();
+    let selected = Path::new(meta["skill_dir"].as_str().unwrap());
+    assert!(selected.is_absolute());
+    assert_ne!(selected, stale);
+    assert_eq!(
+        omgs::setup::check_identity(selected).unwrap(),
+        omgs::setup::bundled_digest()
+    );
+    assert_eq!(meta["skill_identity"], omgs::setup::identity());
+    let brief = String::from_utf8(out.stderr).unwrap();
+    assert!(brief.contains(&selected.display().to_string()));
+    assert!(brief.contains(&omgs::setup::bundled_digest()));
+    assert!(brief.contains("ignoring other installed skills"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(selected).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(selected.join("SKILL.md"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(stale.join("SKILL.md")).unwrap(),
+        "stale brief"
+    );
+    std::fs::write(selected.join("SKILL.md"), "changed cache").unwrap();
+    assert!(omgs::setup::materialize(selected)
+        .unwrap_err()
+        .contains("skill identity mismatch"));
+}
+
+#[test]
+fn default_bundle_materialization_waits_for_storage_boundary_admission() {
+    let fixture = Fixture::new();
+    let target = fixture.0.join("target");
+    std::fs::create_dir(&target).unwrap();
+    for home in [target.clone(), fixture.0.join("run")] {
+        let run = fixture.0.join("run");
+        let out = cli()
+            .env("OMGS_HOME", &home)
+            .args(["audit", "init", "--no-sensors", "--target"])
+            .arg(&target)
+            .arg("--out")
+            .arg(&run)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        assert!(!home.join("skill-bundles").exists());
+        assert!(!run.exists());
+        if home == run {
+            assert!(String::from_utf8_lossy(&out.stderr)
+                .contains("trusted policy store must live outside the run directory"));
+        }
+    }
 }

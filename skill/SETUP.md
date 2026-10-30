@@ -110,3 +110,18 @@ At a terminal, `omgs setup` offers skill installation, a live MXC deny test and 
 policy. Review its consent prompt before accepting these steps. For explicit headless flags and
 replacement rules, read [POLICY-AND-GATE.md](POLICY-AND-GATE.md#base-policy-gate-and-setup).
 Run `omgs doctor --live` before a proof recipe to check runtime reachability inside MXC.
+
+### Review bundle selection
+
+`review`, `batch init` and `audit init` bind one exact bundle before review work. An explicit
+`--skill-dir` takes precedence over `OMGS_SKILL_DIR`; either must match the binary's bundled digest.
+Without either, the binary materializes its embedded bundle in owner-private storage under
+`OMGS_HOME/skill-bundles/<digest>` (the default data directory applies when unset). Run metadata
+and the handoff brief record the absolute directory and exact identity. Load `SKILL.md`, guides and
+role briefs from that directory, even when an older same-version skill is already installed.
+A modified cache fails identity validation rather than being silently replaced.
+
+For source archives, packaging may supply a full commit SHA with `OMGS_BUILD_REVISION` or a
+`BUILD-REVISION` file at the source root. Plain source builds without metadata report
+`unknown revision`. Release artifact verification always requires an exact commit revision and
+matching bundle digest; unknown revision builds cannot pass release verification.

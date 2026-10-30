@@ -516,7 +516,42 @@ fn role_reading_uses_one_contract_and_preserves_full_safety_context() {
     ] {
         assert!(pipeline.contains(rule), "missing {rule}");
     }
-    assert!(!red.contains("the full pipeline"));
+    for (name, phases) in [
+        ("red-hunter", vec!["hunt"]),
+        ("blue-verifier", vec!["challenge", "prove"]),
+        ("evaluator", vec!["adjudicate", "prove"]),
+        ("green-fixer", vec!["prove"]),
+    ] {
+        let path = format!("agents/{name}.md");
+        let bytes = omgs::setup::BUNDLED
+            .iter()
+            .find(|(p, _)| *p == path)
+            .unwrap()
+            .1;
+        let role = normalized(std::str::from_utf8(bytes).unwrap());
+        assert!(!role.contains("the full pipeline"), "{name}");
+        for section in [
+            "the-pipeline-multi-agent-by-default",
+            "required-progress-at-every-transition",
+            "required-reading-by-role",
+        ]
+        .into_iter()
+        .chain(phases)
+        {
+            assert!(
+                role.contains(&format!("../PIPELINE.md#{section}")),
+                "{name}: {section}"
+            );
+        }
+        for required in [
+            "plus all of",
+            "../EXECUTION-SAFETY.md",
+            "../PROOF-CONTRACT.md",
+            "once in this context",
+        ] {
+            assert!(role.contains(required), "{name}: {required}");
+        }
+    }
     for rule in [
         "plus all of",
         "execution safety",

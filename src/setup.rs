@@ -80,6 +80,39 @@ pub fn identity() -> serde_json::Value {
     serde_json::from_str(text).expect("build-generated identity")
 }
 
+/// Materialize the embedded bundle in admitted owner-private storage. Never
+/// replace an existing tree: a changed cache is an identity error.
+pub fn materialize(root: &Path) -> Result<PathBuf, String> {
+    crate::tcc::admit_path(root).map_err(|e| e.to_string())?;
+    let parent = root.parent().ok_or("bundle cache needs a parent")?;
+    crate::platform::create_private_tree(parent).map_err(|e| e.to_string())?;
+    crate::runmeta::with_lock_file(&parent.join(".bundle.lock"), || {
+        if !root.exists() {
+            let nonce = crate::platform::random_nonce().map_err(|e| e.to_string())?;
+            let staged = parent.join(format!(".bundle-stage-{nonce}"));
+            crate::platform::create_private_dir_new(&staged).map_err(|e| e.to_string())?;
+            let publish = || -> Result<(), String> {
+                for (name, bytes) in BUNDLED {
+                    bundle_path::validate(name)?;
+                    let path = staged.join(name);
+                    crate::platform::create_private_tree(path.parent().unwrap())
+                        .map_err(|e| e.to_string())?;
+                    crate::platform::write_private_new(&path, bytes).map_err(|e| e.to_string())?;
+                }
+                check_identity(&staged)?;
+                std::fs::rename(&staged, root).map_err(|e| e.to_string())
+            };
+            if let Err(error) = publish() {
+                let _ = std::fs::remove_dir_all(&staged);
+                return Err(error);
+            }
+        }
+        crate::platform::check_private_dir(root).map_err(|e| e.to_string())?;
+        check_identity(root)?;
+        std::fs::canonicalize(root).map_err(|e| e.to_string())
+    })
+}
+
 fn unlinked(path: &Path) -> Result<(), String> {
     for parent in path.ancestors() {
         match std::fs::symlink_metadata(parent) {
