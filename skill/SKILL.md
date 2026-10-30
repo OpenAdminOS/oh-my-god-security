@@ -13,14 +13,13 @@ only ever runs inside the SHA-256 pinned Microsoft MXC sandbox through `omgs pro
 network denied, synthetic fixtures and dummy data. Nothing is ever run against live systems,
 third-party services or other people's infrastructure.
 
-The host coordinates the review and reasons about evidence. The deterministic Rust `omgs` CLI
-records evidence, enforces proof controls and renders reports. OMGS sends no telemetry and has no
-hosted service. Code context still goes to the provider already used by the chosen host unless it
-runs locally. Local results do not imply that provider processing is local.
+The host coordinates review. The Rust `omgs` CLI records evidence, enforces proofs and renders
+reports. OMGS sends no telemetry and has no hosted service. Code context still goes to the provider
+already used by the chosen host unless it runs locally. Local results do not imply that provider
+processing is local.
 
-The method applies across stacks. TypeScript and Next.js App Router are the most rigorously
-benchmarked; other stacks use the same evidence bar with appropriate packs and proof recipes. Read
-only the relevant guides for each phase, rather than loading this entire bundle at once.
+The method applies across stacks. TypeScript and Next.js App Router have the strongest benchmarks;
+other stacks use the same evidence bar. Read only the guides required for the current role.
 
 ## Authorization and stop conditions
 
@@ -44,8 +43,9 @@ canonical `TARGET`, private
 external `OUTPUT_DIR`, exact `SOURCE_REF` and `OMGS_BIN`. Keep reports, drafts, ledgers and retained
 artifacts outside the target, including after symlink resolution. Never silently mix revisions.
 
-Follow SETUP.md for exact version matching, binary resolution (including `OMGS_HOME`), consent
-before downloads, and installer verification. Show the installed path, version and verification
+Follow SETUP.md for exact version and bundled digest matching, binary resolution (including
+`OMGS_HOME`), consent before downloads, and installer verification. Show the installed path,
+version and verification
 results. Run `omgs doctor` before initialization or hunting and `omgs doctor --live` before a proof
 recipe. Record readiness blockers; never substitute direct execution.
 
@@ -58,6 +58,7 @@ permission to fetch.
 
 ## Seven phases
 
+Use the [required reading matrix](PIPELINE.md#required-reading-by-role) once per role context.
 Read the linked phase text before performing that phase. Preserve role separation in fresh contexts
 and hand each role its full brief with explicit scope, resolved inputs and remaining budget.
 At run start, read [HANDOFF-AND-PROGRESS.md](HANDOFF-AND-PROGRESS.md).

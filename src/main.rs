@@ -92,13 +92,15 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "setup" => ("--yes --from --dry-run --install-skills --replace --verify-mxc --write-policy --mode", false),
         "coalition-anchor" => ("--directory", false),
         "install-self" => ("--to --staging --binary --binary-sha256 --mxc --mxc-sha256 --license --license-sha256", false),
-        "review" => ("--repo-url --mode --budget --no-sensors --persona --out --clone-root", false),
+        "identity" => ("--skill-dir", false),
+        "artifact-check" => ("--run --path", false),
+        "review" => ("--skill-dir --repo-url --mode --budget --no-sensors --persona --out --clone-root", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
-            "--target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of",
+            "--skill-dir --target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of --clone-root",
             true,
         ),
         "batch" if args.first().is_some_and(|a| a == "init") => {
-            ("--list --out --mode --budget --no-sensors --persona --clone-root", true)
+            ("--skill-dir --list --out --mode --budget --no-sensors --persona --clone-root", true)
         }
         "batch" if args.first().is_some_and(|a| a == "index") => ("--batch --out", true),
         "bench" if args.first().is_some_and(|a| a == "score") => ("--cases --runs", true),
@@ -229,6 +231,8 @@ fn main() -> ExitCode {
             println!("omgs {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        "identity" => cmd_identity(rest),
+        "artifact-check" => cmd_artifact_check(rest),
         "update-check" => cmd_update_check(),
         "coalition-anchor" => cmd_coalition_anchor(rest),
         "install-self" => cmd_install_self(rest),
@@ -270,6 +274,45 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+fn cmd_identity(args: &[String]) -> Result<(), String> {
+    selected_skill(args)?;
+    println!("{}", omgs::setup::identity());
+    Ok(())
+}
+
+fn cmd_artifact_check(args: &[String]) -> Result<(), String> {
+    let run = flag(args, "--run").ok_or("artifact-check requires --run")?;
+    let path = flag(args, "--path").ok_or("artifact-check requires relative --path")?;
+    omgs::run_artifact::check_containment(Path::new(&run), Path::new(&path))?;
+    println!("artifact containment checked: {path}");
+    Ok(())
+}
+
+/// Validate external selection before cloning, scanning or creating a run.
+fn selected_skill(args: &[String]) -> Result<(), String> {
+    let selected = flag(args, "--skill-dir")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("OMGS_SKILL_DIR").map(PathBuf::from));
+    if let Some(path) = selected {
+        omgs::setup::check_identity(&path)?;
+    }
+    Ok(())
+}
+
+fn bundle_cache() -> PathBuf {
+    data_dir().join("skill-bundles")
+}
+
+fn review_skill(args: &[String]) -> Result<PathBuf, String> {
+    let selected = flag(args, "--skill-dir")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("OMGS_SKILL_DIR").map(PathBuf::from));
+    omgs::setup::materialize_selected(
+        &bundle_cache().join(omgs::setup::bundled_digest()),
+        selected.as_deref(),
+    )
 }
 
 fn cmd_update_check() -> Result<(), String> {
@@ -701,8 +744,10 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             };
             let d = std::fs::canonicalize(d)
                 .map_err(|e| format!("--test-from {}: {e}", d.display()))?;
-            if target.as_ref().is_some_and(|base| d.starts_with(base)) {
-                return Err("--test-from must be a draft outside the target; drop it to use a test already in the target".into());
+            if let Some(base) = &target {
+                if omgs::paths::overlaps(&d, base)? {
+                    return Err("--test-from must be a draft outside the target; drop it to use a test already in the target".into());
+                }
             }
             if !d.is_file() {
                 return Err(format!("--test-from {} is not a file", d.display()));
@@ -1847,7 +1892,7 @@ fn trusted_store(target: &Path) -> Result<PathBuf, String> {
     let parent = path.parent().ok_or("intent answer store needs a parent")?;
     let resolved = resolve_existing_prefix(parent)?
         .join(path.file_name().ok_or("intent answer store needs a name")?);
-    if resolved.starts_with(target) {
+    if omgs::paths::overlaps(&resolved, target)? {
         return Err(format!(
             "the intent answer store {} resolves inside the target {}; refusing to use it",
             path.display(),
@@ -1902,7 +1947,7 @@ fn trusted_policy_path(target: &Path, run: &Path) -> Result<PathBuf, String> {
     let store = trusted_store(target)?;
     let parent = store.parent().ok_or("trusted store needs a parent")?;
     let resolved = resolve_existing_prefix(parent)?;
-    if resolved.starts_with(run) {
+    if omgs::paths::overlaps(&resolved, run)? {
         return Err("trusted policy store must live outside the run directory".into());
     }
     let run_hash = omgs::sha256::digest(run.as_os_str().as_encoded_bytes());
@@ -1984,7 +2029,7 @@ fn run_answers(dir: Option<&Path>) -> Result<omgs::intent::Answers, String> {
         return refuse("run metadata names no existing target");
     };
     let run = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
-    if run.starts_with(&target) {
+    if omgs::paths::overlaps(&run, &target)? {
         return refuse("the run directory is inside the target");
     }
     if Path::new(&answers.target) != target {
@@ -2203,6 +2248,12 @@ fn cmd_audit(args: &[String]) -> Result<(), String> {
         return Err("usage: omgs audit init --target <repo>".into());
     }
     let run = audit_init(&args[1..])?;
+    let meta = omgs::runmeta::read(&run)?;
+    let target = meta
+        .get("target")
+        .and_then(|v| v.as_str())
+        .ok_or("run lacks target")?;
+    eprintln!("{}", brief(Path::new(target), &run)?);
     println!("{}", run.display());
     Ok(())
 }
@@ -2236,8 +2287,65 @@ fn resolve_existing_prefix(p: &Path) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
+fn admit_bundle_cache(fences: &[PathBuf]) -> Result<(), String> {
+    let cache = resolve_existing_prefix(&bundle_cache())?;
+    let store_root = data_dir().join("intent");
+    for fence in fences.iter().chain(std::iter::once(&store_root)) {
+        if !omgs::paths::overlaps(&cache, fence)? {
+            continue;
+        }
+        return Err(format!(
+            "the skill bundle cache {} overlaps {}; set OMGS_HOME outside the target and the run output",
+            cache.display(),
+            fence.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Initialize a run and return its directory.
 fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
+    selected_skill(rest)?;
+    let target = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
+    let target = std::fs::canonicalize(&target).map_err(|e| format!("target {target}: {e}"))?;
+    // Admit storage boundaries before materializing the default bundle. In
+    // particular, a cache must not populate a target or an invalid run output.
+    trusted_store(&target)?;
+    let mut fences = vec![target.clone()];
+    let out = flag(rest, "--out").map(PathBuf::from).unwrap_or_else(|| {
+        data_dir().join(
+            target
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("target")),
+        )
+    });
+    trusted_policy_path(&target, &out)?;
+    if omgs::paths::overlaps(&target, &out)? {
+        return Err(
+            "run output must live outside the target tree, so findings never enter git history"
+                .into(),
+        );
+    }
+    if has(rest, "--clone-root") {
+        let root = clone_root(rest)?;
+        admit_clone_storage(&root, &target, &out)?;
+        fences.push(root);
+    }
+    fences.push(out);
+    admit_bundle_cache(&fences)?;
+    let skill = review_skill(rest)?;
+    admit_bundle_cache(&fences)?;
+    let run = audit_init_selected(rest)?;
+    admit_bundle_cache(&fences)?;
+    omgs::runmeta::update(&run, |meta| {
+        meta.insert("skill_dir".into(), serde_json::json!(skill));
+        meta.insert("skill_identity".into(), omgs::setup::identity());
+        Ok(())
+    })?;
+    Ok(run)
+}
+
+fn audit_init_selected(rest: &[String]) -> Result<PathBuf, String> {
     let Some(parent) = flag(rest, "--fix-of") else {
         return audit_init_limited(rest, omgs::stacks::INVENTORY_LIMIT);
     };
@@ -2390,7 +2498,12 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
         None
     };
     let outside = |p: &Path| -> Result<(), String> {
-        if resolve_existing_prefix(p)?.starts_with(&target) {
+        if has(rest, "--clone-root") {
+            admit_clone_storage(&clone_root(rest)?, &target, p)?;
+        }
+        admit_bundle_cache(&[target.clone(), p.to_path_buf()])?;
+        trusted_policy_path(&target, p)?;
+        if omgs::paths::overlaps(p, &target)? {
             Err(
                 "run output must live outside the target tree, so findings never enter git history"
                     .into(),
@@ -2430,6 +2543,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             // Claim run-N with an exclusive create, so parallel inits (batch
             // mode) never share a run directory.
             let base = data_dir().join(&repo);
+            outside(&base)?;
             omgs::platform::create_private_tree(&base).map_err(|e| {
                 format!(
                     "default run storage {}: {e}; see README.md#storage-migration",
@@ -3045,6 +3159,10 @@ fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
     let repo = omgs::batch::parse_repo_url(raw_url)?;
     let targets = clone_root(args)?;
     let dest = targets.join(&repo.host).join(&repo.owner).join(&repo.name);
+    let out = flag(args, "--out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir().join(&repo.name));
+    admit_clone_storage(&targets, &dest, &out)?;
     let git_path = omgs::platform::which("git").ok_or("git not found on an absolute PATH entry")?;
     let git = || {
         let mut c = std::process::Command::new(&git_path);
@@ -3058,6 +3176,7 @@ fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
     };
     let parent = dest.parent().ok_or("invalid clone destination")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    admit_clone_storage(&targets, &dest, &out)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -3093,25 +3212,43 @@ fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
                     repo.url
                 ));
             }
+            eprintln!("clone phase=reused destination={}", dest.display());
             return Ok(dest.clone());
         }
+        eprintln!("clone phase=start depth=1 destination={}", dest.display());
+        // Two bounded phase lines replace carriage-return Git progress for hosts.
         let status = git()
-            .args(["clone", "--depth", "1", "--no-recurse-submodules", "--"])
+            .args([
+                "clone",
+                "--quiet",
+                "--depth",
+                "1",
+                "--no-recurse-submodules",
+                "--",
+            ])
             .arg(&repo.url)
             .arg(&dest)
             .status()
             .map_err(|e| e.to_string())?;
         if !status.success() {
             let _ = std::fs::remove_dir_all(&dest);
+            eprintln!("clone phase=failed destination={}", dest.display());
             return Err(format!("git clone failed for {}", repo.url));
         }
+        eprintln!("clone phase=complete destination={}", dest.display());
         Ok(dest.clone())
     })
 }
 
 fn init_args(dest: &Path, args: &[String], out: Option<&Path>) -> Vec<String> {
     let mut v = vec!["--target".to_string(), dest.to_string_lossy().to_string()];
-    for name in ["--mode", "--budget", "--persona"] {
+    for name in [
+        "--mode",
+        "--budget",
+        "--persona",
+        "--skill-dir",
+        "--clone-root",
+    ] {
         if let Some(value) = flag(args, name) {
             v.push(name.into());
             v.push(value);
@@ -3127,20 +3264,50 @@ fn init_args(dest: &Path, args: &[String], out: Option<&Path>) -> Vec<String> {
     v
 }
 
-fn brief(dest: &Path, run: &Path) -> String {
-    format!("agent brief: load the omgs skill, follow its pipeline against {} with run directory {}, validate findings with omgs validate, prove only through omgs prove, reconcile with omgs critic, and render with omgs report.", dest.display(), run.display())
+fn brief(dest: &Path, run: &Path) -> Result<String, String> {
+    let meta = omgs::runmeta::read(run)?;
+    // A plain path, not JSON: JSON escaping doubles Windows backslashes.
+    let skill = meta
+        .get("skill_dir")
+        .and_then(|v| v.as_str())
+        .ok_or("run lacks authoritative skill path")?;
+    let identity = meta
+        .get("skill_identity")
+        .ok_or("run lacks skill identity")?;
+    Ok(format!("agent brief: load SKILL.md only from skill directory {skill}, with exact identity {identity}; use this directory for every role brief and guide, ignoring other installed skills; follow its pipeline against {} with run directory {}, validate findings with omgs validate, prove only through omgs prove, reconcile with omgs critic, and render with omgs report.", dest.display(), run.display()))
+}
+
+/// Fence the whole clone area before git or directory creation, including a
+/// planned destination that does not exist yet.
+fn admit_clone_storage(root: &Path, target: &Path, out: &Path) -> Result<(), String> {
+    for fence in [root, target] {
+        trusted_policy_path(fence, out)?;
+        if omgs::paths::overlaps(fence, out)? {
+            return Err("run output must live outside the reviewed targets".into());
+        }
+    }
+    admit_bundle_cache(&[root.to_path_buf(), target.to_path_buf(), out.to_path_buf()])
 }
 
 fn cmd_review(args: &[String]) -> Result<(), String> {
+    selected_skill(args)?;
     let url = flag(args, "--repo-url").ok_or("review requires --repo-url <url>")?;
     if let Some(p) = flag(args, "--persona") {
         omgs::persona::defaults(&p)?;
     }
+    let repo = omgs::batch::parse_repo_url(&url)?;
+    let root = clone_root(args)?;
+    let planned = root.join(&repo.host).join(&repo.owner).join(&repo.name);
+    let out = flag(args, "--out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir().join(&repo.name));
+    admit_clone_storage(&root, &planned, &out)?;
     let dest = clone_target(&url, args)?;
+    admit_clone_storage(&root, &dest, &out)?;
     let out = flag(args, "--out").map(PathBuf::from);
     let run = audit_init(&init_args(&dest, args, out.as_deref()))?;
     println!("{}", run.display());
-    println!("{}", brief(&dest, &run));
+    println!("{}", brief(&dest, &run)?);
     Ok(())
 }
 
@@ -3149,6 +3316,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
     let rest = args.get(1..).unwrap_or_default();
     match sub {
         Some("init") => {
+            selected_skill(rest)?;
             let list = flag(rest, "--list").ok_or("batch init requires --list <file>")?;
             let out = PathBuf::from(flag(rest, "--out").ok_or("batch init requires --out <dir>")?);
             let text = std::fs::read_to_string(&list).map_err(|e| format!("read {list}: {e}"))?;
@@ -3182,7 +3350,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             };
             let resolved = resolve_existing_prefix(&out_abs)?;
             for t in std::iter::once(&targets_root).chain(&dests) {
-                if resolved.starts_with(resolve_existing_prefix(t)?) {
+                if omgs::paths::overlaps(&resolved, t)? {
                     return Err(format!(
                         "batch output must live outside the reviewed targets, and {} is inside {}",
                         out_abs.display(),
@@ -3190,6 +3358,16 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                     ));
                 }
             }
+            // Admit shared cache and policy storage against every target and
+            // the whole batch output before creating either directory.
+            let mut fences = vec![resolved.clone()];
+            for target in std::iter::once(&targets_root).chain(&dests) {
+                fences.push(resolve_existing_prefix(target)?);
+            }
+            for target in std::iter::once(&targets_root).chain(&dests) {
+                trusted_policy_path(&resolve_existing_prefix(target)?, &resolved)?;
+            }
+            admit_bundle_cache(&fences)?;
             // The batch directory must be new or empty: anything already in it
             // (a planted symlink at <host>/<owner> for example) could redirect
             // a run into a target.
@@ -3212,15 +3390,17 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 .collect::<Result<Vec<_>, String>>()?;
             let contained = |p: &Path| -> Result<(), String> {
                 let p = resolve_existing_prefix(p)?;
-                match resolved_targets.iter().find(|t| p.starts_with(t)) {
-                    Some(t) => Err(format!(
-                        "run directory {} resolves inside {}",
-                        p.display(),
-                        t.display()
-                    )),
-                    None => Ok(()),
+                admit_bundle_cache(std::slice::from_ref(&p))?;
+                for t in &resolved_targets {
+                    trusted_policy_path(t, &p)?;
+                    if omgs::paths::overlaps(&p, t)? {
+                        return Err(format!("run directory {} resolves inside {}", p.display(), t.display()));
+                    }
                 }
+                Ok(())
             };
+            contained(&out)?;
+            admit_bundle_cache(&resolved_targets)?;
             // Claim the batch directory exclusively before any work, so two
             // concurrent batch inits sharing --out cannot both proceed and
             // overwrite each other's batch.json.
@@ -3257,7 +3437,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 });
                 match attempt {
                     Ok((dest, run)) => {
-                        println!("{}", brief(&dest, &run));
+                        println!("{}", brief(&dest, &run)?);
                         batch.runs.push(omgs::batch::BatchRun {
                             url,
                             target: Some(dest.to_string_lossy().to_string()),
@@ -3322,15 +3502,18 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                     targets.push(resolve_existing_prefix(Path::new(t))?);
                 }
             }
+            let store = resolve_existing_prefix(&data_dir().join("intent"))?;
             let inside = |p: &Path| -> Result<(), String> {
-                match targets.iter().find(|t| p.starts_with(t)) {
-                    Some(t) => Err(format!(
-                        "index output must live outside every reviewed target, and {} is inside {}",
-                        out_abs.display(),
-                        t.display()
-                    )),
-                    None => Ok(()),
+                admit_bundle_cache(&[p.to_path_buf()])?;
+                if omgs::paths::overlaps(p, &store)? {
+                    return Err(format!("index output must live outside the trusted intent and policy store, and {} overlaps {}", out_abs.display(), store.display()));
                 }
+                for t in &targets {
+                    if omgs::paths::overlaps(p, t)? {
+                        return Err(format!("index output must live outside every reviewed target, and {} is inside {}", out_abs.display(), t.display()));
+                    }
+                }
+                Ok(())
             };
             inside(&resolve_existing_prefix(&out_abs)?)?;
             std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
@@ -3399,13 +3582,18 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         );
         Ok(usage)
     })?;
-    println!("{stage}: {state}");
+    let mut output = format!("{stage}: {state}\n");
     if !flags(args, "--accounting").is_empty() {
         for line in omgs::accounting::lines(&usage) {
-            println!("{line}");
+            output.push_str(&format!("{line}\n"));
         }
     }
-    Ok(())
+    use std::io::Write;
+    match std::io::stdout().lock().write_all(output.as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(format!("status saved, but output failed: {e}")),
+    }
 }
 
 fn cmd_watch(args: &[String]) -> Result<(), String> {
@@ -4027,6 +4215,8 @@ mod cli_tests {
     }
 
     const COMMANDS: &[(&str, &str)] = &[
+        ("identity", ""),
+        ("artifact-check", ""),
         ("setup", ""),
         ("install-self", ""),
         ("coalition-anchor", ""),
@@ -4073,12 +4263,21 @@ mod cli_tests {
             let name = format!("cmd_{}", cmd.replace('-', "_"));
             let mut sections = vec![(name.as_str(), function(source, &name))];
             match (cmd, sub) {
+                ("identity" | "review" | "audit", _) | ("batch", "init") => {
+                    sections.push(("selected_skill", function(source, "selected_skill")));
+                    sections.push(("review_skill", function(source, "review_skill")));
+                    if cmd == "audit" {
+                        sections.push(("audit_init", function(source, "audit_init")));
+                        sections.push((
+                            "audit_init_selected",
+                            function(source, "audit_init_selected"),
+                        ));
+                        sections
+                            .push(("audit_init_limited", function(source, "audit_init_limited")));
+                    }
+                }
                 ("handoff" | "stage", _) => {
                     sections.push(("actionable_run", function(source, "actionable_run")));
-                }
-                ("audit", _) => {
-                    sections.push(("audit_init", function(source, "audit_init")));
-                    sections.push(("audit_init_limited", function(source, "audit_init_limited")));
                 }
                 ("doctor", _) => {
                     sections.push(("cmd_doctor_inner", function(source, "cmd_doctor_inner")));
@@ -4105,6 +4304,7 @@ mod cli_tests {
             if cmd == "review" || (cmd == "batch" && sub == "init") {
                 sections.push(("init_args", function(source, "init_args")));
                 sections.push(("clone_root", function(source, "clone_root")));
+                sections.push(("clone_target", function(source, "clone_target")));
             }
             for (name, body) in sections {
                 let names = read_options(body);
