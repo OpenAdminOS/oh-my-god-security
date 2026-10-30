@@ -14,6 +14,7 @@ impl Run {
         // Run writes admit their parent as private storage. The OS temp root
         // can be shared or have a different owner, including on Windows.
         omgs::platform::create_private_tree(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
         let path = root.join("run");
         omgs::platform::create_private_dir(&path).unwrap();
         omgs::runmeta::write_atomic(&path.join(omgs::runmeta::FILE), "{}").unwrap();
@@ -940,13 +941,17 @@ fn draft_and_stopped_verdicts_are_pending_in_publications_and_batch_counts() {
         }
         let mut file = finding();
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("benchmark/fixtures/score/run-1/positive");
+            .join("benchmark")
+            .join("fixtures")
+            .join("score")
+            .join("run-1")
+            .join("positive");
         let archived =
             omgs::shape::findings(&std::fs::read_to_string(fixture.join("findings.json")).unwrap())
                 .unwrap();
         let mut confirmed = archived.findings[0].clone();
         confirmed.verified_by = Some("blue".into());
-        omgs::platform::create_private_tree(&run.0.join("proofs/1")).unwrap();
+        omgs::platform::create_private_tree(&run.0.join("proofs").join("1")).unwrap();
         for name in [
             "1.json",
             "1/command.txt",
@@ -1607,15 +1612,19 @@ fn status_publishes_view_counts_and_dashboard_requires_its_completion_verdict() 
 }
 
 fn confirmed_fixture(run: &Run) -> FindingsFile {
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score/run-1/positive");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benchmark")
+        .join("fixtures")
+        .join("score")
+        .join("run-1")
+        .join("positive");
     let mut file =
         omgs::shape::findings(&std::fs::read_to_string(fixture.join("findings.json")).unwrap())
             .unwrap();
     file.findings.truncate(1);
     file.findings[0].verified_by = Some("blue".into());
     file.findings[0].hunted_by = Some("red".into());
-    omgs::platform::create_private_tree(&run.0.join("proofs/1")).unwrap();
+    omgs::platform::create_private_tree(&run.0.join("proofs").join("1")).unwrap();
     for name in [
         "1.json",
         "1/command.txt",
@@ -1628,23 +1637,28 @@ fn confirmed_fixture(run: &Run) -> FindingsFile {
         )
         .unwrap();
     }
-    omgs::platform::create_private_tree(&run.0.join("proofs/2")).unwrap();
+    omgs::platform::create_private_tree(&run.0.join("proofs").join("2")).unwrap();
     for name in ["command.txt", "mxc-config.json", "test-draft"] {
         omgs::runmeta::write_atomic_bytes(
-            &run.0.join("proofs/2").join(name),
-            &std::fs::read(fixture.join("proofs/1").join(name)).unwrap(),
+            &run.0.join("proofs").join("2").join(name),
+            &std::fs::read(fixture.join("proofs").join("1").join(name)).unwrap(),
         )
         .unwrap();
     }
     let mut replay: Value =
-        serde_json::from_slice(&std::fs::read(fixture.join("proofs/1.json")).unwrap()).unwrap();
+        serde_json::from_slice(&std::fs::read(fixture.join("proofs").join("1.json")).unwrap())
+            .unwrap();
     replay["n"] = json!(2);
     replay["replays"] = json!(1);
     replay["proof_dir"] = json!("/omgs-fixture/positive/proofs/2");
-    let config = std::fs::read_to_string(fixture.join("proofs/1/mxc-config.json"))
+    let config = std::fs::read_to_string(fixture.join("proofs").join("1").join("mxc-config.json"))
         .unwrap()
         .replace("/proofs/1/", "/proofs/2/");
-    omgs::runmeta::write_atomic(&run.0.join("proofs/2/mxc-config.json"), &config).unwrap();
+    omgs::runmeta::write_atomic(
+        &run.0.join("proofs").join("2").join("mxc-config.json"),
+        &config,
+    )
+    .unwrap();
     replay["config_sha256"] = json!(omgs::sha256::digest(config.as_bytes()));
     run.put("proofs/2.json", replay);
     let replay = omgs::proof::load(&run.0, "proofs/2.json").unwrap();
