@@ -741,6 +741,22 @@ mod tests {
     }
     #[test]
     fn interrupted_recovery_preserves_ownership_until_payload_removal_finishes() {
+        const CHILD: &str = "OMGS_TEST_INTERRUPTED_RECOVERY";
+        if std::env::var_os(CHILD).is_none() {
+            // Concurrent tests fork while recovery holds a lock. Even CLOEXEC
+            // descriptors retain that lock in the child until exec, so run the
+            // immediate recovery assertions without unrelated process spawns.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "scratch::tests::interrupted_recovery_preserves_ownership_until_payload_removal_finishes",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
         let parent = parent();
         let scratch = Scratch::create_in(&parent, "gate", |_| Ok(())).unwrap();
         let first = scratch.path().join("nested/first");
@@ -790,6 +806,43 @@ mod tests {
         assert!(recover_in(&parent).unwrap().is_empty());
         assert!(!root.exists());
         drop(held);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn scratch_locks_are_not_inheritable() {
+        let parent = parent();
+        let scratch = Scratch::create_in(&parent, "gate", |_| Ok(())).unwrap();
+        let parent_lock = open_lock(&scratch.parent_handle).unwrap();
+        for lock in [&parent_lock, scratch.lock.as_ref().unwrap()] {
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                // SAFETY: lock owns a live descriptor throughout this call.
+                let flags = unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_GETFD) };
+                assert!(flags >= 0, "{}", std::io::Error::last_os_error());
+                assert_ne!(flags & libc::FD_CLOEXEC, 0);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                extern "system" {
+                    fn GetHandleInformation(handle: *mut core::ffi::c_void, flags: *mut u32)
+                        -> i32;
+                }
+                let mut flags = 0;
+                // SAFETY: lock and writable flag storage remain live.
+                assert_ne!(
+                    unsafe { GetHandleInformation(lock.as_raw_handle(), &mut flags) },
+                    0,
+                    "{}",
+                    std::io::Error::last_os_error()
+                );
+                assert_eq!(flags & 1, 0); // HANDLE_FLAG_INHERIT
+            }
+        }
+        drop(parent_lock);
+        drop(scratch);
         std::fs::remove_dir_all(parent).unwrap();
     }
 
