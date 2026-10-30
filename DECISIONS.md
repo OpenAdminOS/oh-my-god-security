@@ -320,6 +320,12 @@ private temp storage; both locations are checked against grants. Private IPC
 storage also refuses baseline-readable system trees, including /System, /Library,
 /usr and /opt, even when an owner prepared a private directory there.
 
+macOS uses public CommonCrypto SHA-256 for content verification. Repeated full
+binary verification otherwise consumes the startup budget in unoptimized builds
+when many proofs prepare at once. Known vectors and comparisons with the portable
+implementation cover streaming and padding boundaries. Linux and Windows retain
+the in-tree implementation. Verification and fixture deadlines do not increase.
+
 Launchd owns the TCC responsible identity of its processes. It does not inherit
 the invoking terminal's Desktop access. To prevent repeated Files and Folders
 prompts after ad hoc rebuilds, nothing on the launchd side may require protected
