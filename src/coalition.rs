@@ -7,7 +7,7 @@ use std::ffi::{CStr, OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::{ffi::OsStrExt, ffi::OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +30,227 @@ struct Request {
     nonce: Option<String>,
     marker: Option<String>,
     parent_coalition: u64,
+    grants: Vec<PathBuf>,
+    capture: supervise::CapturePlan,
+}
+
+/// Only this admitted form can publish a request and submit its launchd job.
+/// Keep filesystem discovery here, including inputs nested inside MXC config,
+/// rather than relying on each caller to remember an independent checklist.
+struct AdmittedRequest<'a> {
+    request: &'a Request,
+    dir: &'a Path,
+}
+impl Request {
+    fn admit<'a>(&'a self, dir: &'a Path) -> io::Result<AdmittedRequest<'a>> {
+        self.admit_with(dir, &mut |path, grant| {
+            if grant {
+                crate::tcc::admit_grant(path)
+            } else {
+                crate::tcc::admit_path(path)
+            }
+        })
+    }
+    fn admit_with<'a>(
+        &'a self,
+        dir: &'a Path,
+        visit: &mut impl FnMut(&Path, bool) -> io::Result<()>,
+    ) -> io::Result<AdmittedRequest<'a>> {
+        // Exhaustive destructuring makes a new handoff field a compile error
+        // until its admission semantics are explicitly assigned here.
+        let Self {
+            program,
+            args,
+            env,
+            cwd,
+            limits: _,
+            nonce: _,
+            marker: _,
+            parent_coalition: _,
+            grants,
+            capture,
+        } = self;
+        let root = dir
+            .parent()
+            .ok_or_else(|| io::Error::other("missing job registry"))?;
+        visit(root, false)?;
+        visit(&root.join("registry"), false)?;
+        admit_job_storage_with(dir, &mut |path| visit(path, false))?;
+        for (key, value) in anchor_environment(dir)? {
+            crate::tcc::visit_environment(OsStr::new(key), &value, &mut |path| visit(path, false))?;
+        }
+        for (_, path) in executor_environment(dir) {
+            visit(&path, false)?;
+        }
+        // Trusted probe, null stdio and the loader's fixed system locations.
+        for path in [
+            "/bin/sleep",
+            "/dev/null",
+            "/usr/lib",
+            "/System/Library/Frameworks",
+        ] {
+            visit(Path::new(path), false)?;
+        }
+        let cwd = Path::new(OsStr::from_bytes(cwd));
+        visit(cwd, false)?;
+        let resolve = |bytes: &[u8]| {
+            let path = Path::new(OsStr::from_bytes(bytes));
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            }
+        };
+        // Launchd must not resolve an executable against an implicit PATH.
+        let program = Path::new(OsStr::from_bytes(program));
+        if !program.is_absolute() {
+            return Err(io::Error::other(
+                "launchd executor requires an absolute path",
+            ));
+        }
+        visit(program, false)?;
+        for arg in args {
+            let path = Path::new(OsStr::from_bytes(arg));
+            if path.is_absolute() {
+                visit(path, false)?;
+            }
+        }
+        for (key, value) in env {
+            crate::tcc::visit_environment(
+                OsStr::from_bytes(key),
+                OsStr::from_bytes(value),
+                &mut |path| visit(path, false),
+            )?;
+        }
+        for grant in grants {
+            visit(grant, true)?;
+        }
+        capture.visit(&mut |path| visit(path, false))?;
+        for root in [
+            dir.parent()
+                .ok_or_else(|| io::Error::other("missing job registry"))?,
+            capture.root(),
+        ] {
+            supervise::validate_capture_grants(root, grants)?;
+        }
+        for pair in args.windows(2).filter(|pair| pair[0] == b"--config") {
+            let path = resolve(&pair[1]);
+            visit(&path, false)?; // Before reading even a child-mounted config.
+            let config: serde_json::Value =
+                serde_json::from_slice(&platform::read_private_bounded_in(
+                    path.parent()
+                        .ok_or_else(|| io::Error::other("missing config parent"))?,
+                    Path::new(
+                        path.file_name()
+                            .ok_or_else(|| io::Error::other("missing config name"))?,
+                    ),
+                    CONTROL_BYTES,
+                )?)
+                .map_err(io::Error::other)?;
+            crate::tcc::visit_config(&config, visit)?;
+        }
+        Ok(AdmittedRequest { request: self, dir })
+    }
+}
+impl AdmittedRequest<'_> {
+    fn command(&self) -> Command {
+        let req = self.request;
+        let mut cmd = Command::new(OsStr::from_bytes(&req.program));
+        cmd.args(req.args.iter().map(|s| OsStr::from_bytes(s)))
+            .env_clear()
+            // Bound executor setup before MXC installs the workload environment.
+            // Missing HOME/TMPDIR must not fall back to implicit host storage.
+            .envs(executor_environment(self.dir))
+            .envs(
+                req.env
+                    .iter()
+                    .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
+            )
+            .current_dir(OsStr::from_bytes(&req.cwd));
+        cmd
+    }
+    fn plist(&self) -> io::Result<String> {
+        let directory = self.dir.to_string_lossy();
+        let binary = self.dir.join("omgs");
+        let environment = anchor_environment(self.dir)?
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "<key>{}</key><string>{}</string>",
+                    xml(key),
+                    xml(&value.to_string_lossy())
+                )
+            })
+            .collect::<String>();
+        Ok(format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>{}</string>
+<key>ProgramArguments</key><array><string>{}</string><string>coalition-anchor</string><string>--directory</string><string>{}</string></array>
+<key>WorkingDirectory</key><string>{}</string>
+<key>EnvironmentVariables</key><dict>{}</dict>
+<key>KeepAlive</key><false/>
+<key>RunAtLoad</key><false/>
+<key>SessionCreate</key><true/>
+<key>ExitTimeOut</key><integer>3</integer>
+</dict></plist>"#,
+            label(self.dir)?,
+            xml(&binary.to_string_lossy()),
+            xml(&directory),
+            xml(&directory),
+            environment
+        ))
+    }
+    fn submit(&self, job: &mut Job, domain: &str) -> io::Result<()> {
+        if self.dir != job.dir {
+            return Err(io::Error::other("admitted job directory mismatch"));
+        }
+        self.request.admit(self.dir)?;
+        for (_, path) in executor_environment(self.dir) {
+            platform::create_private_dir_new(&path)?;
+        }
+        // Repeat admission after staging and immediately before bootstrap.
+        self.request.admit(self.dir)?;
+        write(self.dir, "request", self.request)?;
+        job.submitted = true;
+        launchctl(&[
+            OsStr::new("bootstrap"),
+            OsStr::new(domain),
+            self.dir.join("job.plist").as_os_str(),
+        ])?;
+        let service = format!("{}/{}", domain, label(self.dir)?);
+        launchctl(&[OsStr::new("kickstart"), OsStr::new(&service)])
+    }
+}
+
+fn executor_environment(dir: &Path) -> [(&'static str, PathBuf); 2] {
+    [
+        ("HOME", dir.join("executor-home")),
+        ("TMPDIR", dir.join("executor-temp")),
+    ]
+}
+
+fn anchor_environment(dir: &Path) -> io::Result<Vec<(&'static str, OsString)>> {
+    let data = dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("missing job data directory"))?;
+    Ok(vec![
+        ("OMGS_HOME", data.as_os_str().to_owned()),
+        ("HOME", dir.as_os_str().to_owned()),
+        ("TMPDIR", dir.as_os_str().to_owned()),
+        ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+        ("RUST_BACKTRACE", "0".into()),
+        ("DYLD_INSERT_LIBRARIES", "".into()),
+        ("DYLD_LIBRARY_PATH", "".into()),
+        ("DYLD_FRAMEWORK_PATH", "".into()),
+        ("DYLD_FALLBACK_LIBRARY_PATH", "/usr/lib".into()),
+        (
+            "DYLD_FALLBACK_FRAMEWORK_PATH",
+            "/System/Library/Frameworks".into(),
+        ),
+    ])
 }
 
 #[derive(Serialize, Deserialize)]
@@ -785,18 +1006,10 @@ pub(crate) fn run(
             .get_current_dir()
             .map(Path::to_path_buf)
             .unwrap_or(std::env::current_dir()?);
-        crate::tcc::admit_path(&cwd)?;
-        crate::tcc::admit_path(Path::new(cmd.get_program()))?;
-        for arg in cmd.get_args().filter(|a| Path::new(a).is_absolute()) {
-            crate::tcc::admit_path(Path::new(arg))?;
-        }
-        crate::tcc::admit_environment(cmd.get_envs().filter_map(|(_, value)| value))?;
-        for grant in grants {
-            crate::tcc::admit_grant(grant)?;
-        }
+        let capture = supervise::CapturePlan::new()?;
         let root = root()?;
         supervise::validate_capture_grants(&root, grants)?;
-        supervise::validate_capture_grants(&supervise::capture_root()?, grants)?;
+        supervise::validate_capture_grants(capture.root(), grants)?;
         let registry_guard = registry(&root)?;
         recover(&root, &api)?;
         let dir = root.join(platform::random_nonce()?);
@@ -820,73 +1033,21 @@ pub(crate) fn run(
                 .get_envs()
                 .filter_map(|(k, v)| v.map(|v| (k.as_bytes().to_vec(), v.as_bytes().to_vec())))
                 .collect(),
-            cwd: cmd
-                .get_current_dir()
-                .map(Path::to_path_buf)
-                .unwrap_or(std::env::current_dir()?)
-                .as_os_str()
-                .as_bytes()
-                .to_vec(),
+            cwd: cwd.as_os_str().as_bytes().to_vec(),
             limits: limits.clone(),
             nonce: nonce.map(str::to_owned),
             marker: marker.map(str::to_owned),
             parent_coalition: coalition(std::process::id() as i32)?,
+            grants: grants.to_vec(),
+            capture,
         };
-        write(&job.dir, "request", &request)?;
-        let data = job
-            .dir
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_string_lossy();
-        let directory = job.dir.to_string_lossy();
-        let environment = [
-            ("OMGS_HOME", data.as_ref()),
-            ("HOME", directory.as_ref()),
-            ("TMPDIR", directory.as_ref()),
-            ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
-            ("RUST_BACKTRACE", "0"),
-            ("DYLD_INSERT_LIBRARIES", ""),
-            ("DYLD_LIBRARY_PATH", ""),
-            ("DYLD_FRAMEWORK_PATH", ""),
-            ("DYLD_FALLBACK_LIBRARY_PATH", "/usr/lib"),
-            ("DYLD_FALLBACK_FRAMEWORK_PATH", "/System/Library/Frameworks"),
-        ]
-        .iter()
-        .map(|(key, value)| format!("<key>{}</key><string>{}</string>", xml(key), xml(value)))
-        .collect::<String>();
-        let plist = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>{}</string>
-<key>ProgramArguments</key><array><string>{}</string><string>coalition-anchor</string><string>--directory</string><string>{}</string></array>
-<key>WorkingDirectory</key><string>{}</string>
-<key>EnvironmentVariables</key><dict>{}</dict>
-<key>KeepAlive</key><false/>
-<key>RunAtLoad</key><false/>
-<key>SessionCreate</key><true/>
-<key>ExitTimeOut</key><integer>3</integer>
-</dict></plist>"#,
-            label(&job.dir)?,
-            xml(&binary.to_string_lossy()),
-            xml(&directory),
-            xml(&directory),
-            environment
-        );
+        let request_dir = job.dir.clone();
+        let admitted = request.admit(&request_dir)?;
+        let plist = admitted.plist()?;
         write_file(&job.dir.join("job.plist"), plist.as_bytes())?;
         let domain = domain();
         write(&job.dir, "domain", &domain)?;
-        admit_job_storage(&job.dir)?;
-        job.submitted = true;
-        launchctl(&[
-            OsStr::new("bootstrap"),
-            OsStr::new(&domain),
-            job.dir.join("job.plist").as_os_str(),
-        ])?;
-        let service = format!("{}/{}", domain, label(&job.dir)?);
-        launchctl(&[OsStr::new("kickstart"), OsStr::new(&service)])?;
+        admitted.submit(&mut job, &domain)?;
         let admission_started = Instant::now();
         let mut ready = None;
         let mut interrupted = false;
@@ -1055,6 +1216,7 @@ impl Drop for Job {
 /// Hidden trusted entry point. No target is started until the parent admits the
 /// fresh coalition. After run_inner returns, no path here spawns another process.
 pub fn anchor(dir: &Path) -> io::Result<()> {
+    admit_job_storage(dir)?;
     platform::check_private_dir(dir)?;
     if dir.parent() != Some(root()?.as_path()) {
         return Err(io::Error::other(
@@ -1062,10 +1224,10 @@ pub fn anchor(dir: &Path) -> io::Result<()> {
         ));
     }
     label(dir)?;
-    admit_job_storage(dir)?;
     let outcome = (|| -> io::Result<()> {
         let api = Api::load()?;
         let req: Request = read(dir, "request")?;
+        req.admit(dir)?;
         let pid = std::process::id() as i32;
         let id = coalition(pid)?;
         if id == req.parent_coalition || api.active(id)? != 1 || api.members(id)? != [pid] {
@@ -1127,6 +1289,7 @@ pub fn anchor(dir: &Path) -> io::Result<()> {
         if owner_gone(dir) || dir.join("cancel").exists() {
             return Ok(());
         }
+        let admitted = req.admit(dir)?;
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let monitor = {
@@ -1141,24 +1304,19 @@ pub fn anchor(dir: &Path) -> io::Result<()> {
                 }
             })
         };
-        let mut cmd = Command::new(OsString::from_vec(req.program));
-        cmd.args(req.args.into_iter().map(OsString::from_vec))
-            .env_clear()
-            .envs(
-                req.env
-                    .into_iter()
-                    .map(|(k, v)| (OsString::from_vec(k), OsString::from_vec(v))),
-            )
-            .current_dir(OsString::from_vec(req.cwd));
+        let cmd = admitted.command();
         OWNED.with(|owned| owned.set(Some(id)));
-        let result = supervise::run_inner(
+        let result = supervise::run_controlled(
             cmd,
             &req.limits,
             None,
             req.nonce.as_deref(),
             req.marker.as_deref(),
             true,
-            Some(&stop),
+            supervise::RunControl {
+                cancellation: Some(&stop),
+                capture: Some(&req.capture),
+            },
         );
         done.store(true, Ordering::Release);
         monitor
@@ -1216,6 +1374,225 @@ mod tests {
         fn pause(&mut self) {
             self.elapsed += Duration::from_millis(50);
         }
+    }
+    #[test]
+    fn every_handoff_path_must_pass_admission() {
+        use std::collections::BTreeSet;
+        let data = supervise::capture_root()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(format!(
+                "handoff-test-{}",
+                platform::random_nonce().unwrap()
+            ));
+        platform::create_private_dir_new(&data).unwrap();
+        let dir = data.join("launchd").join(platform::random_nonce().unwrap());
+        platform::create_private_tree(&dir).unwrap();
+        let run = data.join("run").join("proof");
+        platform::create_private_tree(&run).unwrap();
+        let workspace = run.join("workspace");
+        let scratch = run.join("scratch");
+        for path in [&workspace, &scratch] {
+            platform::create_private_dir_new(path).unwrap();
+        }
+        let config_path = run.join("mxc-config.json");
+        let config = serde_json::json!({
+            "filesystem": {"readonlyPaths": ["/usr/bin"], "readwritePaths": [workspace, scratch], "deniedPaths": [run.join("denied")]},
+            "process": {"cwd": workspace, "env": [
+                format!("HOME={}", scratch.display()), format!("TMPDIR={}/", scratch.display()),
+                format!("XDG_CACHE_HOME={}/cache", scratch.display()),
+                format!("CLANG_MODULE_CACHE_PATH={}/clang-cache", scratch.display()),
+                format!("OPENSSL_CONF={}/openssl.cnf", scratch.display()),
+                format!("CARGO_HOME={}/cargo-home", scratch.display()),
+                format!("CUSTOM_HOME={}/literal:home", scratch.display()),
+                "PATH=/usr/bin:/bin".to_string(), "RUSTUP_HOME=/usr/local/rust".to_string()
+            ]}
+        });
+        platform::write_private_new(&config_path, &serde_json::to_vec(&config).unwrap()).unwrap();
+        let request = Request {
+            program: run.join("executor/mxc").as_os_str().as_bytes().to_vec(),
+            args: vec![
+                b"--config".to_vec(),
+                config_path.as_os_str().as_bytes().to_vec(),
+            ],
+            env: vec![(
+                b"TMPDIR".to_vec(),
+                run.join("executor-temp").as_os_str().as_bytes().to_vec(),
+            )],
+            cwd: run.as_os_str().as_bytes().to_vec(),
+            limits: Limits {
+                wall_ms: 5000,
+                cpu_secs: None,
+                file_size_bytes: None,
+                open_files: None,
+                memory_bytes: None,
+                tasks: None,
+                output_cap_bytes: 4096,
+            },
+            nonce: Some("nonce".into()),
+            marker: Some("marker".into()),
+            parent_coalition: 1,
+            grants: vec![workspace.clone(), scratch.clone()],
+            capture: supervise::CapturePlan::new().unwrap(),
+        };
+        // Exercise the real wire round trip, not a separate test-only builder.
+        let request: Request =
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let mut checked = BTreeSet::new();
+        let admitted = request
+            .admit_with(&dir, &mut |path, _| {
+                checked.insert(path.to_path_buf());
+                Ok(())
+            })
+            .unwrap();
+        let plist = admitted.plist().unwrap();
+        let command = admitted.command();
+        for path in [
+            Path::new(command.get_program()),
+            command.get_current_dir().unwrap(),
+        ]
+        .into_iter()
+        .chain(
+            command
+                .get_args()
+                .map(Path::new)
+                .filter(|path| path.is_absolute()),
+        ) {
+            assert!(
+                checked.contains(path),
+                "unadmitted command path: {}",
+                path.display()
+            );
+        }
+        for (key, value) in command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+        {
+            crate::tcc::visit_environment(key, value, &mut |path| {
+                assert!(
+                    checked.contains(path),
+                    "unadmitted command environment: {}",
+                    path.display()
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+        // Inspect the actual launchd wire document too. Any new absolute
+        // plist path or environment path must have gone through the gate.
+        for value in plist
+            .split("<string>")
+            .skip(1)
+            .map(|part| part.split("</string>").next().unwrap())
+        {
+            for path in std::env::split_paths(OsStr::new(value)).filter(|path| path.is_absolute()) {
+                assert!(
+                    checked.contains(&path),
+                    "unadmitted plist path: {}",
+                    path.display()
+                );
+            }
+        }
+        let mut expected: BTreeSet<PathBuf> = [
+            data.clone(),
+            data.join("launchd"),
+            data.join("launchd/registry"),
+            dir.clone(),
+            dir.join("executor-home"),
+            dir.join("executor-temp"),
+            run.clone(),
+            run.join("executor/mxc"),
+            run.join("executor-temp"),
+            config_path,
+            workspace,
+            scratch.clone(),
+            scratch.join("cache"),
+            scratch.join("clang-cache"),
+            scratch.join("openssl.cnf"),
+            scratch.join("cargo-home"),
+            scratch.join("literal:home"),
+            scratch.join("literal"),
+            run.join("denied"),
+        ]
+        .into_iter()
+        .collect();
+        for path in [
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+            "/bin/sleep",
+            "/dev/null",
+            "/usr/lib",
+            "/System/Library/Frameworks",
+            "/usr/local/rust",
+        ] {
+            expected.insert(path.into());
+        }
+        for name in [
+            "owner",
+            "omgs",
+            "job.plist",
+            "request",
+            "domain",
+            "ready",
+            "compatible",
+            "start",
+            "result",
+            "error",
+            "cancel",
+            "orphan",
+            "release",
+        ] {
+            expected.insert(dir.join(name));
+            expected.insert(dir.join(format!("{name}.tmp")));
+        }
+        let capture_json = serde_json::to_value(&request.capture).unwrap();
+        let capture_root = PathBuf::from(capture_json["root"].as_str().unwrap());
+        expected.insert(capture_root.parent().unwrap().to_path_buf());
+        expected.insert(capture_root);
+        for dir in capture_json["directories"].as_array().unwrap() {
+            let dir = PathBuf::from(dir.as_str().unwrap());
+            expected.insert(dir.join("pipe"));
+            expected.insert(dir);
+        }
+        assert_eq!(checked, expected);
+        // Refusing any one path must prevent obtaining the submission token.
+        for rejected in expected {
+            let error = request
+                .admit_with(&dir, &mut |path, _| {
+                    if path == rejected {
+                        Err(io::Error::other("injected handoff refusal"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .err()
+                .unwrap();
+            assert!(
+                error.to_string().contains("injected handoff refusal"),
+                "{}: {error}",
+                rejected.display()
+            );
+        }
+        // The production gate must also inspect config contents, not just its filename.
+        let mut protected = config;
+        protected["process"]["env"][0] = "HOME=/Users/omgs-tcc-refusal/Documents".into();
+        std::fs::write(
+            run.join("mxc-config.json"),
+            serde_json::to_vec(&protected).unwrap(),
+        )
+        .unwrap();
+        assert!(request
+            .admit(&dir)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("TCC consent"));
+        assert!(!dir.join("request").exists());
+        assert!(!dir.join("job.plist").exists());
+        std::fs::remove_dir_all(data).unwrap();
     }
     #[test]
     fn actual_registry_and_job_volumes_are_admitted() {

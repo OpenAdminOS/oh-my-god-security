@@ -543,10 +543,7 @@ fn reader<R: Read + Send + 'static>(
 // Darwin supplies a per-user directory that the pinned Seatbelt baseline denies.
 #[cfg(target_os = "macos")]
 pub(crate) fn capture_root() -> io::Result<PathBuf> {
-    use std::os::unix::{
-        ffi::OsStrExt,
-        fs::{DirBuilderExt, MetadataExt},
-    };
+    use std::os::unix::ffi::OsStrExt;
     let mut bytes = vec![0u8; 4096];
     // SAFETY: confstr writes at most the supplied buffer length.
     let size = unsafe {
@@ -571,12 +568,24 @@ pub(crate) fn capture_root() -> io::Result<PathBuf> {
             "Darwin private temp directory is outside /private/var/folders",
         ));
     }
+    capture_root_with(&base, &mut crate::tcc::admit_path)
+}
+
+#[cfg(target_os = "macos")]
+fn capture_root_with(
+    base: &std::path::Path,
+    admit: &mut impl FnMut(&std::path::Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    admit(base)?;
     let dir = base.join("omgs-capture");
+    admit(&dir)?;
     match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
+    admit(&dir)?;
     let meta = std::fs::symlink_metadata(&dir)?;
     // SAFETY: geteuid has no preconditions.
     if !meta.is_dir()
@@ -608,19 +617,85 @@ pub(crate) fn validate_capture_grants(
     Ok(())
 }
 
+/// Capture names are chosen before submission, never invented by the anchor.
+#[cfg(target_os = "macos")]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CapturePlan {
+    root: PathBuf,
+    directories: [PathBuf; 2],
+}
+#[cfg(target_os = "macos")]
+impl CapturePlan {
+    pub(crate) fn new() -> io::Result<Self> {
+        let root = capture_root()?;
+        Ok(Self {
+            directories: [
+                root.join(format!("pipe-{}", crate::platform::random_nonce()?)),
+                root.join(format!("pipe-{}", crate::platform::random_nonce()?)),
+            ],
+            root,
+        })
+    }
+    pub(crate) fn visit(
+        &self,
+        visit: &mut impl FnMut(&std::path::Path) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let Self { root, directories } = self;
+        visit(
+            root.parent()
+                .ok_or_else(|| io::Error::other("missing capture temp directory"))?,
+        )?;
+        visit(root)?;
+        for dir in directories {
+            if dir.parent() != Some(root.as_path()) || dir.file_name().is_none() {
+                return Err(io::Error::other("capture pipe outside admitted root"));
+            }
+            visit(dir)?;
+            visit(&dir.join("pipe"))?;
+        }
+        Ok(())
+    }
+    pub(crate) fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+    fn pipes(&self) -> io::Result<[(std::fs::File, std::fs::File); 2]> {
+        if self.root != capture_root()? {
+            return Err(io::Error::other("capture root changed since submission"));
+        }
+        self.visit(&mut crate::tcc::admit_path)?;
+        Ok([
+            capture_pipe_at(&self.directories[0])?,
+            capture_pipe_at(&self.directories[1])?,
+        ])
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn capture_pipe() -> io::Result<(std::fs::File, std::fs::File)> {
+    let plan = CapturePlan::new()?;
+    plan.visit(&mut crate::tcc::admit_path)?;
+    capture_pipe_at(&plan.directories[0])
+}
+
 // Darwin's pipe()+fcntl() is not atomic against unrelated concurrent spawns.
 // Open anonymous FIFOs with O_CLOEXEC atomically instead, then unlink them.
 #[cfg(target_os = "macos")]
-fn capture_pipe() -> io::Result<(std::fs::File, std::fs::File)> {
+fn capture_pipe_at(dir: &std::path::Path) -> io::Result<(std::fs::File, std::fs::File)> {
     use std::ffi::CString;
     use std::os::unix::{
         ffi::OsStrExt,
         fs::{DirBuilderExt, OpenOptionsExt},
     };
-    let dir = capture_root()?.join(format!("pipe-{}", crate::platform::random_nonce()?));
-    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    // Recheck both existing children and their actual volume immediately before
+    // creation. Parent admission alone does not cover a mounted child.
+    crate::tcc::admit_path(dir)?;
     let path = dir.join("pipe");
+    crate::tcc::admit_path(&path)?;
+    std::fs::DirBuilder::new().mode(0o700).create(dir)?;
     let result = (|| {
+        crate::tcc::admit_path(dir)?;
+        crate::tcc::admit_path(&path)?;
         let name = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in temp path"))?;
         // SAFETY: name is NUL terminated; the parent is private to this run.
@@ -639,7 +714,7 @@ fn capture_pipe() -> io::Result<(std::fs::File, std::fs::File)> {
         Ok((read, write))
     })();
     let unlink = std::fs::remove_file(&path);
-    let remove = std::fs::remove_dir(&dir);
+    let remove = std::fs::remove_dir(dir);
     let pair = result?;
     unlink?;
     remove?;
@@ -1252,8 +1327,15 @@ pub(crate) fn run_monitored(
     run_inner(cmd, limits, ownership, Some(nonce), None, true, Some(stop))
 }
 
+#[derive(Default)]
+pub(crate) struct RunControl<'a> {
+    pub(crate) cancellation: Option<&'a AtomicBool>,
+    #[cfg(target_os = "macos")]
+    pub(crate) capture: Option<&'a CapturePlan>,
+}
+
 pub(crate) fn run_inner(
-    mut cmd: Command,
+    cmd: Command,
     limits: &Limits,
     ownership: Option<&MacOwnership>,
     nonce: Option<&str>,
@@ -1261,6 +1343,31 @@ pub(crate) fn run_inner(
     check_signals: bool,
     cancellation: Option<&AtomicBool>,
 ) -> Supervised {
+    run_controlled(
+        cmd,
+        limits,
+        ownership,
+        nonce,
+        expect_marker,
+        check_signals,
+        RunControl {
+            cancellation,
+            #[cfg(target_os = "macos")]
+            capture: None,
+        },
+    )
+}
+
+pub(crate) fn run_controlled(
+    mut cmd: Command,
+    limits: &Limits,
+    ownership: Option<&MacOwnership>,
+    nonce: Option<&str>,
+    expect_marker: Option<&str>,
+    check_signals: bool,
+    control: RunControl<'_>,
+) -> Supervised {
+    let cancellation = control.cancellation;
     let start = Instant::now();
     let mut result = Supervised {
         exit_code: None,
@@ -1375,9 +1482,11 @@ pub(crate) fn run_inner(
     }
     cmd.stdin(Stdio::null());
     #[cfg(target_os = "macos")]
-    let (stdout, stderr) = match capture_pipe().and_then(|out| capture_pipe().map(|err| (out, err)))
-    {
-        Ok(((stdout, out), (stderr, err))) => {
+    let (stdout, stderr) = match control.capture.map_or_else(
+        || capture_pipe().and_then(|out| capture_pipe().map(|err| [out, err])),
+        CapturePlan::pipes,
+    ) {
+        Ok([(stdout, out), (stderr, err)]) => {
             cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
             (stdout, stderr)
         }
@@ -1612,6 +1721,61 @@ fn elapsed_ms(start: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_storage_rejects_child_volumes_before_creation() {
+        let base = capture_root().unwrap().join(format!(
+            "capture-volume-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&base).unwrap();
+        let root = base.join("omgs-capture");
+        crate::platform::create_private_dir_new(&root).unwrap();
+        let mut checked = Vec::new();
+        let error = capture_root_with(&base, &mut |path| {
+            crate::tcc::admit_path_with_volume(path, &mut |existing| {
+                checked.push(existing.to_path_buf());
+                if existing == root {
+                    Err(io::Error::other("injected external capture volume"))
+                } else {
+                    Ok(())
+                }
+            })
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("external capture volume"));
+        assert_eq!(checked, [base.clone(), root.clone()]);
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        // A mounted FIFO child must also fail the very same admission visitor.
+        let plan = CapturePlan {
+            root: root.clone(),
+            directories: [root.join("out"), root.join("err")],
+        };
+        for dir in &plan.directories {
+            crate::platform::create_private_dir_new(dir).unwrap();
+        }
+        for rejected in [
+            plan.directories[0].clone(),
+            plan.directories[1].join("pipe"),
+        ] {
+            if rejected.file_name().unwrap() == "pipe" {
+                std::fs::write(&rejected, b"").unwrap();
+            }
+            let error = plan
+                .visit(&mut |path| {
+                    crate::tcc::admit_path_with_volume(path, &mut |existing| {
+                        if existing == rejected {
+                            Err(io::Error::other("injected external FIFO volume"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("external FIFO volume"));
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
     #[cfg(target_os = "macos")]
     #[test]
     fn capture_ignores_unsafe_tmpdir_and_rejects_overlapping_grants() {

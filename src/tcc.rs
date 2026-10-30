@@ -38,6 +38,21 @@ impl Drop for Cf {
     }
 }
 fn local_internal_volume(path: &Path) -> io::Result<()> {
+    // Null stdio is an OS device on devfs, not file storage. Admit only the
+    // exact root-owned Darwin null character device, never an arbitrary devfs
+    // path, replacement regular file or a device on an external volume.
+    if path == Path::new("/dev/null") {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_type().is_char_device()
+            && meta.uid() == 0
+            && libc::major(meta.rdev() as libc::dev_t) == 3
+            && libc::minor(meta.rdev() as libc::dev_t) == 2
+        {
+            return Ok(());
+        }
+        return Err(io::Error::other("invalid system null device"));
+    }
     let bytes = path.as_os_str().as_bytes();
     // SAFETY: bytes are valid throughout construction; the URL retains them.
     let url = Cf(unsafe {
@@ -245,44 +260,89 @@ pub(crate) fn admit_grant(path: &Path) -> io::Result<()> {
     inspect(path, true)
 }
 
-pub(crate) fn admit_environment<'a>(
-    values: impl IntoIterator<Item = &'a std::ffi::OsStr>,
+/// Inspect path lists and single path values without losing a colon in a
+/// literal HOME, TMPDIR or other single-path environment value.
+pub(crate) fn visit_environment(
+    key: &std::ffi::OsStr,
+    value: &std::ffi::OsStr,
+    visit: &mut impl FnMut(&Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    for value in values {
-        for path in std::env::split_paths(value).filter(|p| p.is_absolute()) {
-            admit_path(&path)?;
-        }
+    if key != "PATH" && !key.as_bytes().starts_with(b"DYLD_") && Path::new(value).is_absolute() {
+        visit(Path::new(value))?;
+    }
+    for path in std::env::split_paths(value).filter(|p| p.is_absolute()) {
+        visit(&path)?;
     }
     Ok(())
 }
+
 pub(crate) fn admit_config(config: &serde_json::Value) -> io::Result<()> {
+    visit_config(config, &mut |path, grant| {
+        if grant {
+            admit_grant(path)
+        } else {
+            admit_path(path)
+        }
+    })
+}
+
+/// One visitor for every path MXC receives, shared by submission and the anchor.
+pub(crate) fn visit_config(
+    config: &serde_json::Value,
+    visit: &mut impl FnMut(&Path, bool) -> io::Result<()>,
+) -> io::Result<()> {
     for key in ["readonlyPaths", "readwritePaths"] {
         let paths = config
             .pointer(&format!("/filesystem/{key}"))
             .and_then(|p| p.as_array())
             .ok_or_else(|| io::Error::other("missing launchd filesystem paths"))?;
         for path in paths {
-            admit_grant(Path::new(path.as_str().ok_or_else(|| {
-                io::Error::other("invalid launchd filesystem path")
-            })?))?;
+            visit(
+                Path::new(
+                    path.as_str()
+                        .ok_or_else(|| io::Error::other("invalid launchd filesystem path"))?,
+                ),
+                true,
+            )?;
         }
     }
-    admit_path(Path::new(
-        config
-            .pointer("/process/cwd")
-            .and_then(|p| p.as_str())
-            .ok_or_else(|| io::Error::other("missing launchd workload directory"))?,
-    ))?;
+    if let Some(paths) = config.pointer("/filesystem/deniedPaths") {
+        for path in paths
+            .as_array()
+            .ok_or_else(|| io::Error::other("invalid launchd denied paths"))?
+        {
+            visit(
+                Path::new(
+                    path.as_str()
+                        .ok_or_else(|| io::Error::other("invalid launchd denied path"))?,
+                ),
+                false,
+            )?;
+        }
+    }
+    visit(
+        Path::new(
+            config
+                .pointer("/process/cwd")
+                .and_then(|p| p.as_str())
+                .ok_or_else(|| io::Error::other("missing launchd workload directory"))?,
+        ),
+        false,
+    )?;
     let values = config
         .pointer("/process/env")
         .and_then(|p| p.as_array())
         .ok_or_else(|| io::Error::other("missing launchd workload environment"))?;
     for entry in values {
-        let (_, value) = entry
+        let (key, value) = entry
             .as_str()
             .and_then(|s| s.split_once('='))
             .ok_or_else(|| io::Error::other("invalid launchd environment entry"))?;
-        admit_environment([std::ffi::OsStr::new(value)])?;
+        visit_environment(
+            std::ffi::OsStr::new(key),
+            std::ffi::OsStr::new(value),
+            &mut |path| visit(path, false),
+        )?;
     }
     Ok(())
 }
@@ -349,6 +409,8 @@ mod tests {
     fn internal_temp_is_admitted_and_protected_paths_name_the_fix() {
         admit_path(&crate::platform::temp_root().unwrap()).unwrap();
         admit_path(Path::new("/bin/sh")).unwrap();
+        admit_path(Path::new("/dev/null")).unwrap();
+        assert!(admit_path(Path::new("/dev/zero")).is_err());
         assert!(admit_path(Path::new("/private/tmp/../tmp/test"))
             .unwrap_err()
             .to_string()
