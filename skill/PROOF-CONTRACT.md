@@ -38,7 +38,7 @@ startup and cleanup. This allowance is not extra target execution time.
 
 ## Execution input identity and replay
 
-Schema `omgs-proof/3` requires `execution_inputs.version: 1` for a target. Its SHA-256
+Schema `omgs-proof/3` requires `execution_inputs.version: 2` for a target. Its SHA-256
 matches `target_sha256` and the canonical `proofs/N/input-manifest.json`. The manifest retains
 bounded per-path kinds, modes and content hashes for mismatch diagnostics. Validation and replay
 use the same version and normalization. Older proof schemas and unknown identity versions are
@@ -46,14 +46,23 @@ refused with a request to rerun the proof, never silently interpreted under the 
 
 The disposable workspace contains normalized SHA-1 Git index versions 2 and 3. Stat fields and
 TREE, UNTR, FSMN, EOIE and IEOT cache extensions are removed or zeroed before hashing and execution;
-the checksum is regenerated. Paths, modes, object IDs, stages, flags and all other extensions
-remain bound, as do config, hooks, refs, objects and other Git files. Normalization applies only
+the checksum is regenerated. Paths, modes, object IDs, stages, flags and the supported REUC
+resolve-undo extension remain bound, as do config, hooks, refs, objects and other Git files.
+Every unknown extension signature is rejected. Normalization applies only
 to `index` directly inside `.git` directories. Hook data named `index`, shared indexes and
 auxiliary Git metadata remain byte-bound. Unsupported or malformed
 indexes, including split indexes, fail closed. A linked worktree or external Git directory requires
 a standalone checkout.
 Do not execute Git against the target: config and hooks can execute programs. An incidental index
 stat refresh does not invalidate a proof, but execution-relevant input changes do.
+
+Links bind their exact stored link text and kind, including dangling links and `./` prefixes.
+After hashing and all harness staging, access and modification times on workspace files,
+directories and links are reset to 2000-01-01 UTC without following links. Creation times are
+also reset on macOS and Windows. The workspace root is normalized last. This policy is identical
+for original proofs and replays; source timestamps are never modified. OS-managed change times
+and creation times on filesystems without a setter are properties of the disposable execution,
+not preserved source timestamps. Version 1 identities require a fresh proof.
 
 For a smaller immutable input boundary, pass `--inputs-from SELECTION.json`, containing
 `{"version":1,"paths":["src/decision.rs","Cargo.toml"]}`. Paths can name files or directories.
@@ -72,6 +81,13 @@ mapped beneath the parent of `--test`, and must include that test's basename. Fo
 `checks/main.swift` and `DRAFT_DIR/stubs.swift` at `checks/stubs.swift`. Directory harnesses retain
 at most 128 regular files and 16 MiB total, with canonical relative paths, per-file hashes and
 modes. Links, special files, empty directories, and paths deeper than 32 directories are refused.
+Before staging any file, all destinations are checked against both the copied workspace and
+the original target, including omitted input paths. Existing file, directory or link destinations
+are rejected. Existing directory ancestors are allowed only under their exact names, without
+links. Harness names use portable ASCII letters, digits, dots, underscores and hyphens; hidden
+components, trailing dots, Windows device names, short-name syntax and alternate separators
+are refused. Case aliases, overlapping harness paths and ambiguous Unicode siblings are also
+refused. Move the harness to an unambiguous fresh path when admission fails.
 Retained files live beneath `proofs/N/harness/`;
 replay reads them through the private artifact boundary and never reads the original draft path.
 Single-file drafts retain the existing `test-draft` representation. Replay output says

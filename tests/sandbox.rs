@@ -2832,3 +2832,180 @@ fn staged_harness_paths_and_outer_harness_errors_are_explicit() {
     assert!(!target.join("checks/entry.sh").exists());
     std::fs::remove_dir_all(d).unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn timestamp_sensitive_build_replays_with_normalized_workspace_times() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("timestamp-build");
+    let target = d.join("target");
+    let run = d.join("run");
+    omgs::platform::private_dir(&target).unwrap();
+    omgs::platform::private_dir(&run).unwrap();
+    for file in ["source", "cached"] {
+        std::fs::write(target.join(file), "synthetic").unwrap();
+    }
+    let set_time = |file: &str, seconds| {
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+        std::fs::File::options()
+            .write(true)
+            .open(target.join(file))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(time)
+                    .set_modified(time),
+            )
+            .unwrap();
+    };
+    set_time("source", 946684800);
+    set_time("cached", 946684801);
+    std::fs::write(
+        target.join("build.sh"),
+        "if [ source -nt cached ]; then echo REBUILD; else echo CACHED; fi\n",
+    )
+    .unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "build.sh",
+            "--cmd",
+            "sh build.sh",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let original = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert!(original.output.contains("CACHED") && !original.output.contains("REBUILD"));
+    set_time("source", 1893456000);
+    let replay = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(replay.status.success(), "{}", text(&replay));
+    let replay = omgs::proof::load(&run, "proofs/2.json").unwrap();
+    assert!(replay.output.contains("CACHED") && !replay.output.contains("REBUILD"));
+    assert_eq!(original.execution_inputs, replay.execution_inputs);
+    assert_eq!(
+        std::fs::metadata(target.join("source"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1893456000)
+    );
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_text_changes_refuse_replay_even_when_the_destination_is_equivalent() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("link-text-replay");
+    let target = d.join("target");
+    let run = d.join("run");
+    omgs::platform::private_dir(&target).unwrap();
+    omgs::platform::private_dir(&run).unwrap();
+    std::fs::write(target.join("source"), "synthetic").unwrap();
+    std::fs::write(target.join("test.sh"), "readlink selected\n").unwrap();
+    std::os::unix::fs::symlink("source", target.join("selected")).unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "test.sh",
+            "--cmd",
+            "sh test.sh",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    for link in ["./source", "@workspace/source"] {
+        std::fs::remove_file(target.join("selected")).unwrap();
+        std::os::unix::fs::symlink(link, target.join("selected")).unwrap();
+        let out = omgs(
+            &d,
+            &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+        );
+        assert!(
+            !out.status.success() && text(&out).contains("selected"),
+            "{}",
+            text(&out)
+        );
+        assert!(!run.join("proofs/2.json").exists());
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_harness_cannot_replace_target_source_or_omitted_target_source() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("harness-target-collision");
+    let target = d.join("target");
+    let draft = d.join("draft");
+    omgs::platform::private_dir(&target).unwrap();
+    omgs::platform::private_dir(&draft).unwrap();
+    std::fs::write(target.join("source"), "synthetic").unwrap();
+    std::fs::write(target.join("security.sh"), "echo ORIGINAL_TARGET\n").unwrap();
+    std::fs::write(draft.join("entry.sh"), "sh security.sh\n").unwrap();
+    std::fs::write(draft.join("security.sh"), "echo REPLACED_TARGET\n").unwrap();
+    let selection = d.join("selection.json");
+    std::fs::write(&selection, r#"{"version":1,"paths":["source"]}"#).unwrap();
+    for (label, selected) in [("full", false), ("selected", true)] {
+        let run = d.join(label);
+        omgs::platform::private_dir(&run).unwrap();
+        write_private_fixture(
+            run.join(omgs::runmeta::FILE),
+            serde_json::json!({"target":target}).to_string(),
+        )
+        .unwrap();
+        let mut args = vec![
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "entry.sh",
+            "--test-from",
+            draft.to_str().unwrap(),
+            "--cmd",
+            "sh entry.sh",
+        ];
+        if selected {
+            args.extend(["--inputs-from", selection.to_str().unwrap()]);
+        }
+        let out = omgs(&d, &args);
+        assert!(
+            !out.status.success() && text(&out).contains("harness destination collides"),
+            "{}",
+            text(&out)
+        );
+        assert!(!text(&out).contains("REPLACED_TARGET"));
+        assert_eq!(
+            std::fs::read(target.join("security.sh")).unwrap(),
+            b"echo ORIGINAL_TARGET\n"
+        );
+        assert!(!target.join("entry.sh").exists());
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}

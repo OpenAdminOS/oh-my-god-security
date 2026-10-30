@@ -1,8 +1,8 @@
 //! Versioned, bounded identities for the bytes admitted to a proof workspace.
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_ENTRIES: usize = 100_000;
 pub const MAX_MANIFEST_BYTES: u64 = 16 << 20;
 
@@ -15,7 +15,7 @@ pub struct Selection {
 
 impl Selection {
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != VERSION || self.paths.is_empty() || self.paths.len() > 256 {
+        if self.version != 1 || self.paths.is_empty() || self.paths.len() > 256 {
             return Err("input selection needs version 1 and 1..=256 paths".into());
         }
         for (i, path) in self.paths.iter().enumerate() {
@@ -199,11 +199,7 @@ fn walk(
             );
         }
         let (kind, digest) = if crate::platform::is_link(&meta) {
-            let link = std::fs::canonicalize(&path)
-                .ok()
-                .and_then(|p| p.strip_prefix(root).ok().map(PathBuf::from))
-                .map(|p| PathBuf::from("@workspace").join(p))
-                .unwrap_or(std::fs::read_link(&path).map_err(|e| e.to_string())?);
+            let link = std::fs::read_link(&path).map_err(|e| e.to_string())?;
             (
                 "link",
                 crate::sha256::digest(link.as_os_str().as_encoded_bytes()),
@@ -247,6 +243,89 @@ fn walk(
     Ok(())
 }
 
+/// Reset copy-preserved access/write times after all hashing and staging, in
+/// postorder so creating children cannot refresh a directory's write time.
+/// Never follow links: outside and dangling links remain sandbox inputs.
+pub(crate) fn normalize_timestamps(root: &Path) -> Result<(), String> {
+    fn visit(path: &Path) -> std::io::Result<()> {
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.is_dir() && !crate::platform::is_link(&meta) {
+            for entry in std::fs::read_dir(path)? {
+                visit(&entry?.path())?;
+            }
+        }
+        set_timestamp(path)
+    }
+    visit(root).map_err(|e| format!("cannot normalize workspace timestamps: {e}"))
+}
+
+// 2000-01-01 is representable on every supported filesystem.
+#[cfg(unix)]
+fn set_timestamp(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let times = [libc::timespec {
+        tv_sec: 946684800,
+        tv_nsec: 0,
+    }; 2];
+    #[cfg(target_os = "macos")]
+    {
+        let mut attrs = libc::attrlist {
+            bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+            reserved: 0,
+            commonattr: libc::ATTR_CMN_CRTIME,
+            volattr: 0,
+            dirattr: 0,
+            fileattr: 0,
+            forkattr: 0,
+        };
+        // SAFETY: attrs selects one timespec; times points to that initialized
+        // buffer. FSOPT_NOFOLLOW applies the change to the link itself.
+        if unsafe {
+            libc::setattrlist(
+                path.as_ptr(),
+                (&mut attrs as *mut libc::attrlist).cast(),
+                times.as_ptr().cast_mut().cast(),
+                std::mem::size_of::<libc::timespec>(),
+                libc::FSOPT_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    // SAFETY: path is NUL terminated and times has two initialized timespecs.
+    // AT_SYMLINK_NOFOLLOW prevents any write through a target-controlled link.
+    if unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_timestamp(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::{FileTimesExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0x100) // FILE_WRITE_ATTRIBUTES, including read-only files
+        .custom_flags(0x02000000 | 0x00200000) // backup semantics, open reparse point
+        .open(path)?;
+    let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946684800);
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(time)
+            .set_modified(time)
+            .set_created(time),
+    )
+}
+
 // Git owns these names directly inside a .git directory. Hook data and
 // auxiliary metadata remain byte-bound, even when a leaf is named index.
 fn canonical_git_index(path: &Path) -> bool {
@@ -257,7 +336,7 @@ fn canonical_git_index(path: &Path) -> bool {
 }
 
 /// Index v2/v3 with SHA-1 object IDs. Unknown formats fail closed. Preserve
-/// modes, object IDs, paths, stages, flags and all non-cache extensions.
+/// modes, object IDs, paths, stages, flags and supported semantic extensions.
 fn normalize_index(input: &[u8]) -> Result<Vec<u8>, String> {
     let invalid = || {
         "unsupported or malformed Git index; only SHA-1 index versions 2 and 3 are supported"
@@ -325,9 +404,12 @@ fn normalize_index(input: &[u8]) -> Result<Vec<u8>, String> {
                     .into(),
             );
         }
-        if ![b"TREE", b"UNTR", b"FSMN", b"EOIE", b"IEOT"].contains(&header[..4].try_into().unwrap())
-        {
-            out.extend_from_slice(&input[at..next]);
+        match &header[..4] {
+            // Derived caches are regenerated by Git, never execution inputs.
+            b"TREE" | b"UNTR" | b"FSMN" | b"EOIE" | b"IEOT" => {}
+            // Resolve-undo records carry staged object IDs and modes.
+            b"REUC" => out.extend_from_slice(&input[at..next]),
+            _ => return Err("unsupported Git index extension".into()),
         }
         at = next;
     }
@@ -442,6 +524,67 @@ pub fn retained(
 mod tests {
     use super::*;
 
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let base = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-input-fixtures-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_tree(&base).unwrap();
+        let path = base.join(label);
+        crate::platform::private_dir(&path).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn link_identity_binds_exact_text_including_dangling_namespace_and_dot_prefix() {
+        let d = scratch("links");
+        std::fs::write(d.join("source"), "source").unwrap();
+        let mut identities = std::collections::BTreeSet::new();
+        for text in ["source", "./source", "@workspace/source", "missing"] {
+            std::os::unix::fs::symlink(text, d.join("selected")).unwrap();
+            let identity = manifest(&d, None, false).unwrap();
+            assert_eq!(
+                identity
+                    .entries
+                    .iter()
+                    .find(|e| e.path == "selected")
+                    .unwrap()
+                    .sha256,
+                crate::sha256::digest(text.as_bytes())
+            );
+            assert!(identities.insert(identity.digest().unwrap()), "{text}");
+            std::fs::remove_file(d.join("selected")).unwrap();
+        }
+        std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn workspace_times_are_normalized_for_files_directories_and_root() {
+        let d = scratch("times");
+        std::fs::create_dir(d.join("nested")).unwrap();
+        std::fs::write(d.join("nested/source"), "bytes").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("missing", d.join("dangling")).unwrap();
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(946684800);
+        normalize_timestamps(&d).unwrap();
+        for path in [&d, &d.join("nested"), &d.join("nested/source")] {
+            let meta = std::fs::symlink_metadata(path).unwrap();
+            assert_eq!(meta.modified().unwrap(), time);
+            assert_eq!(meta.accessed().unwrap(), time);
+            #[cfg(any(windows, target_os = "macos"))]
+            assert_eq!(meta.created().unwrap(), time);
+        }
+        #[cfg(unix)]
+        {
+            let meta = std::fs::symlink_metadata(d.join("dangling")).unwrap();
+            assert_eq!(meta.modified().unwrap(), time);
+            assert_eq!(meta.accessed().unwrap(), time);
+            assert!(!d.join("missing").exists());
+        }
+        std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
+    }
+
     fn index() -> Vec<u8> {
         let mut data = b"DIRC\0\0\0\x02\0\0\0\x01".to_vec();
         let mut entry = vec![0; 72];
@@ -511,7 +654,16 @@ mod tests {
         let mut changed = data[..data.len() - 20].to_vec();
         changed.extend(b"TEST\0\0\0\x03abc");
         checksum(&mut changed);
-        assert_ne!(normalize_index(&changed).unwrap(), normalized);
+        assert!(normalize_index(&changed).is_err());
+        for signature in [b"REUC", b"link", b"sdir", b"test"] {
+            changed[84..88].copy_from_slice(signature);
+            changed = reseal(changed);
+            if signature == b"REUC" {
+                assert_ne!(normalize_index(&changed).unwrap(), normalized);
+            } else {
+                assert!(normalize_index(&changed).is_err());
+            }
+        }
         let mut corrupt = data.clone();
         corrupt[20] ^= 1;
         assert!(normalize_index(&corrupt).is_err());

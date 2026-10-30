@@ -1168,10 +1168,9 @@ fn stage_content(
     }
     let dest = dir.join(file);
     match std::fs::symlink_metadata(&dest) {
-        Ok(m) if m.file_type().is_file() && !platform::is_link(&m) => std::fs::remove_file(&dest)?,
         Ok(_) => {
             return Err(Error::other(format!(
-                "{} is a link or directory in the target",
+                "{} already exists in the target",
                 dest.display()
             )))
         }
@@ -1193,6 +1192,101 @@ fn stage_content(
         out.write_all(&bytes[..n])?;
     }
     out.set_permissions(permissions)
+}
+
+/// Admit the entire harness before writing any file. A harness owns fresh
+/// file names only, never an existing target entry or metadata tree.
+/// Restrict names to unambiguous portable ASCII rather than trying to emulate
+/// every filesystem's Unicode folding and generated DOS short-name rules.
+fn preflight_harness(workspace: &Path, paths: &[&str]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut nodes = std::collections::BTreeMap::new();
+    for path in paths {
+        crate::proof_inputs::safe_path(path)?;
+        let parts: Vec<_> = path.split('/').collect();
+        let mut prefix = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            let upper = part.to_ascii_uppercase();
+            let stem = upper.split('.').next().unwrap_or("");
+            if !part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                || part.starts_with('.')
+                || part.ends_with('.')
+                || matches!(stem, "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+                || ["COM", "LPT"].iter().any(|p| {
+                    stem.strip_prefix(p)
+                        .is_some_and(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
+                })
+            {
+                return Err(format!(
+                    "harness path has a reserved or ambiguous component: {path}"
+                ));
+            }
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            let leaf = i + 1 == parts.len();
+            let key = prefix.to_ascii_lowercase();
+            if let Some((previous, was_leaf)) = nodes.get(&key) {
+                if previous != &prefix || *was_leaf || leaf {
+                    return Err(format!("harness paths alias or overlap: {path}"));
+                }
+            } else {
+                nodes.insert(key, (prefix.clone(), leaf));
+            }
+        }
+    }
+    for path in paths {
+        let mut dir = workspace.to_path_buf();
+        let parts: Vec<_> = path.split('/').collect();
+        for (i, part) in parts.iter().enumerate() {
+            let mut exact = false;
+            for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let name = entry.file_name();
+                let name = name
+                    .to_str()
+                    .ok_or("target has an ambiguous non-UTF-8 harness sibling")?;
+                if !name.is_ascii() {
+                    return Err("target has an ambiguous Unicode harness sibling".into());
+                }
+                if name.trim_end_matches([' ', '.']).eq_ignore_ascii_case(part) {
+                    if name != *part || i + 1 == parts.len() {
+                        return Err(format!(
+                            "harness destination collides with target entry: {path}"
+                        ));
+                    }
+                    let meta =
+                        std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+                    if !meta.is_dir() || platform::is_link(&meta) {
+                        return Err(format!(
+                            "harness destination collides with target entry: {path}"
+                        ));
+                    }
+                    exact = true;
+                }
+            }
+            dir.push(part);
+            if !exact {
+                // The OS lookup catches aliases such as Windows generated short
+                // names even when directory enumeration uses a different name.
+                match std::fs::symlink_metadata(&dir) {
+                    Ok(_) => {
+                        return Err(format!(
+                            "harness destination collides with target entry: {path}"
+                        ))
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A readable root that contains, or is contained in, the run directory.
@@ -1312,6 +1406,15 @@ fn stage_workspace(
             "target snapshot differs from the recorded tree; refusing to replay; {details}"
         ));
     }
+    let mut harness_paths: Vec<_> = req.harness.iter().map(|f| f.path.as_str()).collect();
+    if let Some((_, path)) = &req.stage {
+        harness_paths.push(path);
+    }
+    preflight_harness(workspace, &harness_paths)?;
+    if let Some(target) = &req.target {
+        // Selections must not let a harness impersonate omitted target files.
+        preflight_harness(target, &harness_paths)?;
+    }
     for file in &req.harness {
         let rel = Path::new("harness").join(&file.path);
         let (bytes, permissions) = crate::run_artifact::read_with_permissions(
@@ -1380,6 +1483,7 @@ fn stage_workspace(
         req.test.as_deref(),
     )
     .map_err(|e| format!("cannot write command wrapper: {e}"))?;
+    crate::proof_inputs::normalize_timestamps(workspace)?;
     Ok(StagedWorkspace {
         digest,
         manifest,
@@ -2479,10 +2583,98 @@ mod tests {
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
         assert!(stage_file(&ws, "a/b/c.sh", &draft).is_ok());
         std::fs::write(ws.join("existing.sh"), b"old").unwrap();
-        assert!(stage_file(&ws, "existing.sh", &draft).is_ok());
-        assert_eq!(std::fs::read(ws.join("existing.sh")).unwrap(), b"test");
+        assert!(stage_file(&ws, "existing.sh", &draft).is_err());
+        assert_eq!(std::fs::read(ws.join("existing.sh")).unwrap(), b"old");
         assert!(stage_file(&ws, "../x", &draft).is_err());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn harness_preflight_rejects_all_collisions_and_portable_aliases_before_writes() {
+        let base = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-harness-preflight-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_tree(&base).unwrap();
+        let ws = base.join("workspace");
+        crate::platform::private_dir(&ws).unwrap();
+        std::fs::write(ws.join("security.sh"), "ORIGINAL").unwrap();
+        std::fs::create_dir(ws.join("checks")).unwrap();
+        for path in [
+            "security.sh",
+            "SECURITY.SH",
+            "security.sh/child",
+            "checks",
+            ".git/config",
+            ".omgs-wrapper",
+            "securi~1.sh",
+            "x\\security.sh",
+            "x:stream",
+            "security.sh.",
+            "security.sh ",
+            "CON",
+            "NUL.txt",
+            "COM1.sh",
+            "caf\u{e9}/entry.sh",
+            "cafe\u{301}/entry.sh",
+        ] {
+            assert!(
+                preflight_harness(&ws, &["entry.sh", path]).is_err(),
+                "{path}"
+            );
+            assert!(!ws.join("entry.sh").exists());
+            assert_eq!(std::fs::read(ws.join("security.sh")).unwrap(), b"ORIGINAL");
+        }
+        for paths in [
+            vec!["new/a.sh", "NEW/b.sh"],
+            vec!["new/a.sh", "new/A.sh"],
+            vec!["new", "new/a.sh"],
+            vec!["new/a.sh", "new"],
+        ] {
+            assert!(preflight_harness(&ws, &paths).is_err(), "{paths:?}");
+        }
+        assert!(preflight_harness(
+            &ws,
+            &["new/entry.sh", "new/nested/helper.sh", "checks/new.sh"]
+        )
+        .is_ok());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("missing", ws.join("dangling")).unwrap();
+            assert!(preflight_harness(&ws, &["dangling/entry.sh"]).is_err());
+        }
+        let request = ProveRequest {
+            command: "never executed".into(),
+            expect_marker: None,
+            test: Some("entry.sh".into()),
+            timeout_ms: 1000,
+            target: Some(ws.clone()),
+            run_dir: base.join("proof"),
+            tier: Tier::Test,
+            stage: None,
+            expected_tree_sha256: None,
+            inputs: None,
+            expected_inputs: None,
+            harness: ["entry.sh", "security.sh"]
+                .into_iter()
+                .map(|path| crate::proof::HarnessFile {
+                    path: path.into(),
+                    sha256: crate::sha256::digest(b"replacement"),
+                    mode: 0,
+                })
+                .collect(),
+        };
+        let copied = base.join("copy");
+        let result = stage_workspace(&request, &copied, &base.join("scratch"), &[], "nonce");
+        assert!(matches!(result, Err(e) if e.contains("harness destination collides")));
+        assert!(!copied.join("entry.sh").exists());
+        assert_eq!(
+            std::fs::read(copied.join("security.sh")).unwrap(),
+            b"ORIGINAL"
+        );
+        std::fs::write(ws.join("caf\u{e9}"), "unicode").unwrap();
+        assert!(preflight_harness(&ws, &["fresh/entry.sh"]).is_err());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
