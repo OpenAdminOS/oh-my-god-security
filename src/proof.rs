@@ -723,25 +723,8 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
             suffix.replace('/', separator)
         ))
     };
-    let cargo_bin = record
-        .readable_roots
-        .iter()
-        .find(|p| norm(p).ends_with("/.cargo/bin"))
-        .or_else(|| {
-            record
-                .readable_roots
-                .iter()
-                .find(|p| os == "macos" && p.as_str() == crate::sandbox::HOMEBREW_RUSTUP_BIN)
-        });
-    let rust = cargo_bin.map(|bin| crate::sandbox::RustHomes {
-        bin: PathBuf::from(bin),
-        cargo_home: path_at("scratch/cargo-home"),
-        rustup_home: record
-            .readable_roots
-            .iter()
-            .find(|p| norm(p).ends_with("/.rustup"))
-            .map(PathBuf::from),
-    });
+    let readonly: Vec<PathBuf> = record.readable_roots.iter().map(PathBuf::from).collect();
+    let rust = crate::sandbox::select_rust_homes(os, &readonly, &path_at("scratch/cargo-home"));
     let allowed_path = path_at("markers/allowed");
     let expected = crate::sandbox::mxc_config_at(
         &crate::sandbox::ConfigInput {
@@ -756,7 +739,7 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
             workspace: &path_at("workspace"),
             scratch: &path_at("scratch"),
             allowed_marker: (os == "macos").then_some(allowed_path.as_path()),
-            readonly: record.readable_roots.iter().map(PathBuf::from).collect(),
+            readonly,
             denied: if os == "macos" {
                 vec![path_at("markers/denied")]
             } else {
