@@ -53,6 +53,18 @@ fn local_internal_volume(path: &Path) -> io::Result<()> {
         }
         return Err(io::Error::other("invalid system null device"));
     }
+    // A job leaf can be created or atomically renamed while another admission
+    // resolves it. Querying CFURL volume properties on that ephemeral pathname
+    // can fail even though its directory is on healthy internal storage. Use
+    // the directory for same-device regular files and ENOENT only. Keep actual
+    // directory mount points and cross-device leaves subject to their own check.
+    // The requested name may not exist at all (for example job.plist.tmp).
+    // In that case admission already selected an existing ancestor, which can
+    // itself be a freshly created job directory. CFURL resource availability
+    // for that directory is not evidence about the volume. Resolve the actual
+    // mount with statfs and query its stable root instead.
+    let volume_path = mounted_volume_path(&regular_leaf_volume_path(path)?)?;
+    let path = volume_path.as_path();
     let bytes = path.as_os_str().as_bytes();
     // SAFETY: bytes are valid throughout construction; the URL retains them.
     let url = Cf(unsafe {
@@ -94,6 +106,45 @@ fn local_internal_volume(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+fn mounted_volume_path(path: &Path) -> io::Result<PathBuf> {
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: statfs initializes this output structure on success.
+    let mut volume: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: name is NUL-terminated and volume is writable.
+    if unsafe { libc::statfs(name.as_ptr(), &mut volume) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful statfs supplies a NUL-terminated mount point name.
+    let mount = unsafe { CStr::from_ptr(volume.f_mntonname.as_ptr()) }.to_bytes();
+    let mount = PathBuf::from(std::ffi::OsStr::from_bytes(mount));
+    if !mount.is_absolute() {
+        return Err(io::Error::other("cannot identify the storage mount point"));
+    }
+    Ok(mount)
+}
+fn regular_leaf_volume_path(path: &Path) -> io::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let leaf = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(io::Error::other("storage path changed to a symbolic link"));
+        }
+        Ok(meta) if meta.is_file() => Some(meta),
+        Ok(_) => return Ok(path.to_path_buf()),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => None,
+        Err(error) => return Err(error),
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("storage path has no parent"))?;
+    let directory = std::fs::symlink_metadata(parent)?;
+    if !directory.is_dir() {
+        return Err(io::Error::other("storage parent is not a directory"));
+    }
+    if leaf.is_some_and(|meta| meta.dev() != directory.dev()) {
+        return Ok(path.to_path_buf());
+    }
+    Ok(parent.to_path_buf())
 }
 fn system_home() -> io::Result<PathBuf> {
     // HOME is caller controlled. Use the operating system's account directory.
@@ -757,6 +808,68 @@ mod tests {
         .to_string()
         .contains("resolved path is protected"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn leaf_volume_selection_preserves_directory_and_error_checks() {
+        let root = crate::supervise::capture_root().unwrap().join(format!(
+            "tcc-volume-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let mount = mounted_volume_path(&root).unwrap();
+        assert!(mount.is_dir());
+        assert!(!mount.starts_with(&root));
+        // This inventoried sibling is never created in production. Its error
+        // label names the leaf even though admission checks the job directory.
+        inspect_with_home(
+            &root.join("job.plist.tmp"),
+            false,
+            &system_home().unwrap(),
+            &mut |existing| {
+                assert_eq!(existing, root);
+                assert_eq!(mounted_volume_path(existing).unwrap(), mount);
+                local_internal_volume(existing)
+            },
+        )
+        .unwrap();
+        let leaf = root.join("compatible");
+        assert_eq!(regular_leaf_volume_path(&leaf).unwrap(), root);
+        crate::platform::write_private_new(&leaf, b"").unwrap();
+        assert_eq!(regular_leaf_volume_path(&leaf).unwrap(), root);
+        assert_eq!(mounted_volume_path(&leaf).unwrap(), mount);
+        assert_eq!(regular_leaf_volume_path(&root).unwrap(), root);
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&leaf, &alias).unwrap();
+        assert!(regular_leaf_volume_path(&alias).is_err());
+        // ENOTDIR and missing parents are not the admitted leaf ENOENT case.
+        assert!(regular_leaf_volume_path(&leaf.join("child")).is_err());
+        assert!(regular_leaf_volume_path(&root.join("missing/child")).is_err());
+        let error = inspect_with_home(&leaf, false, &system_home().unwrap(), &mut |_| {
+            Err(io::Error::other("unverifiable volume"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("unverifiable volume"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn disappearing_leaf_uses_its_stable_internal_parent() {
+        let root = crate::supervise::capture_root().unwrap().join(format!(
+            "tcc-leaf-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let leaf = root.join("ready.tmp");
+        crate::platform::write_private_new(&leaf, b"{}").unwrap();
+        // Deterministically publish after realpath but before the volume query.
+        let result = inspect_with_home(&leaf, false, &system_home().unwrap(), &mut |path| {
+            assert_eq!(path, leaf);
+            std::fs::rename(&leaf, root.join("ready")).unwrap();
+            local_internal_volume(path)
+        });
+        std::fs::remove_dir_all(root).unwrap();
+        result.unwrap();
     }
     #[test]
     fn internal_temp_is_admitted_and_protected_paths_name_the_fix() {

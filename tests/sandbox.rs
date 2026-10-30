@@ -2431,7 +2431,7 @@ fn killed_owner_jobs_are_recovered_before_the_next_proof() {
             "--run",
             run.to_str().unwrap(),
             "--cmd",
-            "echo $$ > ready; sleep 120",
+            "echo $$ > ready.tmp; mv ready.tmp ready; sleep 120",
         ])
         .env("OMGS_HOME", d.join("home"))
         .stdout(std::process::Stdio::piped())
