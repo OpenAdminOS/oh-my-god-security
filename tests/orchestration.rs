@@ -444,15 +444,16 @@ fn intent_library_is_well_formed() {
 }
 
 fn open_record(key: &str, intent_id: Option<&str>, path: &str) -> Finding {
-    let attack_class = format!("class_{key}");
+    let attack_class = "missing_authz".to_string();
+    let entry_point = format!("GET /{key}");
     Finding {
-        fingerprint: omgs::fingerprint(&attack_class, "GET /x", "db.x", "tenant"),
+        fingerprint: omgs::fingerprint(&attack_class, &entry_point, "db.x", "tenant"),
         title: format!("Title {key}"),
         verdict: Verdict::NeedsValidation,
         severity: None,
         proof_tier: ProofTier::Traced,
         attack_class,
-        entry_point: "GET /x".into(),
+        entry_point,
         sink: "db.x".into(),
         boundary: "tenant".into(),
         location: Location {

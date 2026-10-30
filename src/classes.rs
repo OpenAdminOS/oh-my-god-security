@@ -17,12 +17,25 @@ pub fn all() -> &'static [String] {
 pub fn known(class: &str) -> bool {
     all().iter().any(|c| c == class)
 }
-/// Extension identifiers remain possible without making classification a gate
-/// on coverage accountability. Prefer registered classes whenever applicable.
+/// Syntax check for registry maintenance. Registration is required before an
+/// identifier can be used in candidate or finding identity.
 pub fn valid_identifier(class: &str) -> bool {
     !class.is_empty()
         && class.len() <= 96
         && class
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Finding identity accepts only registered classes. New classes require a
+/// registry update, so typos cannot create a second cross-run identity.
+pub fn validate(class: &str) -> Result<(), String> {
+    if known(class) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown attack class {class}; expected {}",
+            all().join(", ")
+        ))
+    }
 }

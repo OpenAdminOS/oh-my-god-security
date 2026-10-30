@@ -298,7 +298,8 @@ fn keyed(key: &str, verdict: Verdict) -> Finding {
     };
     let severity = (verdict == Verdict::Confirmed).then_some(Severity::High);
     let mut f = finding(verdict, tier, severity);
-    f.attack_class = format!("class_{key}");
+    f.attack_class = "missing_authz".into();
+    f.entry_point = format!("GET /api/{key}");
     f.title = format!("Title {key}");
     f.evidence = format!("Trace: evidence body {key}. Missing fact: missing {key}.");
     f.fingerprint = omgs::fingerprint(&f.attack_class, &f.entry_point, &f.sink, &f.boundary);

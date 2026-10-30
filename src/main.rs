@@ -472,10 +472,12 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
 
 fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
     let get = |n: &str| flag(args, n).ok_or_else(|| format!("fingerprint requires {n}"));
+    let class = get("--attack-class")?;
+    omgs::classes::validate(&class)?;
     println!(
         "{}",
         omgs::fingerprint(
-            &get("--attack-class")?,
+            &class,
             &get("--entry-point")?,
             &get("--sink")?,
             &get("--boundary")?

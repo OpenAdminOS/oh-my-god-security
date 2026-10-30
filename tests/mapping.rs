@@ -480,3 +480,95 @@ fn t10_t53_metadata_and_graph_failures_leave_additions_unchanged() {
     assert!(omgs::mapping::apply_metadata(&mut u, r#"{"child_units":[],"unknown":1}"#).is_err());
     assert!(!u.extra.contains_key("child_units"));
 }
+
+#[test]
+fn additional_a_unknown_classes_fail_validation_and_fingerprint_creation() {
+    let candidates: serde_json::Value =
+        serde_json::from_str(include_str!("../skill/schemas/candidates.schema.json")).unwrap();
+    let findings: serde_json::Value =
+        serde_json::from_str(include_str!("../skill/schemas/findings.schema.json")).unwrap();
+    for schema in [candidates, findings] {
+        let key = if schema["properties"].get("candidates").is_some() {
+            "candidates"
+        } else {
+            "findings"
+        };
+        assert_eq!(
+            schema["properties"][key]["items"]["properties"]["attack_class"]["enum"],
+            json!(omgs::classes::all())
+        );
+    }
+    let t = Temp::new();
+    let unknown = "unregistered_boundary_typo";
+    let fp = omgs::fingerprint(unknown, "GET /x", "db.x", "owner");
+    let candidate = json!({"candidates":[{
+        "hunter":"red", "unit_ids":["u"], "source_ref":"synthetic", "title":"Synthetic boundary",
+        "attack_class":unknown, "entry_point":"GET /x", "sink":"db.x", "boundary":"owner",
+        "location":{"path":"src/x.ts","line":1}, "attacker_capability":"caller",
+        "trace":"source trace", "concrete_result":"predicted read", "counterevidence":"guard inspected",
+        "proof_plan":"synthetic decision only", "fingerprint":fp
+    }]});
+    let path = t.0.join("candidates.json");
+    omgs::runmeta::write_atomic(&path, &candidate.to_string()).unwrap();
+    let cli = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .env("OMGS_HOME", &t.0)
+            .env("RUSTUP_AUTO_INSTALL", "0")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = cli(&["validate", "--candidates", path.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("unknown attack class"), "{text}");
+    for class in omgs::classes::all() {
+        assert!(text.contains(class), "{class}");
+    }
+    let out = cli(&[
+        "fingerprint",
+        "--attack-class",
+        unknown,
+        "--entry-point",
+        "GET /x",
+        "--sink",
+        "db.x",
+        "--boundary",
+        "owner",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let mut finding = omgs::shape::findings(include_str!("fixtures/report-run/findings.json"))
+        .unwrap()
+        .findings
+        .into_iter()
+        .next()
+        .unwrap();
+    finding.attack_class = unknown.into();
+    let errors = omgs::model::validate(&omgs::model::FindingsFile {
+        findings: vec![finding],
+    });
+    assert!(has(&errors, "unknown attack class"));
+    for class in [
+        "download_integrity",
+        "deletion_path_safety",
+        "download_and_execute",
+    ] {
+        let out = cli(&[
+            "fingerprint",
+            "--attack-class",
+            class,
+            "--entry-point",
+            "GET /x",
+            "--sink",
+            "db.x",
+            "--boundary",
+            "owner",
+        ]);
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            omgs::fingerprint(class, "GET /x", "db.x", "owner")
+        );
+    }
+}

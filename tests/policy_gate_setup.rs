@@ -233,7 +233,7 @@ fn evidence(run: &Path, target: &Path) {
     write(&run.join("proofs/1.json"), &proof);
     let findings = json!({"findings":[{
         "fingerprint": proof["finding"], "title":"Boundary read", "verdict":"confirmed", "severity":"high",
-        "proof_tier":"test_proven", "attack_class":"idor", "entry_point":"GET /x", "sink":"db.x", "boundary":"tenant",
+        "proof_tier":"test_proven", "attack_class":"missing_authz", "entry_point":"GET /x", "sink":"db.x", "boundary":"tenant",
         "location":{"path":"main.rs","line":1}, "evidence":"Assertion failed after authorized control",
         "hunted_by":"red", "verified_by":"blue", "proof_ref":"proofs/1.json"
     }]});
@@ -1347,9 +1347,9 @@ fn report_intent_uses_committed_policy_and_rejects_untrusted_provenance() {
         &run.join("findings.json"),
         &json!({"findings": [{
             "title": "Intent trust fixture", "verdict": "needs_validation",
-            "fingerprint": omgs::fingerprint("access", "GET /x", "resource", "owner"),
+            "fingerprint": omgs::fingerprint("missing_authz", "GET /x", "resource", "owner"),
             "hunted_by": "reviewer", "verified_by": "verifier",
-            "proof_tier": "traced", "attack_class": "access",
+            "proof_tier": "traced", "attack_class": "missing_authz",
             "entry_point": "GET /x", "sink": "resource", "boundary": "owner",
             "location": {"path": "main.rs", "line": 1},
             "intent_id": p.accepted_intent[0].id
@@ -1462,7 +1462,7 @@ fn fix_runs_ignore_edited_parent_policy_and_rederive_all_settings() {
         ..Policy::default()
     };
     p.suppressions.push(policy::Suppression {
-        fingerprint: omgs::fingerprint("access", "GET /x", "resource", "owner"),
+        fingerprint: omgs::fingerprint("missing_authz", "GET /x", "resource", "owner"),
         reason: "Owner reviewed".into(),
         expires_unix: omgs::runmeta::now_unix() + 3600,
     });

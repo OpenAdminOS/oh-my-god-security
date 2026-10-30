@@ -14,15 +14,16 @@ fn write_private_fixture(
 
 /// A valid confirmed record for `key`, hunted by red-1 and verified by blue-1.
 fn record(key: &str) -> Finding {
-    let attack_class = format!("class_{key}");
+    let attack_class = "missing_authz".to_string();
+    let entry_point = format!("GET /api/{key}");
     Finding {
-        fingerprint: omgs::fingerprint(&attack_class, "GET /api/x", "db.x", "tenant"),
+        fingerprint: omgs::fingerprint(&attack_class, &entry_point, "db.x", "tenant"),
         title: format!("Title {key}"),
         verdict: Verdict::Confirmed,
         severity: Some(Severity::High),
         proof_tier: ProofTier::TestProven,
         attack_class,
-        entry_point: "GET /api/x".into(),
+        entry_point,
         sink: "db.x".into(),
         boundary: "tenant".into(),
         location: Location {
@@ -128,7 +129,7 @@ fn hunter_and_verifier_are_required_and_distinct() {
 fn merged_candidates_are_checked_across_records() {
     let a = record("a");
     let b = record("b");
-    let stray = omgs::fingerprint("class_c", "GET /api/x", "db.x", "tenant");
+    let stray = omgs::fingerprint("missing_authz", "GET /api/c", "db.x", "tenant");
 
     let mut bad = a.clone();
     bad.candidates = vec!["nope".into()];
@@ -378,7 +379,12 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
 fn complete_run() -> (Ledger, Vec<SourcedCandidate>, FindingsFile) {
     let f = record("a");
     let mut ledger = Ledger::default();
-    let mut unit = Unit::new("route:x", "app/api/x/route.ts", &["class_a"], "covered");
+    let mut unit = Unit::new(
+        "route:x",
+        "app/api/x/route.ts",
+        &["missing_authz"],
+        "covered",
+    );
     unit.evidence = vec![f.fingerprint.clone()];
     ledger.units.push(unit);
     let c = Candidate {
@@ -979,11 +985,11 @@ fn candidates_require_every_schema_field() {
 fn critic_flags_blank_identity_inputs_on_merged_candidates() {
     let (ledger, mut cands, mut findings) = complete_run();
     let blank = Candidate {
-        fingerprint: omgs::fingerprint("class_m", "GET /api/x", "", "tenant"),
+        fingerprint: omgs::fingerprint("missing_authz", "GET /api/x", "", "tenant"),
         hunter: "red-1".into(),
         unit_ids: vec!["route:x".into()],
         title: "Copy".into(),
-        attack_class: "class_m".into(),
+        attack_class: "missing_authz".into(),
         entry_point: "GET /api/x".into(),
         sink: "".into(),
         boundary: "tenant".into(),

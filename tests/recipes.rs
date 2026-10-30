@@ -168,7 +168,7 @@ fn check(recipe: Recipe) -> bool {
         ],
     );
     assert!(init.status.success(), "{}", text(&init));
-    let fp = omgs::fingerprint("authorization", "can_read", "resource", "owner");
+    let fp = omgs::fingerprint("missing_authz", "can_read", "resource", "owner");
     let findings_path = run.join("findings.json");
     let mut n = 0;
     for (variant, source, exit) in [
@@ -246,7 +246,7 @@ fn check(recipe: Recipe) -> bool {
         std::fs::write(target.join(recipe.test), harness).unwrap();
         let findings = serde_json::json!({"findings": [{
             "fingerprint": fp, "title": "Unauthorized resource access", "verdict": "confirmed",
-            "severity": "high", "proof_tier": "test_proven", "attack_class": "authorization",
+            "severity": "high", "proof_tier": "test_proven", "attack_class": "missing_authz",
             "entry_point": "can_read", "sink": "resource", "boundary": "owner",
             "location": {"path": recipe.source, "line": 1},
             "evidence": "Real target invocation with synthetic owner and intruder.",

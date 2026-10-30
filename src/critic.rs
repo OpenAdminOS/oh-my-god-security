@@ -111,11 +111,8 @@ pub fn validate_candidate(c: &Candidate) -> Vec<String> {
             errors.push(format!("{name} is empty"));
         }
     }
-    if !crate::classes::valid_identifier(&c.attack_class) {
-        errors.push(
-            "attack_class must be a stable lowercase identifier; consult intent/classes.json"
-                .into(),
-        );
+    if let Err(error) = crate::classes::validate(&c.attack_class) {
+        errors.push(error);
     }
     if c.location.line == Some(0) {
         errors.push("location.line must be one-based".into());
