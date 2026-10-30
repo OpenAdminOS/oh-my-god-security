@@ -21,8 +21,11 @@ units and packs:
 - Green, only for explicitly approved fixes: [agents/green-fixer.md](agents/green-fixer.md).
 
 For initialization, `omgs audit init --target TARGET --persona builder|inheritor|team` selects
-defaults, report depth and budget profile. Builder uses concise coverage and 24 calls/proofs;
-inheritor uses full detail and 64; team uses full detail and 96. Without committed base policy, all
+defaults, report depth and budget profile. There is one shared pool for dispatch calls, original
+proofs and replays. Builder defaults to 24 combined units, inheritor to 64, and team to 96.
+An explicit `--budget 40` replaces that default with 40 combined units. The effective profile is
+`custom` when a persona's selected cap differs from its default; metadata separately retains
+`persona_budget_profile` and `persona_budget_default`. Without committed base policy, all
 default to advisory and explicit --mode and --budget override defaults. With --base, committed
 policy takes precedence and conflicting overrides fail. The persona is recorded in run metadata and
 never changes the evidence bar, sandbox rules or verdict semantics. Without --persona, the existing
