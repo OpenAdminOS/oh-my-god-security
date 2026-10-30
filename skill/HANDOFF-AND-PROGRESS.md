@@ -72,7 +72,7 @@ Record dispatch and transcript-observed completion or safety stops using the ret
 attempt contract in [BUDGETS-AND-ROUTING.md](BUDGETS-AND-ROUTING.md#retained-attempts-and-stops).
 Status clocks are progress only; marking a stage done does not complete verification.
 Reopening a done or failed stage with pending or active preserves its prior label, detail and
-time window in `history`, creates a new stage attempt id and resets an omitted label
+time window and children in `history`, creates a new stage attempt id and resets an omitted label
 to the stage id. Supply the current worker identity in `--label` on each round.
 Omitting `--parent` updates a uniquely existing child; ambiguous ids require a parent.
 New logs and rendered timeline dates use ISO 8601 UTC, including the date and `Z`.

@@ -48,7 +48,6 @@ fn upsert<'v>(
     if restarting && restart {
         let mut previous = entry.clone();
         previous.remove("history");
-        previous.remove("children");
         entry
             .entry("history")
             .or_insert_with(|| json!([]))
@@ -58,6 +57,7 @@ fn upsert<'v>(
         let round = entry["history"].as_array().unwrap().len() + 1;
         entry.insert("attempt_id".into(), json!(format!("{id}:{round}")));
         entry.insert("label".into(), json!(label.unwrap_or(id)));
+        entry.remove("children");
         entry.remove("detail");
         entry.remove("started_ms");
         entry.remove("ended_ms");
@@ -129,10 +129,10 @@ pub fn check_document(doc: &Map<String, Value>) -> Result<(), String> {
         }
         if let Some(history) = o.get("history") {
             for old in history.as_array().ok_or("history must be an array")? {
-                if old.get("history").is_some() || old.get("children").is_some() {
+                if old.get("history").is_some() {
                     return Err("history cannot nest".into());
                 }
-                stage(old, at, true)?;
+                stage(old, at, nested)?;
             }
         }
         match (o.get("children"), nested) {

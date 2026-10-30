@@ -1726,7 +1726,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         &supplied_models,
         || {
             let mut accounting = omgs::accounting::read(&saved)?;
-            accounting.extend(supplied_usage.clone());
+            omgs::accounting::submit(&saved, &mut accounting, supplied_usage.clone())?;
             let persona = flag(args, "--persona")
                 .or_else(|| {
                     saved
@@ -3475,7 +3475,7 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     )?;
     let usage = omgs::runmeta::update(Path::new(&run), |m| {
         let mut usage = omgs::accounting::read(m)?;
-        usage.extend(supplied_usage);
+        omgs::accounting::submit(m, &mut usage, supplied_usage)?;
         m.insert(
             "accounting".into(),
             serde_json::to_value(&usage).map_err(|e| e.to_string())?,

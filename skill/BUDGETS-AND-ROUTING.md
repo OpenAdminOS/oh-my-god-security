@@ -139,7 +139,10 @@ retain their event history. Reconcile linked ledger dispositions after recovery.
 Usage may be supplied as `--accounting blue-verifier@ATTEMPT_ID=tokens,cost-usd,duration-ms`
 (and the equivalent role keys for other roles). Starting an attempt records unknown
 components automatically. A continuation replaces that attempt's cumulative usage;
-never add cumulative continuation totals together. Distinct attempts remain distinct.
+never add cumulative continuation totals together. Each submission records the latest
+dispatched turn it covers. A later dispatch retains the known subtotal but marks
+unreported continuation usage unknown, including after a safety stop. Submit fresh
+cumulative usage to cover that turn. Distinct attempts remain distinct.
 Reports show known subtotals, the unknown count for each component, and whether the
 aggregate is complete. Legacy role totals remain supported; once attempt entries
 exist, they are historical totals and are excluded from attempt subtotals to avoid

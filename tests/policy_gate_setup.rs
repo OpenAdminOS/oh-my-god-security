@@ -300,6 +300,27 @@ fn registered_gate_executes_immutable_head_and_ignores_advisory_artifacts() {
     evidence(&run, &repo); // A different, unregistered confirmed finding is advisory.
     let advisory = gate(&root, &repo, &base, &base, Some(&run), 1);
     assert!(output(&advisory).contains("not yet a registered gate test"));
+    let original = read(&run.join("findings.json"));
+    let mut draft = original.clone();
+    draft["findings"][0]["verification"]["state"] = json!("draft");
+    write(&run.join("findings.json"), &draft);
+    let advisory = gate(&root, &repo, &base, &base, Some(&run), 1);
+    assert!(!output(&advisory).contains("advisory: confirmed finding"));
+    write(&run.join("findings.json"), &original);
+    omgs::attempts::append(
+        &run,
+        omgs::attempts::Event::Stop {
+            id: "fixture-verifier".into(),
+            actor: "host".into(),
+            kind: "policy".into(),
+            reason: "Observed stop".into(),
+            artifacts: vec!["findings.json".into()],
+            disposition: "quarantined".into(),
+        },
+    )
+    .unwrap();
+    let advisory = gate(&root, &repo, &base, &base, Some(&run), 1);
+    assert!(!output(&advisory).contains("advisory: confirmed finding"));
     std::fs::write(run.join("findings.json"), "corrupt").unwrap();
     std::fs::write(run.join("run-metadata.json"), "corrupt").unwrap();
     std::fs::remove_dir_all(run.join("proofs")).unwrap();

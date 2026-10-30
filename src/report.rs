@@ -172,33 +172,28 @@ pub fn timeline(run: &std::path::Path) -> Result<Vec<TimelineRow>, String> {
             detail: v["detail"].as_str().unwrap_or_default().into(),
         }
     }
+    fn collect(v: &serde_json::Value, parent: &str, historical: bool, rows: &mut Vec<TimelineRow>) {
+        if let Some(history) = v["history"].as_array() {
+            for old in history {
+                collect(old, parent, true, rows);
+            }
+        }
+        rows.push(row(v, parent, historical));
+        if let Some(children) = v["children"].as_array() {
+            for child in children {
+                collect(
+                    child,
+                    &format!("{parent}{} / ", v["label"].as_str().unwrap_or_default()),
+                    historical,
+                    rows,
+                );
+            }
+        }
+    }
     let mut rows = Vec::new();
     if let Some(stages) = doc["stages"].as_array() {
         for v in stages {
-            if let Some(history) = v["history"].as_array() {
-                for old in history {
-                    rows.push(row(old, "", true));
-                }
-            }
-            rows.push(row(v, "", false));
-            if let Some(children) = v["children"].as_array() {
-                for child in children {
-                    if let Some(history) = child["history"].as_array() {
-                        for old in history {
-                            rows.push(row(
-                                old,
-                                &format!("{} / ", v["label"].as_str().unwrap_or_default()),
-                                true,
-                            ));
-                        }
-                    }
-                    rows.push(row(
-                        child,
-                        &format!("{} / ", v["label"].as_str().unwrap_or_default()),
-                        false,
-                    ));
-                }
-            }
+            collect(v, "", false, &mut rows);
         }
     }
     Ok(rows)
@@ -1570,7 +1565,7 @@ pub fn publish(
                 m.insert("verifier".into(), serde_json::json!(v));
             }
             let mut usage = crate::accounting::read(m)?;
-            usage.extend(completion.accounting);
+            crate::accounting::submit(m, &mut usage, completion.accounting)?;
             m.insert(
                 "accounting".into(),
                 serde_json::to_value(usage).map_err(|e| e.to_string())?,

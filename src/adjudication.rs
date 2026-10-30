@@ -214,7 +214,11 @@ pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String>
             ]
         });
     };
-    let mut gaps = Vec::new();
+    let mut gaps: Vec<String> = e
+        .gaps
+        .iter()
+        .map(|gap| format!("Evaluator gap: {gap}"))
+        .collect();
     let meta = if crate::run_artifact::optional_text(
         run,
         Path::new(crate::runmeta::FILE),

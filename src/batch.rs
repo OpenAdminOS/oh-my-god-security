@@ -227,6 +227,7 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
         Some(text) => {
             use crate::model::Verdict;
             let f = crate::shape::findings(&text).map_err(|e| at("findings.json", e))?;
+            let f = crate::attempts::publication(dir, &f)?;
             for x in &f.findings {
                 match x.verdict {
                     Verdict::Confirmed => s.confirmed += 1,
@@ -263,7 +264,7 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("invalid refusal history: {e}"))?;
         }
-        s.blockers.extend(crate::attempts::active_blockers(&meta)?);
+        s.blockers.extend(crate::attempts::gaps(&meta)?);
     }
     if let Some(text) = crate::run_artifact::optional_text(
         dir,
@@ -286,6 +287,9 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
             .strip_prefix(index_dir)
             .ok()
             .map(|rel| format!("{}/REPORT.html", rel.to_string_lossy()));
+    }
+    if s.state == "complete" && (s.needs_validation > 0 || !s.blockers.is_empty()) {
+        s.state = "partial".into();
     }
     Ok(s)
 }

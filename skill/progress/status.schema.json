@@ -186,6 +186,9 @@
                 },
                 "attempt_id": {
                   "type": "string"
+                },
+                "children": {
+                  "$ref": "#/properties/stages/items/properties/children"
                 }
               },
               "additionalProperties": false

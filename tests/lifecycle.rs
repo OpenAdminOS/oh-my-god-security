@@ -4,16 +4,23 @@ use omgs::model::{FindingsFile, Verdict};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-struct Run(PathBuf);
+struct Run(PathBuf, PathBuf);
 impl Run {
     fn new() -> Self {
-        let path = omgs::platform::temp_root().unwrap().join(format!(
+        let root = omgs::platform::temp_root().unwrap().join(format!(
             "omgs-lifecycle-{}",
             omgs::platform::random_nonce().unwrap()
         ));
+        // Run writes admit their parent as private storage. The OS temp root
+        // can be shared or have a different owner, including on Windows.
+        omgs::platform::create_private_tree(&root).unwrap();
+        let path = root.join("run");
         omgs::platform::create_private_dir(&path).unwrap();
         omgs::runmeta::write_atomic(&path.join(omgs::runmeta::FILE), "{}").unwrap();
-        Self(path)
+        // Exercise the same admission and locking path as later mutations so
+        // a negative CLI assertion cannot pass because storage was rejected.
+        omgs::runmeta::update(&path, |_| Ok(())).unwrap();
+        Self(path, root)
     }
     fn put(&self, name: &str, value: Value) {
         omgs::runmeta::write_atomic(&self.0.join(name), &value.to_string()).unwrap();
@@ -27,7 +34,7 @@ impl Run {
 }
 impl Drop for Run {
     fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).unwrap();
+        std::fs::remove_dir_all(&self.1).unwrap();
     }
 }
 fn start(id: &str, role: &str) -> Value {
@@ -67,13 +74,19 @@ fn stage(
     )
 }
 fn cli(run: &Run, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .env("OMGS_HOME", run.0.join("state"))
         .args(args)
         .arg("--run")
         .arg(&run.0)
         .output()
-        .unwrap()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("storage-migration"),
+        "CLI failed storage admission: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 #[test]
 fn t19_manifests_disclose_procedural_isolation_and_context_limits() {
@@ -381,6 +394,7 @@ fn event_cli_rejects_unknown_fields_without_mutating_history() {
         ],
     );
     assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown field"));
     assert!(!run.meta().contains_key("attempts"));
     let schema: Value =
         serde_json::from_str(include_str!("../skill/schemas/attempt-event.schema.json")).unwrap();
@@ -400,7 +414,10 @@ fn scaffold_cli_cannot_validate_or_pass_critic_and_publishes_as_incomplete() {
         .output()
         .unwrap();
     assert_eq!(validate.status.code(), Some(1));
-    assert_eq!(cli(&run, &["critic"]).status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&validate.stderr).contains("verification requires"));
+    let critic = cli(&run, &["critic"]);
+    assert_eq!(critic.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&critic.stderr).contains("verification requires"));
     let report = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
         .arg("report")
         .arg("--findings")
@@ -736,4 +753,282 @@ fn additional_f_persona_defaults_and_custom_combined_allowances_are_explicit() {
         assert_eq!(allowance.budget_semantics, "combined_calls_proofs_replays");
     }
     assert!(include_str!("../skill/PIPELINE.md").contains("one shared pool"));
+}
+
+#[test]
+fn evaluator_sampling_gap_prevents_completion_after_passing_reconciliation() {
+    let run = Run::new();
+    for (id, role) in [
+        ("red", "hunter"),
+        ("blue", "verifier"),
+        ("independent", "evaluator"),
+    ] {
+        run.event(start(id, role)).unwrap();
+        run.event(complete(id)).unwrap();
+    }
+    run.put("findings.json", json!({"findings":[]}));
+    run.put("candidates-red.json", json!({"candidates":[]}));
+    run.put("coverage-ledger.json", json!({"units":[{"id":"surface","surface":"source","attack_classes":["input_validation"],"status":"covered","evidence":["source.rs"]}]}));
+    let evaluation = json!({"evaluator":"independent","attempt":"independent","source_ref":"synthetic","decisions":[],"gaps":[]});
+    run.put("evaluation.json", evaluation.clone());
+    let file = FindingsFile::default();
+    let reconciliation = omgs::critic::critique_dir(&run.0, &file).unwrap();
+    assert!(reconciliation.passed(), "{:?}", reconciliation.gaps);
+    let mut evaluation = evaluation;
+    evaluation["gaps"] = json!(["Sampling unfinished"]);
+    run.put("evaluation.json", evaluation);
+    let critic = omgs::critic::critique_dir(&run.0, &file).unwrap();
+    assert!(critic
+        .gaps
+        .iter()
+        .any(|g| g.contains("Sampling unfinished")));
+    assert_eq!(cli(&run, &["critic"]).status.code(), Some(1));
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .arg("report")
+        .arg("--findings")
+        .arg(run.0.join("findings.json"))
+        .arg("--out")
+        .arg(&run.0)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for name in ["REPORT.md", "REPORT.html"] {
+        let text = std::fs::read_to_string(run.0.join(name)).unwrap();
+        assert!(text.contains("Incomplete review"));
+        assert!(!text.contains("Completed review: no confirmed findings"));
+    }
+    assert_eq!(run.meta()["run_status"], "partial");
+    // A legacy saved completion cannot override the current evaluator gap.
+    omgs::runmeta::update(&run.0, |m| {
+        m.insert("run_status".into(), json!("complete"));
+        Ok(())
+    })
+    .unwrap();
+    let summary = omgs::batch::summarize(
+        &omgs::batch::BatchRun {
+            run_dir: Some(run.0.to_str().unwrap().into()),
+            ..Default::default()
+        },
+        &run.0,
+    )
+    .unwrap();
+    assert_eq!(summary.state, "partial");
+}
+
+#[test]
+fn cumulative_usage_covers_only_the_submitted_turn_even_after_safety_stop() {
+    let run = Run::new();
+    run.event(start("blue", "verifier")).unwrap();
+    let dispatch = |turn| json!({"event":"dispatch","id":"blue","turn":turn,"actor":"host","reason":"Authorized turn"});
+    run.event(dispatch("one")).unwrap();
+    assert!(cli(
+        &run,
+        &[
+            "status",
+            "--stage",
+            "verify",
+            "--state",
+            "done",
+            "--accounting",
+            "blue-verifier@blue=100,1,50"
+        ]
+    )
+    .status
+    .success());
+    assert_eq!(
+        run.meta()["accounting"]["blue-verifier@blue"]["covered_turn"],
+        "one"
+    );
+    let lines =
+        || omgs::accounting::lines(&omgs::accounting::read(&run.meta()).unwrap()).join("\n");
+    assert!(lines().contains("Aggregate complete"));
+    run.event(complete("blue")).unwrap();
+    run.event(dispatch("two")).unwrap();
+    for stopped in [false, true] {
+        if stopped {
+            run.event(stop("blue", "policy")).unwrap();
+        }
+        let text = lines();
+        assert!(
+            text.contains("tokens known subtotal 100, 1 unknown attempt(s)"),
+            "{text}"
+        );
+        assert!(text.contains("later turn usage unknown"));
+        assert!(text.contains("Aggregate incomplete"));
+        assert!(!text.contains("Aggregate complete"));
+    }
+}
+
+#[test]
+fn cumulative_usage_refresh_replaces_subtotal_and_covers_the_latest_turn() {
+    let run = Run::new();
+    run.event(start("blue", "verifier")).unwrap();
+    for (turn, total) in [("one", "100"), ("two", "150")] {
+        run.event(json!({"event":"dispatch","id":"blue","turn":turn,"actor":"host","reason":"Authorized turn"})).unwrap();
+        assert!(cli(
+            &run,
+            &[
+                "status",
+                "--stage",
+                "verify",
+                "--state",
+                "done",
+                "--accounting",
+                &format!("blue-verifier@blue={total},1,50")
+            ]
+        )
+        .status
+        .success());
+    }
+    let text = omgs::accounting::lines(&omgs::accounting::read(&run.meta()).unwrap()).join("\n");
+    assert!(text.contains("tokens known subtotal 150, 0 unknown attempt(s)"));
+    assert!(text.contains("Aggregate complete"));
+    assert!(!text.contains("subtotal 250"));
+}
+
+#[test]
+fn parent_round_archives_its_failed_children_before_successful_replacement() {
+    let run = Run::new();
+    stage(&run, "hunt", None, "active", Some("wave one")).unwrap();
+    stage(&run, "child", Some("hunt"), "failed", Some("failed child")).unwrap();
+    stage(&run, "hunt", None, "done", None).unwrap();
+    stage(&run, "hunt", None, "active", Some("wave two")).unwrap();
+    stage(
+        &run,
+        "child",
+        Some("hunt"),
+        "active",
+        Some("replacement child"),
+    )
+    .unwrap();
+    stage(&run, "child", Some("hunt"), "done", None).unwrap();
+    stage(&run, "hunt", None, "done", None).unwrap();
+    // A later mutation validates the archived children as well.
+    stage(&run, "report", None, "done", None).unwrap();
+    let rows = omgs::report::timeline(&run.0).unwrap();
+    let old = rows
+        .iter()
+        .find(|r| r.label == "wave one / failed child")
+        .unwrap();
+    assert!(old.historical);
+    assert_eq!(old.state, "failed");
+    let current = rows
+        .iter()
+        .find(|r| r.label == "wave two / replacement child")
+        .unwrap();
+    assert!(!current.historical);
+    assert_eq!(current.state, "done");
+    let meta = omgs::report::ReportMeta {
+        timeline: rows,
+        critic: Some(Default::default()),
+        ..Default::default()
+    };
+    assert!(omgs::report::review_state(&FindingsFile::default(), &meta).is_none());
+}
+
+#[test]
+fn draft_and_stopped_verdicts_are_pending_in_publications_and_batch_counts() {
+    for stopped in [false, true] {
+        let run = Run::new();
+        run.event(start("blue", "verifier")).unwrap();
+        if stopped {
+            run.event(stop("blue", "policy")).unwrap();
+        }
+        let mut file = finding();
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("benchmark/fixtures/score/run-1/positive");
+        let archived =
+            omgs::shape::findings(&std::fs::read_to_string(fixture.join("findings.json")).unwrap())
+                .unwrap();
+        let mut confirmed = archived.findings[0].clone();
+        confirmed.verified_by = Some("blue".into());
+        std::fs::create_dir_all(run.0.join("proofs/1")).unwrap();
+        for name in [
+            "1.json",
+            "1/command.txt",
+            "1/mxc-config.json",
+            "1/test-draft",
+        ] {
+            std::fs::copy(
+                fixture.join("proofs").join(name),
+                run.0.join("proofs").join(name),
+            )
+            .unwrap();
+        }
+        confirmed.fix_brief = Some("Retained draft fix".into());
+        file.findings.push(confirmed);
+        for f in &mut file.findings {
+            f.verification = Some(omgs::model::Verification {
+                state: if stopped { "final" } else { "draft" }.into(),
+                attempt: "blue".into(),
+            });
+        }
+        run.put("findings.json", serde_json::to_value(&file).unwrap());
+        let published = attempts::publication(&run.0, &file).unwrap();
+        assert!(published
+            .findings
+            .iter()
+            .all(|f| f.verdict == Verdict::NeedsValidation && f.fix_brief.is_none()));
+        let handoff = omgs::handoff::build(&run.0, &file, None).unwrap();
+        assert_eq!(handoff.review_state, "incomplete");
+        assert!(handoff
+            .records
+            .iter()
+            .all(|r| r.verdict == Verdict::NeedsValidation));
+        let summary = omgs::batch::summarize(
+            &omgs::batch::BatchRun {
+                run_dir: Some(run.0.to_str().unwrap().into()),
+                ..Default::default()
+            },
+            &run.0,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                summary.confirmed,
+                summary.rejected,
+                summary.needs_validation
+            ),
+            (0, 0, 2)
+        );
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .arg("report")
+            .arg("--findings")
+            .arg(run.0.join("findings.json"))
+            .arg("--out")
+            .arg(&run.0)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        for name in ["REPORT.md", "REPORT.html"] {
+            let text = std::fs::read_to_string(run.0.join(name)).unwrap();
+            assert!(text.contains("0 confirmed finding(s)"));
+            assert!(!text.contains("Retained draft fix"));
+        }
+        let sarif: Value = serde_json::from_str(
+            &std::fs::read_to_string(run.0.join("findings.sarif.json")).unwrap(),
+        )
+        .unwrap();
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r["level"] == "note"
+            && r["properties"]["verdict"] == "needs_validation"
+            && r["properties"]["proof_ref"].is_null()));
+        let handoff: Value =
+            serde_json::from_str(&std::fs::read_to_string(run.0.join("handoff.json")).unwrap())
+                .unwrap();
+        assert!(handoff["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["verdict"] == "needs_validation"));
+    }
 }

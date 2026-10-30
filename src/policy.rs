@@ -841,6 +841,7 @@ fn advisory_findings(run: &Path, p: &Policy) {
         )
         .map_err(|e| e.to_string())?;
         let f = crate::shape::findings(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)?;
+        let f = crate::attempts::publication(run, &f)?;
         for f in f
             .findings
             .iter()

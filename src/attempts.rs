@@ -251,6 +251,13 @@ pub fn append(run: &Path, event: Event) -> Result<AppendOutcome, String> {
             "attempts".into(),
             serde_json::to_value(h).map_err(|e| e.to_string())?,
         );
+        if dispatch {
+            let usage = crate::accounting::read(m)?;
+            m.insert(
+                "accounting".into(),
+                serde_json::to_value(usage).map_err(|e| e.to_string())?,
+            );
+        }
         Ok(AppendOutcome::Recorded)
     })
 }
@@ -449,10 +456,11 @@ pub fn publication(
             f.proof_tier = crate::model::ProofTier::Traced;
             f.proof_ref = None;
             f.verification = None;
-            f.evidence = format!(
-                "Verification incomplete. Retained draft, not a finalized decision. {}",
-                f.evidence
-            );
+            const DRAFT: &str =
+                "Verification incomplete. Retained draft, not a finalized decision. ";
+            if !f.evidence.starts_with(DRAFT) {
+                f.evidence = format!("{DRAFT}{}", f.evidence);
+            }
         }
     }
     Ok(out)

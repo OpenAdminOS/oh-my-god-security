@@ -78,6 +78,8 @@ fn quote(s: &str) -> String {
 pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Handoff, String> {
     let canonical_run = std::fs::canonicalize(run).map_err(|e| format!("run directory: {e}"))?;
     let run = canonical_run.as_path();
+    let published = crate::attempts::publication(run, file)?;
+    let file = &published;
     let mut records = Vec::new();
     for (verdict, prefix) in [(Verdict::Confirmed, 'C'), (Verdict::NeedsValidation, 'V')] {
         for (i, f) in file

@@ -9,6 +9,10 @@ pub struct Usage {
     pub tokens: Option<u64>,
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covered_turn: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unreported: bool,
 }
 
 pub type Accounting = BTreeMap<String, Usage>;
@@ -37,10 +41,46 @@ pub fn read(meta: &Map<String, Value>) -> Result<Accounting, String> {
             return Err("accounting cost must be finite and non-negative".into());
         }
     }
+    let turns = latest_turns(meta)?;
+    for (role, usage) in &mut values {
+        if let Some((_, id)) = role.split_once('@') {
+            if let Some(turn) = turns.get(id) {
+                usage.unreported = usage.covered_turn.as_ref() != Some(turn);
+            }
+        }
+    }
     for role in ROLES {
         values.entry(role.into()).or_default();
     }
     Ok(values)
+}
+
+fn latest_turns(meta: &Map<String, Value>) -> Result<BTreeMap<String, String>, String> {
+    let mut turns = BTreeMap::new();
+    for record in crate::attempts::history(meta)? {
+        if let crate::attempts::Event::Dispatch { id, turn, .. } = record.record {
+            turns.insert(id, turn);
+        }
+    }
+    Ok(turns)
+}
+
+/// Cumulative submissions cover the latest dispatched turn under the run lock.
+pub fn submit(
+    meta: &Map<String, Value>,
+    values: &mut Accounting,
+    supplied: Accounting,
+) -> Result<(), String> {
+    let turns = latest_turns(meta)?;
+    for (role, mut usage) in supplied {
+        usage.covered_turn = role
+            .split_once('@')
+            .and_then(|(_, id)| turns.get(id))
+            .cloned();
+        usage.unreported = false;
+        values.insert(role, usage);
+    }
+    Ok(())
 }
 
 fn check_role(role: &str) -> Result<(), String> {
@@ -97,6 +137,7 @@ pub fn parse(entries: &[String]) -> Result<Accounting, String> {
             tokens: integer(fields[0])?,
             cost_usd,
             duration_ms: integer(fields[2])?,
+            ..Default::default()
         };
         if out.insert(role.into(), usage).is_some() {
             return Err(format!("duplicate accounting role {role}"));
@@ -138,9 +179,14 @@ pub fn lines(values: &Accounting) -> Vec<String> {
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "unknown".into());
             format!(
-                "{role}: tokens {}, cost USD {cost}, duration ms {}",
+                "{role}: tokens {}, cost USD {cost}, duration ms {}{}",
                 show(u.tokens),
-                show(u.duration_ms)
+                show(u.duration_ms),
+                if u.unreported {
+                    "; later turn usage unknown"
+                } else {
+                    ""
+                }
             )
         })
         .collect();
@@ -158,15 +204,21 @@ pub fn lines(values: &Accounting) -> Vec<String> {
                 .iter()
                 .filter_map(|u| get(u))
                 .try_fold(0u64, u64::checked_add);
-            let unknown = parts.iter().filter(|u| get(u).is_none()).count();
+            let unknown = parts
+                .iter()
+                .filter(|u| get(u).is_none() || u.unreported)
+                .count();
             format!(
                 "known subtotal {}, {unknown} unknown attempt(s)",
                 total.map_or_else(|| "overflow".into(), |n| n.to_string())
             )
         };
         let cost: f64 = parts.iter().filter_map(|u| u.cost_usd).sum();
-        let unknown_cost = parts.iter().filter(|u| u.cost_usd.is_none()).count();
-        lines.push(format!("{role}: tokens {}; cost USD known subtotal {cost}, {unknown_cost} unknown attempt(s); duration ms {}. Aggregate {}", sum(|u| u.tokens), sum(|u| u.duration_ms), if parts.iter().all(|u| u.tokens.is_some() && u.cost_usd.is_some() && u.duration_ms.is_some()) { "complete" } else { "incomplete" }));
+        let unknown_cost = parts
+            .iter()
+            .filter(|u| u.cost_usd.is_none() || u.unreported)
+            .count();
+        lines.push(format!("{role}: tokens {}; cost USD known subtotal {cost}, {unknown_cost} unknown attempt(s); duration ms {}. Aggregate {}", sum(|u| u.tokens), sum(|u| u.duration_ms), if parts.iter().all(|u| !u.unreported && u.tokens.is_some() && u.cost_usd.is_some() && u.duration_ms.is_some()) { "complete" } else { "incomplete" }));
     }
     lines
 }
