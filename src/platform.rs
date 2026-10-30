@@ -103,6 +103,8 @@ pub fn temp_root() -> std::io::Result<PathBuf> {
 pub fn scratch_root() -> std::io::Result<PathBuf> {
     let root =
         data_dir().ok_or_else(|| std::io::Error::other("OMGS data directory unavailable"))?;
+    #[cfg(target_os = "macos")]
+    crate::tcc::admit_path(&root)?;
     create_private_tree(&root)?;
     // Git for Windows cannot consume extended canonical path prefixes.
     Ok(PathBuf::from(mxc_path(&std::fs::canonicalize(root)?)))

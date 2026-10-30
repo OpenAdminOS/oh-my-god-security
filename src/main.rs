@@ -90,6 +90,7 @@ fn command_help(cmd: &str, args: &[String]) {
 fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
     let (allowed, positional): (&str, bool) = match cmd {
         "setup" => ("--yes --from --dry-run --install-skills --replace --verify-mxc --write-policy --mode", false),
+        "coalition-anchor" => ("--directory", false),
         "install-self" => ("--to --staging --binary --binary-sha256 --mxc --mxc-sha256 --license --license-sha256", false),
         "review" => ("--repo-url --mode --budget --no-sensors --persona --out --clone-root", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
@@ -229,6 +230,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         "update-check" => cmd_update_check(),
+        "coalition-anchor" => cmd_coalition_anchor(rest),
         "install-self" => cmd_install_self(rest),
         "gate" => cmd_gate(rest),
         "setup" => cmd_setup(rest),
@@ -275,6 +277,19 @@ fn cmd_update_check() -> Result<(), String> {
         println!("{line}");
     }
     Ok(())
+}
+
+fn cmd_coalition_anchor(rest: &[String]) -> Result<(), String> {
+    let dir = flag(rest, "--directory").ok_or("coalition-anchor requires --directory")?;
+    #[cfg(target_os = "macos")]
+    {
+        omgs::coalition::anchor(&PathBuf::from(dir)).map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dir;
+        Err("launchd coalition anchors require macOS".into())
+    }
 }
 
 fn cmd_install_self(rest: &[String]) -> Result<(), String> {
@@ -477,6 +492,16 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     #[cfg(unix)]
     let _signals = omgs::supervise::interruption::Guard::install().map_err(|e| e.to_string())?;
     let run = flag(args, "--run").map(PathBuf::from);
+    #[cfg(target_os = "macos")]
+    {
+        for path in std::iter::once(data_dir()).chain(run.iter().cloned()) {
+            if let Err(error) = omgs::tcc::admit_path(&path) {
+                eprintln!("needs_validation: target code was not executed. {error}");
+                return Err("__EXIT3__".into());
+            }
+        }
+    }
+
     // A replay reruns a recorded proof exactly, so an independent evaluator
     // can check a result instead of trusting the file that claims it.
     let replay = match flag(args, "--replay") {
@@ -4004,6 +4029,7 @@ mod cli_tests {
     const COMMANDS: &[(&str, &str)] = &[
         ("setup", ""),
         ("install-self", ""),
+        ("coalition-anchor", ""),
         ("gate", ""),
         ("stage", ""),
         ("review", ""),

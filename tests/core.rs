@@ -138,7 +138,6 @@ fn mxc_config_matches_verified_contract() {
         timeout_ms: 30000,
         workspace: Path::new("/work/run/workspace"),
         scratch: Path::new("/work/run/scratch"),
-        allowed_marker: Some(Path::new("/work/run/markers/allowed")),
         readonly: vec![PathBuf::from("/opt/homebrew")],
         denied: vec![PathBuf::from("/home/u/.cargo/credentials.toml")],
         rust: None,
@@ -157,7 +156,7 @@ fn mxc_config_matches_verified_contract() {
     );
     assert_eq!(
         v["filesystem"]["readonlyPaths"],
-        serde_json::json!(["/opt/homebrew", "/work/run/markers/allowed"])
+        serde_json::json!(["/opt/homebrew"])
     );
     assert_eq!(
         v["filesystem"]["deniedPaths"][0],

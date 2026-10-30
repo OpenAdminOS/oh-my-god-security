@@ -780,7 +780,6 @@ pub(super) mod tests {
                     timeout_ms: 5000,
                     workspace: &granted,
                     scratch: &granted,
-                    allowed_marker: None,
                     readonly: vec![],
                     denied: vec![],
                     rust: None,

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Limits {
     pub wall_ms: u64,
     pub cpu_secs: Option<u64>,
@@ -16,19 +16,18 @@ pub struct Limits {
     pub output_cap_bytes: usize,
 }
 
-#[derive(Debug, Clone)]
-pub struct SweepMarkers {
-    pub allowed: PathBuf,
-    pub denied: PathBuf,
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MacOwnership {
+    pub grants: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Survivor {
     pub pid: i32,
     pub command: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Supervised {
     pub exit_code: Option<i32>,
     /// Executor status is independent of the wrapper-reported workload status.
@@ -589,11 +588,6 @@ pub(crate) fn capture_root() -> io::Result<PathBuf> {
             "unsafe capture directory ownership, mode or canonical location",
         ));
     }
-    let roots = crate::sandbox::toolchain_roots("macos", crate::platform::home().as_deref());
-    validate_capture_grants(
-        &dir,
-        &roots.into_iter().filter(|p| p.exists()).collect::<Vec<_>>(),
-    )?;
     Ok(dir)
 }
 
@@ -604,7 +598,7 @@ pub(crate) fn validate_capture_grants(
 ) -> io::Result<()> {
     for grant in grants {
         let grant = std::fs::canonicalize(grant)?;
-        if root.starts_with(&grant) || grant.starts_with(root) {
+        if crate::tcc::overlaps(root, &grant) {
             return Err(io::Error::other(format!(
                 "capture directory overlaps sandbox grant {}",
                 grant.display()
@@ -1107,18 +1101,6 @@ mod cgroup {
 #[cfg(target_os = "macos")]
 mod sweep {
     use super::*;
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    extern "C" {
-        fn sandbox_check(
-            pid: libc::pid_t,
-            operation: *const libc::c_char,
-            type_: libc::c_int,
-            ...
-        ) -> libc::c_int;
-    }
-
     // Darwin's PROC_PIDUNIQIDENTIFIERINFO (17) and
     // PROC_PIDT_BSDINFOWITHUNIQID (18), from XNU's sys/proc_info.h.
     // The kernel increments generation at fork and preserves it across exec.
@@ -1152,26 +1134,6 @@ mod sweep {
         fn deref_mut(&mut self) -> &mut Self::Target {
             &mut self.bsd
         }
-    }
-
-    pub(super) fn generation(pid: u32) -> io::Result<u64> {
-        let pid =
-            i32::try_from(pid).map_err(|_| io::Error::other("executor pid is out of range"))?;
-        // SAFETY: UniqueInfo is a plain C output structure.
-        let mut info = unsafe { std::mem::zeroed::<UniqueInfo>() };
-        let size = std::mem::size_of_val(&info) as i32;
-        // SAFETY: the buffer has size writable bytes. arg=1 includes zombies,
-        // so even an immediately exiting executor remains identifiable until
-        // our own wait reaps it.
-        let count =
-            unsafe { libc::proc_pidinfo(pid, 17, 1, (&mut info as *mut UniqueInfo).cast(), size) };
-        if count != size {
-            return Err(io::Error::last_os_error());
-        }
-        if info.generation == 0 {
-            return Err(io::Error::other("missing kernel process generation"));
-        }
-        Ok(info.generation)
     }
 
     fn info(pid: i32) -> io::Result<ProcessInfo> {
@@ -1213,24 +1175,6 @@ mod sweep {
         Ok(pids)
     }
 
-    fn owned_pids(uid: libc::uid_t, capacity: usize) -> io::Result<Vec<i32>> {
-        let mut pids = vec![0i32; capacity.saturating_add(1024)];
-        let size = std::mem::size_of::<i32>();
-        let bytes = i32::try_from(pids.len().saturating_mul(size))
-            .map_err(|_| io::Error::other("uid pid list is too large"))?;
-        // SAFETY: pids has bytes writable bytes; PROC_UID_ONLY filters by uid.
-        let count = unsafe { libc::proc_listpids(4, uid, pids.as_mut_ptr().cast(), bytes) };
-        if count <= 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if count >= bytes || !(count as usize).is_multiple_of(size) {
-            return Err(io::Error::other("uid pid list exceeded its buffer"));
-        }
-        pids.truncate(count as usize / size);
-        pids.sort_unstable();
-        Ok(pids)
-    }
-
     pub(super) fn group_has_live_processes(group: i32) -> io::Result<bool> {
         for pid in pids()? {
             if pid <= 0 {
@@ -1256,1082 +1200,40 @@ mod sweep {
         }
         Ok(false)
     }
-
-    fn policy_check(pid: i32, path: Option<&CString>) -> io::Result<i32> {
-        let operation = b"file-read-data\0";
-        // SAFETY: a null operation queries confinement without a path. Otherwise
-        // operation and path are NUL terminated and live through the call.
-        let result = unsafe {
-            match path {
-                None => sandbox_check(pid, std::ptr::null(), 0),
-                Some(path) => sandbox_check(pid, operation.as_ptr().cast(), 1, path.as_ptr()),
-            }
-        };
-        if result < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(result)
-    }
-
-    fn policy_matches(
-        allowed: &CString,
-        denied: &CString,
-        mut check: impl FnMut(Option<&CString>) -> io::Result<i32>,
-    ) -> io::Result<bool> {
-        // Avoid expensive path resolution for unsandboxed same-uid processes.
-        // Descendants inherit Seatbelt confinement and cannot remove it.
-        if check(None)? == 0 {
-            return Ok(false);
-        }
-        // sandbox_check returns a denial for a vanished pid, too. Query deny
-        // first: an unrestricted process exiting or entering another sandbox
-        // between calls must not combine an old allow with a new denial.
-        if check(Some(denied))? == 0 {
-            return Ok(false);
-        }
-        Ok(check(Some(allowed))? == 0)
-    }
-
-    fn same_identity(before: &ProcessInfo, after: &ProcessInfo) -> bool {
-        before.pbi_uid == after.pbi_uid
-            && before.pbi_start_tvsec == after.pbi_start_tvsec
-            && before.pbi_start_tvusec == after.pbi_start_tvusec
-            && before.unique.generation == after.unique.generation
-    }
-
-    fn command(pid: i32) -> Option<String> {
-        let mut buffer = [0u8; 4096];
-        // SAFETY: buffer is writable for the specified byte count.
-        let mut count =
-            unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
-        if count <= 0 {
-            // SAFETY: the same live buffer is passed with its full byte count.
-            count =
-                unsafe { libc::proc_name(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
-        }
-        if count <= 0 {
-            return None;
-        }
-        let length = (count as usize).min(buffer.len());
-        let end = buffer[..length]
-            .iter()
-            .position(|b| *b == 0)
-            .unwrap_or(length);
-        Some(String::from_utf8_lossy(&buffer[..end]).into_owned())
-    }
-
-    const MAX_SCANS: usize = 20;
-
-    trait ProcessQueries {
-        fn pids(&mut self) -> io::Result<Vec<i32>>;
-        fn owned_pids(&mut self, uid: libc::uid_t, capacity: usize) -> io::Result<Vec<i32>>;
-        fn info(&mut self, pid: i32) -> io::Result<ProcessInfo>;
-        fn policy_check(&mut self, pid: i32, path: Option<&CString>) -> io::Result<i32>;
-        fn matches(&mut self, pid: i32, allowed: &CString, denied: &CString) -> io::Result<bool> {
-            policy_matches(allowed, denied, |path| self.policy_check(pid, path))
-        }
-        fn command(&mut self, pid: i32) -> Option<String>;
-        fn signal(&mut self, pid: i32, number: i32, notes: &mut Vec<String>) -> bool;
-        fn elapsed(&self) -> Duration;
-        fn pause(&mut self);
-    }
-
-    struct Libproc {
-        start: Instant,
-    }
-
-    impl ProcessQueries for Libproc {
-        fn pids(&mut self) -> io::Result<Vec<i32>> {
-            pids()
-        }
-
-        fn owned_pids(&mut self, uid: libc::uid_t, capacity: usize) -> io::Result<Vec<i32>> {
-            owned_pids(uid, capacity)
-        }
-
-        fn info(&mut self, pid: i32) -> io::Result<ProcessInfo> {
-            info(pid)
-        }
-
-        fn policy_check(&mut self, pid: i32, path: Option<&CString>) -> io::Result<i32> {
-            policy_check(pid, path)
-        }
-
-        fn command(&mut self, pid: i32) -> Option<String> {
-            command(pid)
-        }
-
-        fn signal(&mut self, pid: i32, number: i32, notes: &mut Vec<String>) -> bool {
-            super::signal(pid, number, notes)
-        }
-
-        fn elapsed(&self) -> Duration {
-            self.start.elapsed()
-        }
-
-        fn pause(&mut self) {
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    pub(super) fn run(
-        markers: &SweepMarkers,
-        result: &mut Supervised,
-        minimum_generation: u64,
-    ) -> bool {
-        // SAFETY: getpid has no pointer arguments or preconditions.
-        let own = unsafe { libc::getpid() };
-        // SAFETY: geteuid has no pointer arguments or preconditions.
-        let uid = unsafe { libc::geteuid() };
-        run_with(
-            markers,
-            result,
-            &mut Libproc {
-                start: Instant::now(),
-            },
-            own,
-            uid,
-            minimum_generation,
-        )
-    }
-
-    fn run_with(
-        markers: &SweepMarkers,
-        result: &mut Supervised,
-        processes: &mut impl ProcessQueries,
-        own: i32,
-        uid: libc::uid_t,
-        minimum_generation: u64,
-    ) -> bool {
-        let (Ok(allowed), Ok(denied)) = (
-            CString::new(markers.allowed.as_os_str().as_bytes()),
-            CString::new(markers.denied.as_os_str().as_bytes()),
-        ) else {
-            result
-                .notes
-                .push("survivor sweep markers contain NUL".into());
-            return false;
-        };
-        if !markers.allowed.is_absolute()
-            || !markers.denied.is_absolute()
-            || markers.allowed == markers.denied
-        {
-            result
-                .notes
-                .push("survivor sweep requires distinct absolute marker paths".into());
-            return false;
-        }
-        result.enforced.push("survivor_sweep".into());
-        let mut healthy = true;
-        let mut seen = Vec::new();
-        let mut zombies = Vec::new();
-        for _ in 0..MAX_SCANS {
-            let pids = match processes.pids() {
-                Ok(pids) => pids,
-                Err(error) => {
-                    result
-                        .notes
-                        .push(format!("survivor pid enumeration failed: {error}"));
-                    return false;
-                }
-            };
-            let owned = match processes.owned_pids(uid, pids.len()) {
-                Ok(owned) => owned,
-                Err(error) => {
-                    result
-                        .notes
-                        .push(format!("survivor uid enumeration failed: {error}"));
-                    return false;
-                }
-            };
-            let mut found = false;
-            for pid in pids {
-                if processes.elapsed() >= DRAIN {
-                    result
-                        .notes
-                        .push("survivor sweep time bound reached before a scan completed".into());
-                    return false;
-                }
-                if pid <= 0 || pid == own || owned.binary_search(&pid).is_err() {
-                    continue;
-                }
-                let before = match processes.info(pid) {
-                    // A pre-existing service can happen to share the two-path
-                    // policy fingerprint. It cannot be this executor's child.
-                    Ok(info) if info.unique.generation < minimum_generation => continue,
-                    Ok(info) if info.pbi_uid == uid && info.pbi_status != 5 => info,
-                    Ok(info) if info.pbi_uid == uid && info.pbi_status == 5 => {
-                        let identity = (
-                            pid,
-                            info.pbi_uid,
-                            info.pbi_start_tvsec,
-                            info.pbi_start_tvusec,
-                            info.unique.generation,
-                        );
-                        // The first zombie lookup is ambiguous. A later scan
-                        // covers any child it forked before that lookup. The
-                        // same retained zombie cannot fork between scans.
-                        if !zombies.contains(&identity) {
-                            zombies.push(identity);
-                            found = true;
-                        }
-                        continue;
-                    }
-                    // An enumerated owned process may have forked after the
-                    // snapshot and then exited before this first lookup. Its
-                    // child is visible only to a later scan. Do not signal or
-                    // record the parent without a verified live identity.
-                    Ok(_) => {
-                        found = true;
-                        continue;
-                    }
-                    Err(error) => {
-                        found = true;
-                        if !matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
-                            result
-                                .notes
-                                .push(format!("survivor uid lookup for {pid} failed: {error}"));
-                            healthy = false;
-                        }
-                        continue;
-                    }
-                };
-                let matched = match processes.matches(pid, &allowed, &denied) {
-                    Ok(matched) => matched,
-                    Err(error) => {
-                        found = true;
-                        if !matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
-                            result
-                                .notes
-                                .push(format!("sandbox check for {pid} failed: {error}"));
-                            healthy = false;
-                        }
-                        continue;
-                    }
-                };
-                if !matched {
-                    // A vanished pid can return a denial, not just ESRCH. A
-                    // negative fingerprint is stable only while its original
-                    // identity is still alive. Otherwise it may have forked
-                    // after enumeration, so require another complete scan.
-                    match processes.info(pid) {
-                        Ok(after) if same_identity(&before, &after) && after.pbi_status != 5 => {}
-                        Ok(_) => found = true,
-                        Err(error) => {
-                            found = true;
-                            if !matches!(error.raw_os_error(), Some(libc::ESRCH | libc::ENOENT)) {
-                                result.notes.push(format!(
-                                    "non-match identity recheck for {pid} failed: {error}"
-                                ));
-                                healthy = false;
-                            }
-                        }
-                    }
-                    continue;
-                }
-                // Every match requires another scan, even if it exits or its pid
-                // is reused before the recheck. It may have forked another child.
-                found = true;
-                let identity = (
-                    pid,
-                    before.pbi_uid,
-                    before.pbi_start_tvsec,
-                    before.pbi_start_tvusec,
-                    before.unique.generation,
-                );
-                let unseen = !seen.contains(&identity);
-                let command = if unseen { processes.command(pid) } else { None };
-                // Check identity after the policy and command calls, before
-                // recording a survivor or signalling a potentially reused pid.
-                let (may_signal, exited) = match processes.info(pid) {
-                    Ok(after) if !same_identity(&before, &after) => {
-                        continue;
-                    }
-                    // A zombie cannot execute or fork, and awaits its own parent.
-                    Ok(after) => (after.pbi_status != 5, after.pbi_status == 5),
-                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => (false, true),
-                    Err(error) => {
-                        result.notes.push(format!(
-                            "survivor identity recheck for {pid} failed: {error}"
-                        ));
-                        healthy = false;
-                        (false, false)
-                    }
-                };
-                if unseen {
-                    let command = command.unwrap_or_else(|| {
-                        if exited {
-                            "exited before its command was read".into()
-                        } else {
-                            result
-                                .notes
-                                .push(format!("could not read command for survivor {pid}"));
-                            "unknown".into()
-                        }
-                    });
-                    // Exited matches still outlived the workload. Preserve their
-                    // proof record without reporting a cleanup failure.
-                    result.survivors.push(Survivor { pid, command });
-                    seen.push(identity);
-                }
-                if may_signal {
-                    healthy &= processes.signal(pid, libc::SIGKILL, &mut result.notes);
-                }
-            }
-            if processes.elapsed() >= DRAIN {
-                break;
-            }
-            if !found {
-                return healthy;
-            }
-            processes.pause();
-        }
-        result
-            .notes
-            .push("survivor sweep reached its scan or time bound with matches or ambiguous inspections present".into());
-        false
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use std::collections::VecDeque;
-
-        const OWN: i32 = 1;
-        const UID: libc::uid_t = 501;
-        const A: i32 = 101;
-        const B: i32 = 102;
-
-        #[test]
-        fn policy_fingerprint_filters_unconfined_and_other_runs_and_preserves_errors() {
-            let allowed = CString::new("/allowed").unwrap();
-            let denied = CString::new("/denied").unwrap();
-            for (answers, matched) in [
-                (vec![0], false),
-                (vec![1, 0], false),
-                (vec![1, 1, 1], false),
-                (vec![1, 1, 0], true),
-            ] {
-                let mut answers: VecDeque<_> = answers.into();
-                let mut paths = Vec::new();
-                let result = policy_matches(&allowed, &denied, |path| {
-                    paths.push(path.map(|p| p.to_bytes().to_vec()));
-                    Ok(answers.pop_front().unwrap())
-                });
-                assert_eq!(result.unwrap(), matched);
-                assert!(answers.is_empty());
-                let order = [None, Some(b"/denied".to_vec()), Some(b"/allowed".to_vec())];
-                assert_eq!(paths, order[..paths.len()]);
-            }
-            for failing_query in 0..3 {
-                let mut query = 0;
-                let error = policy_matches(&allowed, &denied, |_| {
-                    query += 1;
-                    if query == failing_query + 1 {
-                        Err(io::Error::from_raw_os_error(libc::EPERM))
-                    } else {
-                        Ok(1)
-                    }
-                })
-                .unwrap_err();
-                assert_eq!(error.raw_os_error(), Some(libc::EPERM));
-                assert_eq!(query, failing_query + 1);
-            }
-        }
-
-        #[test]
-        fn process_exiting_between_path_queries_is_not_a_policy_match() {
-            use std::io::BufRead;
-
-            let mut child = Command::new("/usr/bin/sandbox-exec")
-                .env_clear()
-                .args([
-                    "-p",
-                    "(version 1)(allow default)(deny file-read-data (literal \"/usr/bin/true\"))",
-                    "/bin/sh",
-                    "-c",
-                    "printf 'ready\\n'; exec /bin/sleep 30",
-                ])
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let mut ready = String::new();
-            std::io::BufReader::new(child.stdout.take().unwrap())
-                .read_line(&mut ready)
-                .unwrap();
-            let allowed = CString::new("/bin/sh").unwrap();
-            let denied = CString::new("/usr/bin/true").unwrap();
-            let mut reaped = false;
-            let matched = policy_matches(&allowed, &denied, |path| {
-                let result = policy_check(child.id() as i32, path);
-                if path.is_some() && !reaped {
-                    child.kill().unwrap();
-                    child.wait().unwrap();
-                    reaped = true;
-                }
-                result
-            });
-            if !reaped {
-                let _ = child.kill();
-            }
-            child.wait().unwrap();
-            assert_eq!(ready, "ready\n");
-            assert!(reaped, "the positive control must be sandboxed");
-            assert!(!matched.unwrap());
-        }
-
-        enum Step {
-            Pids(Vec<i32>, Duration),
-            Info(i32, Result<ProcessInfo, i32>),
-            Matches(i32),
-            Policy(i32, Option<&'static str>, Result<i32, i32>),
-            Command(i32, Option<&'static str>),
-            Signal(i32),
-            Pause,
-        }
-
-        struct Scripted {
-            steps: VecDeque<Step>,
-            owned: Vec<i32>,
-            elapsed: Duration,
-            scans: usize,
-            signalled: Vec<i32>,
-        }
-
-        impl Scripted {
-            fn next(&mut self) -> Step {
-                self.steps.pop_front().expect("unexpected process query")
-            }
-        }
-
-        impl ProcessQueries for Scripted {
-            fn pids(&mut self) -> io::Result<Vec<i32>> {
-                let Step::Pids(pids, elapsed) = self.next() else {
-                    panic!("expected pid enumeration");
-                };
-                self.scans += 1;
-                self.elapsed = elapsed;
-                self.owned = pids.clone();
-                self.owned.sort_unstable();
-                Ok(pids)
-            }
-
-            fn owned_pids(&mut self, uid: libc::uid_t, capacity: usize) -> io::Result<Vec<i32>> {
-                assert_eq!(uid, UID);
-                assert_eq!(capacity, self.owned.len());
-                Ok(self.owned.clone())
-            }
-
-            fn info(&mut self, pid: i32) -> io::Result<ProcessInfo> {
-                let Step::Info(expected, result) = self.next() else {
-                    panic!("expected info query for {pid}");
-                };
-                assert_eq!(pid, expected);
-                result.map_err(io::Error::from_raw_os_error)
-            }
-
-            fn policy_check(&mut self, pid: i32, path: Option<&CString>) -> io::Result<i32> {
-                let Step::Policy(expected, expected_path, result) = self.next() else {
-                    panic!("expected sandbox query for {pid}");
-                };
-                assert_eq!(pid, expected);
-                assert_eq!(path.map(|p| p.to_str().unwrap()), expected_path);
-                result.map_err(io::Error::from_raw_os_error)
-            }
-
-            fn command(&mut self, pid: i32) -> Option<String> {
-                let Step::Command(expected, command) = self.next() else {
-                    panic!("expected command query for {pid}");
-                };
-                assert_eq!(pid, expected);
-                command.map(str::to_owned)
-            }
-
-            fn signal(&mut self, pid: i32, number: i32, _notes: &mut Vec<String>) -> bool {
-                let Step::Signal(expected) = self.next() else {
-                    panic!("unexpected signal to {pid}");
-                };
-                assert_eq!(pid, expected);
-                assert_eq!(number, libc::SIGKILL);
-                self.signalled.push(pid);
-                true
-            }
-
-            fn elapsed(&self) -> Duration {
-                self.elapsed
-            }
-
-            fn pause(&mut self) {
-                assert!(matches!(self.next(), Step::Pause));
-            }
-        }
-
-        fn live() -> ProcessInfo {
-            // SAFETY: proc_bsdinfo is a plain C structure; these are test values.
-            let mut info = unsafe { std::mem::zeroed::<ProcessInfo>() };
-            info.unique.generation = 101;
-            info.pbi_uid = UID;
-            info.pbi_status = 2;
-            info.pbi_start_tvsec = 10;
-            info.pbi_start_tvusec = 20;
-            info
-        }
-
-        fn scan(pids: &[i32]) -> Step {
-            Step::Pids(pids.to_vec(), Duration::ZERO)
-        }
-
-        fn exercise(steps: Vec<Step>) -> (Supervised, Scripted) {
-            let mut processes = Scripted {
-                steps: steps
-                    .into_iter()
-                    .flat_map(|step| match step {
-                        Step::Matches(pid) => vec![
-                            Step::Policy(pid, None, Ok(1)),
-                            Step::Policy(pid, Some("/denied"), Ok(1)),
-                            Step::Policy(pid, Some("/allowed"), Ok(0)),
-                        ],
-                        step => vec![step],
-                    })
-                    .collect(),
-                owned: Vec::new(),
-                elapsed: Duration::ZERO,
-                scans: 0,
-                signalled: Vec::new(),
-            };
-            let mut result = Supervised {
-                exit_code: Some(0),
-                executor_exit_code: Some(0),
-                command_started: true,
-                command_finished: true,
-                test_reachable: None,
-                boundary_marker_seen: false,
-                authorized_control_seen: false,
-                enumerate_rejected: false,
-                success: false,
-                timed_out: false,
-                executor_error: false,
-                killed: false,
-                interrupted: false,
-                duration_ms: 0,
-                output: String::new(),
-                stdout: String::new(),
-                stdout_bytes: Vec::new(),
-                output_bytes_total: 0,
-                capture_complete: true,
-                cleanup_complete: false,
-                survivors: Vec::new(),
-                enforced: Vec::new(),
-                notes: Vec::new(),
-            };
-            let markers = SweepMarkers {
-                allowed: "/allowed".into(),
-                denied: "/denied".into(),
-            };
-            result.cleanup_complete =
-                run_with(&markers, &mut result, &mut processes, OWN, UID, 100);
-            assert!(
-                processes.steps.is_empty(),
-                "sweep stopped before script ended"
-            );
-            (result, processes)
-        }
-
-        #[test]
-        fn early_disappearance_or_zombie_rescans_and_kills_forked_child() {
-            let mut zombie = live();
-            zombie.pbi_status = 5;
-            for first_lookup in [Err(libc::ESRCH), Err(libc::ENOENT), Ok(zombie)] {
-                let mut steps = vec![scan(&[A]), Step::Info(A, first_lookup)];
-                steps.extend([
-                    Step::Pause,
-                    scan(&[B]),
-                    Step::Info(B, Ok(live())),
-                    Step::Matches(B),
-                    Step::Command(B, Some("child")),
-                    Step::Info(B, Ok(live())),
-                    Step::Signal(B),
-                    Step::Pause,
-                    scan(&[]),
-                ]);
-                let (result, processes) = exercise(steps);
-                assert!(result.cleanup_complete, "{result:?}");
-                assert!(result.notes.is_empty(), "{result:?}");
-                assert_eq!(processes.scans, 3);
-                assert_eq!(processes.signalled, [B]);
-                assert_eq!(result.survivors.len(), 1);
-                assert_eq!(result.survivors[0].pid, B);
-                assert_eq!(result.survivors[0].command, "child");
-            }
-        }
-
-        #[test]
-        fn retained_zombie_rescans_finds_child_and_then_reaches_quiescence() {
-            let mut zombie = live();
-            zombie.pbi_status = 5;
-            let (result, processes) = exercise(vec![
-                scan(&[A]),
-                Step::Info(A, Ok(zombie)),
-                Step::Pause,
-                scan(&[A, B]),
-                Step::Info(A, Ok(zombie)),
-                Step::Info(B, Ok(live())),
-                Step::Matches(B),
-                Step::Command(B, Some("child")),
-                Step::Info(B, Ok(live())),
-                Step::Signal(B),
-                Step::Pause,
-                scan(&[A]),
-                Step::Info(A, Ok(zombie)),
-            ]);
-            assert!(result.cleanup_complete, "{result:?}");
-            assert!(result.notes.is_empty(), "{result:?}");
-            assert_eq!(processes.scans, 3);
-            assert_eq!(processes.signalled, [B]);
-            assert_eq!(result.survivors.len(), 1);
-            assert_eq!(result.survivors[0].pid, B);
-        }
-
-        #[test]
-        fn libproc_hidden_zombie_rescans_and_finds_child_without_stalling() {
-            let mut zombie = live();
-            zombie.pbi_status = 5;
-            let (result, processes) = exercise(vec![
-                scan(&[A]),
-                Step::Info(A, Err(libc::ESRCH)),
-                Step::Pause,
-                scan(&[A, B]),
-                Step::Info(A, Ok(zombie)),
-                Step::Info(B, Ok(live())),
-                Step::Matches(B),
-                Step::Command(B, Some("child")),
-                Step::Info(B, Ok(live())),
-                Step::Signal(B),
-                Step::Pause,
-                scan(&[A]),
-                Step::Info(A, Ok(zombie)),
-            ]);
-            assert!(result.cleanup_complete, "{result:?}");
-            assert!(result.notes.is_empty(), "{result:?}");
-            assert_eq!(processes.scans, 3);
-            assert_eq!(processes.signalled, [B]);
-            assert_eq!(result.survivors.len(), 1);
-            assert_eq!(result.survivors[0].pid, B);
-        }
-
-        #[test]
-        fn kernel_identity_lookup_errors_fail_closed_without_signalling() {
-            let (result, processes) = exercise(vec![
-                scan(&[A]),
-                Step::Info(A, Err(libc::EPERM)),
-                Step::Pause,
-                scan(&[]),
-            ]);
-            assert!(!result.cleanup_complete, "{result:?}");
-            assert!(processes.signalled.is_empty());
-            assert!(result.notes.iter().any(|note| note.contains("uid lookup")));
-        }
-
-        #[test]
-        fn preexisting_process_is_not_fingerprinted_recorded_or_signalled() {
-            let mut old = live();
-            old.unique.generation = 99;
-            let (result, processes) = exercise(vec![scan(&[A]), Step::Info(A, Ok(old))]);
-            assert!(result.cleanup_complete, "{result:?}");
-            assert!(result.survivors.is_empty());
-            assert!(processes.signalled.is_empty());
-            assert_eq!(processes.scans, 1);
-        }
-
-        #[test]
-        fn kernel_queries_identify_live_and_retained_zombie_generations() {
-            let own = generation(std::process::id()).unwrap();
-            assert_ne!(info(std::process::id() as i32).unwrap().pbi_status, 5);
-            assert_eq!(
-                info(i32::MAX).err().unwrap().raw_os_error(),
-                Some(libc::ESRCH)
-            );
-            let mut child = Command::new("/bin/sh")
-                .args(["-c", "exit 0"])
-                .spawn()
-                .unwrap();
-            let start = Instant::now();
-            while !super::super::exited_without_reaping(child.id()).unwrap() {
-                assert!(start.elapsed() < Duration::from_secs(5));
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let pid = i32::try_from(child.id()).unwrap();
-            let first = info(pid).unwrap();
-            let second = info(pid).unwrap();
-            let child_generation = generation(child.id()).unwrap();
-            // The old arg=0 call really does hide retained zombies.
-            let mut legacy = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
-            let legacy_size = std::mem::size_of_val(&legacy) as i32;
-            let count = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    libc::PROC_PIDTBSDINFO,
-                    0,
-                    (&mut legacy as *mut libc::proc_bsdinfo).cast(),
-                    legacy_size,
-                )
-            };
-            let error = io::Error::last_os_error();
-            child.wait().unwrap();
-            assert_eq!(first.pbi_status, 5);
-            assert!(same_identity(&first, &second));
-            assert!(child_generation > own);
-            assert_eq!(first.unique.generation, child_generation);
-            assert_eq!(count, 0);
-            assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
-        }
-
-        #[test]
-        fn early_ambiguity_at_scan_or_time_bound_fails_cleanup() {
-            for time_bound in [false, true] {
-                let scans = if time_bound { 1 } else { MAX_SCANS };
-                let mut steps = Vec::new();
-                for _ in 0..scans {
-                    steps.extend([scan(&[A]), Step::Info(A, Err(libc::ESRCH)), Step::Pause]);
-                }
-                if time_bound {
-                    steps.push(Step::Pids(vec![], DRAIN));
-                }
-                let (result, processes) = exercise(steps);
-                assert!(!result.cleanup_complete, "{result:?}");
-                assert!(result.notes.iter().any(|note| note.contains("time bound")));
-                assert!(processes.signalled.is_empty());
-                assert!(result.survivors.is_empty());
-            }
-        }
-
-        #[test]
-        fn vanished_match_rescans_and_kills_forked_child() {
-            let (result, processes) = exercise(vec![
-                scan(&[A]),
-                Step::Info(A, Ok(live())),
-                Step::Matches(A),
-                Step::Command(A, None),
-                Step::Info(A, Err(libc::ESRCH)),
-                Step::Pause,
-                scan(&[B]),
-                Step::Info(B, Ok(live())),
-                Step::Matches(B),
-                Step::Command(B, Some("child")),
-                Step::Info(B, Ok(live())),
-                Step::Signal(B),
-                Step::Pause,
-                scan(&[]),
-            ]);
-            assert!(result.cleanup_complete, "{result:?}");
-            assert!(result.notes.is_empty(), "{result:?}");
-            assert_eq!(processes.scans, 3);
-            assert_eq!(processes.signalled, [B]);
-            assert_eq!(result.survivors.len(), 2);
-            assert_eq!(result.survivors[0].pid, A);
-            assert_eq!(
-                result.survivors[0].command,
-                "exited before its command was read"
-            );
-            assert_eq!(result.survivors[1].pid, B);
-            assert_eq!(result.survivors[1].command, "child");
-        }
-
-        fn negative_inspections() -> Vec<Vec<Step>> {
-            let mut reused = live();
-            reused.pbi_start_tvusec += 1;
-            let mut other_uid = live();
-            other_uid.pbi_uid += 1;
-            let mut zombie = live();
-            zombie.pbi_status = 5;
-            let mut cases = Vec::new();
-            for after in [None, Some(reused), Some(other_uid), Some(zombie)] {
-                cases.push(vec![
-                    Step::Policy(A, None, Ok(1)),
-                    Step::Policy(A, Some("/denied"), Ok(1)),
-                    // P vanished or changed identity before the allowed query.
-                    Step::Policy(A, Some("/allowed"), Ok(1)),
-                    Step::Info(A, after.ok_or(libc::ESRCH)),
-                ]);
-            }
-            for query in 0..3 {
-                let mut steps = Vec::new();
-                for (index, path) in [None, Some("/denied"), Some("/allowed")]
-                    .into_iter()
-                    .enumerate()
-                {
-                    steps.push(Step::Policy(
-                        A,
-                        path,
-                        if index == query {
-                            Err(libc::ESRCH)
-                        } else {
-                            Ok(1)
-                        },
-                    ));
-                    if index == query {
-                        break;
-                    }
-                }
-                cases.push(steps);
-            }
-            cases
-        }
-
-        #[test]
-        fn vanished_or_reused_non_match_rescans_and_kills_forked_child() {
-            for inspection in negative_inspections() {
-                let mut steps = vec![scan(&[A]), Step::Info(A, Ok(live()))];
-                steps.extend(inspection);
-                steps.extend([
-                    Step::Pause,
-                    scan(&[B]),
-                    Step::Info(B, Ok(live())),
-                    Step::Matches(B),
-                    Step::Command(B, Some("child")),
-                    Step::Info(B, Ok(live())),
-                    Step::Signal(B),
-                    Step::Pause,
-                    scan(&[]),
-                ]);
-                let (result, processes) = exercise(steps);
-                assert!(result.cleanup_complete, "{result:?}");
-                assert!(result.notes.is_empty(), "{result:?}");
-                assert_eq!(processes.scans, 3);
-                assert_eq!(processes.signalled, [B]);
-                assert_eq!(result.survivors.len(), 1);
-                assert_eq!(result.survivors[0].pid, B);
-                assert_eq!(result.survivors[0].command, "child");
-            }
-        }
-
-        #[test]
-        fn stable_non_matches_do_not_require_a_rescan_or_signal() {
-            for paths in [
-                vec![None],
-                vec![None, Some("/denied")],
-                vec![None, Some("/denied"), Some("/allowed")],
-            ] {
-                let mut steps = vec![scan(&[A]), Step::Info(A, Ok(live()))];
-                for (index, path) in paths.iter().enumerate() {
-                    let answer = if paths.len() == 3 || index + 1 < paths.len() {
-                        1
-                    } else {
-                        0
-                    };
-                    steps.push(Step::Policy(A, *path, Ok(answer)));
-                }
-                steps.push(Step::Info(A, Ok(live())));
-                let (result, processes) = exercise(steps);
-                assert!(result.cleanup_complete, "{result:?}");
-                assert_eq!(processes.scans, 1);
-                assert!(processes.signalled.is_empty());
-                assert!(result.survivors.is_empty());
-            }
-        }
-
-        #[test]
-        fn ambiguous_non_matches_at_scan_or_time_bound_fail_cleanup() {
-            for time_bound in [false, true] {
-                let scans = if time_bound { 1 } else { MAX_SCANS };
-                let mut steps = Vec::new();
-                for _ in 0..scans {
-                    steps.extend([
-                        scan(&[A]),
-                        Step::Info(A, Ok(live())),
-                        Step::Policy(A, None, Ok(1)),
-                        Step::Policy(A, Some("/denied"), Ok(1)),
-                        Step::Policy(A, Some("/allowed"), Ok(1)),
-                        Step::Info(A, Err(libc::ESRCH)),
-                        Step::Pause,
-                    ]);
-                }
-                if time_bound {
-                    steps.push(Step::Pids(vec![], DRAIN));
-                }
-                let (result, processes) = exercise(steps);
-                assert!(!result.cleanup_complete, "{result:?}");
-                assert!(result.notes.iter().any(|note| note.contains("time bound")));
-                assert!(processes.signalled.is_empty());
-                assert!(result.survivors.is_empty());
-            }
-        }
-
-        #[test]
-        fn identity_recheck_errors_keep_survivor_and_fail_cleanup() {
-            for error in [libc::EPERM, libc::EIO, libc::ENOENT] {
-                let (result, processes) = exercise(vec![
-                    scan(&[A]),
-                    Step::Info(A, Ok(live())),
-                    Step::Matches(A),
-                    Step::Command(A, None),
-                    Step::Info(A, Err(error)),
-                    Step::Pause,
-                    scan(&[]),
-                ]);
-                assert!(!result.cleanup_complete, "{result:?}");
-                assert_eq!(processes.scans, 2);
-                assert!(processes.signalled.is_empty());
-                assert_eq!(result.survivors.len(), 1);
-                assert_eq!(result.survivors[0].pid, A);
-                assert_eq!(result.survivors[0].command, "unknown");
-                assert!(result
-                    .notes
-                    .iter()
-                    .any(|note| note.contains("identity recheck")));
-                assert!(result
-                    .notes
-                    .iter()
-                    .any(|note| note.contains("could not read command")));
-            }
-        }
-
-        #[test]
-        fn reused_identity_is_omitted_without_signal_and_rescanned() {
-            for field in 0..4 {
-                let mut replacement = live();
-                match field {
-                    0 => replacement.pbi_uid += 1,
-                    1 => replacement.pbi_start_tvsec += 1,
-                    2 => replacement.pbi_start_tvusec += 1,
-                    _ => replacement.unique.generation += 1,
-                }
-                for command in [None, Some("replacement")] {
-                    let (result, processes) = exercise(vec![
-                        scan(&[A]),
-                        Step::Info(A, Ok(live())),
-                        Step::Matches(A),
-                        Step::Command(A, command),
-                        Step::Info(A, Ok(replacement)),
-                        Step::Pause,
-                        scan(&[]),
-                    ]);
-                    assert!(result.cleanup_complete, "{result:?}");
-                    assert!(result.notes.is_empty(), "{result:?}");
-                    assert!(result.survivors.is_empty(), "{result:?}");
-                    assert!(processes.signalled.is_empty());
-                    assert_eq!(processes.scans, 2);
-                }
-            }
-        }
-
-        #[test]
-        fn matched_zombie_is_recorded_without_cleanup_failure_or_signal() {
-            let mut zombie = live();
-            zombie.pbi_status = 5;
-            let (result, processes) = exercise(vec![
-                scan(&[A]),
-                Step::Info(A, Ok(live())),
-                Step::Matches(A),
-                Step::Command(A, None),
-                Step::Info(A, Ok(zombie)),
-                Step::Pause,
-                scan(&[]),
-            ]);
-            assert!(result.cleanup_complete, "{result:?}");
-            assert!(result.notes.is_empty(), "{result:?}");
-            assert_eq!(result.survivors.len(), 1);
-            assert_eq!(result.survivors[0].pid, A);
-            assert_eq!(
-                result.survivors[0].command,
-                "exited before its command was read"
-            );
-            assert!(processes.signalled.is_empty());
-            assert_eq!(processes.scans, 2);
-        }
-
-        #[test]
-        fn scan_bound_with_persistent_match_fails_cleanup() {
-            let mut steps = Vec::new();
-            for scan_number in 0..MAX_SCANS {
-                steps.extend([scan(&[A]), Step::Info(A, Ok(live())), Step::Matches(A)]);
-                if scan_number == 0 {
-                    steps.push(Step::Command(A, Some("persistent")));
-                }
-                steps.extend([Step::Info(A, Ok(live())), Step::Signal(A), Step::Pause]);
-            }
-            let (result, processes) = exercise(steps);
-            assert!(!result.cleanup_complete, "{result:?}");
-            assert_eq!(processes.scans, MAX_SCANS);
-            assert_eq!(processes.signalled, vec![A; MAX_SCANS]);
-            assert_eq!(result.survivors.len(), 1);
-            assert!(result
-                .notes
-                .iter()
-                .any(|note| note.contains("scan or time bound")));
-        }
-
-        #[test]
-        fn scan_bound_with_reused_identities_fails_without_recording_or_signalling() {
-            let mut steps = Vec::new();
-            let mut replacement = live();
-            replacement.pbi_start_tvusec += 1;
-            for _ in 0..MAX_SCANS {
-                steps.extend([
-                    scan(&[A]),
-                    Step::Info(A, Ok(live())),
-                    Step::Matches(A),
-                    Step::Command(A, None),
-                    Step::Info(A, Ok(replacement)),
-                    Step::Pause,
-                ]);
-            }
-            let (result, processes) = exercise(steps);
-            assert!(!result.cleanup_complete, "{result:?}");
-            assert_eq!(processes.scans, MAX_SCANS);
-            assert!(result.survivors.is_empty());
-            assert!(processes.signalled.is_empty());
-            assert!(result
-                .notes
-                .iter()
-                .any(|note| note.contains("scan or time bound")));
-        }
-
-        #[test]
-        fn time_bound_before_quiescence_fails_cleanup() {
-            for pids in [vec![B], vec![]] {
-                let (result, processes) = exercise(vec![
-                    scan(&[A]),
-                    Step::Info(A, Ok(live())),
-                    Step::Matches(A),
-                    Step::Command(A, None),
-                    Step::Info(A, Err(libc::ESRCH)),
-                    Step::Pause,
-                    Step::Pids(pids, DRAIN),
-                ]);
-                assert!(!result.cleanup_complete, "{result:?}");
-                assert_eq!(processes.scans, 2);
-                assert!(processes.signalled.is_empty());
-                assert!(result.notes.iter().any(|note| note.contains("time bound")));
-            }
-        }
-    }
 }
 
 /// Callers must use env_clear before supplying an explicit environment. Command
 /// does not expose whether it inherits the host environment; Linux scope wrapping
 /// reconstructs only get_envs and clears bus credentials before the executor.
-pub fn run(cmd: Command, limits: &Limits, markers: Option<&SweepMarkers>) -> Supervised {
-    run_inner(cmd, limits, markers, None, None, true, None)
+pub fn run(cmd: Command, limits: &Limits, ownership: Option<&MacOwnership>) -> Supervised {
+    run_inner(cmd, limits, ownership, None, None, true, None)
 }
 
 pub fn run_marked(
     cmd: Command,
     limits: &Limits,
-    markers: Option<&SweepMarkers>,
+    ownership: Option<&MacOwnership>,
     nonce: &str,
 ) -> Supervised {
-    run_contracted(cmd, limits, markers, nonce, None)
+    run_contracted(cmd, limits, ownership, nonce, None)
 }
 
 pub fn run_contracted(
     cmd: Command,
     limits: &Limits,
-    markers: Option<&SweepMarkers>,
+    ownership: Option<&MacOwnership>,
     nonce: &str,
     expect_marker: Option<&str>,
 ) -> Supervised {
-    run_inner(cmd, limits, markers, Some(nonce), expect_marker, true, None)
+    run_inner(
+        cmd,
+        limits,
+        ownership,
+        Some(nonce),
+        expect_marker,
+        true,
+        None,
+    )
 }
 
 /// Bounded cleanup inspection must still work after the user requested a stop.
@@ -2343,17 +1245,17 @@ pub(crate) fn run_cleanup(cmd: Command, limits: &Limits) -> Supervised {
 pub(crate) fn run_monitored(
     cmd: Command,
     limits: &Limits,
-    markers: Option<&SweepMarkers>,
+    ownership: Option<&MacOwnership>,
     nonce: &str,
     stop: &AtomicBool,
 ) -> Supervised {
-    run_inner(cmd, limits, markers, Some(nonce), None, true, Some(stop))
+    run_inner(cmd, limits, ownership, Some(nonce), None, true, Some(stop))
 }
 
-fn run_inner(
+pub(crate) fn run_inner(
     mut cmd: Command,
     limits: &Limits,
-    markers: Option<&SweepMarkers>,
+    ownership: Option<&MacOwnership>,
     nonce: Option<&str>,
     expect_marker: Option<&str>,
     check_signals: bool,
@@ -2410,10 +1312,10 @@ fn run_inner(
         }
     }
     #[cfg(not(target_os = "macos"))]
-    if markers.is_some() {
+    if ownership.is_some() {
         result
             .notes
-            .push("survivor sweep not applied: only available on macOS".into());
+            .push("launchd coalition ownership not applied: only available on macOS".into());
     }
     #[cfg(any(unix, windows))]
     let _signals = if cfg!(windows) || nonce.is_some() {
@@ -2436,6 +1338,18 @@ fn run_inner(
             result.notes.push(result.output.clone());
             return result;
         }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(ownership) = ownership {
+        return crate::coalition::run(
+            cmd,
+            limits,
+            nonce,
+            expect_marker,
+            cancellation,
+            &ownership.grants,
+            result,
+        );
     }
     #[cfg(unix)]
     let unix_controls = match prepare_unix(&mut cmd, limits) {
@@ -2485,20 +1399,6 @@ fn run_inner(
             result.duration_ms = elapsed_ms(start);
             return result;
         }
-    };
-    #[cfg(target_os = "macos")]
-    let executor_generation = if markers.is_some() {
-        match sweep::generation(child.id()) {
-            Ok(generation) => Some(generation),
-            Err(error) => {
-                result.notes.push(format!(
-                    "cannot establish executor creation identity: {error}"
-                ));
-                None
-            }
-        }
-    } else {
-        None
     };
     // File-backed Stdio remains owned by Command after spawn. Close the
     // parent's writers before reading, otherwise EOF could never arrive.
@@ -2579,13 +1479,7 @@ fn run_inner(
     result.executor_exit_code = waited.status.and_then(|status| status.code());
     let cleanup_complete = waited.healthy;
     #[cfg(target_os = "macos")]
-    let cleanup_complete = match markers {
-        Some(markers) => match executor_generation {
-            Some(generation) => sweep::run(markers, &mut result, generation) && cleanup_complete,
-            None => false,
-        },
-        None => cleanup_complete,
-    };
+    let cleanup_complete = crate::coalition::cleanup(&mut result) && cleanup_complete;
     // The scope's exit status is the command's, so a failing proof test exits
     // nonzero with the limits fully applied. Only systemd-run's own refusal
     // to create the scope means they were not; it is checked once capture ends.
@@ -2736,6 +1630,11 @@ mod tests {
         let pair = capture_pipe().unwrap();
         drop(pair);
         assert!(validate_capture_grants(&root, std::slice::from_ref(&root)).is_err());
+        let different_case = PathBuf::from(root.to_string_lossy().to_ascii_uppercase());
+        assert!(validate_capture_grants(&different_case, std::slice::from_ref(&root)).is_err());
+        let data_alias =
+            std::path::Path::new("/System/Volumes/Data").join(root.strip_prefix("/").unwrap());
+        assert!(validate_capture_grants(&data_alias, std::slice::from_ref(&root)).is_err());
         assert!(validate_capture_grants(&root, &[root.parent().unwrap().to_path_buf()]).is_err());
         let alias = root.join("alias");
         std::os::unix::fs::symlink(&root, &alias).unwrap();

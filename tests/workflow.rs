@@ -296,7 +296,6 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
         let command = "npm test -- tests/security/x.test.ts";
         let wrapped =
             omgs::sandbox::wrapped_command(os, command, &nonce, Some("tests/security/x.test.ts"));
-        let allowed_marker = proof_dir.join("markers/allowed");
         let config = omgs::sandbox::mxc_config(&omgs::sandbox::ConfigInput {
             contract: None,
             os,
@@ -305,17 +304,8 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             timeout_ms: 1000,
             workspace: &proof_dir.join("workspace"),
             scratch: &proof_dir.join("scratch"),
-            allowed_marker: if os == "macos" {
-                Some(allowed_marker.as_path())
-            } else {
-                None
-            },
             readonly: vec![],
-            denied: if os == "macos" {
-                vec![proof_dir.join("markers/denied")]
-            } else {
-                vec![]
-            },
+            denied: vec![],
             rust: None,
             list_parents: false,
         })
@@ -1924,6 +1914,20 @@ fn multiline_records_validate_and_dry_run_evidence_is_required() {
             .unwrap()
             .notes
             .is_empty());
+        #[cfg(target_os = "macos")]
+        {
+            let controls = record.enforced.clone();
+            record
+                .enforced
+                .retain(|c| c != "launchd_resource_coalition");
+            record.enforced.push("survivor_sweep".into());
+            omgs::proof::write(&dir, &record).unwrap();
+            assert!(has(
+                &omgs::proof::validate_proofs(&findings, &dir),
+                "launchd_resource_coalition"
+            ));
+            record.enforced = controls;
+        }
         record.enforced.retain(|c| !c.contains("--dry-run"));
         omgs::proof::write(&dir, &record).unwrap();
         assert!(has(
@@ -2019,7 +2023,6 @@ fn check_saved_config_roots(name: &str, cargo_bin: Option<std::path::PathBuf>) {
     let command = omgs::proof::recorded_command(&dir, &record).unwrap();
     let wrapped =
         omgs::sandbox::wrapped_command(os, &command, &record.marker_nonce, record.test.as_deref());
-    let allowed = proof_dir.join("markers/allowed");
     let config = omgs::sandbox::mxc_config(&omgs::sandbox::ConfigInput {
         contract: None,
         os,
@@ -2028,17 +2031,12 @@ fn check_saved_config_roots(name: &str, cargo_bin: Option<std::path::PathBuf>) {
         timeout_ms: record.timeout_ms,
         workspace: &proof_dir.join("workspace"),
         scratch: &proof_dir.join("scratch"),
-        allowed_marker: (os == "macos").then_some(allowed.as_path()),
         readonly: record
             .readable_roots
             .iter()
             .map(std::path::PathBuf::from)
             .collect(),
-        denied: if os == "macos" {
-            vec![proof_dir.join("markers/denied")]
-        } else {
-            vec![]
-        },
+        denied: vec![],
         rust: Some(omgs::sandbox::RustHomes {
             bin: cargo,
             cargo_home: proof_dir.join("scratch").join("cargo-home"),
@@ -2274,10 +2272,7 @@ fn forged_readable_roots_are_rejected_even_with_matching_config_digests() {
     ] {
         record.readable_roots = roots.clone();
         let mut forged = config.clone();
-        let mut readonly = roots;
-        if cfg!(target_os = "macos") {
-            readonly.push(format!("{}/markers/allowed", record.proof_dir));
-        }
+        let readonly = roots;
         forged["filesystem"]["readonlyPaths"] = serde_json::json!(readonly);
         let bytes = serde_json::to_vec(&forged).unwrap();
         record.config_sha256 = omgs::sha256::digest(&bytes);
@@ -2332,7 +2327,6 @@ fn windows_unc_proof_directories_match_writer_and_validator() {
                 timeout_ms: record.timeout_ms,
                 workspace: &workspace,
                 scratch: &scratch,
-                allowed_marker: None,
                 readonly: vec![],
                 denied: vec![],
                 rust: None,
