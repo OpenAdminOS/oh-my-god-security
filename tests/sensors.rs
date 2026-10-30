@@ -1171,3 +1171,41 @@ fn deep_scanner_writes_are_cancelled_and_fully_removed() {
         .unwrap()
         .contains("raw-secret-must-be-discarded"));
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn sensor_output_near_its_cap_survives_launchd_result_transport() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    f.tool("gitleaks", "[]", 0);
+    let baseline = omgs::sensors::read_report(&f.init("small-output"))
+        .unwrap()
+        .unwrap();
+    assert!(baseline.tools_run.contains(&"gitleaks".into()));
+    // Exercise the real sensor limits, including its existing deadline. The
+    // wrapper adds a leading newline, START line, separator and END line.
+    let overhead = 1 + "OMGS_START_".len() + 64 + 1 + 1 + "OMGS_END_".len() + 64 + 2 + 1;
+    let cap = 4 * 1024 * 1024;
+    for total in [1024 * 1024, cap - 1, cap, cap + 1] {
+        let output = format!("[]{}", " ".repeat(total - overhead - 2));
+        f.tool("gitleaks", &output, 0);
+        let report = omgs::sensors::read_report(&f.init(&format!("output-{total}")))
+            .unwrap()
+            .unwrap();
+        if total <= cap {
+            assert_eq!(report, baseline, "total={total}");
+        } else {
+            assert!(!report.tools_run.contains(&"gitleaks".into()));
+            assert!(
+                report
+                    .gaps
+                    .iter()
+                    .any(|gap| gap.starts_with("gitleaks:") && gap.contains("output incomplete")),
+                "{:?}",
+                report.gaps
+            );
+        }
+    }
+}

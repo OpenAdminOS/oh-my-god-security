@@ -177,7 +177,12 @@ fn protected(path: &Path, home: &Path, grant: bool) -> bool {
     }
     false
 }
-fn inspect_with_home(path: &Path, grant: bool, home: &Path) -> io::Result<()> {
+fn inspect_with_home(
+    path: &Path,
+    grant: bool,
+    home: &Path,
+    volume: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -220,14 +225,20 @@ fn inspect_with_home(path: &Path, grant: bool, home: &Path) -> io::Result<()> {
     if protected(&resolved, home, grant) {
         return Err(refuse("resolved path is protected"));
     }
-    local_internal_volume(&canonical).map_err(|e| refuse(&e.to_string()))
+    volume(&canonical).map_err(|e| refuse(&e.to_string()))
 }
 fn inspect(path: &Path, grant: bool) -> io::Result<()> {
-    inspect_with_home(path, grant, &system_home()?)
+    inspect_with_home(path, grant, &system_home()?, &mut local_internal_volume)
 }
 /// Call before creating proof storage or submitting any launchd job.
 pub fn admit_path(path: &Path) -> io::Result<()> {
-    inspect(path, false)
+    admit_path_with_volume(path, &mut local_internal_volume)
+}
+pub(crate) fn admit_path_with_volume(
+    path: &Path,
+    volume: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    inspect_with_home(path, false, &system_home()?, volume)
 }
 /// A grant must not include a protected directory either directly or as a child.
 pub(crate) fn admit_grant(path: &Path) -> io::Result<()> {
@@ -323,10 +334,15 @@ mod tests {
         std::os::unix::fs::symlink(home.join("Desktop"), &alias).unwrap();
         // The synthetic home is entirely in local temp storage. No real
         // protected folder is read, even to test refusal of an alias.
-        assert!(inspect_with_home(&alias.join("new-run"), false, &home)
-            .unwrap_err()
-            .to_string()
-            .contains("resolved path is protected"));
+        assert!(inspect_with_home(
+            &alias.join("new-run"),
+            false,
+            &home,
+            &mut local_internal_volume
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("resolved path is protected"));
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

@@ -356,18 +356,42 @@ pub(crate) fn cleanup(result: &mut Supervised) -> bool {
     }
 }
 
+const CONTROL_BYTES: u64 = 4 * 1024 * 1024;
+
+fn result_bytes(limits: &Limits) -> io::Result<u64> {
+    // For each captured byte, JSON needs at most six bytes in each of output
+    // and stdout (escaping controls also bounds lossy UTF-8), and four in the
+    // stdout_bytes array (three decimal digits plus a comma). Keep the existing
+    // control budget for status, notes, survivor commands and field names.
+    u64::try_from(limits.output_cap_bytes)
+        .ok()
+        .and_then(|cap| cap.checked_mul(16))
+        .and_then(|bytes| bytes.checked_add(CONTROL_BYTES))
+        .ok_or_else(|| io::Error::other("result IPC bound overflow"))
+}
 fn read<T: DeserializeOwned>(dir: &Path, name: &str) -> io::Result<T> {
-    let bytes = platform::read_private_bounded_in(dir, Path::new(name), 4 * 1024 * 1024)?;
+    read_bounded(dir, name, CONTROL_BYTES)
+}
+fn read_bounded<T: DeserializeOwned>(dir: &Path, name: &str, limit: u64) -> io::Result<T> {
+    crate::tcc::admit_path(&dir.join(name))?;
+    let bytes = platform::read_private_bounded_in(dir, Path::new(name), limit)?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
 }
 fn write<T: Serialize>(dir: &Path, name: &str, value: &T) -> io::Result<()> {
+    crate::tcc::admit_path(&dir.join(name))?;
+    crate::tcc::admit_path(&dir.join(format!("{name}.tmp")))?;
     platform::write_private_new(
         &dir.join(format!("{name}.tmp")),
         &serde_json::to_vec(value)?,
     )?;
     std::fs::rename(dir.join(format!("{name}.tmp")), dir.join(name))
 }
+fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    crate::tcc::admit_path(path)?;
+    platform::write_private_new(path, bytes)
+}
 fn lock(dir: &Path, create: bool) -> io::Result<File> {
+    crate::tcc::admit_path(&dir.join("owner"))?;
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -412,12 +436,47 @@ fn admit_private_data_location(data: &Path) -> io::Result<()> {
 fn root() -> io::Result<PathBuf> {
     let data =
         platform::data_dir().ok_or_else(|| io::Error::other("OMGS data directory unavailable"))?;
-    admit_private_data_location(&data)?;
-    crate::tcc::admit_path(&data)?;
-    platform::create_private_tree(&data)?;
+    root_with(&data, &mut crate::tcc::admit_path)
+}
+fn root_with(data: &Path, admit: &mut impl FnMut(&Path) -> io::Result<()>) -> io::Result<PathBuf> {
+    admit_private_data_location(data)?;
+    admit(data)?;
+    platform::create_private_tree(data)?;
     let root = data.join("launchd");
+    // A child can be a mount point even when its parent volume was admitted.
+    admit(&root)?;
     platform::create_private_tree(&root)?;
+    admit(&root)?;
     Ok(root)
+}
+
+fn admit_job_storage(dir: &Path) -> io::Result<()> {
+    admit_job_storage_with(dir, &mut crate::tcc::admit_path)
+}
+fn admit_job_storage_with(
+    dir: &Path,
+    admit: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    admit(dir)?; // Also the anchor's working directory, HOME and TMPDIR.
+    for name in [
+        "owner",
+        "omgs",
+        "job.plist",
+        "request",
+        "domain",
+        "ready",
+        "compatible",
+        "start",
+        "result",
+        "error",
+        "cancel",
+        "orphan",
+        "release",
+    ] {
+        admit(&dir.join(name))?;
+        admit(&dir.join(format!("{name}.tmp")))?;
+    }
+    Ok(())
 }
 
 fn domain() -> String {
@@ -499,6 +558,7 @@ fn remove_job(dir: &Path) -> io::Result<()> {
 /// Recover only nonce directories admitted under the owner-private data root.
 /// A held owner lock excludes every active independent invocation.
 fn registry(root: &Path) -> io::Result<File> {
+    crate::tcc::admit_path(&root.join("registry"))?;
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -519,6 +579,23 @@ fn registry(root: &Path) -> io::Result<File> {
         std::thread::sleep(POLL);
     }
 }
+fn reclaim_unpublished(dir: &Path) -> io::Result<()> {
+    match std::fs::remove_dir(dir) {
+        Ok(()) => Ok(()),
+        // A published job can retire outside the registry lock. Preserve its
+        // remaining state, or accept that it already removed the directory.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+// The registry lock must span recovery and directory/owner publication.
 fn recover(root: &Path, api: &Api) -> io::Result<()> {
     let boot = boot_id()?;
     for entry in std::fs::read_dir(root)? {
@@ -526,17 +603,25 @@ fn recover(root: &Path, api: &Api) -> io::Result<()> {
         if dir.file_name() == Some(OsStr::new("registry")) {
             continue;
         }
+        crate::tcc::admit_path(&dir)?;
         match platform::check_private_dir(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         }
         label(&dir)?;
+        admit_job_storage(&dir)?;
         let _lock = match lock(&dir, false) {
             Ok(lock) => lock,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            // Creation has not yet published the owner file.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            // Publication holds the registry lock across mkdir and owner
+            // creation. With that lock held, an empty ownerless directory can
+            // only be abandoned. Nonempty state may belong to a concurrently
+            // retiring job and must remain intact.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                reclaim_unpublished(&dir)?;
+                continue;
+            }
             Err(e) => return Err(e),
         };
         if let Ok(ready) = read::<Ready>(&dir, "ready") {
@@ -550,10 +635,10 @@ fn recover(root: &Path, api: &Api) -> io::Result<()> {
         // Taking the abandoned lock also tells its anchor that the owner is gone
         // through the explicit cancellation file, even while recovery owns it.
         if !dir.join("orphan").exists() {
-            platform::write_private_new(&dir.join("orphan"), b"")?;
+            write_file(&dir.join("orphan"), b"")?;
         }
         if !dir.join("cancel").exists() {
-            platform::write_private_new(&dir.join("cancel"), b"")?;
+            write_file(&dir.join("cancel"), b"")?;
         }
         let start = Instant::now();
         while start.elapsed() < STARTUP {
@@ -655,6 +740,7 @@ fn verify_copy(source: &mut File, staged: &mut File, before: &std::fs::Metadata)
 fn stage_binary(source: &Path, target: &Path) -> io::Result<()> {
     use std::io::{Read, Write};
     use std::os::unix::fs::OpenOptionsExt;
+    crate::tcc::admit_path(target)?;
     let mut source = File::open(source)?;
     let before = source.metadata()?;
     if !before.is_file() {
@@ -693,6 +779,7 @@ pub(crate) fn run(
     let started = Instant::now();
     let mut workload_started: Option<Instant> = None;
     let result = (|| -> io::Result<Supervised> {
+        let result_limit = result_bytes(limits)?;
         let api = Api::load()?;
         let cwd = cmd
             .get_current_dir()
@@ -713,7 +800,9 @@ pub(crate) fn run(
         let registry_guard = registry(&root)?;
         recover(&root, &api)?;
         let dir = root.join(platform::random_nonce()?);
+        admit_job_storage(&dir)?;
         platform::create_private_dir_new(&dir)?;
+        admit_job_storage(&dir)?;
         let owner = lock(&dir, true)?;
         drop(registry_guard);
         let mut job = Job {
@@ -786,9 +875,10 @@ pub(crate) fn run(
             xml(&directory),
             environment
         );
-        platform::write_private_new(&job.dir.join("job.plist"), plist.as_bytes())?;
+        write_file(&job.dir.join("job.plist"), plist.as_bytes())?;
         let domain = domain();
         write(&job.dir, "domain", &domain)?;
+        admit_job_storage(&job.dir)?;
         job.submitted = true;
         launchctl(&[
             OsStr::new("bootstrap"),
@@ -812,7 +902,7 @@ pub(crate) fn run(
                 timed_out = true;
             }
             if (interrupted || timed_out) && !cancel_sent {
-                platform::write_private_new(&job.dir.join("cancel"), b"")?;
+                write_file(&job.dir.join("cancel"), b"")?;
                 cancel_sent = true;
             }
             if let Ok(error) = read::<String>(&job.dir, "error") {
@@ -838,12 +928,12 @@ pub(crate) fn run(
                     // This timestamp only bounds a lost anchor response; cleanup
                     // keeps its independent grace. Deadline covers preparation.
                     workload_started = Some(Instant::now());
-                    platform::write_private_new(&job.dir.join("start"), b"")?;
+                    write_file(&job.dir.join("start"), b"")?;
                     ready = Some(r);
                 }
             }
             if job.dir.join("result").exists() {
-                let mut result: Supervised = read(&job.dir, "result")?;
+                let mut result: Supervised = read_bounded(&job.dir, "result", result_limit)?;
                 let r = ready
                     .as_ref()
                     .ok_or_else(|| io::Error::other("anchor result without admission"))?;
@@ -919,7 +1009,7 @@ struct Job {
 }
 impl Job {
     fn finish(&mut self, api: &Api, ready: &Ready) -> io::Result<()> {
-        platform::write_private_new(&self.dir.join("release"), b"")?;
+        write_file(&self.dir.join("release"), b"")?;
         let start = Instant::now();
         while !empty(api, ready.coalition)? {
             if start.elapsed() >= STARTUP {
@@ -935,7 +1025,7 @@ impl Job {
 impl Drop for Job {
     fn drop(&mut self) {
         if self.submitted {
-            let _ = platform::write_private_new(&self.dir.join("cancel"), b"");
+            let _ = write_file(&self.dir.join("cancel"), b"");
             // Bootout can kill the anchor. Recover by the already published ID,
             // never by a label-derived PID or a same-user process scan.
             if let (Ok(api), Ok(ready)) = (Api::load(), read::<Ready>(&self.dir, "ready")) {
@@ -972,6 +1062,7 @@ pub fn anchor(dir: &Path) -> io::Result<()> {
         ));
     }
     label(dir)?;
+    admit_job_storage(dir)?;
     let outcome = (|| -> io::Result<()> {
         let api = Api::load()?;
         let req: Request = read(dir, "request")?;
@@ -1025,7 +1116,7 @@ pub fn anchor(dir: &Path) -> io::Result<()> {
         if api.active(id)? != 1 {
             return Err(io::Error::other("coalition exit accounting check failed"));
         }
-        platform::write_private_new(&dir.join("compatible"), b"")?;
+        write_file(&dir.join("compatible"), b"")?;
         let start = Instant::now();
         while !dir.join("start").exists() {
             if owner_gone(dir) || dir.join("cancel").exists() || start.elapsed() >= STARTUP {
@@ -1127,6 +1218,101 @@ mod tests {
         }
     }
     #[test]
+    fn actual_registry_and_job_volumes_are_admitted() {
+        let data = supervise::capture_root()
+            .unwrap()
+            .join(format!("mount-test-{}", platform::random_nonce().unwrap()));
+        platform::create_private_dir_new(&data).unwrap();
+        let root = data.join("launchd");
+        platform::create_private_dir_new(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let data = data.canonicalize().unwrap();
+        let mut checked = Vec::new();
+        let mut reject_mount = |mount: &Path| {
+            checked.push(mount.to_path_buf());
+            if mount == root {
+                Err(io::Error::other("injected external child volume"))
+            } else {
+                Ok(())
+            }
+        };
+        let error = root_with(&data, &mut |path| {
+            crate::tcc::admit_path_with_volume(path, &mut reject_mount)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("external child volume"));
+        assert_eq!(checked, [data.clone(), root.clone()]);
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+
+        let dir = root.join(platform::random_nonce().unwrap());
+        platform::create_private_dir_new(&dir).unwrap();
+        // Model mounts on the working directory and on individual existing
+        // leaves. No real external storage or protected folder is accessed.
+        for leaf in ["", "omgs", "job.plist", "request", "result", "result.tmp"] {
+            let rejected = if leaf.is_empty() {
+                dir.clone()
+            } else {
+                dir.join(leaf)
+            };
+            if !leaf.is_empty() {
+                platform::write_private_new(&rejected, b"").unwrap();
+            }
+            let error = admit_job_storage_with(&dir, &mut |path| {
+                crate::tcc::admit_path_with_volume(path, &mut |existing| {
+                    if existing == rejected {
+                        Err(io::Error::other("injected external job volume"))
+                    } else {
+                        Ok(())
+                    }
+                })
+            })
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("external job volume"),
+                "{leaf}: {error}"
+            );
+            if !leaf.is_empty() {
+                std::fs::remove_file(rejected).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(data).unwrap();
+    }
+    #[test]
+    fn recovery_reclaims_unpublished_ownerless_directories_and_spares_live_jobs() {
+        let root = supervise::capture_root()
+            .unwrap()
+            .join(format!("owner-test-{}", platform::random_nonce().unwrap()));
+        platform::create_private_dir_new(&root).unwrap();
+        let guard = registry(&root).unwrap();
+        let abandoned = root.join(platform::random_nonce().unwrap());
+        let live = root.join(platform::random_nonce().unwrap());
+        platform::create_private_dir_new(&abandoned).unwrap();
+        platform::create_private_dir_new(&live).unwrap();
+        let owner = lock(&live, true).unwrap();
+        let api = Api::load().unwrap();
+        recover(&root, &api).unwrap();
+        assert!(!abandoned.exists());
+        assert!(live.join("owner").exists());
+        assert!(!live.join("cancel").exists());
+        assert!(!live.join("orphan").exists());
+        // Cleanup can unlink a live job's owner before its other files or
+        // directory. That state must not block a concurrent invocation.
+        platform::create_private_dir_new(&abandoned).unwrap();
+        platform::write_private_new(&abandoned.join("request"), b"evidence").unwrap();
+        recover(&root, &api).unwrap();
+        assert_eq!(
+            std::fs::read(abandoned.join("request")).unwrap(),
+            b"evidence"
+        );
+        // Also cover disappearance after enumeration but before reclamation.
+        reclaim_unpublished(&root.join(platform::random_nonce().unwrap())).unwrap();
+        assert!(live.join("owner").exists());
+        assert!(!live.join("cancel").exists());
+        drop(owner);
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn rolling_chain_and_empty_enumeration_cannot_substitute_for_the_count() {
         for listed in [false, true] {
             let mut chain = Chain {
@@ -1180,7 +1366,10 @@ mod tests {
             },
         )
         .unwrap();
+        let guard = registry(&root).unwrap();
         recover(&root, &Api::load().unwrap()).unwrap();
+        drop(guard);
+        std::fs::remove_file(root.join("registry")).unwrap();
         assert!(!dir.exists());
         std::fs::remove_dir(root).unwrap();
     }
