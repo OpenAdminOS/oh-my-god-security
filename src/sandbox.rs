@@ -1655,18 +1655,22 @@ mod tests {
     fn rust_layouts_round_trip_staging_and_proof_validation_without_host_discovery() {
         const CHILD: &str = "OMGS_TEST_RUST_LAYOUT_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            for home in [
-                None,
-                Some(""),
-                Some("relative-home"),
-                Some("/omgs-fixture-home"),
+            let absolute = platform::temp_root()
+                .unwrap()
+                .join(format!("omgs-rust-layouts-home-{}", std::process::id()));
+            let absolute_home = absolute.join("host-home");
+            for (home, discovered) in [
+                (None, "0"),
+                (Some(""), "0"),
+                (Some("relative-home"), "0"),
+                (absolute_home.to_str(), "1"),
             ] {
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap());
                 child.args([
                     "--exact",
                     "sandbox::tests::rust_layouts_round_trip_staging_and_proof_validation_without_host_discovery",
                     "--nocapture",
-                ]).env(CHILD, "1").env_remove("HOME");
+                ]).env(CHILD, discovered).env_remove("HOME");
                 if let Some(home) = home {
                     child.env("HOME", home);
                 }
@@ -1678,13 +1682,22 @@ mod tests {
                     String::from_utf8_lossy(&output.stderr)
                 );
             }
+            let _ = std::fs::remove_dir_all(absolute);
             return;
         }
+        // Discovery decides whether HOME contributes roots: missing, empty and
+        // relative values must yield none, an absolute one its Rust roots.
+        let discovered = platform::home();
+        assert_eq!(
+            discovered.is_some(),
+            std::env::var(CHILD).unwrap() == "1",
+            "{discovered:?}"
+        );
         let dir = platform::temp_root()
             .unwrap()
             .join(format!("omgs-rust-layouts-{}", std::process::id()));
         platform::create_private_tree(&dir).unwrap();
-        let home = dir.join("host-home");
+        let home = discovered.clone().unwrap_or_else(|| dir.join("host-home"));
         for sub in ["bin", "registry", "git"] {
             std::fs::create_dir_all(home.join(".cargo").join(sub)).unwrap();
         }
@@ -1693,10 +1706,8 @@ mod tests {
             std::fs::write(home.join(".cargo").join(name), b"host secret").unwrap();
         }
         let brew_bin = PathBuf::from(HOMEBREW_RUSTUP_BIN);
-        // Model discovery's admitted roots for present and unavailable HOME.
-        // Missing, empty and relative HOME all produce None in platform::home.
         // Subprocesses isolate HOME changes; no installed Rust tools are needed.
-        for has_home in [false, true] {
+        for has_home in [discovered.is_some()] {
             for layout in ["cargo", "homebrew", "both"] {
                 let run = dir.join(format!("{layout}-{has_home}"));
                 let proof_dir = run.join("proofs/1");
@@ -1712,7 +1723,7 @@ mod tests {
                     stage: None,
                     expected_tree_sha256: None,
                 };
-                let readonly: Vec<_> = toolchain_roots("macos", has_home.then_some(home.as_path()))
+                let readonly: Vec<_> = toolchain_roots("macos", discovered.as_deref())
                     .into_iter()
                     .filter(|p| {
                         if p == &brew_bin {
