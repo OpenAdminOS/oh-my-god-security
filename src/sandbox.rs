@@ -300,6 +300,7 @@ pub fn toolchain_roots(os: &str, home: Option<&Path>) -> Vec<PathBuf> {
             "/opt/homebrew/bin".into(),
             "/opt/homebrew/lib".into(),
             "/opt/homebrew/opt".into(),
+            HOMEBREW_RUSTUP_BIN.into(),
             "/opt/homebrew/Cellar".into(),
             "/opt/homebrew/share".into(),
             "/opt/homebrew/include".into(),
@@ -330,10 +331,11 @@ pub fn toolchain_roots(os: &str, home: Option<&Path>) -> Vec<PathBuf> {
 }
 
 const RUST_CACHES: [&str; 2] = ["registry", "git"];
+pub(crate) const HOMEBREW_RUSTUP_BIN: &str = "/opt/homebrew/opt/rustup/bin";
 
 /// Rust locations for the sandboxed environment.
 pub struct RustHomes {
-    /// The real `~/.cargo/bin`, put first on PATH.
+    /// The admitted Rust proxy directory, put first on PATH.
     pub bin: PathBuf,
     /// A per-run CARGO_HOME in scratch, linking to the readable caches.
     pub cargo_home: PathBuf,
@@ -1192,7 +1194,11 @@ fn stage_workspace(
     }
     let home = platform::home();
     let rust = match home.as_ref().map(|h| h.join(".cargo")) {
-        Some(cargo) if readonly.contains(&cargo.join("bin")) => {
+        Some(cargo)
+            if readonly.contains(&cargo.join("bin"))
+                || cfg!(target_os = "macos")
+                    && readonly.contains(&PathBuf::from(HOMEBREW_RUSTUP_BIN)) =>
+        {
             let cargo_home = scratch.join("cargo-home");
             std::fs::create_dir_all(&cargo_home).map_err(|e| e.to_string())?;
             for sub in RUST_CACHES {
@@ -1203,7 +1209,12 @@ fn stage_workspace(
                 }
             }
             Some(RustHomes {
-                bin: cargo.join("bin"),
+                // Homebrew rustup puts proxies under opt, without ~/.cargo/bin.
+                bin: if readonly.contains(&cargo.join("bin")) {
+                    cargo.join("bin")
+                } else {
+                    HOMEBREW_RUSTUP_BIN.into()
+                },
                 cargo_home,
                 rustup_home: home
                     .map(|h| h.join(".rustup"))
@@ -1627,6 +1638,54 @@ mod tests {
             assert!(!roots.iter().any(|r| Path::new(denied).starts_with(r)));
         }
         assert!(roots.contains(&PathBuf::from("/opt/homebrew/Cellar")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn homebrew_rustup_without_cargo_bin_gets_a_scratch_cargo_home() {
+        let home = platform::home().unwrap();
+        let dir = platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-homebrew-rustup-{}", std::process::id()));
+        let req = ProveRequest {
+            expect_marker: None,
+            command: "cargo run --offline".into(),
+            test: None,
+            timeout_ms: 1000,
+            target: None,
+            run_dir: dir.clone(),
+            tier: Tier::Test,
+            stage: None,
+            expected_tree_sha256: None,
+        };
+        let scratch = dir.join("scratch");
+        let brew_bin = PathBuf::from("/opt/homebrew/opt/rustup/bin");
+        // The runner has Homebrew proxies and ~/.rustup, but no ~/.cargo/bin.
+        let mut readonly = vec![brew_bin.clone(), home.join(".rustup")];
+        readonly.extend(RUST_CACHES.map(|sub| home.join(".cargo").join(sub)));
+        let staged =
+            stage_workspace(&req, &dir.join("workspace"), &scratch, &readonly, "nonce").unwrap();
+        let rust = staged
+            .rust
+            .expect("admitted Homebrew rustup must enable Rust");
+        assert_eq!(rust.bin, brew_bin);
+        assert_eq!(rust.rustup_home, Some(home.join(".rustup")));
+        assert_eq!(rust.cargo_home, scratch.join("cargo-home"));
+        for sub in RUST_CACHES {
+            assert_eq!(
+                std::fs::read_link(rust.cargo_home.join(sub)).unwrap(),
+                home.join(".cargo").join(sub)
+            );
+        }
+        assert!(!rust.cargo_home.join("config.toml").exists());
+        assert!(!rust.cargo_home.join("credentials.toml").exists());
+        let env = environment("macos", scratch.to_str().unwrap(), Some(&rust), "");
+        assert!(env
+            .iter()
+            .any(|v| v.starts_with(&format!("PATH={}:", brew_bin.display()))));
+        assert!(env.contains(&format!("RUSTUP_HOME={}", home.join(".rustup").display())));
+        assert!(toolchain_roots("macos", Some(&home)).contains(&brew_bin));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -726,7 +726,13 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
     let cargo_bin = record
         .readable_roots
         .iter()
-        .find(|p| norm(p).ends_with("/.cargo/bin"));
+        .find(|p| norm(p).ends_with("/.cargo/bin"))
+        .or_else(|| {
+            record
+                .readable_roots
+                .iter()
+                .find(|p| os == "macos" && p.as_str() == crate::sandbox::HOMEBREW_RUSTUP_BIN)
+        });
     let rust = cargo_bin.map(|bin| crate::sandbox::RustHomes {
         bin: PathBuf::from(bin),
         cargo_home: path_at("scratch/cargo-home"),
