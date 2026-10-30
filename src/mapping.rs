@@ -101,14 +101,88 @@ pub fn unit_errors(u: &Unit) -> Vec<String> {
     errors
 }
 
-fn normalized_scope(scope: &str) -> String {
+fn normalized_scope(scope: &str, root: Option<&Path>) -> Result<String, String> {
     let (path, operation) = scope.split_once('#').unwrap_or((scope, ""));
-    let mut normalized = crate::paths::display(Path::new(path));
+    let mut normalized = if let Some(root) = root {
+        canonical_scope_path(root, Path::new(path))?
+    } else {
+        let path = crate::paths::display(Path::new(path));
+        // Legacy ledgers lack a target root. Fail conservatively on platforms
+        // commonly using case-insensitive volumes until regenerated with context.
+        if cfg!(any(target_os = "macos", windows)) {
+            path.to_lowercase()
+        } else {
+            path
+        }
+    };
     if scope.contains('#') {
         normalized.push('#');
         normalized.push_str(operation);
     }
-    normalized
+    Ok(normalized)
+}
+
+// Resolve each component using the target filesystem, rather than realpath's
+// caller-supplied casing on APFS. Exact names on case-sensitive volumes remain
+// distinct. Directory scopes and operation suffixes retain their hierarchy.
+fn canonical_scope_path(root: &Path, path: &Path) -> Result<String, String> {
+    if !root.is_absolute() || !crate::paths::safe_relative(path) {
+        return Err("scope target and relative path are invalid".into());
+    }
+    let mut current = root.to_path_buf();
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        let requested = current.join(name);
+        let entries: Vec<_> = std::fs::read_dir(&current)
+            .map_err(|_| "scope target directory is unavailable")?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<_, _>>()
+            .map_err(|_| "scope target entry is unavailable")?;
+        let name = scope_component(name, &entries, |entry| {
+            same_object(&requested, &current.join(entry))
+        })
+        .ok_or("scope path is absent from target")?;
+        current.push(&name);
+        relative.push(name);
+    }
+    Ok(crate::paths::display(&relative))
+}
+
+fn scope_component(
+    requested: &std::ffi::OsStr,
+    entries: &[std::ffi::OsString],
+    equivalent: impl Fn(&std::ffi::OsStr) -> bool,
+) -> Option<std::ffi::OsString> {
+    entries
+        .iter()
+        .find(|entry| entry.as_os_str() == requested)
+        .or_else(|| entries.iter().find(|entry| equivalent(entry)))
+        .cloned()
+}
+
+fn same_object(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        a == b
+    }
 }
 
 fn overlap(a: &str, b: &str) -> bool {
@@ -121,6 +195,14 @@ fn overlap(a: &str, b: &str) -> bool {
 /// invalid residual. Closed checklists require fully reconciled children.
 pub fn partition_errors(ledger: &Ledger) -> Vec<String> {
     let mut errors = Vec::new();
+    let root = ledger
+        .extra
+        .get("scope_root")
+        .and_then(Value::as_str)
+        .map(Path::new);
+    if ledger.extra.contains_key("scope_root") && root.is_none() {
+        errors.push("scope_root must be an absolute target path".into());
+    }
     let index: BTreeMap<_, _> = ledger.units.iter().map(|u| (u.id.as_str(), u)).collect();
     let mut edges: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut owners: BTreeMap<(String, &str), &str> = BTreeMap::new();
@@ -188,7 +270,13 @@ pub fn partition_errors(ledger: &Ledger) -> Vec<String> {
                     }
                     if let Some(scopes) = scopes {
                         for scope in scopes.iter().filter_map(Value::as_str) {
-                            let scope = normalized_scope(scope);
+                            let scope = match normalized_scope(scope, root) {
+                                Ok(scope) => scope,
+                                Err(e) => {
+                                    errors.push(format!("{id}: {e}"));
+                                    continue;
+                                }
+                            };
                             for class in &child.attack_classes {
                                 for ((prior_scope, prior_class), prior_id) in &owners {
                                     if *prior_id != id
@@ -301,4 +389,28 @@ pub fn apply_metadata(unit: &mut Unit, text: &str) -> Result<(), String> {
         unit.extra.insert(key.clone(), value.clone());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn case_sensitive_comparison_preserves_distinct_inventory_names() {
+        let entries = vec!["decision.ts".into(), "DECISION.ts".into()];
+        for name in ["decision.ts", "DECISION.ts"] {
+            let result = scope_component(std::ffi::OsStr::new(name), &entries, |entry| {
+                entry == std::ffi::OsStr::new(name)
+            });
+            assert_eq!(result.unwrap(), std::ffi::OsStr::new(name));
+        }
+        let entries = vec!["decision.ts".into()];
+        assert!(
+            scope_component(std::ffi::OsStr::new("DECISION.ts"), &entries, |_| false).is_none()
+        );
+        assert_eq!(
+            scope_component(std::ffi::OsStr::new("DECISION.ts"), &entries, |_| true).unwrap(),
+            std::ffi::OsStr::new("decision.ts")
+        );
+    }
 }

@@ -4,6 +4,7 @@
   "type": "object",
   "required": ["units"],
   "properties": {
+    "scope_root": {"type": "string", "description": "Absolute target root used to resolve filesystem spelling of scope paths. Unavailable paths fail mapping validation; legacy ledgers compare conservatively on macOS and Windows."},
     "units": {
       "type": "array",
       "items": {

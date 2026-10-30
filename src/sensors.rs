@@ -11,8 +11,8 @@ pub struct SensorHit {
     pub fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<PackageIdentity>,
-    /// Digest of the scanner occurrence, including its span and match data.
-    /// Raw match data is never retained. Absent on legacy artifacts.
+    /// Position identity, or an opaque identity authenticated with an ephemeral key.
+    /// Neither raw match data nor the key is retained. Absent on legacy artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurrence: Option<String>,
     /// Safe provenance only. Indices refer to the ordered normalized input
@@ -104,7 +104,7 @@ use crate::platform::which;
 
 /// Run deterministic sensor tools against source text. Sensors never execute
 /// target code. Raw scanner output can contain matched secret values, so only
-/// rule, file, line and occurrence digests are retained; the raw report is deleted.
+/// rule, file, line and opaque occurrence identities are retained; the raw report is deleted.
 pub fn run_sensors(target: &Path, artifacts: &Path) -> SensorsReport {
     let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
     let target = target.as_path();
@@ -136,6 +136,12 @@ pub fn parse_semgrep(text: &str, target: &Path, report: &mut SensorsReport) {
     let Some(results) = value.get("results").and_then(|r| r.as_array()) else {
         return;
     };
+    let Ok(mut key) = OccurrenceKey::new() else {
+        report
+            .gaps
+            .push("semgrep: occurrence randomness unavailable".into());
+        return;
+    };
     for item in results {
         let file = item
             .get("path")
@@ -153,20 +159,97 @@ pub fn parse_semgrep(text: &str, target: &Path, report: &mut SensorsReport) {
                 .and_then(|v| v.as_u64()),
             target,
         ) {
-            identify_occurrence(&mut hit, item);
+            key.identify(&mut hit, item);
             report.hits.push(hit);
         }
     }
 }
 
-// Hash the complete occurrence conservatively: any differing scanner match,
-// column, span or metadata keeps separate accountability. Exact repeats merge.
-fn identify_occurrence(hit: &mut SensorHit, item: &serde_json::Value) {
-    hit.occurrence = Some(crate::sha256::digest(&serde_json::to_vec(item).unwrap()));
-    hit.fingerprint = hit_fingerprint(hit);
+// Some scanners omit columns, and conflicting records can share a span.
+// Authenticate the complete record to keep those matches distinct without
+// exposing an offline secret-guessing oracle. A fresh key belongs only to this
+// parser invocation, never to a persisted artifact or process-wide cache.
+struct OccurrenceKey {
+    key: String,
+    positions: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
-/// Identity uses retained metadata and a digest, never persisted match text.
+impl OccurrenceKey {
+    fn new() -> Result<Self, ()> {
+        Ok(Self {
+            key: crate::platform::random_nonce().map_err(|_| ())?,
+            positions: Default::default(),
+        })
+    }
+
+    fn identify(&mut self, hit: &mut SensorHit, item: &serde_json::Value) {
+        // Only numeric coordinates may contribute to a public position identity.
+        let pointers: &[&str] = match hit.tool.as_str() {
+            "semgrep" => &[
+                "/start/col",
+                "/start/offset",
+                "/end/line",
+                "/end/col",
+                "/end/offset",
+            ],
+            "gitleaks" => &["/StartColumn", "/EndLine", "/EndColumn"],
+            _ => &["/SourceMetadata/Data/Filesystem/column"],
+        };
+        let coordinates: Vec<_> = pointers
+            .iter()
+            .map(|p| item.pointer(p).and_then(serde_json::Value::as_u64))
+            .collect();
+        let position = crate::sha256::digest(
+            &serde_json::to_vec(&(
+                "position-v2",
+                &hit.tool,
+                &hit.rule,
+                &hit.file,
+                hit.line,
+                &coordinates,
+            ))
+            .unwrap(),
+        );
+        let record = serde_json::to_string(item).unwrap();
+        let records = self.positions.entry(position.clone()).or_default();
+        if let Some(identity) = records.get(&record) {
+            hit.occurrence = Some(identity.clone());
+            hit.fingerprint = hit_fingerprint(hit);
+            return;
+        }
+        if records.is_empty()
+            && coordinates
+                .first()
+                .is_some_and(|c| c.is_some_and(|n| n > 0))
+        {
+            records.insert(record, position.clone());
+            hit.occurrence = Some(position);
+            hit.fingerprint = hit_fingerprint(hit);
+            return;
+        }
+        // Missing coordinates or conflicting matches at the same position
+        // require a secret-independent key. Records stay only in scan memory.
+        // HMAC-SHA-256, RFC 2104. random_nonce supplies a 64-byte ASCII key.
+        let mut inner_pad = [0x36u8; 64];
+        let mut outer_pad = [0x5cu8; 64];
+        for (i, byte) in self.key.bytes().enumerate() {
+            inner_pad[i] ^= byte;
+            outer_pad[i] ^= byte;
+        }
+        let mut inner = crate::sha256::Sha256::new();
+        inner.update(&inner_pad);
+        inner.update(b"omgs-occurrence-v2\0");
+        inner.update(record.as_bytes());
+        let mut outer = crate::sha256::Sha256::new();
+        outer.update(&outer_pad);
+        outer.update(&inner.finish());
+        hit.occurrence = Some(crate::sha256::hex(&outer.finish()));
+        records.insert(record, hit.occurrence.clone().unwrap());
+        hit.fingerprint = hit_fingerprint(hit);
+    }
+}
+
+/// Identity uses retained metadata and an opaque occurrence, never match text.
 pub fn hit_fingerprint(hit: &SensorHit) -> String {
     let identity = if let Some(package) = &hit.package {
         serde_json::to_vec(&(&hit.tool, &hit.rule, &hit.file, hit.line, package)).unwrap()
@@ -242,6 +325,7 @@ fn metadata_hit(
 /// TruffleHog emits JSON objects separated by newlines. An empty stream is a
 /// valid zero-hit scan, but any non-JSON line or missing identity aborts it.
 fn trufflehog_hits(output: &str, target: &Path) -> Result<Vec<SensorHit>, ()> {
+    let mut key = OccurrenceKey::new()?;
     let mut hits = Vec::new();
     for line in output.lines().filter(|l| !l.trim().is_empty()) {
         let v = crate::shape::strict_json(line).map_err(|_| ())?;
@@ -270,7 +354,7 @@ fn trufflehog_hits(output: &str, target: &Path) -> Result<Vec<SensorHit>, ()> {
             return Err(());
         }
         let mut hit = metadata_hit("trufflehog", rule, file, Some(line), target)?;
-        identify_occurrence(&mut hit, &v);
+        key.identify(&mut hit, &v);
         hits.push(hit);
     }
     Ok(hits)
@@ -509,6 +593,7 @@ fn simple_hits(tool: &str, output: &str, target: &Path) -> Result<Vec<SensorHit>
     } else {
         array(&v)?
     };
+    let mut key = OccurrenceKey::new()?;
     let mut hits = Vec::new();
     for item in items {
         let (rule, file, line) = if tool == "semgrep" {
@@ -527,7 +612,7 @@ fn simple_hits(tool: &str, output: &str, target: &Path) -> Result<Vec<SensorHit>
         // Semgrep paths in the disposable copy are returned relative to the
         // scan root by requesting a relative target from that copy's parent.
         let mut hit = metadata_hit(tool, rule, file, Some(line), target)?;
-        identify_occurrence(&mut hit, item);
+        key.identify(&mut hit, item);
         hits.push(hit);
     }
     Ok(hits)
@@ -738,6 +823,29 @@ mod offline_tests {
                 &mut ledger,
             );
             assert_eq!(ledger.units.len(), 3);
+        }
+    }
+
+    #[test]
+    fn positioned_identity_is_independent_of_short_secret_guesses() {
+        for tool in ["gitleaks", "semgrep", "trufflehog"] {
+            let mut expected = None;
+            for guess in ["0000", "0427", "9999"] {
+                let item = match tool {
+                    "gitleaks" => json!({"StartColumn":1,"EndColumn":8,"Secret":guess}),
+                    "semgrep" => json!({"start":{"col":1},"end":{"col":8},"extra":{"lines":guess}}),
+                    _ => json!({"SourceMetadata":{"Data":{"Filesystem":{"column":1}}},"Raw":guess}),
+                };
+                let mut hit =
+                    metadata_hit(tool, "fixture", "src/app.rs", Some(2), Path::new("/target"))
+                        .unwrap();
+                OccurrenceKey::new().unwrap().identify(&mut hit, &item);
+                if let Some(expected) = &expected {
+                    assert_eq!(&hit, expected);
+                } else {
+                    expected = Some(hit);
+                }
+            }
         }
     }
 

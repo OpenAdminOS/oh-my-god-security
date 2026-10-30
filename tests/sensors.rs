@@ -1317,3 +1317,77 @@ fn additional_b_repeated_gitleaks_hits_have_one_identity_and_bounded_provenance(
     );
     assert!(!omgs::critic::critique(&l, 1, &[], &Default::default()).passed());
 }
+
+#[test]
+fn short_secret_guesses_cannot_be_confirmed_from_persisted_artifacts() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    // No column forces the ephemeral keyed fallback.
+    let mut hit = json!({"RuleID":"fixture-rule", "File":"src/main.rs", "StartLine":1,
+        "Secret":"0427"});
+    f.tool(
+        "gitleaks",
+        &json!([hit.clone(), hit.clone()]).to_string(),
+        1,
+    );
+    let run = f.init("short-secret");
+    let first = read(&run.join("sensor-hits.json"));
+    assert_eq!(first.as_array().unwrap().len(), 1);
+    assert_eq!(first[0]["duplicate_sources"]["count"], 1);
+    let out = f.cli(&[
+        "report",
+        "--findings",
+        run.join("findings.json").to_str().unwrap(),
+        "--out",
+        run.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fn collect(path: &Path, bytes: &mut Vec<u8>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(&path, bytes);
+            } else {
+                bytes.extend(std::fs::read(path).unwrap());
+                bytes.push(b'\n');
+            }
+        }
+    }
+    let mut bytes = Vec::new();
+    collect(&run, &mut bytes);
+    bytes.extend(out.stdout);
+    bytes.extend(out.stderr);
+    let saved = String::from_utf8_lossy(&bytes);
+    assert!(!saved.contains("\"Secret\":\"0427\""));
+    for guess in 0..10_000 {
+        hit["Secret"] = json!(format!("{guess:04}"));
+        let digest = omgs::sha256::digest(&serde_json::to_vec(&hit).unwrap());
+        assert!(
+            !saved.contains(&digest),
+            "guess {guess} has a persisted oracle"
+        );
+        let old_fingerprint = omgs::sha256::digest(
+            &serde_json::to_vec(&(
+                "occurrence-v1",
+                "gitleaks",
+                "fixture-rule",
+                "src/main.rs",
+                Some(1u64),
+                &digest,
+            ))
+            .unwrap(),
+        );
+        assert!(!saved.contains(&old_fingerprint));
+    }
+    let second = f.init("short-secret-again");
+    assert_ne!(
+        first[0]["occurrence"],
+        read(&second.join("sensor-hits.json"))[0]["occurrence"]
+    );
+}

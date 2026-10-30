@@ -2658,6 +2658,9 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
         units,
         ..Ledger::default()
     };
+    ledger
+        .extra
+        .insert("scope_root".into(), serde_json::json!(target));
     let started_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

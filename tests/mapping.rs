@@ -663,3 +663,32 @@ fn documented_legacy_classes_keep_their_identity() {
         );
     }
 }
+
+#[test]
+fn filesystem_case_aliases_cannot_duplicate_ownership() {
+    let t = Temp::new();
+    let target = t.0.join("target");
+    std::fs::create_dir_all(target.join("src")).unwrap();
+    std::fs::write(target.join("src/decision.ts"), "source").unwrap();
+    let mut parent = unit("stack:node", "covered");
+    parent.extra.insert("child_units".into(), json!(["a", "b"]));
+    let a = unit("a", "covered");
+    let mut b = unit("b", "covered");
+    b.extra
+        .insert("scope_paths".into(), json!(["src/DECISION.ts#GET"]));
+    let mut l = ledger(vec![parent, a, b]);
+    l.extra.insert("scope_root".into(), json!(target));
+    if target.join("src/DECISION.ts").exists() {
+        assert!(has(&validate_ledger(&l), "overlapping ownership"));
+        assert!(!omgs::critic::critique(&l, 1, &[], &Default::default()).passed());
+    } else {
+        // Both names really exist on this case-sensitive comparison path.
+        std::fs::write(target.join("src/DECISION.ts"), "other source").unwrap();
+        assert!(validate_ledger(&l).is_empty(), "{:?}", validate_ledger(&l));
+    }
+    // Operation names are not filesystem names, so their case stays intact.
+    l.units[2]
+        .extra
+        .insert("scope_paths".into(), json!(["src/decision.ts#get"]));
+    assert!(validate_ledger(&l).is_empty());
+}
