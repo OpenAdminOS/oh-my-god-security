@@ -301,14 +301,16 @@ fn selected_skill(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn bundle_cache() -> PathBuf {
+    data_dir().join("skill-bundles")
+}
+
 fn review_skill(args: &[String]) -> Result<PathBuf, String> {
     let selected = flag(args, "--skill-dir")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("OMGS_SKILL_DIR").map(PathBuf::from));
     omgs::setup::materialize_selected(
-        &data_dir()
-            .join("skill-bundles")
-            .join(omgs::setup::bundled_digest()),
+        &bundle_cache().join(omgs::setup::bundled_digest()),
         selected.as_deref(),
     )
 }
@@ -2291,9 +2293,22 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     // Admit storage boundaries before materializing the default bundle. In
     // particular, a cache must not populate a target or an invalid run output.
     trusted_store(&target)?;
+    let mut fences = vec![target.clone()];
     if let Some(out) = flag(rest, "--out") {
-        let out = std::path::absolute(out).map_err(|e| e.to_string())?;
-        trusted_policy_path(&target, &resolve_existing_prefix(&out)?)?;
+        let out = resolve_existing_prefix(&std::path::absolute(out).map_err(|e| e.to_string())?)?;
+        trusted_policy_path(&target, &out)?;
+        fences.push(out);
+    }
+    let cache = resolve_existing_prefix(&bundle_cache())?;
+    if let Some(fence) = fences
+        .iter()
+        .find(|f| cache.starts_with(f) || f.starts_with(&cache))
+    {
+        return Err(format!(
+            "the skill bundle cache {} overlaps {}; set OMGS_HOME outside the target and the run output",
+            cache.display(),
+            fence.display()
+        ));
     }
     let skill = review_skill(rest)?;
     let run = audit_init_selected(rest)?;
@@ -3209,8 +3224,10 @@ fn init_args(dest: &Path, args: &[String], out: Option<&Path>) -> Vec<String> {
 
 fn brief(dest: &Path, run: &Path) -> Result<String, String> {
     let meta = omgs::runmeta::read(run)?;
+    // A plain path, not JSON: JSON escaping doubles Windows backslashes.
     let skill = meta
         .get("skill_dir")
+        .and_then(|v| v.as_str())
         .ok_or("run lacks authoritative skill path")?;
     let identity = meta
         .get("skill_identity")

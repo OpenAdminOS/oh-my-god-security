@@ -427,6 +427,8 @@ fn default_review_binds_embedded_bundle_despite_stale_installed_skill() {
     assert_eq!(meta["skill_identity"], omgs::setup::identity());
     let brief = String::from_utf8(out.stderr).unwrap();
     assert!(brief.contains(&selected.display().to_string()));
+    // The path is printed verbatim, never as an escaped JSON string.
+    assert!(!brief.contains(&format!("\"{}", selected.display())), "{brief}");
     assert!(brief.contains(&omgs::setup::bundled_digest()));
     assert!(brief.contains("ignoring other installed skills"));
     #[cfg(unix)]
@@ -453,6 +455,39 @@ fn default_review_binds_embedded_bundle_despite_stale_installed_skill() {
     assert!(omgs::setup::materialize(selected)
         .unwrap_err()
         .contains("skill identity mismatch"));
+}
+
+#[test]
+fn bundle_cache_overlapping_the_target_or_output_is_refused_before_writing() {
+    let fixture = Fixture::new();
+    let home = fixture.0.join("home");
+    omgs::platform::create_private_dir(&home).unwrap();
+    let cache = home.join("skill-bundles");
+    let source = fixture.0.join("source");
+    std::fs::create_dir(&source).unwrap();
+    // The cache is a sibling of the intent store, so admitting only the
+    // intent store would miss it. Use it once as the target, once as --out.
+    for (target, out) in [
+        (cache.clone(), fixture.0.join("run")),
+        (source.clone(), cache.clone()),
+    ] {
+        std::fs::create_dir_all(&target).unwrap();
+        let output = cli()
+            .env("OMGS_HOME", &home)
+            .args(["audit", "init", "--no-sensors", "--target"])
+            .arg(&target)
+            .arg("--out")
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("skill bundle cache"),
+            "{output:?}"
+        );
+        assert_eq!(std::fs::read_dir(&cache).map(|d| d.count()).unwrap_or(0), 0);
+        let _ = std::fs::remove_dir(&cache);
+    }
 }
 
 #[test]
