@@ -1440,12 +1440,27 @@ fn stage_workspace(
     } else {
         create_staging_dir(workspace).map_err(|e| e.to_string())?;
     }
+    let mut harness_paths: Vec<_> = req.harness.iter().map(|f| f.path.as_str()).collect();
+    if let Some((_, path)) = &req.stage {
+        harness_paths.push(path);
+    }
+    preflight_harness(workspace, &harness_paths)?;
+    if let Some(target) = &req.target {
+        // Selections must not let a harness impersonate omitted target files.
+        preflight_harness(target, &harness_paths)?;
+    }
     eprintln!("proof inputs: hash started");
     let started = std::time::Instant::now();
     let manifest = req
         .target
         .as_ref()
-        .map(|_| crate::proof_inputs::manifest(workspace, req.inputs.clone()))
+        .map(|_| {
+            crate::proof_inputs::manifest_to(
+                workspace,
+                req.inputs.clone(),
+                &req.run_dir.join("input-manifest.json"),
+            )
+        })
         .transpose()?;
     let digest = manifest
         .as_ref()
@@ -1453,7 +1468,7 @@ fn stage_workspace(
         .transpose()?;
     eprintln!(
         "proof inputs: hash complete ({} entries, {} ms)",
-        manifest.as_ref().map(|m| m.entries.len()).unwrap_or(0),
+        manifest.as_ref().map(|m| m.count).unwrap_or(0),
         started.elapsed().as_millis()
     );
     if req
@@ -1468,15 +1483,6 @@ fn stage_workspace(
         return Err(format!(
             "target snapshot differs from the recorded tree; refusing to replay; {details}"
         ));
-    }
-    let mut harness_paths: Vec<_> = req.harness.iter().map(|f| f.path.as_str()).collect();
-    if let Some((_, path)) = &req.stage {
-        harness_paths.push(path);
-    }
-    preflight_harness(workspace, &harness_paths)?;
-    if let Some(target) = &req.target {
-        // Selections must not let a harness impersonate omitted target files.
-        preflight_harness(target, &harness_paths)?;
     }
     for file in &req.harness {
         let rel = Path::new("harness").join(&file.path);

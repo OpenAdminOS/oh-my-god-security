@@ -2,7 +2,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
+const MAX_LINE_BYTES: usize = 6400;
+const MAX_HEADER_BYTES: usize = 1 << 20;
 // Shared with gate export policy. Six JSON bytes per path byte plus entry
 // fields covers even maximally escaped canonical 1024-byte paths.
 pub const MAX_ENTRIES: usize = crate::policy::GateLimits::MAX_ENTRIES;
@@ -72,76 +74,241 @@ pub struct Entry {
     pub sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+/// A small identity descriptor, never an in-memory entry collection.
+#[derive(Debug, Clone)]
 pub struct Manifest {
-    pub version: u32,
     pub selection: Option<Selection>,
-    pub entries: Vec<Entry>,
+    pub count: usize,
+    root: std::path::PathBuf,
+    sha256: String,
+    retained: Option<(std::path::PathBuf, std::path::PathBuf)>,
+}
+
+impl PartialEq for Manifest {
+    fn eq(&self, other: &Self) -> bool {
+        self.sha256 == other.sha256 && self.selection == other.selection
+    }
+}
+impl Eq for Manifest {}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Header {
+    version: u32,
+    entries: usize,
+    selection: Option<Selection>,
+}
+
+struct DigestWriter<W> {
+    inner: W,
+    hash: crate::sha256::Sha256,
+    bytes: u64,
+}
+impl<W: std::io::Write> std::io::Write for DigestWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() as u64 > MAX_MANIFEST_BYTES - self.bytes {
+            return Err(std::io::Error::other(
+                "execution input manifest exceeds serialized byte limit",
+            ));
+        }
+        let n = self.inner.write(bytes)?;
+        self.hash.update(&bytes[..n]);
+        self.bytes += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn line(writer: &mut impl std::io::Write, value: &impl Serialize) -> Result<(), String> {
+    serde_json::to_writer(&mut *writer, value).map_err(|e| e.to_string())?;
+    writer.write_all(b"\n").map_err(|e| e.to_string())
 }
 
 impl Manifest {
-    pub fn bytes(&self) -> Result<Vec<u8>, String> {
-        check_entry_count(self.entries.len())?;
-        let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
-        if bytes.len() as u64 > MAX_MANIFEST_BYTES {
-            return Err(
-                "execution input manifest exceeds serialized byte limit; use --inputs-from".into(),
-            );
-        }
-        Ok(bytes)
+    pub fn digest(&self) -> Result<String, String> {
+        Ok(self.sha256.clone())
     }
 
-    pub fn digest(&self) -> Result<String, String> {
-        struct DigestWriter {
-            hash: crate::sha256::Sha256,
-            bytes: u64,
-        }
-        impl std::io::Write for DigestWriter {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.bytes += bytes.len() as u64;
-                if self.bytes > MAX_MANIFEST_BYTES {
-                    return Err(std::io::Error::other(
-                        "execution input manifest exceeds serialized byte limit",
-                    ));
-                }
-                self.hash.update(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        check_entry_count(self.entries.len())?;
+    fn stream(&self, writer: impl std::io::Write) -> Result<String, String> {
         let mut writer = DigestWriter {
+            inner: writer,
             hash: crate::sha256::Sha256::new(),
             bytes: 0,
         };
-        serde_json::to_writer(&mut writer, self).map_err(|e| e.to_string())?;
+        line(
+            &mut writer,
+            &Header {
+                version: VERSION,
+                entries: self.count,
+                selection: self.selection.clone(),
+            },
+        )?;
+        let mut count = 0;
+        walk(
+            &self.root,
+            &self.root,
+            self.selection.as_ref(),
+            &mut count,
+            &mut |entry| line(&mut writer, &entry),
+        )?;
+        if count != self.count {
+            return Err("execution inputs changed while streaming manifest".into());
+        }
+        std::io::Write::flush(&mut writer).map_err(|e| e.to_string())?;
         Ok(crate::sha256::hex(&writer.hash.finish()))
     }
 
-    pub fn differences(&self, other: &Self) -> String {
-        let old: std::collections::BTreeMap<_, _> =
-            self.entries.iter().map(|e| (&e.path, e)).collect();
-        let new: std::collections::BTreeMap<_, _> =
-            other.entries.iter().map(|e| (&e.path, e)).collect();
-        let paths: std::collections::BTreeSet<_> = old.keys().chain(new.keys()).collect();
-        let changed: Vec<_> = paths
-            .into_iter()
-            .filter(|p| old.get(*p) != new.get(*p))
-            .collect();
-        let names: Vec<_> = changed
-            .iter()
-            .take(20)
-            .map(|p| crate::platform::escape_controls(p))
-            .collect();
-        format!(
-            "{} differing input path(s): {}",
-            changed.len(),
-            names.join(", ")
-        )
+    pub fn write_to(&self, path: &Path) -> Result<(), String> {
+        crate::runmeta::write_atomic_stream(path, None, |file| {
+            let digest = self
+                .stream(std::io::BufWriter::new(file))
+                .map_err(std::io::Error::other)?;
+            if digest != self.sha256 {
+                return Err(std::io::Error::other(
+                    "execution inputs changed before publication",
+                ));
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
     }
+
+    pub fn differences(&self, other: &Self) -> String {
+        let Some((run, path)) = &self.retained else {
+            return "input identity mismatch".into();
+        };
+        let result = crate::run_artifact::with_reader(run, path, |file| {
+            let mut reader = ManifestReader::new(std::io::BufReader::new(file))
+                .map_err(std::io::Error::other)?;
+            let mut difference = None;
+            let mut count = 0;
+            let comparison = walk(
+                &other.root,
+                &other.root,
+                other.selection.as_ref(),
+                &mut count,
+                &mut |entry| {
+                    let old = reader.next()?;
+                    if old.as_ref() != Some(&entry) {
+                        difference = Some(format!(
+                            "differing input path(s): {}{}",
+                            crate::platform::escape_controls(&entry.path),
+                            old.filter(|e| e.path != entry.path)
+                                .map(|e| format!(", {}", crate::platform::escape_controls(&e.path)))
+                                .unwrap_or_default()
+                        ));
+                        return Err("stop at first divergence".into());
+                    }
+                    Ok(())
+                },
+            );
+            if let Some(difference) = difference {
+                return Ok(difference);
+            }
+            comparison.map_err(std::io::Error::other)?;
+            if let Some(old) = reader.next().map_err(std::io::Error::other)? {
+                return Ok(format!(
+                    "differing input path(s): {}",
+                    crate::platform::escape_controls(&old.path)
+                ));
+            }
+            Ok("input header differs".into())
+        });
+        result.unwrap_or_else(|e| format!("input diagnostics unavailable: {e}"))
+    }
+}
+
+fn read_line(reader: &mut impl std::io::BufRead, limit: usize) -> Result<Vec<u8>, String> {
+    use std::io::{BufRead, Read};
+    let mut bytes = Vec::new();
+    reader
+        .take(limit as u64 + 1)
+        .read_until(b'\n', &mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > limit || (!bytes.is_empty() && bytes.last() != Some(&b'\n')) {
+        return Err("invalid or oversized execution input manifest line".into());
+    }
+    Ok(bytes)
+}
+
+fn strict_line<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    let value = crate::shape::strict_json(std::str::from_utf8(bytes).map_err(|e| e.to_string())?)?;
+    if !value.is_object() {
+        return Err("manifest lines must be objects".into());
+    }
+    serde_json::from_value(value).map_err(|e| e.to_string())
+}
+
+struct ManifestReader<R> {
+    reader: R,
+    remaining: usize,
+    bytes: u64,
+    previous: Option<String>,
+}
+impl<R: std::io::BufRead> ManifestReader<R> {
+    fn new(mut reader: R) -> Result<Self, String> {
+        let bytes = read_line(&mut reader, MAX_HEADER_BYTES)?;
+        let header: Header = strict_line(&bytes)?;
+        check_entry_count(header.entries)?;
+        if header.version != VERSION {
+            return Err("unsupported execution input manifest version; rerun proof".into());
+        }
+        if let Some(s) = &header.selection {
+            s.validate()?;
+        }
+        Ok(Self {
+            reader,
+            remaining: header.entries,
+            bytes: bytes.len() as u64,
+            previous: None,
+        })
+    }
+    fn next(&mut self) -> Result<Option<Entry>, String> {
+        // Check the count before allocating or reading any additional line.
+        if self.remaining == 0 {
+            if !self
+                .reader
+                .fill_buf()
+                .map_err(|e| e.to_string())?
+                .is_empty()
+            {
+                return Err("execution input manifest exceeds declared entry count".into());
+            }
+            return Ok(None);
+        }
+        let bytes = read_line(&mut self.reader, MAX_LINE_BYTES)?;
+        self.bytes += bytes.len() as u64;
+        if self.bytes > MAX_MANIFEST_BYTES {
+            return Err("execution input manifest exceeds serialized byte limit".into());
+        }
+        let entry: Entry = strict_line(&bytes)?;
+        safe_path(&entry.path)?;
+        if !["file", "dir", "link"].contains(&entry.kind.as_str())
+            || entry.mode > if cfg!(windows) { 1 } else { 0o777 }
+            || (entry.kind == "link" && entry.mode != 0)
+            || entry.sha256.len() != 64
+            || !entry
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || (entry.kind == "dir" && entry.sha256 != crate::sha256::digest(b""))
+            || self
+                .previous
+                .as_ref()
+                .is_some_and(|p| path_order(p, &entry.path) != std::cmp::Ordering::Less)
+        {
+            return Err("invalid or unordered execution input entry".into());
+        }
+        self.previous = Some(entry.path.clone());
+        self.remaining -= 1;
+        Ok(Some(entry))
+    }
+}
+
+fn path_order(a: &str, b: &str) -> std::cmp::Ordering {
+    a.split('/').cmp(b.split('/'))
 }
 
 fn check_entry_count(count: usize) -> Result<(), String> {
@@ -150,6 +317,12 @@ fn check_entry_count(count: usize) -> Result<(), String> {
             "execution input manifest exceeds {MAX_ENTRIES} entries; use --inputs-from"
         ));
     }
+    Ok(())
+}
+
+fn admit_entry(count: &mut usize) -> Result<(), String> {
+    check_entry_count(*count + 1)?;
+    *count += 1;
     Ok(())
 }
 
@@ -201,32 +374,124 @@ pub fn permissions(mode: u32, current: std::fs::Permissions) -> std::fs::Permiss
 /// Hash normalized index bytes as well as all other Git state. The same index
 /// normalization is applied while freshly staging the disposable workspace.
 pub fn manifest(root: &Path, selection: Option<Selection>) -> Result<Manifest, String> {
+    let mut manifest = descriptor(root, selection)?;
+    manifest.sha256 = manifest.stream(std::io::sink())?;
+    Ok(manifest)
+}
+
+/// Publish the staged identity in one content-hashing pass, before execution.
+pub fn manifest_to(
+    root: &Path,
+    selection: Option<Selection>,
+    path: &Path,
+) -> Result<Manifest, String> {
+    let mut manifest = descriptor(root, selection)?;
+    let mut digest = String::new();
+    crate::runmeta::write_atomic_stream(path, None, |file| {
+        digest = manifest
+            .stream(std::io::BufWriter::new(file))
+            .map_err(std::io::Error::other)?;
+        Ok(())
+    })
+    .map_err(|e| e.to_string())?;
+    manifest.sha256 = digest;
+    Ok(manifest)
+}
+
+fn descriptor(root: &Path, selection: Option<Selection>) -> Result<Manifest, String> {
     if let Some(s) = &selection {
         s.validate()?;
     }
-    let mut entries = Vec::new();
-    walk(root, root, selection.as_ref(), &mut entries)?;
-    let manifest = Manifest {
-        version: VERSION,
+    let mut count = 0;
+    // Count first so the canonical header precedes entries. No content is retained.
+    count_paths(root, root, selection.as_ref(), &mut count)?;
+    Ok(Manifest {
         selection,
-        entries,
-    };
-    manifest.digest()?;
-    Ok(manifest)
+        count,
+        root: root.into(),
+        sha256: String::new(),
+        retained: None,
+    })
+}
+
+// Fixed-size sorted batches avoid collecting an arbitrarily wide directory.
+// The admitted path length also bounds recursion depth. Order is component-wise.
+fn children(
+    dir: &Path,
+    mut visit: impl FnMut(std::fs::DirEntry) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut after = None;
+    loop {
+        let mut batch = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| "execution input paths must be UTF-8")?;
+            if after.as_ref().is_some_and(|a| &name <= a) {
+                continue;
+            }
+            if batch.len() < 256 || batch.last_key_value().is_some_and(|(last, _)| &name < last) {
+                batch.insert(name, entry);
+                if batch.len() > 256 {
+                    batch.pop_last();
+                }
+            }
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        after = batch.last_key_value().map(|(name, _)| name.clone());
+        for (_, entry) in batch {
+            visit(entry)?;
+        }
+    }
+}
+
+fn count_paths(
+    root: &Path,
+    dir: &Path,
+    selection: Option<&Selection>,
+    count: &mut usize,
+) -> Result<(), String> {
+    children(dir, |entry| {
+        let path = entry.path();
+        let name = path
+            .strip_prefix(root)
+            .map_err(|e| e.to_string())?
+            .to_str()
+            .ok_or("execution input paths must be UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if selection.is_some_and(|s| {
+            name != ".git"
+                && !name.starts_with(".git/")
+                && !s.paths.iter().any(|p| overlaps(p, &name))
+        }) {
+            return Ok(());
+        }
+        safe_path(&name)?;
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if crate::platform::contentless(&meta) {
+            return Ok(());
+        }
+        admit_entry(count)?;
+        if meta.is_dir() && !crate::platform::is_link(&meta) {
+            count_paths(root, &path, selection, count)?;
+        }
+        Ok(())
+    })
 }
 
 fn walk(
     root: &Path,
     dir: &Path,
     selection: Option<&Selection>,
-    out: &mut Vec<Entry>,
+    count: &mut usize,
+    emit: &mut impl FnMut(Entry) -> Result<(), String>,
 ) -> Result<(), String> {
-    let mut entries = std::fs::read_dir(dir)
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
+    children(dir, |entry| {
         crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
         let path = entry.path();
         let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
@@ -239,14 +504,14 @@ fn walk(
                 && !name.starts_with(".git/")
                 && !s.paths.iter().any(|p| overlaps(p, &name))
         }) {
-            continue;
+            return Ok(());
         }
         safe_path(&name)?;
         let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
         if crate::platform::contentless(&meta) {
-            continue;
+            return Ok(());
         }
-        check_entry_count(out.len() + 1)?;
+        admit_entry(count)?;
         let (kind, digest) = if crate::platform::is_link(&meta) {
             admit_link(&path)?;
             let link = std::fs::read_link(&path).map_err(|e| e.to_string())?;
@@ -271,17 +536,17 @@ fn walk(
         } else {
             return Err(format!("unsupported execution input: {name}"));
         };
-        out.push(Entry {
+        emit(Entry {
             path: name,
             kind: kind.into(),
             mode: if kind == "link" { 0 } else { mode(&meta) },
             sha256: digest,
-        });
+        })?;
         if meta.is_dir() && !crate::platform::is_link(&meta) {
-            walk(root, &path, selection, out)?;
+            walk(root, &path, selection, count, emit)?;
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Reset copy-preserved access/write times after all hashing and staging, in
@@ -513,7 +778,7 @@ fn sha1(input: &[u8]) -> [u8; 20] {
     result
 }
 
-/// Read a retained manifest only through the run artifact admission boundary.
+/// Recover replay identity from the record without reading diagnostic entries.
 pub fn retained(
     run: &Path,
     record: &crate::proof::ProofRecord,
@@ -528,37 +793,35 @@ pub fn retained(
     if identity.version != VERSION {
         return Err("unsupported execution input identity version; rerun proof".into());
     }
-    let path = Path::new("proofs")
-        .join(record.n.to_string())
-        .join("input-manifest.json");
-    let text = crate::run_artifact::text(run, &path, MAX_MANIFEST_BYTES)?;
-    let value = crate::shape::strict_json(&text)?;
-    if !value.is_object()
-        || value
-            .get("entries")
-            .and_then(|v| v.as_array())
-            .is_none_or(|entries| entries.iter().any(|e| !e.is_object()))
-        || value
-            .get("selection")
-            .is_some_and(|v| !v.is_null() && !v.is_object())
+    if record.target_sha256.as_ref() != Some(&identity.sha256)
+        || identity.sha256.len() != 64
+        || !identity
+            .sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
-        return Err("execution input manifest and entries must be objects".into());
+        return Err("execution input identity does not match record".into());
     }
-    let manifest: Manifest = serde_json::from_value(value).map_err(|e| e.to_string())?;
-    if manifest.version != VERSION
-        || manifest.entries.len() > MAX_ENTRIES
-        || manifest.digest()? != identity.sha256
-        || record.target_sha256.as_ref() != Some(&identity.sha256)
-    {
-        return Err("retained execution input manifest does not match record identity".into());
-    }
-    if let Some(s) = &manifest.selection {
+    if let Some(s) = &identity.selection {
         s.validate()?;
     }
-    for e in &manifest.entries {
-        safe_path(&e.path)?;
-    }
-    Ok(Some(manifest))
+    Ok(Some(Manifest {
+        selection: identity.selection.clone(),
+        count: 0,
+        root: record
+            .target
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or(Path::new(""))
+            .into(),
+        sha256: identity.sha256.clone(),
+        retained: Some((
+            run.into(),
+            Path::new("proofs")
+                .join(record.n.to_string())
+                .join("input-manifest.json"),
+        )),
+    }))
 }
 
 #[cfg(test)]
@@ -585,15 +848,16 @@ mod tests {
         for text in ["source", "./source", "@workspace/source", "missing"] {
             std::os::unix::fs::symlink(text, d.join("selected")).unwrap();
             let identity = manifest(&d, None).unwrap();
-            assert_eq!(
-                identity
-                    .entries
-                    .iter()
-                    .find(|e| e.path == "selected")
-                    .unwrap()
-                    .sha256,
-                crate::sha256::digest(text.as_bytes())
-            );
+            let mut found = false;
+            walk(&d, &d, None, &mut 0, &mut |entry| {
+                if entry.path == "selected" {
+                    assert_eq!(entry.sha256, crate::sha256::digest(text.as_bytes()));
+                    found = true;
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert!(found);
             assert!(identities.insert(identity.digest().unwrap()), "{text}");
             std::fs::remove_file(d.join("selected")).unwrap();
         }
@@ -627,39 +891,139 @@ mod tests {
     }
 
     #[test]
-    fn gate_manifest_limits_cover_export_boundary_and_stream_identical_json() {
-        assert_eq!(MAX_ENTRIES, crate::policy::GateLimits::MAX_ENTRIES);
-        check_entry_count(crate::scratch::GATE_EXPORT_ENTRIES).unwrap();
+    fn manifest_limits_reject_before_reading_entries() {
+        let header = format!(
+            "{{\"version\":4,\"entries\":{},\"selection\":null}}\n",
+            MAX_ENTRIES + 1
+        );
+        let mut reader = std::io::Cursor::new(header.as_bytes());
+        assert!(ManifestReader::new(&mut reader).is_err());
+        assert_eq!(reader.position(), header.len() as u64);
+        for count in [MAX_ENTRIES - 1, MAX_ENTRIES] {
+            let header = format!("{{\"version\":4,\"entries\":{count},\"selection\":null}}\n");
+            let parsed = ManifestReader::new(std::io::Cursor::new(header)).unwrap();
+            assert_eq!(parsed.remaining, count);
+        }
+        // Exercise the production generation counter at the actual boundary,
+        // using a lazy generator with no paths or entries retained.
+        let mut count = 0;
+        for () in std::iter::repeat_n((), MAX_ENTRIES - 1) {
+            admit_entry(&mut count).unwrap();
+        }
+        assert_eq!(count, MAX_ENTRIES - 1);
+        admit_entry(&mut count).unwrap();
+        assert!(admit_entry(&mut count).is_err());
+        assert_eq!(count, MAX_ENTRIES);
         check_entry_count(MAX_ENTRIES).unwrap();
         assert!(check_entry_count(MAX_ENTRIES + 1).is_err());
-        // Synthetic entries exercise the former entry and serialized byte caps
-        // without creating hundreds of thousands of filesystem objects in CI.
-        let manifest = Manifest {
-            version: VERSION,
-            selection: None,
-            entries: (0..100_001)
-                .map(|i| Entry {
-                    path: format!("{:0200}", i),
-                    kind: "dir".into(),
-                    mode: 0,
-                    sha256: crate::sha256::digest(b""),
-                })
-                .collect(),
-        };
-        let bytes = manifest.bytes().unwrap();
-        assert!(bytes.len() > 16 << 20);
-        assert_eq!(manifest.digest().unwrap(), crate::sha256::digest(&bytes));
-        // Worst-case JSON escaping for each admitted path still fits the scaled
-        // cap at the gate hard maximum, including all fields and the header.
+    }
+
+    #[test]
+    fn diagnostics_lines_are_strict_bounded_and_stop_at_declared_count() {
+        let header = b"{\"version\":4,\"entries\":1,\"selection\":null}\n";
         let entry = Entry {
-            path: "\u{1}".repeat(1024),
+            path: "source".into(),
             kind: "file".into(),
-            mode: 0o777,
+            mode: 0,
             sha256: "f".repeat(64),
         };
-        safe_path(&entry.path).unwrap();
-        let size = serde_json::to_vec(&entry).unwrap().len() as u64 + 1;
-        assert!(size * MAX_ENTRIES as u64 + 65536 <= MAX_MANIFEST_BYTES);
+        let mut bytes = header.to_vec();
+        line(&mut bytes, &entry).unwrap();
+        let end = bytes.len();
+        bytes.extend(b"unread excess entry");
+        let mut reader = ManifestReader::new(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.next().unwrap(), Some(entry));
+        assert!(reader.next().is_err());
+        assert_eq!(reader.reader.position(), end as u64);
+        for bad in [
+            "{\"version\":4,\"version\":4,\"entries\":0,\"selection\":null}\n".to_string(),
+            "{\"version\":3,\"entries\":0,\"selection\":null}\n".to_string(),
+            "{\"version\":4,\"entries\":0,\"selection\":null,\"extra\":0}\n".to_string(),
+            "x".repeat(MAX_HEADER_BYTES + 1),
+        ] {
+            assert!(ManifestReader::new(std::io::Cursor::new(bad)).is_err());
+        }
+        for bad in [
+            "{\"path\":\"a\",\"path\":\"b\",\"kind\":\"file\",\"mode\":0,\"sha256\":\"f\"}\n"
+                .to_string(),
+            "x".repeat(MAX_LINE_BYTES + 1),
+        ] {
+            let mut bytes = header.to_vec();
+            bytes.extend(bad.as_bytes());
+            assert!(ManifestReader::new(std::io::Cursor::new(bytes))
+                .unwrap()
+                .next()
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn streamed_manifest_bytes_match_digest_and_diagnostics_report_first_difference() {
+        let d = scratch("stream");
+        let target = d.join("target");
+        crate::platform::private_dir(&target).unwrap();
+        std::fs::write(target.join("a"), "before").unwrap();
+        std::fs::write(target.join("b"), "before").unwrap();
+        let mut original = manifest(&target, None).unwrap();
+        original.write_to(&d.join("manifest")).unwrap();
+        assert_eq!(
+            crate::sha256::digest_file(&d.join("manifest")).unwrap(),
+            original.digest().unwrap()
+        );
+        original.retained = Some((d.clone(), "manifest".into()));
+        std::fs::write(target.join("b"), "after").unwrap();
+        assert!(original
+            .differences(&manifest(&target, None).unwrap())
+            .contains("b"));
+        std::fs::write(target.join("a"), "after").unwrap();
+        assert_eq!(
+            original.differences(&manifest(&target, None).unwrap()),
+            "differing input path(s): a"
+        );
+        assert!(original.write_to(&d.join("manifest")).is_err());
+        assert_eq!(
+            crate::sha256::digest_file(&d.join("manifest")).unwrap(),
+            original.digest().unwrap()
+        );
+        assert!(!std::fs::read_dir(&d).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+        std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn wide_directory_stream_is_component_sorted_across_batches() {
+        let d = scratch("wide");
+        let target = d.join("target");
+        crate::platform::private_dir(&target).unwrap();
+        for i in (0..300).rev() {
+            std::fs::write(target.join(format!("p{i:04}")), b"").unwrap();
+        }
+        std::fs::create_dir(target.join("a")).unwrap();
+        for name in ["a/child", "a!", "z", "é", "𐀀"] {
+            std::fs::write(target.join(name), b"").unwrap();
+        }
+        let identity = manifest_to(&target, None, &d.join("manifest")).unwrap();
+        assert_eq!(identity, manifest(&target, None).unwrap());
+        assert_eq!(
+            identity.digest().unwrap(),
+            crate::sha256::digest_file(&d.join("manifest")).unwrap()
+        );
+        let mut reader = ManifestReader::new(std::io::BufReader::new(
+            std::fs::File::open(d.join("manifest")).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(reader.next().unwrap().unwrap().path, "a");
+        assert_eq!(reader.next().unwrap().unwrap().path, "a/child");
+        assert_eq!(reader.next().unwrap().unwrap().path, "a!");
+        let mut count = 3;
+        while reader.next().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, identity.count);
+        std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
     }
 
     #[cfg(unix)]
@@ -808,7 +1172,7 @@ mod tests {
             std::fs::write(d.join(name), b"changed").unwrap();
             let next = manifest(&d, None).unwrap();
             assert_ne!(next.digest().unwrap(), original.digest().unwrap());
-            assert!(original.differences(&next).contains(name));
+
             if name.contains("hooks/") || name.ends_with("sharedindex.fixture") {
                 assert_eq!(manifest(&d, None).unwrap(), next);
                 assert_eq!(std::fs::read(d.join(name)).unwrap(), b"changed");
@@ -851,7 +1215,7 @@ mod tests {
             paths: vec!["source".into()],
         });
         let first = manifest(&d, selection.clone()).unwrap();
-        assert!(first.entries.iter().any(|e| e.path == ".git/config"));
+        assert!(first.count >= 3);
         std::fs::write(d.join("asset"), b"changed").unwrap();
         assert_eq!(manifest(&d, selection.clone()).unwrap(), first);
         std::fs::write(d.join(".git/config"), b"changed").unwrap();

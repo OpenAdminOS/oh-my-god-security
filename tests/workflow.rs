@@ -397,14 +397,14 @@ fn bind_execution_inputs(
     record.execution_inputs = Some(omgs::proof::ExecutionInputs {
         version: omgs::proof_inputs::VERSION,
         sha256: digest,
+        selection: None,
     });
-    write_private_fixture(
-        run.join("proofs")
-            .join(record.n.to_string())
-            .join("input-manifest.json"),
-        manifest.bytes().unwrap(),
-    )
-    .unwrap();
+    let path = run
+        .join("proofs")
+        .join(record.n.to_string())
+        .join("input-manifest.json");
+    omgs::platform::create_private_tree(path.parent().unwrap()).unwrap();
+    manifest.write_to(&path).unwrap();
 }
 
 fn complete_run() -> (Ledger, Vec<SourcedCandidate>, FindingsFile) {

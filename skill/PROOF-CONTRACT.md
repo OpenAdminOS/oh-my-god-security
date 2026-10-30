@@ -38,7 +38,7 @@ startup and cleanup. This allowance is not extra target execution time.
 
 ## Execution input identity and replay
 
-Schema `omgs-proof/3` requires `execution_inputs.version: 3` for a target. Its SHA-256
+Schema `omgs-proof/3` requires `execution_inputs.version: 4` for a target. Its SHA-256
 matches `target_sha256` and the canonical `proofs/N/input-manifest.json`. The manifest retains
 bounded per-path kinds, modes and content hashes for mismatch diagnostics. Validation and replay
 use the same version and normalization. Older proof schemas and unknown identity versions are
@@ -95,12 +95,34 @@ error before copying, including on Unix. Git indexes are normalized during fresh
 staging with their identity-bound modes, including group-writable 0664 indexes. Manifest
 construction never rewrites the source tree. Index input remains capped at 16 MiB.
 The retained identity shares the gate hard maximum of 2,000,000 entries and is capped at
-12,800,065,536 serialized bytes (6,400 per allowed entry plus 65,536 bytes of overhead); use a
-selection if a full tree exceeds either bound. The serialized bound covers maximally escaped
-1024-byte paths at the hard entry cap. Digest calculation streams JSON into SHA-256 without a
-second full serialized buffer. The entry list and retained JSON reads/writes still require
-memory proportional to the admitted manifest. Copy and hash start/completion phases report
-elapsed time and entry count.
+12,800,065,536 serialized bytes (6,400 per allowed entry plus 65,536 bytes of overhead).
+Version 4 uses canonical JSON Lines at `input-manifest.json`: one header object with fields
+`version`, `entries` and `selection`, then one entry object per line with fields `path`,
+`kind`, `mode` and `sha256`, in that field order. Every line ends with a single LF.
+Entries use depth-first, UTF-8 component-sorted path order. SHA-256 covers exactly these
+bytes, including the header and line endings. The proof record also carries the selection
+in `execution_inputs.selection`, so reproduction never depends on parsing the retained artifact.
+Older identity versions, including version 3, require a fresh proof.
+
+Generation counts admitted paths before writing the header, enforces the entry limit before
+constructing each entry, and streams content hashes and canonical JSON into SHA-256.
+Publication streams through a private sibling temporary file, flushes and fsyncs it, then
+renames it atomically before target execution. Publication computes the identity over the
+bytes written; a changed entry count aborts publication. A separately computed identity must still match when republished. No full entry list,
+JSON value, string or serialized manifest buffer is retained. Directory traversal retains
+at most 256 sorted children per active directory level and rescans wide directories in
+batches. The 1024-byte canonical path limit bounds recursion depth. Git index normalization
+still uses its separate 16 MiB bound.
+
+Validation and replay recompute the target or staged workspace digest and compare it with
+the proof record. They do not open the retained manifest to decide reproduction. Only mismatch
+diagnostics open it through the same private, single-link, no-follow run artifact admission.
+Diagnostics parse one line at a time, limited to 1 MiB for the header and 6,400 bytes for an
+entry (including LF), reject duplicate keys and unknown fields, validate paths, kinds, modes,
+hashes and ordering, and enforce the declared count and hard entry limit before reading or
+allocating another entry. Diagnostics stop at the first divergent entry, reporting at most
+two paths. Diagnostic failures cannot allow reproduction. Copy and hash phases report elapsed
+time and entry count.
 Each execution receives a fresh disposable copy; no mutable workspace cache is reused.
 
 `--test-from` accepts a regular file or a directory outside the target. A directory's files are
@@ -125,7 +147,7 @@ directory ancestor uses mode 0755 on Unix or writable on Windows; existing targe
 their identity-bound modes. Scratch directories use the same fixed directory policy. The empty
 macOS OpenSSL config and Windows command wrapper use mode 0644 on Unix or writable on Windows.
 The wrapper content and name derive from the recorded command, test path and fresh marker nonce.
-These constants do not change the version 3 identity representation. Replay output says
+These materialization constants continue to apply with version 4. Replay output says
 `replay record` and names the original path; it never offers a replacement `proof_ref`.
 
 ## Redaction and marker observations

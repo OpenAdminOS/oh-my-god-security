@@ -21,6 +21,8 @@ pub struct Survivor {
 pub struct ExecutionInputs {
     pub version: u32,
     pub sha256: String,
+    #[serde(default)]
+    pub selection: Option<crate::proof_inputs::Selection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

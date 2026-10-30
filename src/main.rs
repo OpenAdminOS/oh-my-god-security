@@ -962,13 +962,13 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         target: target.as_ref().map(|t| t.to_string_lossy().to_string()),
         target_head,
         target_sha256: result.target_sha256.clone(),
-        execution_inputs: result
-            .input_manifest
-            .as_ref()
-            .map(|_| omgs::proof::ExecutionInputs {
+        execution_inputs: result.input_manifest.as_ref().map(|manifest| {
+            omgs::proof::ExecutionInputs {
+                selection: manifest.selection.clone(),
                 version: omgs::proof_inputs::VERSION,
                 sha256: result.target_sha256.clone().unwrap(),
-            }),
+            }
+        }),
         harness: harness
             .as_ref()
             .map(|h| h.files.clone())
@@ -1021,10 +1021,6 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         output,
         omgs_version: env!("CARGO_PKG_VERSION").into(),
     };
-    if let Some(manifest) = &result.input_manifest {
-        omgs::runmeta::write_atomic_bytes(&run_dir.join("input-manifest.json"), &manifest.bytes()?)
-            .map_err(|e| e.to_string())?;
-    }
     let record_path = match (&run, &proof_dir) {
         (Some(r), Some(_)) => omgs::proof::write(r, &record)?,
         _ => {

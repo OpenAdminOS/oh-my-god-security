@@ -453,7 +453,7 @@ pub(crate) fn read_private_bounded_with_permissions_in(
     })
 }
 
-fn with_file_in<T>(
+pub(crate) fn with_file_in<T>(
     target: &Path,
     relative: &Path,
     read: impl FnOnce(std::fs::File) -> std::io::Result<T>,

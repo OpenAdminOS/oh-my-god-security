@@ -233,11 +233,9 @@ fn evidence(run: &Path, target: &Path) {
     let digest = manifest.digest().unwrap();
     proof["target_sha256"] = json!(digest);
     proof["execution_inputs"] = json!({"version": omgs::proof_inputs::VERSION, "sha256": digest});
-    omgs::runmeta::write_atomic_bytes(
-        &run.join("proofs/1/input-manifest.json"),
-        &manifest.bytes().unwrap(),
-    )
-    .unwrap();
+    manifest
+        .write_to(&run.join("proofs/1/input-manifest.json"))
+        .unwrap();
     write(&run.join("proofs/1.json"), &proof);
     let findings = json!({"findings":[{
         "fingerprint": proof["finding"], "title":"Boundary read", "verdict":"confirmed", "severity":"high",

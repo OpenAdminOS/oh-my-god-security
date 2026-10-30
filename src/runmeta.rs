@@ -44,7 +44,18 @@ fn write_atomic_content(
     bytes: &[u8],
     permissions: Option<std::fs::Permissions>,
 ) -> std::io::Result<()> {
-    use std::io::Write;
+    write_atomic_stream(path, permissions, |file| {
+        use std::io::Write;
+        file.write_all(bytes)
+    })
+}
+
+/// Stream an artifact through the same private admission and atomic publication.
+pub fn write_atomic_stream(
+    path: &Path,
+    permissions: Option<std::fs::Permissions>,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     #[cfg(windows)]
     if let Some(file) = crate::platform::open_single_link(path)? {
         crate::platform::check_private_file(&file)
@@ -89,7 +100,7 @@ fn write_atomic_content(
         }
     };
     if let Err(e) = crate::platform::check_private_file(&file)
-        .and_then(|_| file.write_all(bytes))
+        .and_then(|_| write(&mut file))
         .and_then(|_| match permissions {
             Some(p) => file.set_permissions(p),
             None => Ok(()),

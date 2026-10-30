@@ -2762,11 +2762,22 @@ fn selected_multifile_harness_replays_exactly_with_redacted_marker_observations(
     assert_eq!(audit.marker_observations.len(), 2);
     assert_eq!(audit.redactions.len(), 1);
     assert!(omgs::proof::runner_evidence(&run, &original).is_empty());
-    let mut unsupported = original.clone();
-    unsupported.execution_inputs.as_mut().unwrap().version = 99;
-    assert!(omgs::proof::runner_evidence(&run, &unsupported)
-        .iter()
-        .any(|e| e.contains("unsupported execution input identity version")));
+    // Reproduction is decided from streamed workspace identity, even when the
+    // diagnostic artifact is malformed or absent.
+    let manifest_path = run.join("proofs/1/input-manifest.json");
+    let manifest_bytes = std::fs::read(&manifest_path).unwrap();
+    write_private_fixture(&manifest_path, b"{\"version\":4,\"entries\":2000001}\n").unwrap();
+    assert!(omgs::proof::runner_evidence(&run, &original).is_empty());
+    std::fs::remove_file(&manifest_path).unwrap();
+    assert!(omgs::proof::runner_evidence(&run, &original).is_empty());
+    write_private_fixture(&manifest_path, manifest_bytes).unwrap();
+    for version in [3, 99] {
+        let mut unsupported = original.clone();
+        unsupported.execution_inputs.as_mut().unwrap().version = version;
+        assert!(omgs::proof::runner_evidence(&run, &unsupported)
+            .iter()
+            .any(|e| e.contains("unsupported execution input identity version")));
+    }
     let mut invalid_audit = original.clone();
     invalid_audit
         .output_audit
