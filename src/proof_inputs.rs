@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const MAX_ENTRIES: usize = 100_000;
 pub const MAX_MANIFEST_BYTES: u64 = 16 << 20;
 
@@ -113,15 +113,33 @@ impl Manifest {
     }
 }
 
+/// Windows reparse links cannot be materialized with portable exact semantics.
+/// Use the same admission boundary for source validation and workspace staging.
+pub(crate) fn admit_link(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        Err(format!("unsupported execution input link on Windows: {}; use a target without links or reparse points", path.display()))
+    }
+    #[cfg(unix)]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 pub fn mode(meta: &std::fs::Metadata) -> u32 {
+    permission_mode(&meta.permissions())
+}
+
+pub(crate) fn permission_mode(permissions: &std::fs::Permissions) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o777
+        permissions.mode() & 0o777
     }
     #[cfg(windows)]
     {
-        u32::from(meta.permissions().readonly())
+        u32::from(permissions.readonly())
     }
 }
 
@@ -199,6 +217,7 @@ fn walk(
             );
         }
         let (kind, digest) = if crate::platform::is_link(&meta) {
+            admit_link(&path)?;
             let link = std::fs::read_link(&path).map_err(|e| e.to_string())?;
             (
                 "link",

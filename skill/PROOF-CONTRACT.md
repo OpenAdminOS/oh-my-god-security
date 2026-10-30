@@ -38,7 +38,7 @@ startup and cleanup. This allowance is not extra target execution time.
 
 ## Execution input identity and replay
 
-Schema `omgs-proof/3` requires `execution_inputs.version: 2` for a target. Its SHA-256
+Schema `omgs-proof/3` requires `execution_inputs.version: 3` for a target. Its SHA-256
 matches `target_sha256` and the canonical `proofs/N/input-manifest.json`. The manifest retains
 bounded per-path kinds, modes and content hashes for mismatch diagnostics. Validation and replay
 use the same version and normalization. Older proof schemas and unknown identity versions are
@@ -56,13 +56,30 @@ a standalone checkout.
 Do not execute Git against the target: config and hooks can execute programs. An incidental index
 stat refresh does not invalidate a proof, but execution-relevant input changes do.
 
-Links bind their exact stored link text and kind, including dangling links and `./` prefixes.
+Version 3 materializes the workspace from fresh directories and regular files in sorted,
+depth-first path order. Regular file content is written densely; hard links become independent
+files with link count one. The only source permissions admitted are Unix 0777 bits or the Windows
+read-only bit. Setuid, setgid and sticky bits are removed. Source ownership, extended attributes,
+ACLs, file flags, sparse allocation and directory insertion order are never copied. The workspace
+root uses fixed permissions (0755 on Unix, writable on Windows), independent of the target root.
+Fresh objects belong to the staging user and receive the destination environment's default security
+metadata; no source security descriptors or alternate data streams are imported.
+
+On Unix, links bind and preserve their exact stored link text and kind, including dangling links
+and `./` prefixes. On Windows, all target links and reparse points (file, directory, junction,
+outside and dangling) are rejected before execution with an unsupported-input message. Manifest
+validation uses the same admission rule, so no link is converted, rewritten or silently omitted.
 After hashing and all harness staging, access and modification times on workspace files,
 directories and links are reset to 2000-01-01 UTC without following links. Creation times are
 also reset on macOS and Windows. The workspace root is normalized last. This policy is identical
-for original proofs and replays; source timestamps are never modified. OS-managed change times
-and creation times on filesystems without a setter are properties of the disposable execution,
-not preserved source timestamps. Version 1 identities require a fresh proof.
+for original proofs and replays; source timestamps are never modified.
+
+OS-managed ctime, inode numbers, filesystem enumeration behavior, physical allocation details
+beyond dense writes, and creation times on filesystems without a setter are properties of the
+disposable execution. Code depending on these values is nondeterministic. A detectable change in
+the recorded outcome makes replay report a mismatch; replay cannot detect differences the harness
+does not observe. Identical identity is not a guarantee of deterministic behavior for such code.
+Version 1 and 2 identities require a fresh proof.
 
 For a smaller immutable input boundary, pass `--inputs-from SELECTION.json`, containing
 `{"version":1,"paths":["src/decision.rs","Cargo.toml"]}`. Paths can name files or directories.

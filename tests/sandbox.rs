@@ -2833,6 +2833,71 @@ fn staged_harness_paths_and_outer_harness_errors_are_explicit() {
     std::fs::remove_dir_all(d).unwrap();
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn source_xattr_changes_replay_only_the_normalized_workspace() {
+    use std::os::unix::ffi::OsStrExt;
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("xattr-replay");
+    let target = d.join("target");
+    let run = d.join("run");
+    omgs::platform::private_dir(&target).unwrap();
+    omgs::platform::private_dir(&run).unwrap();
+    std::fs::write(target.join("source"), "synthetic").unwrap();
+    std::fs::write(target.join("check.sh"),
+        "if /usr/bin/xattr -p user.omgs_fixture source >/dev/null 2>&1; then echo COPIED; else echo NORMALIZED; fi\n").unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    let source = std::ffi::CString::new(target.join("source").as_os_str().as_bytes()).unwrap();
+    let set_xattr = |value: &[u8]| {
+        assert_eq!(
+            unsafe {
+                libc::setxattr(
+                    source.as_ptr(),
+                    c"user.omgs_fixture".as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+    };
+    set_xattr(b"BEFORE");
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "check.sh",
+            "--cmd",
+            "sh check.sh",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let original = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert!(original.output.contains("NORMALIZED") && !original.output.contains("COPIED"));
+    set_xattr(b"AFTER");
+    assert!(omgs::proof::runner_evidence(&run, &original).is_empty());
+    let replay = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(replay.status.success(), "{}", text(&replay));
+    let replay = omgs::proof::load(&run, "proofs/2.json").unwrap();
+    assert!(replay.output.contains("NORMALIZED") && !replay.output.contains("COPIED"));
+    assert_eq!(original.execution_inputs, replay.execution_inputs);
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn timestamp_sensitive_build_replays_with_normalized_workspace_times() {

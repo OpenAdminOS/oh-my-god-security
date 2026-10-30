@@ -822,8 +822,8 @@ pub fn declared_limits(os: &str) -> Vec<String> {
     v
 }
 
-/// Copy `src` into the empty directory `dst`: an APFS clone on macOS, a
-/// reflink where the filesystem supports it on Linux, a plain copy otherwise.
+/// Materialize fresh entries in sorted order, preserving only admitted bytes,
+/// link text and allow-listed permissions, never source filesystem metadata.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     copy_tree_with_gaps(src, dst).map(|_| ())
 }
@@ -858,60 +858,16 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
         ));
     }
     if outside_links > 0 {
-        let action = if cfg!(unix) {
-            "copied as links, sandbox access rules apply"
-        } else {
-            "dropped from the workspace"
-        };
+        let action = "copied as links, sandbox access rules apply";
         gaps.push(format!(
             "{outside_links} target link(s) resolve outside the target or do not resolve: {action}"
         ));
     }
     supervise::check_interrupted().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
-    let from = format!("{}/.", src.display());
-    let attempts: Vec<Vec<&str>> = if cfg!(target_os = "macos") {
-        vec![vec!["-c", "-R", "-p"], vec!["-R", "-p"]]
-    } else if cfg!(target_os = "linux") {
-        vec![vec!["-a", "--no-preserve=links", "--reflink=auto"]]
-    } else {
-        vec![]
-    };
-    for flags in attempts.into_iter().filter(|_| specials == 0) {
-        let child = Command::new("/bin/cp")
-            .args(&flags)
-            .arg(&from)
-            .arg(dst)
-            .spawn();
-        let ok = match child {
-            Ok(mut child) => loop {
-                if let Err(e) = supervise::check_interrupted() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(e.to_string());
-                }
-                match child.try_wait() {
-                    Ok(Some(status)) => break status.success(),
-                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                    Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(e.to_string());
-                    }
-                }
-            },
-            Err(_) => false,
-        };
-        if ok {
-            record_live_links(&root, dst, &links, &mut gaps);
-            return Ok(gaps);
-        }
-        // A partial clone must not be mixed with the next attempt.
-        let _ = std::fs::remove_dir_all(dst);
-        std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    }
     let roots = (root, dst.to_path_buf());
-    copy_recursive(src, dst, &roots)?;
+    copy_recursive(&roots.0, dst, &roots, None)?;
+    set_input_permissions(dst, root_mode())?;
     record_live_links(&roots.0, dst, &links, &mut gaps);
     Ok(gaps)
 }
@@ -932,56 +888,74 @@ fn copy_selected(
         paths.retain(|p| !p.starts_with(".git/"));
         paths.push(".git".into());
     }
-    let mut gaps = Vec::new();
-    for rel in paths {
+    paths.sort();
+    let mut specials = Vec::new();
+    for rel in &paths {
         let mut from = root.to_path_buf();
-        for part in Path::new(&rel) {
+        for part in Path::new(rel) {
             from.push(part);
             let meta = std::fs::symlink_metadata(&from).map_err(|e| e.to_string())?;
             if platform::is_link(&meta) {
                 return Err("scoped inputs cannot contain links".into());
             }
         }
-        // Keep ancestor directory modes as part of the selected identity.
-        let relative = Path::new(&rel);
-        let mut ancestors: Vec<_> = relative
-            .ancestors()
-            .skip(1)
-            .filter(|p| !p.as_os_str().is_empty())
-            .collect();
-        ancestors.reverse();
-        for parent in ancestors {
-            std::fs::create_dir_all(dst.join(parent)).map_err(|e| e.to_string())?;
-            let mode = std::fs::metadata(root.join(parent))
-                .map_err(|e| e.to_string())?
-                .permissions();
-            std::fs::set_permissions(dst.join(parent), mode).map_err(|e| e.to_string())?;
-        }
         let meta = std::fs::symlink_metadata(&from).map_err(|e| e.to_string())?;
-        let to = dst.join(&rel);
+        if !meta.is_dir() && !meta.is_file() {
+            return Err("selected input must be a file or directory".into());
+        }
         if meta.is_dir() {
-            let mut special = Vec::new();
             let mut links = Vec::new();
             let mut outside = 0;
-            inspect_target(&from, &from, &mut special, &mut links, &mut outside)?;
+            inspect_target(root, &from, &mut specials, &mut links, &mut outside)?;
             if !links.is_empty() {
                 return Err("scoped inputs cannot contain links".into());
             }
-            gaps.extend(copy_tree_with_gaps(&from, &to)?);
-            std::fs::set_permissions(&to, meta.permissions()).map_err(|e| e.to_string())?;
-        } else if meta.is_file() {
-            if rel == ".git" {
-                return Err(
-                    "external Git directories are not execution inputs; use a standalone checkout"
-                        .into(),
-                );
-            }
-            stage_file(dst, &rel, &from).map_err(|e| e.to_string())?;
-        } else {
-            return Err("selected input must be a file or directory".into());
+        }
+        if rel == ".git" && meta.is_file() {
+            return Err(
+                "external Git directories are not execution inputs; use a standalone checkout"
+                    .into(),
+            );
         }
     }
+    // One sorted traversal also creates shared ancestors in a fixed order.
+    let selection = crate::proof_inputs::Selection { version: 1, paths };
+    copy_recursive(
+        root,
+        dst,
+        &(root.to_path_buf(), dst.to_path_buf()),
+        Some(&selection),
+    )?;
+    set_input_permissions(dst, root_mode())?;
+    specials.sort();
+    let mut gaps: Vec<_> = specials
+        .iter()
+        .take(MAX_SPECIAL_PATHS)
+        .map(|p| format!("skipped target socket or FIFO: {}", p.display()))
+        .collect();
+    if specials.len() > MAX_SPECIAL_PATHS {
+        gaps.push(format!(
+            "skipped {} additional target sockets or FIFOs",
+            specials.len() - MAX_SPECIAL_PATHS
+        ));
+    }
     Ok(gaps)
+}
+
+fn root_mode() -> u32 {
+    if cfg!(unix) {
+        0o755
+    } else {
+        0
+    }
+}
+
+fn set_input_permissions(path: &Path, mode: u32) -> Result<(), String> {
+    let current = std::fs::symlink_metadata(path)
+        .map_err(|e| e.to_string())?
+        .permissions();
+    std::fs::set_permissions(path, crate::proof_inputs::permissions(mode, current))
+        .map_err(|e| e.to_string())
 }
 
 fn inspect_target(
@@ -996,6 +970,7 @@ fn inspect_target(
         let entry = entry.map_err(|e| e.to_string())?;
         let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
         if platform::is_link(&meta) {
+            crate::proof_inputs::admit_link(&entry.path())?;
             links.push(
                 entry
                     .path()
@@ -1051,65 +1026,78 @@ fn record_live_links(root: &Path, dst: &Path, links: &[PathBuf], gaps: &mut Vec<
 }
 
 /// `roots` is (canonical source root, destination root) of the whole copy.
-fn copy_recursive(src: &Path, dst: &Path, roots: &(PathBuf, PathBuf)) -> Result<(), String> {
-    for entry in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
+fn copy_recursive(
+    src: &Path,
+    dst: &Path,
+    roots: &(PathBuf, PathBuf),
+    selection: Option<&crate::proof_inputs::Selection>,
+) -> Result<(), String> {
+    let mut entries = std::fs::read_dir(src)
+        .map_err(|e| format!("read {}: {e}", src.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
         supervise::check_interrupted().map_err(|e| e.to_string())?;
-        let entry = entry.map_err(|e| e.to_string())?;
-        let ty = entry.file_type().map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let rel = path.strip_prefix(&roots.0).map_err(|e| e.to_string())?;
+        let name = rel
+            .to_str()
+            .ok_or("execution input paths must be UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if selection.is_some_and(|s| {
+            !s.paths.iter().any(|p| {
+                p == &name
+                    || p.starts_with(&format!("{name}/"))
+                    || name.starts_with(&format!("{p}/"))
+            })
+        }) {
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
         let to = dst.join(entry.file_name());
-        if platform::is_link(&entry.metadata().map_err(|e| e.to_string())?) {
-            copy_link(&entry.path(), &to, roots)?;
-        } else if ty.is_dir() {
-            std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
-            copy_recursive(&entry.path(), &to, roots)?;
-            std::fs::set_permissions(
-                &to,
-                entry.metadata().map_err(|e| e.to_string())?.permissions(),
+        if platform::is_link(&meta) {
+            if selection.is_some() {
+                return Err("scoped inputs cannot contain links".into());
+            }
+            crate::proof_inputs::admit_link(&path)?;
+            copy_link(&path, &to)?;
+        } else if meta.is_dir() {
+            std::fs::create_dir(&to).map_err(|e| e.to_string())?;
+            copy_recursive(&path, &to, roots, selection)?;
+            set_input_permissions(&to, crate::proof_inputs::mode(&meta))?;
+        } else if meta.is_file() {
+            // stage_file uses create_new and dense writes, with no clone/copy
+            // operation that could retain xattrs, ACLs, flags or sparse holes.
+            stage_file(
+                dst,
+                entry
+                    .file_name()
+                    .to_str()
+                    .ok_or("execution input paths must be UTF-8")?,
+                &path,
             )
             .map_err(|e| e.to_string())?;
-        } else if ty.is_file() {
-            std::fs::copy(entry.path(), &to)
-                .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
-        } else if ty.is_symlink() {
-            copy_link(&entry.path(), &to, roots)?;
-        } else if !platform::contentless(&entry.metadata().map_err(|e| e.to_string())?) {
+        } else if !platform::contentless(&meta) {
             return Err(format!(
                 "unsupported target file type at {}; devices are refused",
-                entry.path().display()
+                path.display()
             ));
         }
     }
     Ok(())
 }
 
-/// Preserve the same link text as cp, including dangling and outside links.
+/// Preserve exact link text, including dangling and outside links.
 #[cfg(unix)]
-fn copy_link(link: &Path, to: &Path, _roots: &(PathBuf, PathBuf)) -> Result<(), String> {
+fn copy_link(link: &Path, to: &Path) -> Result<(), String> {
     let target = std::fs::read_link(link).map_err(|e| e.to_string())?;
     std::os::unix::fs::symlink(target, to).map_err(|e| format!("link {}: {e}", to.display()))
 }
 
-/// Windows uses junctions and file copies without following outside links.
 #[cfg(windows)]
-fn copy_link(link: &Path, to: &Path, roots: &(PathBuf, PathBuf)) -> Result<(), String> {
-    let Ok(resolved) = std::fs::canonicalize(link) else {
-        return Ok(());
-    };
-    let Ok(rel) = resolved.strip_prefix(&roots.0) else {
-        return Ok(());
-    };
-    let mapped = roots.1.join(rel);
-    if resolved.is_dir() {
-        // The directory may not be copied yet; create it so the link resolves.
-        std::fs::create_dir_all(&mapped).map_err(|e| e.to_string())?;
-        link_dir(&mapped, to).map_err(|e| format!("link {}: {e}", to.display()))
-    } else if resolved.is_file() {
-        std::fs::copy(&resolved, to)
-            .map(|_| ())
-            .map_err(|e| format!("copy {}: {e}", link.display()))
-    } else {
-        Ok(())
-    }
+fn copy_link(link: &Path, _to: &Path) -> Result<(), String> {
+    crate::proof_inputs::admit_link(link)
 }
 
 /// Why tier 2 cannot run on this OS, if it cannot.
@@ -1127,7 +1115,9 @@ pub fn tier2_unavailable(os: &str) -> Option<String> {
 pub fn stage_file(workspace: &Path, rel: &str, draft: &Path) -> std::io::Result<()> {
     // Caller-supplied source drafts follow the checkout content policy.
     let source = platform::open_regular(draft)?;
-    let permissions = source.metadata()?.permissions();
+    let meta = source.metadata()?;
+    let permissions =
+        crate::proof_inputs::permissions(crate::proof_inputs::mode(&meta), meta.permissions());
     stage_content(workspace, rel, source, permissions)
 }
 
@@ -1191,7 +1181,8 @@ fn stage_content(
         }
         out.write_all(&bytes[..n])?;
     }
-    out.set_permissions(permissions)
+    let mode = crate::proof_inputs::permission_mode(&permissions);
+    out.set_permissions(crate::proof_inputs::permissions(mode, permissions))
 }
 
 /// Admit the entire harness before writing any file. A harness owns fresh
@@ -2246,6 +2237,267 @@ mod tests {
                 assert_eq!(keys, expected, "{os}");
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_staging_normalizes_hardlinks_sparse_files_and_special_modes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-fresh-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let src = d.join("source");
+        std::fs::create_dir_all(src.join("dir")).unwrap();
+        std::fs::write(src.join("a"), b"same").unwrap();
+        std::fs::hard_link(src.join("a"), src.join("b")).unwrap();
+        let sparse = std::fs::File::create(src.join("zeros")).unwrap();
+        sparse.set_len(2 << 20).unwrap();
+        drop(sparse);
+        std::fs::set_permissions(src.join("a"), std::fs::Permissions::from_mode(0o6755)).unwrap();
+        std::fs::set_permissions(src.join("dir"), std::fs::Permissions::from_mode(0o3775)).unwrap();
+        let before = crate::proof_inputs::manifest(&src, None, false).unwrap();
+        let first = d.join("first");
+        copy_tree(&src, &first).unwrap();
+        assert_eq!(
+            crate::proof_inputs::manifest(&first, None, false).unwrap(),
+            before
+        );
+        for name in ["a", "b"] {
+            let meta = std::fs::metadata(first.join(name)).unwrap();
+            assert_eq!(meta.nlink(), 1);
+            assert_eq!(meta.mode() & 0o7777, 0o755);
+        }
+        assert_ne!(
+            std::fs::metadata(first.join("a")).unwrap().ino(),
+            std::fs::metadata(first.join("b")).unwrap().ino()
+        );
+        assert_eq!(
+            std::fs::metadata(first.join("dir")).unwrap().mode() & 0o7777,
+            0o775
+        );
+        assert_eq!(std::fs::metadata(&first).unwrap().mode() & 0o7777, 0o755);
+        assert!(std::fs::metadata(first.join("zeros")).unwrap().blocks() >= (2 << 20) / 512);
+        // Independent files, dense bytes and no special bits admit identically.
+        std::fs::remove_file(src.join("b")).unwrap();
+        std::fs::write(src.join("b"), b"same").unwrap();
+        std::fs::set_permissions(src.join("a"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(src.join("b"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(src.join("dir"), std::fs::Permissions::from_mode(0o775)).unwrap();
+        std::fs::write(src.join("zeros"), vec![0; 2 << 20]).unwrap();
+        assert_eq!(
+            crate::proof_inputs::manifest(&src, None, false).unwrap(),
+            before
+        );
+        let second = d.join("second");
+        copy_tree(&src, &second).unwrap();
+        assert_eq!(
+            crate::proof_inputs::manifest(&second, None, false).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::metadata(first.join("zeros")).unwrap().blocks(),
+            std::fs::metadata(second.join("zeros")).unwrap().blocks()
+        );
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn fresh_staging_never_transfers_source_extended_attributes() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-xattr-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let src = d.join("source");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("file"), b"bytes").unwrap();
+        for path in [&src, &src.join("file")] {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let name = c"user.omgs_fixture";
+            #[cfg(target_os = "macos")]
+            let result = unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    b"BEFORE".as_ptr().cast(),
+                    6,
+                    0,
+                    0,
+                )
+            };
+            #[cfg(target_os = "linux")]
+            let result = unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    b"BEFORE".as_ptr().cast(),
+                    6,
+                    0,
+                )
+            };
+            assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        }
+        let before = crate::proof_inputs::manifest(&src, None, false).unwrap();
+        for (n, value) in [b"BEFORE".as_slice(), b"AFTER".as_slice()]
+            .iter()
+            .enumerate()
+        {
+            let path = std::ffi::CString::new(src.join("file").as_os_str().as_bytes()).unwrap();
+            #[cfg(target_os = "macos")]
+            let result = unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    c"user.omgs_fixture".as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            };
+            #[cfg(target_os = "linux")]
+            let result = unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    c"user.omgs_fixture".as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            };
+            assert_eq!(result, 0);
+            assert_eq!(
+                crate::proof_inputs::manifest(&src, None, false).unwrap(),
+                before
+            );
+            let dst = d.join(format!("copy-{n}"));
+            copy_tree(&src, &dst).unwrap();
+            for path in [&dst, &dst.join("file")] {
+                let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                #[cfg(target_os = "macos")]
+                let result = unsafe {
+                    libc::getxattr(
+                        path.as_ptr(),
+                        c"user.omgs_fixture".as_ptr(),
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        0,
+                    )
+                };
+                #[cfg(target_os = "linux")]
+                let result = unsafe {
+                    libc::getxattr(
+                        path.as_ptr(),
+                        c"user.omgs_fixture".as_ptr(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert_eq!(result, -1, "source xattr must be absent");
+            }
+            assert_eq!(
+                crate::proof_inputs::manifest(&dst, None, false).unwrap(),
+                before
+            );
+        }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_staging_never_transfers_source_acls_or_flags() {
+        use std::os::macos::fs::MetadataExt;
+        use std::os::unix::ffi::OsStrExt;
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-acl-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let src = d.join("source");
+        std::fs::create_dir_all(src.join("dir")).unwrap();
+        std::fs::write(src.join("file"), b"bytes").unwrap();
+        let before = crate::proof_inputs::manifest(&src, None, false).unwrap();
+        let acl_listing = |path: &Path| {
+            let out = Command::new("/bin/ls")
+                .arg("-lde")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .skip(1)
+                .any(|line| line.trim_start().starts_with("0:"))
+        };
+        for path in [&src, &src.join("dir"), &src.join("file")] {
+            let status = Command::new("/bin/chmod")
+                .args(["+a", "everyone allow read"])
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert!(acl_listing(path));
+            let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chflags(cpath.as_ptr(), libc::UF_HIDDEN) }, 0);
+        }
+        assert_eq!(
+            crate::proof_inputs::manifest(&src, None, false).unwrap(),
+            before
+        );
+        let dst = d.join("copy");
+        copy_tree(&src, &dst).unwrap();
+        for path in [&dst, &dst.join("dir"), &dst.join("file")] {
+            assert!(!acl_listing(path));
+            assert_eq!(std::fs::metadata(path).unwrap().st_flags(), 0);
+        }
+        assert_eq!(
+            crate::proof_inputs::manifest(&dst, None, false).unwrap(),
+            before
+        );
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_directory_and_dangling_links_have_one_admission_policy() {
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-link-admission-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let src = d.join("source");
+        std::fs::create_dir_all(src.join("dir")).unwrap();
+        std::fs::write(src.join("file"), b"bytes").unwrap();
+        let src = std::fs::canonicalize(src).unwrap();
+        for kind in ["file", "directory", "dangling", "junction"] {
+            let link = src.join("link");
+            let result = match kind {
+                "junction" => link_dir(&src.join("dir"), &link),
+                "directory" => std::os::windows::fs::symlink_dir("dir", &link),
+                "file" => std::os::windows::fs::symlink_file("file", &link),
+                _ => std::os::windows::fs::symlink_file("missing", &link),
+            };
+            if let Err(e) = result {
+                // Windows symlinks need Developer Mode or SeCreateSymbolicLinkPrivilege.
+                // Junctions always exercise directory reparse admission.
+                if kind != "junction" && e.raw_os_error() == Some(1314) {
+                    eprintln!("{kind} symlink fixture unavailable: {e}");
+                    continue;
+                }
+                panic!("{kind}: {e}");
+            }
+            let validation = crate::proof_inputs::manifest(&src, None, false).unwrap_err();
+            let staging = copy_tree(&src, &d.join(format!("copy-{kind}"))).unwrap_err();
+            assert_eq!(staging, validation);
+            assert!(staging.contains("unsupported execution input link on Windows"));
+            if matches!(kind, "directory" | "junction") {
+                std::fs::remove_dir(link).unwrap();
+            } else {
+                std::fs::remove_file(link).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[cfg(unix)]
