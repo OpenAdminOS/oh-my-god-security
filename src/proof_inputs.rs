@@ -211,11 +211,7 @@ fn walk(
         } else if meta.is_dir() {
             ("dir", crate::sha256::digest(b""))
         } else if meta.is_file() {
-            if rel
-                .file_name()
-                .is_some_and(|s| s == "index" || s.to_string_lossy().starts_with("sharedindex."))
-                && rel.components().any(|c| c.as_os_str() == ".git")
-            {
+            if canonical_git_index(rel) {
                 let bytes = crate::platform::read_bounded_in(root, rel, MAX_MANIFEST_BYTES)
                     .map_err(|e| e.to_string())?;
                 let bytes = normalize_index(&bytes).map_err(|e| format!("{name}: {e}"))?;
@@ -249,6 +245,15 @@ fn walk(
         }
     }
     Ok(())
+}
+
+// Git owns these names directly inside a .git directory. Hook data and
+// auxiliary metadata remain byte-bound, even when a leaf is named index.
+fn canonical_git_index(path: &Path) -> bool {
+    path.parent()
+        .and_then(Path::file_name)
+        .is_some_and(|p| p == ".git")
+        && path.file_name().is_some_and(|name| name == "index")
 }
 
 /// Index v2/v3 with SHA-1 object IDs. Unknown formats fail closed. Preserve
@@ -464,6 +469,16 @@ mod tests {
             crate::sha256::hex(&sha1(b"abc")),
             "a9993e364706816aba3e25717850c26c9cd0d89d"
         );
+        assert!(canonical_git_index(Path::new(".git/index")));
+        assert!(canonical_git_index(Path::new("nested/.git/index")));
+        for path in [
+            ".git/hooks/index",
+            ".git/modules/module/index",
+            ".git/worktrees/other/index",
+            ".git/sharedindex.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(!canonical_git_index(Path::new(path)), "{path}");
+        }
         let data = index();
         let normalized = normalize_index(&data).unwrap();
         assert_eq!(normalize_index(&normalized).unwrap(), normalized);
@@ -518,6 +533,9 @@ mod tests {
             "source",
             ".git/config",
             ".git/hooks/pre-commit",
+            ".git/hooks/index",
+            ".git/hooks/sharedindex.fixture",
+            ".git/sharedindex.fixture",
             ".git/HEAD",
             ".git/refs/heads/main",
             ".git/objects/pack",
@@ -532,6 +550,10 @@ mod tests {
             let next = manifest(&d, None, false).unwrap();
             assert_ne!(next.digest().unwrap(), original.digest().unwrap());
             assert!(original.differences(&next).contains(name));
+            if name.contains("hooks/") || name.ends_with("sharedindex.fixture") {
+                assert_eq!(manifest(&d, None, true).unwrap(), next);
+                assert_eq!(std::fs::read(d.join(name)).unwrap(), b"changed");
+            }
             std::fs::write(d.join(name), b"original").unwrap();
         }
         let raw = index();

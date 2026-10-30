@@ -47,7 +47,9 @@ refused with a request to rerun the proof, never silently interpreted under the 
 The disposable workspace contains normalized SHA-1 Git index versions 2 and 3. Stat fields and
 TREE, UNTR, FSMN, EOIE and IEOT cache extensions are removed or zeroed before hashing and execution;
 the checksum is regenerated. Paths, modes, object IDs, stages, flags and all other extensions
-remain bound, as do config, hooks, refs, objects and other Git files. Unsupported or malformed
+remain bound, as do config, hooks, refs, objects and other Git files. Normalization applies only
+to `index` directly inside `.git` directories. Hook data named `index`, shared indexes and
+auxiliary Git metadata remain byte-bound. Unsupported or malformed
 indexes, including split indexes, fail closed. A linked worktree or external Git directory requires
 a standalone checkout.
 Do not execute Git against the target: config and hooks can execute programs. An incidental index
