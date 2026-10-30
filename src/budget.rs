@@ -400,7 +400,12 @@ pub(crate) fn charge_calls_locked(
 
 pub fn summary(run: &Path) -> Result<String, String> {
     let root = original(run)?;
-    let a = runmeta::with_lock(&root, || allowance(&root))?;
+    runmeta::with_lock(&root, || summary_locked(run))
+}
+
+/// Caller holds the family lock, or is reading a frozen archive snapshot.
+pub fn summary_locked(run: &Path) -> Result<String, String> {
+    let a = allowance(&original(run)?)?;
     Ok(format!(
         "Cumulative budget: {} used of {}; {} remaining across {} run(s)",
         a.calls_and_proofs_used,

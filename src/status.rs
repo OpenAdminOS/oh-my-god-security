@@ -96,17 +96,20 @@ pub fn apply(dir: &Path, u: &Update) -> Result<(), String> {
 
 /// Append all supplied log messages in the same status transaction.
 pub fn apply_with_logs(dir: &Path, u: &Update, logs: &[String]) -> Result<(), String> {
-    with_lock(dir, || {
-        apply_locked(dir, u, logs)?;
-        if u.state != "done" {
-            crate::runmeta::invalidate_completion_locked(dir)?;
-        }
-        let view = crate::review::View::load_locked(dir)?;
-        write_atomic(
-            &dir.join(FILE),
-            &serde_json::to_string_pretty(&view.progress).map_err(|e| e.to_string())?,
-        )
-    })
+    with_lock(dir, || apply_with_logs_locked(dir, u, logs))
+}
+
+/// Caller holds the run lock through the enclosing publication.
+pub fn apply_with_logs_locked(dir: &Path, u: &Update, logs: &[String]) -> Result<(), String> {
+    apply_locked(dir, u, logs)?;
+    if u.state != "done" {
+        crate::runmeta::invalidate_completion_locked(dir)?;
+    }
+    let view = crate::review::View::load_locked(dir)?;
+    write_atomic(
+        &dir.join(FILE),
+        &serde_json::to_string_pretty(&view.progress).map_err(|e| e.to_string())?,
+    )
 }
 
 /// Check an existing status document against the status schema before it is

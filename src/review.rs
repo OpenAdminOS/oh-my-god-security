@@ -6,6 +6,9 @@ use std::path::Path;
 
 pub struct View {
     pub findings: FindingsFile,
+    pub saved: serde_json::Map<String, Value>,
+    pub budget: Option<String>,
+    pub accounting: crate::accounting::Accounting,
     pub meta: ReportMeta,
     pub state: Option<String>,
     pub reasons: Vec<String>,
@@ -23,16 +26,38 @@ impl View {
         crate::runmeta::with_lock(run, || Self::load_locked(run))
     }
 
+    pub fn load_archive(run: &Path) -> Result<Self, String> {
+        crate::runmeta::with_archive_lock(run, || Self::build_locked(run, None, true))
+    }
+
     pub fn with_findings(run: &Path, findings: &FindingsFile) -> Result<Self, String> {
-        crate::runmeta::with_lock(run, || Self::build_locked(run, Some(findings)))
+        crate::runmeta::with_lock(run, || Self::build_locked(run, Some(findings), false))
     }
 
     /// Caller holds the metadata lock, including through publication.
-    pub(crate) fn load_locked(run: &Path) -> Result<Self, String> {
-        Self::build_locked(run, None)
+    pub fn load_locked(run: &Path) -> Result<Self, String> {
+        Self::build_locked(run, None, false)
     }
 
-    fn build_locked(run: &Path, supplied: Option<&FindingsFile>) -> Result<Self, String> {
+    /// Use the metadata transaction that will be saved with these artifacts.
+    /// Caller holds the family/run locks and has read findings under that lock.
+    pub fn for_publication_locked(
+        run: &Path,
+        findings: &FindingsFile,
+        saved: &serde_json::Map<String, Value>,
+    ) -> Result<Self, String> {
+        let mut view = Self::build_locked(run, Some(findings), false)?;
+        view.saved = saved.clone();
+        view.accounting = crate::accounting::read(saved)?;
+        view.meta.accounting = view.accounting.clone();
+        Ok(view)
+    }
+
+    fn build_locked(
+        run: &Path,
+        supplied: Option<&FindingsFile>,
+        archive: bool,
+    ) -> Result<Self, String> {
         let saved = crate::runmeta::read_optional(run)?.unwrap_or_default();
         let stored = crate::run_artifact::optional_text(
             run,
@@ -151,7 +176,17 @@ impl View {
         progress["counters"]["rejected"] = json!(rejected);
         progress["review_state"] = json!(state.as_deref().unwrap_or("complete"));
         progress["review_complete"] = json!(state.is_none());
+        let accounting = crate::accounting::read(&saved)?;
+        meta.accounting = accounting.clone();
+        let budget = if archive || saved.is_empty() {
+            None
+        } else {
+            Some(crate::budget::summary_locked(run)?)
+        };
         Ok(Self {
+            saved,
+            budget,
+            accounting,
             findings,
             meta,
             state,

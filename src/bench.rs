@@ -570,7 +570,7 @@ struct Evidence {
 struct ObservationReview {
     state: Option<String>,
     needs_validation: usize,
-    final_decisions: BTreeSet<String>,
+    decisions: BTreeMap<String, crate::model::Verdict>,
 }
 
 fn source_findings(dir: &Path, observation: &Value) -> Result<(crate::review::View, PathBuf)> {
@@ -590,7 +590,7 @@ fn source_findings(dir: &Path, observation: &Value) -> Result<(crate::review::Vi
     // Admit the archive boundary, then read publication inputs under its lock.
     crate::run_artifact::text(&root, &relative, crate::run_artifact::FINDINGS_BYTES)?;
     let source = root.join(source);
-    let view = crate::review::View::load(&source)?;
+    let view = crate::review::View::load_archive(&source)?;
     if !view.strict_errors.is_empty() {
         return Err(view.strict_errors.join("; "));
     }
@@ -651,18 +651,21 @@ fn evidence_errors(dir: &Path, r: &Value, manifest: &Value) -> Result<Evidence> 
             Ok((view, _)) => ObservationReview {
                 state: view.state.clone(),
                 needs_validation: view.needs_validation,
-                final_decisions: view
+                decisions: view
                     .findings
                     .findings
                     .iter()
-                    .filter(|f| f.verdict != crate::model::Verdict::NeedsValidation)
-                    .map(|f| f.fingerprint.clone())
+                    .flat_map(|f| {
+                        std::iter::once(&f.fingerprint)
+                            .chain(f.candidates.iter())
+                            .map(move |fp| (fp.clone(), f.verdict))
+                    })
                     .collect(),
             },
             Err(e) => ObservationReview {
                 state: Some(e.clone()),
                 needs_validation: 0,
-                final_decisions: BTreeSet::new(),
+                decisions: BTreeMap::new(),
             },
         };
         observations.insert(
@@ -739,9 +742,9 @@ fn evidence_errors(dir: &Path, r: &Value, manifest: &Value) -> Result<Evidence> 
 
 // Use the same cumulative usage model as report and status.
 fn accounting(dir: &Path) -> Result<Value> {
-    let meta = crate::runmeta::read_optional(dir)?.unwrap_or_default();
-    let mut usage = crate::accounting::aggregate(&meta)?;
-    if let Some(calls) = meta.get("agent_calls_used") {
+    let view = crate::review::View::load_archive(dir)?;
+    let mut usage = crate::accounting::aggregate(&view.saved)?;
+    if let Some(calls) = view.saved.get("agent_calls_used") {
         integer(calls)?;
         usage["calls"] = calls.clone();
     }
@@ -914,14 +917,22 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[ScoringRun]) -> Result<V
                     if positive && !cs.is_empty() {
                         submitted.insert(key.clone());
                         if cs.iter().any(|c| {
-                            c["verifier"] == "rejected"
-                                && identity(c).is_ok_and(|fp| review.final_decisions.contains(&fp))
+                            identity(c).is_ok_and(|fp| {
+                                review.decisions.get(&fp) == Some(&crate::model::Verdict::Rejected)
+                            })
                         }) {
                             rejected.insert(key.clone());
                         }
                         if cs.iter().any(|c| {
-                            c["verifier"] == "pending"
-                                || identity(c).is_ok_and(|fp| !review.final_decisions.contains(&fp))
+                            identity(c).is_ok_and(|fp| {
+                                !matches!(
+                                    review.decisions.get(&fp),
+                                    Some(
+                                        crate::model::Verdict::Confirmed
+                                            | crate::model::Verdict::Rejected
+                                    )
+                                )
+                            })
                         }) {
                             pending.insert(key.clone());
                         }
@@ -1067,6 +1078,9 @@ mod tests {
         crate::platform::create_private_tree(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap() {
             let entry = entry.unwrap();
+            if entry.file_name() == ".omgs-run.lock" {
+                continue;
+            }
             let dest = to.join(entry.file_name());
             if entry.file_type().unwrap().is_dir() {
                 copy_private(&entry.path(), &dest);

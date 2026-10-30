@@ -301,6 +301,23 @@ fn registered_gate_executes_immutable_head_and_ignores_advisory_artifacts() {
     let advisory = gate(&root, &repo, &base, &base, Some(&run), 1);
     assert!(output(&advisory).contains("not yet a registered gate test"));
     let original = read(&run.join("findings.json"));
+    // Registration changes the advisory, while the immutable registered
+    // failing test continues to decide the gate exit code.
+    let mut matching_policy = p.clone();
+    matching_policy.gate_tests[0].fingerprint = original["findings"][0]["fingerprint"]
+        .as_str()
+        .map(str::to_owned);
+    let registered_base = commit_policy(&repo, &matching_policy);
+    let registered_out = gate(
+        &root,
+        &repo,
+        &registered_base,
+        &registered_base,
+        Some(&run),
+        1,
+    );
+    assert!(!output(&registered_out).contains("not yet a registered gate test"));
+    let base = registered_base;
     let mut draft = original.clone();
     draft["findings"][0]["verification"]["state"] = json!("draft");
     write(&run.join("findings.json"), &draft);

@@ -220,16 +220,10 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
     };
     let at = |name: &str, e: String| format!("{}: {name}: {e}", dir.display());
     let view = crate::review::View::load(dir)?;
-    if crate::run_artifact::optional_text(
-        dir,
-        Path::new(crate::runmeta::FILE),
-        crate::run_artifact::METADATA_BYTES,
-    )?
-    .is_some()
-    {
-        let meta = crate::runmeta::read(dir)?;
-        check_meta_types(&meta).map_err(|e| at(crate::runmeta::FILE, e))?;
-        s.budget = Some(crate::budget::summary(dir)?);
+    if !view.saved.is_empty() {
+        let meta = &view.saved;
+        check_meta_types(meta).map_err(|e| at(crate::runmeta::FILE, e))?;
+        s.budget = view.budget.clone();
         s.agent_calls = meta.get("agent_calls_used").and_then(|v| v.as_u64());
         s.reroutes = meta
             .get("reroutes")

@@ -196,11 +196,7 @@ pub fn build_view(
     };
     Ok(Handoff {
         review_state: review_state.into(),
-        budget: if crate::runmeta::read_optional(run)?.is_some() {
-            Some(crate::budget::summary(run)?)
-        } else {
-            None
-        },
+        budget: view.budget.clone(),
         schema: "omgs-handoff/1",
         trust: Trust {
             record_strings: RECORD_TRUST,

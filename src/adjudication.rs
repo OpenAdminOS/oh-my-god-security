@@ -334,6 +334,19 @@ pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String>
 }
 
 pub fn report_lines(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String> {
+    report_lines_inner(run, findings, false)
+}
+
+/// Caller holds the family and run locks through artifact publication.
+pub fn report_lines_locked(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String> {
+    report_lines_inner(run, findings, true)
+}
+
+fn report_lines_inner(
+    run: &Path,
+    findings: &FindingsFile,
+    locked: bool,
+) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     if let Some(e) = load(run)? {
         lines.push(format!(
@@ -382,7 +395,11 @@ pub fn report_lines(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, 
             lines.push(format!("Attempt history {}: {:?}", event.at, event.record));
         }
         lines.push("Context isolation is procedural unless the host enforces private views. Separate identities do not attest separate contexts. The same model across roles limits adversarial independence.".into());
-        lines.push(crate::budget::summary(run)?);
+        lines.push(if locked {
+            crate::budget::summary_locked(run)?
+        } else {
+            crate::budget::summary(run)?
+        });
     }
     if let Some(text) = crate::run_artifact::optional_text(
         run,

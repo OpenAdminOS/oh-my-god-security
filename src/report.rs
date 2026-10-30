@@ -8,10 +8,10 @@ fn html_escape(s: &str) -> String {
 
 #[derive(Default)]
 pub struct ReportMeta {
+    pub accounting: crate::accounting::Accounting,
     pub artifact_base: String,
     pub review_limits: Vec<String>,
     pub timeline: Vec<TimelineRow>,
-    pub accounting: crate::accounting::Accounting,
     pub persona: String,
     pub report_depth: String,
     pub repo: String,
@@ -1504,70 +1504,66 @@ fn tier_label(f: &Finding) -> String {
 pub struct Completion {
     pub hunters: Option<u32>,
     pub verifier: Option<String>,
-    pub accounting: crate::accounting::Accounting,
     pub complete: bool,
 }
 
-/// Publish initial counters, render without holding the run lock, then publish
-/// completion against fresh metadata under the lock. Rendering may overlap a
-/// charge from another process and must never restore its earlier allowance.
+/// Render artifacts and save completion while holding the same family/run lock.
+/// The callback must use lock-aware readers and writers throughout publication.
 pub fn publish(
     run: Option<&std::path::Path>,
     calls: Option<u32>,
     models: &std::collections::BTreeMap<String, String>,
-    render: impl FnOnce() -> Result<Completion, String>,
+    render: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<Completion, String>,
 ) -> Result<(), String> {
+    let transaction = |m: &mut serde_json::Map<String, serde_json::Value>| {
+        if let Some(n) = calls {
+            let old = m
+                .get("agent_calls_used")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if u64::from(n) < old {
+                return Err("--agent-calls cannot decrease recorded usage".into());
+            }
+            m.insert("agent_calls_used".into(), serde_json::json!(n));
+        }
+        let saved = m
+            .entry("models")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or("models must be an object")?;
+        for (role, model) in models {
+            saved.insert(role.clone(), serde_json::json!(model));
+        }
+        let completion = render(m)?;
+        if let Some(n) = completion.hunters {
+            m.insert("hunters".into(), serde_json::json!(n));
+        }
+        if let Some(v) = &completion.verifier {
+            m.insert("verifier".into(), serde_json::json!(v));
+        }
+        m.insert(
+            "run_status".into(),
+            serde_json::json!(if completion.complete {
+                "complete"
+            } else {
+                "partial"
+            }),
+        );
+        m.insert(
+            "completed_unix".into(),
+            serde_json::json!(crate::runmeta::now_unix()),
+        );
+        Ok(())
+    };
     if let Some(run) = run {
-        crate::runmeta::update(run, |m| {
-            if let Some(n) = calls {
-                let old = m
-                    .get("agent_calls_used")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if u64::from(n) < old {
-                    return Err("--agent-calls cannot decrease recorded usage".into());
-                }
-                m.insert("agent_calls_used".into(), serde_json::json!(n));
-            }
-            let saved = m
-                .entry("models")
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-                .ok_or("models must be an object")?;
-            for (role, model) in models {
-                saved.insert(role.clone(), serde_json::json!(model));
-            }
-            Ok(())
-        })?;
+        if crate::runmeta::read_optional(run)?.is_some() {
+            crate::runmeta::update(run, transaction)
+        } else {
+            crate::runmeta::with_lock(run, || transaction(&mut Default::default()))
+        }
+    } else {
+        transaction(&mut Default::default())
     }
-    let completion = render()?;
-    if let Some(run) = run {
-        crate::runmeta::update(run, |m| {
-            if let Some(n) = completion.hunters {
-                m.insert("hunters".into(), serde_json::json!(n));
-            }
-            if let Some(v) = &completion.verifier {
-                m.insert("verifier".into(), serde_json::json!(v));
-            }
-            let mut usage = crate::accounting::read(m)?;
-            crate::accounting::submit(m, &mut usage, completion.accounting)?;
-            m.insert(
-                "accounting".into(),
-                serde_json::to_value(usage).map_err(|e| e.to_string())?,
-            );
-            let complete = completion.complete && crate::review::View::load_locked(run)?.complete();
-            m.insert(
-                "run_status".into(),
-                serde_json::json!(if complete { "complete" } else { "partial" }),
-            );
-            m.insert(
-                "completed_unix".into(),
-                serde_json::json!(crate::runmeta::now_unix()),
-            );
-            Ok(())
-        })?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1585,17 +1581,26 @@ mod publication_tests {
             r#"{"run_id":"publication-test","budget_agent_calls":12,"agent_calls_used":0}"#,
         )
         .unwrap();
-        super::publish(Some(&run), Some(5), &Default::default(), || {
-            assert_eq!(crate::runmeta::read(&run)?["agent_calls_used"], 5);
-            crate::budget::charge_calls(&run, 1)?;
+        let mut charge = None;
+        super::publish(Some(&run), Some(5), &Default::default(), |m| {
+            assert_eq!(m["agent_calls_used"], 5);
+            let path = run.clone();
+            let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let writer_ready = ready.clone();
+            charge = Some(std::thread::spawn(move || {
+                writer_ready.wait();
+                crate::budget::charge_calls(&path, 1)
+            }));
+            ready.wait();
+            assert_eq!(m["agent_calls_used"], 5);
             Ok(super::Completion {
                 hunters: None,
                 verifier: None,
-                accounting: Default::default(),
-                complete: true,
+                complete: false,
             })
         })
         .unwrap();
+        charge.unwrap().join().unwrap().unwrap();
         let meta = crate::runmeta::read(&run).unwrap();
         assert_eq!(meta["run_status"], "partial");
         assert_eq!(meta["agent_calls_used"], 6);

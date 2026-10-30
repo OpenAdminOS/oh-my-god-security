@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 #[serde(deny_unknown_fields)]
 pub struct Usage {
     pub tokens: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,8 +67,43 @@ fn latest_turns(meta: &Map<String, Value>) -> Result<BTreeMap<String, String>, S
     Ok(turns)
 }
 
+/// A submission is bound to the accounting and turns observed by its caller.
+/// Reject stale totals rather than attributing them to a continuation or
+/// replacing a newer cumulative submission, including one on the same turn.
+pub struct Submission {
+    observed: Accounting,
+    turns: BTreeMap<String, String>,
+    supplied: Accounting,
+}
+
+impl Submission {
+    pub fn observe(meta: &Map<String, Value>, supplied: Accounting) -> Result<Self, String> {
+        Ok(Self {
+            observed: read(meta)?,
+            turns: latest_turns(meta)?,
+            supplied,
+        })
+    }
+
+    pub fn apply(self, meta: &mut Map<String, Value>) -> Result<(), String> {
+        if self.supplied.is_empty() {
+            return Ok(());
+        }
+        if read(meta)? != self.observed || latest_turns(meta)? != self.turns {
+            return Err("accounting submission is stale; reload current turns and totals before resubmitting".into());
+        }
+        let mut usage = read(meta)?;
+        submit(meta, &mut usage, self.supplied)?;
+        meta.insert(
+            "accounting".into(),
+            serde_json::to_value(usage).map_err(|e| e.to_string())?,
+        );
+        Ok(())
+    }
+}
+
 /// Cumulative submissions cover the latest dispatched turn under the run lock.
-pub fn submit(
+fn submit(
     meta: &Map<String, Value>,
     values: &mut Accounting,
     supplied: Accounting,
@@ -250,7 +287,13 @@ pub fn aggregate(meta: &Map<String, Value>) -> Result<Value, String> {
         }
     }
     let mut out = serde_json::json!({"tokens":null,"input_tokens":null,"output_tokens":null,"calls":null,"cost_usd":null,"duration_ms":null,"roles":values,"known_subtotals":{},"unknown_usage":{}});
-    for field in ["tokens", "cost_usd", "duration_ms"] {
+    for field in [
+        "tokens",
+        "input_tokens",
+        "output_tokens",
+        "cost_usd",
+        "duration_ms",
+    ] {
         let mut total = 0u64;
         let mut cost = 0.0;
         let mut unknown = 0;
@@ -261,10 +304,11 @@ pub fn aggregate(meta: &Map<String, Value>) -> Result<Value, String> {
                     usage.cost_usd.is_some()
                 }
                 _ => {
-                    let value = if field == "tokens" {
-                        usage.tokens
-                    } else {
-                        usage.duration_ms
+                    let value = match field {
+                        "tokens" => usage.tokens,
+                        "input_tokens" => usage.input_tokens,
+                        "output_tokens" => usage.output_tokens,
+                        _ => usage.duration_ms,
                     };
                     total = total
                         .checked_add(value.unwrap_or_default())

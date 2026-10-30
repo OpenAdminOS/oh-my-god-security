@@ -238,6 +238,41 @@ pub fn with_lock<T>(dir: &Path, f: impl FnOnce() -> Result<T, String>) -> Result
     with_lock_file(&dir.join(LOCK), f)
 }
 
+/// Read archived data without creating a lock file or requiring write access.
+/// If a writer creates the lock during an unlocked read, retry under that lock.
+pub fn with_archive_lock<T>(dir: &Path, read: impl Fn() -> Result<T, String>) -> Result<T, String> {
+    let path = dir.join(LOCK);
+    for _ in 0..3 {
+        match crate::platform::open_single_link(&path).map_err(|e| e.to_string())? {
+            Some(file) => {
+                crate::platform::check_private_file(&file).map_err(|e| e.to_string())?;
+                let start = std::time::Instant::now();
+                loop {
+                    match file.try_lock_shared() {
+                        Ok(()) => break,
+                        Err(std::fs::TryLockError::WouldBlock)
+                            if start.elapsed().as_secs() < 30 =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(e) => return Err(format!("archive lock: {e}")),
+                    }
+                }
+                let result = read();
+                let _ = file.unlock();
+                return result;
+            }
+            None => {
+                let result = read();
+                if !path.try_exists().map_err(|e| e.to_string())? {
+                    return result;
+                }
+            }
+        }
+    }
+    Err("archive changed while reading; retry with a frozen archive".into())
+}
+
 /// Apply `change` to the run metadata in `dir` under the run lock and write
 /// it back atomically. `change` may fail, in which case nothing is written.
 pub fn update<T>(

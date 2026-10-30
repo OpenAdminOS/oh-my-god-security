@@ -1603,10 +1603,9 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             }
         }
     }
-    let raw_file = file;
     let file = omgs::review::View::with_findings(
         findings_dir.as_deref().unwrap_or(Path::new(".")),
-        &raw_file,
+        &file,
     )?
     .findings;
     // Explicit flags override saved metadata. Verifier identities on findings
@@ -1630,11 +1629,12 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         .transpose()?
         .flatten();
     let publication_run = findings_dir.as_deref().filter(|_| saved_text.is_some());
-    let mut saved = publication_run
+    let saved = publication_run
         .map(omgs::runmeta::read)
         .transpose()?
         .unwrap_or_default();
     omgs::batch::check_meta_types(&saved)?;
+    let submission = omgs::accounting::Submission::observe(&saved, supplied_usage)?;
     let hunters = flag(args, "--hunters")
         .and_then(|s| s.parse::<u32>().ok())
         .or_else(|| {
@@ -1700,16 +1700,73 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         })?;
-        saved = omgs::runmeta::read(run)?;
     }
     let supplied_models = omgs::route::parse_identities(&flags(args, "--model"))?;
     omgs::report::publish(
-        publication_run,
+        findings_dir.as_deref(),
         explicit_agent_calls,
         &supplied_models,
-        || {
-            let mut accounting = omgs::accounting::read(&saved)?;
-            omgs::accounting::submit(&saved, &mut accounting, supplied_usage.clone())?;
+        |saved| {
+            submission.apply(saved)?;
+            if let Some(run) = publication_run {
+                saved.insert("run_status".into(), serde_json::json!("partial"));
+                omgs::runmeta::write_atomic(
+                    &run.join(omgs::runmeta::FILE),
+                    &serde_json::to_string_pretty(&saved).map_err(|e| e.to_string())?,
+                )?;
+            }
+            let saved = saved.clone();
+            let run = findings_dir.as_deref().unwrap_or(Path::new("."));
+            if run.join(omgs::status::FILE).exists() {
+                omgs::status::apply_with_logs_locked(
+                    run,
+                    &omgs::status::Update {
+                        stage: "report",
+                        label: None,
+                        parent: None,
+                        state: "done",
+                        detail: None,
+                        counters: &[],
+                        log: None,
+                    },
+                    &[],
+                )?;
+            }
+            let fresh = read_findings(&path)?;
+            let errors = omgs::model::validate_drafts(&fresh);
+            if !errors.is_empty() {
+                return Err(errors.join("; "));
+            }
+            let view = omgs::review::View::for_publication_locked(run, &fresh, &saved)?;
+            let accounting = view.accounting.clone();
+            let hunters = flag(args, "--hunters")
+                .and_then(|s| s.parse::<u32>().ok())
+                .or_else(|| {
+                    saved
+                        .get("hunters")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|n| u32::try_from(n).ok())
+                });
+            let verifier = flag(args, "--verifier")
+                .or_else(|| {
+                    saved
+                        .get("verifier")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                })
+                .or_else(|| {
+                    let ids: std::collections::BTreeSet<_> = view
+                        .findings
+                        .findings
+                        .iter()
+                        .filter_map(|f| identity(&f.verified_by))
+                        .collect();
+                    (!ids.is_empty()).then(|| ids.into_iter().collect::<Vec<_>>().join(", "))
+                });
+            let agent_calls = saved
+                .get("agent_calls_used")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u32::try_from(n).ok());
             let persona = flag(args, "--persona")
                 .or_else(|| {
                     saved
@@ -1766,10 +1823,6 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 persona,
                 report_depth,
             };
-            let view = omgs::review::View::with_findings(
-                findings_dir.as_deref().unwrap_or(Path::new(".")),
-                &raw_file,
-            )?;
             view.apply(&mut meta);
             let file = view.findings.clone();
             let handoff = omgs::handoff::build_view(
@@ -1787,7 +1840,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 .map(omgs::sensors::read_report)
                 .transpose()?
                 .flatten();
-            let evidence = omgs::adjudication::report_lines(
+            let evidence = omgs::adjudication::report_lines_locked(
                 findings_dir.as_deref().unwrap_or(Path::new(".")),
                 &file,
             )?;
@@ -1817,62 +1870,11 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 dir.join("HANDOFF.md").display(),
                 dir.join("handoff.json").display()
             );
-            let mut completion = omgs::report::Completion {
+            let completion = omgs::report::Completion {
                 hunters: meta.hunters,
                 verifier: meta.verifier.clone(),
-                accounting: supplied_usage.clone(),
                 complete: view.complete(),
             };
-            let status_run = findings_dir
-                .as_deref()
-                .map(|run| {
-                    omgs::run_artifact::optional_text(
-                        run,
-                        Path::new(omgs::status::FILE),
-                        omgs::run_artifact::STATUS_BYTES,
-                    )
-                    .map(|text| text.map(|_| run))
-                })
-                .transpose()?
-                .flatten();
-            if let Some(run) = status_run {
-                omgs::status::apply(
-                    run,
-                    &omgs::status::Update {
-                        stage: "report",
-                        label: None,
-                        parent: None,
-                        state: "done",
-                        detail: None,
-                        counters: &[],
-                        log: None,
-                    },
-                )?;
-            }
-            if let Some(run) = status_run {
-                let view = omgs::review::View::with_findings(run, &raw_file)?;
-                view.apply(&mut meta);
-                let file = &view.findings;
-                completion.complete = view.complete();
-                write_handoff(
-                    dir,
-                    &omgs::handoff::build_view(run, &view, None)?,
-                    &meta.artifact_base,
-                )?;
-                write_out(dir.join("findings.sarif.json"), render_sarif(file, &meta))
-                    .map_err(|e| e.to_string())?;
-                write_out(
-                    dir.join("REPORT.md"),
-                    format!("{}{sensor_md}{evidence_md}", render_markdown(file, &meta)),
-                )
-                .map_err(|e| e.to_string())?;
-                write_out(
-                    dir.join("REPORT.html"),
-                    render_html(file, &meta)
-                        .replace("</body>", &format!("{sensor_html}{evidence_html}</body>")),
-                )
-                .map_err(|e| e.to_string())?;
-            }
 
             Ok(completion)
         },
@@ -3434,8 +3436,8 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     let stage = flag(args, "--stage").ok_or("status requires --stage <id>")?;
     let state = flag(args, "--state").ok_or("status requires --state <state>")?;
     let supplied_usage = omgs::accounting::parse(&flags(args, "--accounting"))?;
-    // Refuse malformed metadata before updating progress.
-    omgs::runmeta::read(Path::new(&run))?;
+    let observed = omgs::review::View::load(Path::new(&run))?;
+    let submission = omgs::accounting::Submission::observe(&observed.saved, supplied_usage)?;
     let mut counters = Vec::new();
     for c in flags(args, "--counter") {
         let (k, v) = c
@@ -3463,22 +3465,14 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
         },
         &logs,
     )?;
-    let usage = omgs::runmeta::update(Path::new(&run), |m| {
-        let mut usage = omgs::accounting::read(m)?;
-        omgs::accounting::submit(m, &mut usage, supplied_usage)?;
-        m.insert(
-            "accounting".into(),
-            serde_json::to_value(&usage).map_err(|e| e.to_string())?,
-        );
-        Ok(usage)
-    })?;
+    omgs::runmeta::update(Path::new(&run), |m| submission.apply(m))?;
     let view = omgs::review::View::load(Path::new(&run))?;
     println!(
         "{stage}: {state}; review {}",
         view.state.as_deref().unwrap_or("complete")
     );
     if !flags(args, "--accounting").is_empty() {
-        for line in omgs::accounting::lines(&usage) {
+        for line in omgs::accounting::lines(&view.accounting) {
             println!("{line}");
         }
     }

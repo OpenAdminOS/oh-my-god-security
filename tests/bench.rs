@@ -5,6 +5,9 @@ fn copy_private(from: &std::path::Path, to: &std::path::Path) {
     omgs::platform::create_private_tree(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
+        if entry.file_name() == ".omgs-run.lock" {
+            continue;
+        }
         let dest = to.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
             copy_private(&entry.path(), &dest);
@@ -16,28 +19,25 @@ fn copy_private(from: &std::path::Path, to: &std::path::Path) {
 }
 
 fn root() -> PathBuf {
-    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    ROOT.get_or_init(|| {
-        // Checked-out files can be owned by Administrators on Windows. Build
-        // valid archived run fixtures using the same private writer as the CLI.
-        let dir = omgs::platform::temp_root()
-            .unwrap()
-            .join(format!("omgs-score-source-{}", std::process::id()));
-        copy_private(
-            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score"),
-            &dir,
-        );
-        dir
-    })
-    .clone()
+    let dir = omgs::platform::temp_root().unwrap().join(format!(
+        "omgs-score-source-{}",
+        omgs::platform::random_nonce().unwrap()
+    ));
+    copy_private(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score"),
+        &dir,
+    );
+    dir
 }
+
 fn fixture() -> Value {
     serde_json::from_str(include_str!("../benchmark/fixtures/score/cases.json")).unwrap()
 }
 fn score() -> Value {
+    let root = root();
     omgs::bench::score(
-        &root().join("cases.json"),
-        &[root().join("run-1"), root().join("run-2")],
+        &root.join("cases.json"),
+        &[root.join("run-1"), root.join("run-2")],
     )
     .unwrap()
 }
@@ -156,6 +156,7 @@ fn required_fields_are_never_defaulted() {
 }
 #[test]
 fn examples_aliases_and_manifest_semantics_fail_closed() {
+    let root = root();
     let mut v = fixture();
     v["examples_only"] = json!(true);
     assert!(omgs::bench::manifest(&v).is_err());
@@ -185,11 +186,11 @@ fn examples_aliases_and_manifest_semantics_fail_closed() {
         v["cases"][0]["expected_findings"][1]["aliases"].clone();
     assert!(omgs::bench::manifest(&v).is_err());
     assert!(omgs::bench::score(
-        &root().join("cases.json"),
-        &[root().join("run-1"), root().join("run-1")]
+        &root.join("cases.json"),
+        &[root.join("run-1"), root.join("run-1")]
     )
     .is_err());
-    assert!(omgs::bench::score(&root().join("cases.json"), &[root().join("run-1")]).is_err());
+    assert!(omgs::bench::score(&root.join("cases.json"), &[root.join("run-1")]).is_err());
 }
 #[test]
 fn cli_emits_json_and_markdown_offline() {
@@ -224,7 +225,10 @@ impl SavedRuns {
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        copy_private(&root(), &dir);
+        copy_private(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score"),
+            &dir,
+        );
         Self(dir)
     }
     fn edit(&self, path: &str, mutate: impl FnOnce(&mut Value)) {
@@ -778,5 +782,87 @@ fn empty_observations_reconcile_shared_lifecycle_stages_coverage_and_evaluation(
             .iter()
             .filter(|o| o["snapshot_id"] == "fixed")
             .all(|o| o["status"] == context["status"]));
+    }
+}
+
+#[test]
+fn verifier_metrics_use_canonical_outcomes_including_absorbed_candidates() {
+    for label in ["rejected", "pending"] {
+        let saved = SavedRuns::new();
+        let baseline = saved.score();
+        saved.edit("run-1/benchmark-run.json", |r| {
+            r["observations"][0]["candidates"][0]["verifier"] = json!(label);
+            r["observations"][0]["candidates"][1]["verifier"] = json!("pending");
+        });
+        let scored = saved.score();
+        for metric in ["verifier_false_rejection_rate", "true_candidates_pending"] {
+            assert_eq!(
+                scored["cohorts"][0]["runs"][0][metric],
+                baseline["cohorts"][0]["runs"][0][metric]
+            );
+        }
+        // The second candidate is now absorbed by a confirmed source record.
+        saved.edit("run-1/positive/findings.json", |f| {
+            let removed = f["findings"].as_array_mut().unwrap().remove(1);
+            f["findings"][0]["candidates"] = json!([removed["fingerprint"]]);
+        });
+        saved.edit("run-1/benchmark-run.json", |r| {
+            r["observations"][0]["findings"]
+                .as_array_mut()
+                .unwrap()
+                .remove(1);
+        });
+        let scored = saved.score();
+        let run = &scored["cohorts"][0]["runs"][0];
+        assert_eq!(run["verifier_false_rejection_rate"]["numerator"], 0);
+        assert_eq!(run["true_candidates_pending"]["numerator"], 1);
+    }
+}
+
+#[test]
+fn scoring_archives_never_creates_lock_files_and_preserves_token_splits() {
+    let saved = SavedRuns::new();
+    for role in ["red-hunter", "blue-verifier", "evaluator", "green-fixer"] {
+        saved.edit("run-1/run-metadata.json", |m| {
+            m["accounting"][role]["input_tokens"] = json!(10);
+            m["accounting"][role]["output_tokens"] = json!(5);
+        });
+    }
+    let score = saved.score();
+    let usage = &score["cost_per_run"][0]["numerator"];
+    assert_eq!(usage["input_tokens"], 40);
+    assert_eq!(usage["output_tokens"], 20);
+    fn no_locks(dir: &std::path::Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            assert_ne!(entry.file_name(), ".omgs-run.lock");
+            if entry.file_type().unwrap().is_dir() {
+                no_locks(&entry.path());
+            }
+        }
+    }
+    no_locks(&saved.0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fn readonly(dir: &std::path::Path, mode: u32) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    readonly(&path, mode);
+                }
+            }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        // Existing locks must also be usable through read-only descriptors.
+        for dir in [saved.0.join("run-1"), saved.0.join("run-1/positive")] {
+            let lock = dir.join(".omgs-run.lock");
+            omgs::runmeta::write_atomic(&lock, "").unwrap();
+            std::fs::set_permissions(lock, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        readonly(&saved.0, 0o500);
+        let result = saved.try_score();
+        readonly(&saved.0, 0o700);
+        assert!(result.is_ok(), "{result:?}");
     }
 }
