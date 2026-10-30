@@ -49,6 +49,13 @@ pub fn bundled_digest() -> String {
 
 pub fn check_identity(root: &Path) -> Result<String, String> {
     let files = manifest(root)?;
+    check_manifest_identity(root, &files)
+}
+
+fn check_manifest_identity(
+    root: &Path,
+    files: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<String, String> {
     let names: Vec<_> = files
         .keys()
         .map(|p| {
@@ -80,10 +87,26 @@ pub fn identity() -> serde_json::Value {
     serde_json::from_str(text).expect("build-generated identity")
 }
 
-/// Materialize the embedded bundle in admitted owner-private storage. Never
-/// replace an existing tree: a changed cache is an identity error.
+/// Materialize the embedded bundle in admitted owner-private storage.
 pub fn materialize(root: &Path) -> Result<PathBuf, String> {
-    crate::tcc::admit_path(root).map_err(|e| e.to_string())?;
+    materialize_selected(root, None)
+}
+
+/// Snapshot an external selection before validation and publish only those
+/// validated bytes. Never point a review at mutable external storage or replace
+/// an existing cache tree: a changed cache is an identity error.
+pub fn materialize_selected(root: &Path, from: Option<&Path>) -> Result<PathBuf, String> {
+    let files = match from {
+        Some(from) => {
+            let files = manifest(from)?;
+            check_manifest_identity(from, &files)?;
+            files
+        }
+        None => BUNDLED
+            .iter()
+            .map(|(name, bytes)| (PathBuf::from(name), bytes.to_vec()))
+            .collect(),
+    };
     let parent = root.parent().ok_or("bundle cache needs a parent")?;
     crate::platform::create_private_tree(parent).map_err(|e| e.to_string())?;
     crate::runmeta::with_lock_file(&parent.join(".bundle.lock"), || {
@@ -92,8 +115,7 @@ pub fn materialize(root: &Path) -> Result<PathBuf, String> {
             let staged = parent.join(format!(".bundle-stage-{nonce}"));
             crate::platform::create_private_dir_new(&staged).map_err(|e| e.to_string())?;
             let publish = || -> Result<(), String> {
-                for (name, bytes) in BUNDLED {
-                    bundle_path::validate(name)?;
+                for (name, bytes) in &files {
                     let path = staged.join(name);
                     crate::platform::create_private_tree(path.parent().unwrap())
                         .map_err(|e| e.to_string())?;

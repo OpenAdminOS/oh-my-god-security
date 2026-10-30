@@ -272,7 +272,11 @@ fn clone_progress_has_bounded_start_completion_reuse_and_failure_phases() {
     let first = invoke(&home, false);
     assert!(first.status.success(), "{first:?}");
     let brief = String::from_utf8_lossy(&first.stdout);
-    assert!(brief.contains(&skill.display().to_string()));
+    let private_bundle = home
+        .join("skill-bundles")
+        .join(omgs::setup::bundled_digest());
+    assert!(brief.contains(&private_bundle.display().to_string()));
+    assert!(!brief.contains(&skill.display().to_string()));
     assert!(brief.contains(&omgs::setup::bundled_digest()));
     let text = String::from_utf8(first.stderr).unwrap();
     let phases: Vec<_> = text
@@ -472,6 +476,153 @@ fn default_bundle_materialization_waits_for_storage_boundary_admission() {
         if home == run {
             assert!(String::from_utf8_lossy(&out.stderr)
                 .contains("trusted policy store must live outside the run directory"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn external_writable_bundles_are_copied_before_briefing() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let source = fixture.skill();
+    // Both a replaceable guide directory and its files are writable by others.
+    for path in [&source, &source.join("agents")] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777)).unwrap();
+    }
+    let guide = source.join("agents/red-hunter.md");
+    std::fs::set_permissions(&guide, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let original = std::fs::read(&guide).unwrap();
+    let target = fixture.0.join("target");
+    std::fs::create_dir(&target).unwrap();
+    let home = fixture.0.join("data");
+    for explicit in [true, false] {
+        let run = fixture
+            .0
+            .join(if explicit { "runs/flag" } else { "runs/env" });
+        let mut command = cli();
+        command
+            .env("OMGS_HOME", &home)
+            .args(["audit", "init", "--no-sensors", "--target"])
+            .arg(&target)
+            .arg("--out")
+            .arg(&run);
+        if explicit {
+            command.arg("--skill-dir").arg(&source);
+        } else {
+            command.env("OMGS_SKILL_DIR", &source);
+        }
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let meta = omgs::runmeta::read(&run).unwrap();
+        let selected = Path::new(meta["skill_dir"].as_str().unwrap());
+        assert_eq!(
+            selected,
+            home.join("skill-bundles")
+                .join(omgs::setup::bundled_digest())
+        );
+        let brief = String::from_utf8(out.stderr).unwrap();
+        assert!(brief.contains(&selected.display().to_string()));
+        assert!(!brief.contains(&source.display().to_string()));
+        assert_eq!(meta["skill_identity"], omgs::setup::identity());
+        assert_eq!(
+            std::fs::metadata(selected).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let private_guide = selected.join("agents/red-hunter.md");
+        assert_eq!(
+            std::fs::metadata(&private_guide)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        std::fs::write(&guide, "replacement after identity validation").unwrap();
+        assert_eq!(std::fs::read(&private_guide).unwrap(), original);
+        assert_eq!(
+            omgs::setup::check_identity(selected).unwrap(),
+            omgs::setup::bundled_digest()
+        );
+        std::fs::write(&guide, &original).unwrap();
+    }
+    let bundle = home
+        .join("skill-bundles")
+        .join(omgs::setup::bundled_digest());
+    std::fs::write(bundle.join("SKILL.md"), "changed cache").unwrap();
+    assert!(omgs::setup::materialize_selected(&bundle, Some(&source))
+        .unwrap_err()
+        .contains("skill identity mismatch"));
+    std::fs::write(
+        bundle.join("SKILL.md"),
+        std::fs::read(source.join("SKILL.md")).unwrap(),
+    )
+    .unwrap();
+    omgs::setup::check_identity(&bundle).unwrap();
+    // Revalidate the snapshot even when a matching private cache already exists.
+    std::fs::write(&guide, "changed external selection").unwrap();
+    assert!(omgs::setup::materialize_selected(&bundle, Some(&source))
+        .unwrap_err()
+        .contains("skill identity mismatch"));
+}
+
+#[test]
+fn review_and_batch_admit_storage_before_materializing_bundles() {
+    for batch in [false, true] {
+        for location in ["target", "target/cache", "output", "output/cache"] {
+            let fixture = Fixture::new();
+            let clones = fixture.0.join("clones");
+            let target = clones.join("example.invalid/owner/repo");
+            std::fs::create_dir_all(&target).unwrap();
+            for args in [
+                vec!["init", "--quiet"],
+                vec![
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://example.invalid/owner/repo",
+                ],
+            ] {
+                let result = Command::new("git")
+                    .arg("-C")
+                    .arg(&target)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(result.status.success(), "{result:?}");
+            }
+            let output = fixture.0.join("output");
+            let home = match location {
+                "target" => target.clone(),
+                "target/cache" => target.join("cache"),
+                "output" => output.clone(),
+                _ => output.join("cache"),
+            };
+            let mut command = cli();
+            command.env("OMGS_HOME", &home);
+            if batch {
+                let list = fixture.0.join("repos.txt");
+                std::fs::write(&list, "https://example.invalid/owner/repo\n").unwrap();
+                command.args(["batch", "init", "--list"]).arg(&list);
+            } else {
+                command.args(["review", "--repo-url", "https://example.invalid/owner/repo"]);
+            }
+            let out = command
+                .args(["--no-sensors", "--clone-root"])
+                .arg(&clones)
+                .arg("--out")
+                .arg(&output)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(2), "{batch} {location}: {out:?}");
+            assert!(!home.join("skill-bundles").exists(), "{batch} {location}");
+            assert!(!output.exists(), "{batch} {location}");
+            let error = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                error.contains("resolves inside the target")
+                    || error.contains("trusted policy store must live outside the run directory"),
+                "{error}"
+            );
         }
     }
 }

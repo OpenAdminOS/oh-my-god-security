@@ -302,17 +302,14 @@ fn selected_skill(args: &[String]) -> Result<(), String> {
 }
 
 fn review_skill(args: &[String]) -> Result<PathBuf, String> {
-    selected_skill(args)?;
-    if let Some(path) = flag(args, "--skill-dir")
+    let selected = flag(args, "--skill-dir")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("OMGS_SKILL_DIR").map(PathBuf::from))
-    {
-        return std::fs::canonicalize(path).map_err(|e| e.to_string());
-    }
-    omgs::setup::materialize(
+        .or_else(|| std::env::var_os("OMGS_SKILL_DIR").map(PathBuf::from));
+    omgs::setup::materialize_selected(
         &data_dir()
             .join("skill-bundles")
             .join(omgs::setup::bundled_digest()),
+        selected.as_deref(),
     )
 }
 
@@ -3222,10 +3219,7 @@ fn brief(dest: &Path, run: &Path) -> Result<String, String> {
 }
 
 fn cmd_review(args: &[String]) -> Result<(), String> {
-    let skill = review_skill(args)?;
-    let mut resolved = args.to_vec();
-    resolved.extend(["--skill-dir".into(), skill.to_string_lossy().into_owned()]);
-    let args = resolved.as_slice();
+    selected_skill(args)?;
     let url = flag(args, "--repo-url").ok_or("review requires --repo-url <url>")?;
     if let Some(p) = flag(args, "--persona") {
         omgs::persona::defaults(&p)?;
@@ -3243,10 +3237,7 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
     let rest = args.get(1..).unwrap_or_default();
     match sub {
         Some("init") => {
-            let skill = review_skill(rest)?;
-            let mut resolved = rest.to_vec();
-            resolved.extend(["--skill-dir".into(), skill.to_string_lossy().into_owned()]);
-            let rest = resolved.as_slice();
+            selected_skill(rest)?;
             let list = flag(rest, "--list").ok_or("batch init requires --list <file>")?;
             let out = PathBuf::from(flag(rest, "--out").ok_or("batch init requires --out <dir>")?);
             let text = std::fs::read_to_string(&list).map_err(|e| format!("read {list}: {e}"))?;
@@ -3287,6 +3278,11 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                         t.display()
                     ));
                 }
+            }
+            // Admit shared cache and policy storage against every target and
+            // the whole batch output before creating either directory.
+            for target in std::iter::once(&targets_root).chain(&dests) {
+                trusted_policy_path(&resolve_existing_prefix(target)?, &resolved)?;
             }
             // The batch directory must be new or empty: anything already in it
             // (a planted symlink at <host>/<owner> for example) could redirect
