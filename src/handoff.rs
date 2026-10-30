@@ -75,11 +75,55 @@ fn quote(s: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// Read, decide and publish while holding the family lock before the run lock.
+/// The writer must not acquire another run or family lock.
+pub fn publish<T>(
+    run: &Path,
+    only: Option<&str>,
+    write: impl FnOnce(&Handoff) -> Result<T, String>,
+) -> Result<T, String> {
+    let run = std::fs::canonicalize(run).map_err(|e| format!("run directory: {e}"))?;
+    let transaction = || {
+        let file = crate::shape::findings(&crate::run_artifact::text(
+            &run,
+            Path::new("findings.json"),
+            crate::run_artifact::FINDINGS_BYTES,
+        )?)?;
+        let mut errors = crate::model::validate_drafts(&file);
+        errors.extend(crate::proof::validate_proofs(&file, &run));
+        if !errors.is_empty() {
+            return Err(errors.join("\n"));
+        }
+        let view = crate::review::View::for_publication_locked(
+            &run,
+            &file,
+            &crate::runmeta::read_optional(&run)?.unwrap_or_default(),
+        )?;
+        write(&build_view(&run, &view, only)?)
+    };
+    if crate::runmeta::read_optional(&run)?.is_some() {
+        crate::budget::with_family_lock(&run, transaction)
+    } else {
+        crate::runmeta::with_lock(&run, || {
+            if crate::runmeta::read_optional(&run)?.is_some() {
+                return Err("run metadata appeared before handoff publication; retry".into());
+            }
+            transaction()
+        })
+    }
+}
+
 pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Handoff, String> {
     let canonical_run = std::fs::canonicalize(run).map_err(|e| format!("run directory: {e}"))?;
     let run = canonical_run.as_path();
-    let view = crate::review::View::with_findings(run, file)?;
-    build_view(run, &view, only)
+    crate::runmeta::with_lock(run, || {
+        let view = crate::review::View::for_publication_locked(
+            run,
+            file,
+            &crate::runmeta::read_optional(run)?.unwrap_or_default(),
+        )?;
+        build_view(run, &view, only)
+    })
 }
 
 pub fn build_view(

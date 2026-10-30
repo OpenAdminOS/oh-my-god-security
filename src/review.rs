@@ -39,6 +39,11 @@ impl View {
         Self::build_locked(run, None, false)
     }
 
+    /// Caller holds every archive input lock through output publication.
+    pub fn load_archive_locked(run: &Path) -> Result<Self, String> {
+        Self::build_locked(run, None, true)
+    }
+
     /// Use the metadata transaction that will be saved with these artifacts.
     /// Caller holds the family/run locks and has read findings under that lock.
     pub fn for_publication_locked(

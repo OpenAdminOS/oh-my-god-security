@@ -1,7 +1,6 @@
 use omgs::architecture::{
     render_architecture_html, render_architecture_markdown, validate_architecture, ArchitectureFile,
 };
-use omgs::critic::critique_run;
 use omgs::ledger::{add_unit, coverage_lines, set_status, validate_ledger, Ledger, Unit, STATUSES};
 use omgs::model::{identity, validate, FindingsFile};
 use omgs::report::{render_html, render_markdown, render_sarif, ReportMeta};
@@ -348,12 +347,14 @@ fn cmd_budget(args: &[String]) -> Result<(), String> {
         omgs::budget::charge_calls(Path::new(&run), n)?;
     }
     let root = omgs::budget::original(Path::new(&run))?;
-    let allowance = omgs::runmeta::with_lock(&root, || omgs::budget::allowance(&root))?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&allowance).map_err(|e| e.to_string())?
-    );
-    Ok(())
+    omgs::runmeta::with_lock(&root, || {
+        let allowance = omgs::budget::allowance(&root)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&allowance).map_err(|e| e.to_string())?
+        );
+        Ok(())
+    })
 }
 
 fn read_findings(path: &str) -> Result<FindingsFile, String> {
@@ -378,6 +379,26 @@ fn validate_at(file: &FindingsFile, path: &str) -> Vec<String> {
 }
 
 fn cmd_validate(args: &[String]) -> Result<(), String> {
+    let path = [
+        "--findings",
+        "--candidates",
+        "--dispositions",
+        "--evaluation",
+    ]
+    .iter()
+    .find_map(|k| flag(args, k));
+    if let Some(path) = path {
+        let dir = Path::new(&path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        omgs::runmeta::with_archive_lock(dir, || cmd_validate_locked(args))
+    } else {
+        cmd_validate_locked(args)
+    }
+}
+
+fn cmd_validate_locked(args: &[String]) -> Result<(), String> {
     let inputs = [
         "--findings",
         "--candidates",
@@ -418,7 +439,11 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let view = omgs::review::View::with_findings(dir, &file)?;
+        let view = omgs::review::View::for_publication_locked(
+            dir,
+            &file,
+            &omgs::runmeta::read_optional(dir)?.unwrap_or_default(),
+        )?;
         println!(
             "valid: {} finding(s); review {}",
             view.findings.findings.len(),
@@ -442,32 +467,38 @@ fn read_architecture(path: &str) -> Result<ArchitectureFile, String> {
 fn cmd_architecture(args: &[String]) -> Result<(), String> {
     let inp = flag(args, "--in").ok_or("architecture requires --in <architecture.json>")?;
     let out = flag(args, "--out").ok_or("architecture requires --out <dir>")?;
-    let file = read_architecture(&inp)?;
-    let errors = validate_architecture(&file);
-    if !errors.is_empty() {
-        for e in &errors {
-            eprintln!("invalid: {e}");
+    let input_dir = Path::new(&inp)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    omgs::runmeta::with_lock(input_dir, || {
+        let file = read_architecture(&inp)?;
+        let errors = validate_architecture(&file);
+        if !errors.is_empty() {
+            for e in &errors {
+                eprintln!("invalid: {e}");
+            }
+            return Err("__EXIT1__".into());
         }
-        return Err("__EXIT1__".into());
-    }
-    let dir = Path::new(&out);
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    write_out(
-        dir.join("ARCHITECTURE.md"),
-        render_architecture_markdown(&file),
-    )
-    .map_err(|e| e.to_string())?;
-    write_out(
-        dir.join("ARCHITECTURE.html"),
-        render_architecture_html(&file),
-    )
-    .map_err(|e| e.to_string())?;
-    println!(
-        "wrote {}, {}",
-        dir.join("ARCHITECTURE.md").display(),
-        dir.join("ARCHITECTURE.html").display()
-    );
-    Ok(())
+        let dir = Path::new(&out);
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        write_out(
+            dir.join("ARCHITECTURE.md"),
+            render_architecture_markdown(&file),
+        )
+        .map_err(|e| e.to_string())?;
+        write_out(
+            dir.join("ARCHITECTURE.html"),
+            render_architecture_html(&file),
+        )
+        .map_err(|e| e.to_string())?;
+        println!(
+            "wrote {}, {}",
+            dir.join("ARCHITECTURE.md").display(),
+            dir.join("ARCHITECTURE.html").display()
+        );
+        Ok(())
+    })
 }
 
 fn cmd_bench(args: &[String]) -> Result<(), String> {
@@ -476,13 +507,14 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
         .into_iter()
         .map(PathBuf::from)
         .collect();
-    let result = omgs::bench::score(Path::new(&cases), &dirs)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
-    );
-    eprint!("{}", omgs::bench::markdown(&result));
-    Ok(())
+    omgs::bench::publish_score(Path::new(&cases), &dirs, |result| {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
+        );
+        eprint!("{}", omgs::bench::markdown(&result));
+        Ok(())
+    })
 }
 
 fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
@@ -1495,23 +1527,29 @@ fn write_handoff(
 
 fn cmd_handoff(args: &[String]) -> Result<(), String> {
     let run = PathBuf::from(flag(args, "--run").ok_or("handoff requires --run <dir>")?);
-    let file = read_findings(&run.join("findings.json").to_string_lossy())?;
-    let mut errors = omgs::model::validate_drafts(&file);
-    errors.extend(omgs::proof::validate_proofs(&file, &run));
-    if !errors.is_empty() {
-        return Err(errors.join("\n"));
-    }
     let only = flag(args, "--finding");
-    let h = omgs::handoff::build(&run, &file, only.as_deref())?;
-    write_handoff(&run, &h, "")?;
+    omgs::handoff::publish(&run, only.as_deref(), |h| write_handoff(&run, h, ""))?;
     println!("wrote HANDOFF.md and handoff.json in {}", run.display());
     Ok(())
 }
 
 fn cmd_stage(args: &[String]) -> Result<(), String> {
     let run = PathBuf::from(flag(args, "--run").ok_or("stage requires --run <dir>")?);
+    if omgs::runmeta::read_optional(&run)?.is_some() {
+        omgs::budget::with_family_lock(&run, || cmd_stage_locked(&run))
+    } else {
+        omgs::runmeta::with_lock(&run, || {
+            if omgs::runmeta::read_optional(&run)?.is_some() {
+                return Err("run metadata appeared before test staging; retry".into());
+            }
+            cmd_stage_locked(&run)
+        })
+    }
+}
+
+fn cmd_stage_locked(run: &Path) -> Result<(), String> {
     let file = read_findings(&run.join("findings.json").to_string_lossy())?;
-    let staged = omgs::handoff::stage_validated(&run, &file)?;
+    let staged = omgs::handoff::stage_validated(run, &file)?;
     for reason in &staged.excluded {
         eprintln!("{reason}");
     }
@@ -1520,14 +1558,14 @@ fn cmd_stage(args: &[String]) -> Result<(), String> {
     // Legacy runs can still export retained tests. Policy-aware runs also
     // produce the owner-reviewable registry and intent proposal.
     if omgs::run_artifact::optional_text(
-        &run,
+        run,
         Path::new(omgs::runmeta::FILE),
         omgs::run_artifact::METADATA_BYTES,
     )?
     .is_some()
-        && omgs::runmeta::read(&run)?.contains_key("policy")
+        && omgs::runmeta::read(run)?.contains_key("policy")
     {
-        intent_propose_with_tests(&run, Some(&staged))?;
+        intent_propose_with_tests(run, Some(&staged))?;
     }
     Ok(())
 }
@@ -1575,32 +1613,6 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 })
         {
             return Err("candidates files but no coverage-ledger.json; restore the ledger so the critic can run".into());
-        }
-    }
-    let mut sensors_summary: Option<String> = None;
-    if let Some(dir) = &findings_dir {
-        let path = dir.join("sensors.json");
-        let text = omgs::run_artifact::optional_text(
-            dir,
-            Path::new("sensors.json"),
-            omgs::run_artifact::SENSORS_BYTES,
-        )?;
-        if let Some(text) = text {
-            {
-                let rep = omgs::shape::sensors(&text)
-                    .map_err(|e| format!("parse {}: {e}", path.display()))?;
-                let vendored = rep.hits.iter().filter(|h| h.vendored).count();
-                sensors_summary = Some(format!(
-                    "{} run, {} hit(s), {} vendored; pattern matches only, never a clean bill of health",
-                    if rep.tools_run.is_empty() {
-                        "no tools".into()
-                    } else {
-                        rep.tools_run.join(", ")
-                    },
-                    rep.hits.len(),
-                    vendored
-                ));
-            }
         }
     }
     let file = omgs::review::View::with_findings(
@@ -1688,27 +1700,18 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             publication.insert(key, value);
         }
     }
-    if let Some(run) = publication_run {
-        omgs::runmeta::update(run, |m| {
-            let p = m
-                .entry("publication")
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-                .ok_or("publication must be an object")?;
-            for (key, value) in &publication {
-                p.insert((*key).into(), serde_json::json!(value));
-            }
-            Ok(())
-        })?;
-    }
     let supplied_models = omgs::route::parse_identities(&flags(args, "--model"))?;
     omgs::report::publish(
         findings_dir.as_deref(),
         explicit_agent_calls,
         &supplied_models,
+        &publication,
         |saved| {
             submission.apply(saved)?;
-            if let Some(run) = publication_run {
+            if let Some(run) = findings_dir
+                .as_deref()
+                .filter(|run| run.join(omgs::runmeta::FILE).exists())
+            {
                 saved.insert("run_status".into(), serde_json::json!("partial"));
                 omgs::runmeta::write_atomic(
                     &run.join(omgs::runmeta::FILE),
@@ -1803,15 +1806,15 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             }
             models.sort();
             let mut meta = ReportMeta {
-                repo: defaulted(flag(args, "--repo"), "repo", "target"),
-                source_ref: defaulted(flag(args, "--ref"), "source_ref", "working tree"),
+                repo: defaulted(None, "repo", "target"),
+                source_ref: defaulted(None, "source_ref", "working tree"),
                 mode: defaulted(flag(args, "--mode"), "mode", "advisory"),
-                sandbox: defaulted(flag(args, "--sandbox"), "sandbox", "not recorded"),
+                sandbox: defaulted(None, "sandbox", "not recorded"),
                 artifact_base: String::new(),
                 review_limits: Vec::new(),
                 timeline: Vec::new(),
                 coverage: Vec::new(),
-                sensors: sensors_summary,
+                sensors: None,
                 hunters,
                 verifier,
                 agent_calls,
@@ -1840,6 +1843,11 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 .map(omgs::sensors::read_report)
                 .transpose()?
                 .flatten();
+            meta.sensors = sensors.as_ref().map(|rep| format!(
+                "{} run, {} hit(s), {} vendored; pattern matches only, never a clean bill of health",
+                if rep.tools_run.is_empty() { "no tools".into() } else { rep.tools_run.join(", ") },
+                rep.hits.len(), rep.hits.iter().filter(|h| h.vendored).count()
+            ));
             let evidence = omgs::adjudication::report_lines_locked(
                 findings_dir.as_deref().unwrap_or(Path::new(".")),
                 &file,
@@ -3100,16 +3108,18 @@ fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
 
 fn cmd_critic(args: &[String]) -> Result<(), String> {
     let run = flag(args, "--run").ok_or("critic requires --run <run-dir>")?;
-    let report = critique_run(Path::new(&run))?;
-    for gap in &report.gaps {
-        eprintln!("gap: {gap}");
-    }
-    println!("critic: {}", report.summary());
-    if report.passed() {
-        Ok(())
-    } else {
-        Err("__EXIT1__".into())
-    }
+    omgs::runmeta::with_lock(Path::new(&run), || {
+        let report = omgs::critic::critique_run_locked(Path::new(&run))?;
+        for gap in &report.gaps {
+            eprintln!("gap: {gap}");
+        }
+        println!("critic: {}", report.summary());
+        if report.passed() {
+            Ok(())
+        } else {
+            Err("__EXIT1__".into())
+        }
+    })
 }
 
 /// Clone (or reuse) a repository for review. Only validated https URLs reach
@@ -3411,15 +3421,19 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
             // Recheck the directory as it now exists, before writing anything.
             let out = std::fs::canonicalize(&out).map_err(|e| e.to_string())?;
             inside(&out)?;
+            let paths = batch.runs.iter().filter_map(|r| r.run_dir.as_deref()).map(PathBuf::from).collect::<Vec<_>>();
+            omgs::runmeta::with_run_locks(&paths, false, || {
             let runs = batch
                 .runs
                 .iter()
-                .map(|r| omgs::batch::summarize(r, &out))
+                .map(|r| omgs::batch::summarize_locked(r, &out))
                 .collect::<Result<Vec<_>, String>>()?;
             write_out(out.join("INDEX.md"), omgs::batch::render_index_markdown(&runs))
                 .map_err(|e| e.to_string())?;
             write_out(out.join("INDEX.html"), omgs::batch::render_index_html(&runs))
                 .map_err(|e| e.to_string())?;
+            Ok(())
+            })?;
             println!(
                 "wrote {}, {}",
                 out.join("INDEX.md").display(),
@@ -3452,31 +3466,38 @@ fn cmd_status(args: &[String]) -> Result<(), String> {
     let parent = flag(args, "--parent");
     let detail = flag(args, "--detail");
     let logs = flags(args, "--log");
-    omgs::status::apply_with_logs(
-        Path::new(&run),
-        &omgs::status::Update {
-            stage: &stage,
-            label: label.as_deref(),
-            parent: parent.as_deref(),
-            state: &state,
-            detail: detail.as_deref(),
-            counters: &counters,
-            log: None,
-        },
-        &logs,
-    )?;
-    omgs::runmeta::update(Path::new(&run), |m| submission.apply(m))?;
-    let view = omgs::review::View::load(Path::new(&run))?;
-    println!(
-        "{stage}: {state}; review {}",
-        view.state.as_deref().unwrap_or("complete")
-    );
-    if !flags(args, "--accounting").is_empty() {
-        for line in omgs::accounting::lines(&view.accounting) {
-            println!("{line}");
+    omgs::runmeta::update(Path::new(&run), |m| {
+        submission.apply(m)?;
+        omgs::runmeta::write_atomic(
+            &Path::new(&run).join(omgs::runmeta::FILE),
+            &serde_json::to_string_pretty(m).map_err(|e| e.to_string())?,
+        )?;
+        omgs::status::apply_with_logs_locked(
+            Path::new(&run),
+            &omgs::status::Update {
+                stage: &stage,
+                label: label.as_deref(),
+                parent: parent.as_deref(),
+                state: &state,
+                detail: detail.as_deref(),
+                counters: &counters,
+                log: None,
+            },
+            &logs,
+        )?;
+        *m = omgs::runmeta::read(Path::new(&run))?;
+        let view = omgs::review::View::load_locked(Path::new(&run))?;
+        println!(
+            "{stage}: {state}; review {}",
+            view.state.as_deref().unwrap_or("complete")
+        );
+        if !flags(args, "--accounting").is_empty() {
+            for line in omgs::accounting::lines(&view.accounting) {
+                println!("{line}");
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn cmd_watch(args: &[String]) -> Result<(), String> {
@@ -3674,7 +3695,7 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
 }
 
 fn intent_propose(run: &Path) -> Result<(), String> {
-    intent_propose_with_tests(run, None)
+    omgs::budget::with_family_lock(run, || intent_propose_with_tests(run, None))
 }
 
 fn intent_propose_with_tests(
@@ -4213,6 +4234,12 @@ mod cli_tests {
                 }
                 ("doctor", _) => {
                     sections.push(("cmd_doctor_inner", function(source, "cmd_doctor_inner")));
+                }
+                ("validate", _) => {
+                    sections.push((
+                        "cmd_validate_locked",
+                        function(source, "cmd_validate_locked"),
+                    ));
                 }
                 ("route", _) => sections.push(("models_path", function(source, "models_path"))),
                 ("ledger", _) => {

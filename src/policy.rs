@@ -833,7 +833,11 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
     Ok(blocked)
 }
 pub fn advisory_lines(run: &Path, p: &Policy) -> Result<Vec<String>, String> {
-    let view = crate::review::View::load(run)?;
+    crate::runmeta::with_lock(run, || advisory_lines_locked(run, p))
+}
+
+fn advisory_lines_locked(run: &Path, p: &Policy) -> Result<Vec<String>, String> {
+    let view = crate::review::View::load_locked(run)?;
     let mut lines = Vec::new();
     if let Some(state) = &view.state {
         lines.push(format!("advisory: {state}"));
@@ -859,16 +863,25 @@ pub fn advisory_lines(run: &Path, p: &Policy) -> Result<Vec<String>, String> {
 }
 
 fn advisory_findings(run: &Path, p: &Policy) {
-    match advisory_lines(run, p) {
-        Ok(lines) => {
-            for line in lines {
-                println!("{line}");
+    let result = crate::runmeta::with_lock(run, || {
+        match advisory_lines_locked(run, p) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
             }
+            Err(e) => println!(
+                "advisory run unavailable: {}",
+                crate::platform::escape_controls(&e)
+            ),
         }
-        Err(e) => println!(
+        Ok(())
+    });
+    if let Err(e) = result {
+        println!(
             "advisory run unavailable: {}",
             crate::platform::escape_controls(&e)
-        ),
+        );
     }
 }
 

@@ -45,6 +45,11 @@ fn text(status: u16) -> Response {
 /// Answer one raw request. Pure apart from reading the status file, so the
 /// routing and Host rules are testable without a socket.
 pub fn respond(raw: &str, port: u16, run_dir: &Path) -> Response {
+    crate::runmeta::with_lock(run_dir, || Ok(respond_locked(raw, port, run_dir)))
+        .unwrap_or_else(|_| text(500))
+}
+
+fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
     let mut lines = raw.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
     let mut parts = request_line.split(' ');
@@ -76,7 +81,7 @@ pub fn respond(raw: &str, port: u16, run_dir: &Path) -> Response {
             body: DASHBOARD.as_bytes().to_vec(),
         },
         "/pipeline-status.json" => {
-            let body = match crate::review::View::load(run_dir)
+            let body = match crate::review::View::load_locked(run_dir)
                 .and_then(|view| serde_json::to_vec(&view.progress).map_err(|e| e.to_string()))
             {
                 Ok(bytes) => bytes,
@@ -159,7 +164,11 @@ fn handle(mut stream: TcpStream, port: u16, run_dir: &Path) {
         }
     }
     let raw = String::from_utf8_lossy(&buf);
-    write_response(&mut stream, &respond(&raw, port, run_dir), deadline);
+    // Retain the input lock until the bounded socket write has completed.
+    let _ = crate::runmeta::with_lock(run_dir, || {
+        write_response(&mut stream, &respond_locked(&raw, port, run_dir), deadline);
+        Ok(())
+    });
 }
 
 /// Bind loopback and return the listener with its port, so callers can print

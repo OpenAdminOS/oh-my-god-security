@@ -1513,6 +1513,7 @@ pub fn publish(
     run: Option<&std::path::Path>,
     calls: Option<u32>,
     models: &std::collections::BTreeMap<String, String>,
+    publication: &std::collections::BTreeMap<&str, String>,
     render: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<Completion, String>,
 ) -> Result<(), String> {
     let transaction = |m: &mut serde_json::Map<String, serde_json::Value>| {
@@ -1533,6 +1534,20 @@ pub fn publish(
             .ok_or("models must be an object")?;
         for (role, model) in models {
             saved.insert(role.clone(), serde_json::json!(model));
+        }
+        let labels = m
+            .entry("publication")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or("publication must be an object")?;
+        for (key, value) in publication {
+            if !["repo", "source_ref", "sandbox"].contains(key)
+                || value.trim().is_empty()
+                || value.chars().any(char::is_control)
+            {
+                return Err("invalid publication label".into());
+            }
+            labels.insert((*key).into(), serde_json::json!(value));
         }
         let completion = render(m)?;
         if let Some(n) = completion.hunters {
@@ -1559,7 +1574,12 @@ pub fn publish(
         if crate::runmeta::read_optional(run)?.is_some() {
             crate::runmeta::update(run, transaction)
         } else {
-            crate::runmeta::with_lock(run, || transaction(&mut Default::default()))
+            crate::runmeta::with_lock(run, || {
+                if crate::runmeta::read_optional(run)?.is_some() {
+                    return Err("run metadata appeared before report publication; retry".into());
+                }
+                transaction(&mut Default::default())
+            })
         }
     } else {
         transaction(&mut Default::default())
@@ -1582,23 +1602,29 @@ mod publication_tests {
         )
         .unwrap();
         let mut charge = None;
-        super::publish(Some(&run), Some(5), &Default::default(), |m| {
-            assert_eq!(m["agent_calls_used"], 5);
-            let path = run.clone();
-            let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
-            let writer_ready = ready.clone();
-            charge = Some(std::thread::spawn(move || {
-                writer_ready.wait();
-                crate::budget::charge_calls(&path, 1)
-            }));
-            ready.wait();
-            assert_eq!(m["agent_calls_used"], 5);
-            Ok(super::Completion {
-                hunters: None,
-                verifier: None,
-                complete: false,
-            })
-        })
+        super::publish(
+            Some(&run),
+            Some(5),
+            &Default::default(),
+            &Default::default(),
+            |m| {
+                assert_eq!(m["agent_calls_used"], 5);
+                let path = run.clone();
+                let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+                let writer_ready = ready.clone();
+                charge = Some(std::thread::spawn(move || {
+                    writer_ready.wait();
+                    crate::budget::charge_calls(&path, 1)
+                }));
+                ready.wait();
+                assert_eq!(m["agent_calls_used"], 5);
+                Ok(super::Completion {
+                    hunters: None,
+                    verifier: None,
+                    complete: false,
+                })
+            },
+        )
         .unwrap();
         charge.unwrap().join().unwrap().unwrap();
         let meta = crate::runmeta::read(&run).unwrap();

@@ -1196,95 +1196,101 @@ fn publication_holds_the_lock_from_complete_view_through_artifact_commit() {
     use std::time::Duration;
     let run = finished_review();
     let mut mutation = None;
-    omgs::report::publish(Some(&run.0), None, &Default::default(), |_| {
-        let view = omgs::review::View::load_locked(&run.0)?;
-        assert!(view.complete());
-        let path = run.0.clone();
-        let barrier = Arc::new(Barrier::new(2));
-        let writer_barrier = barrier.clone();
-        let (send, receive) = mpsc::channel();
-        mutation = Some(std::thread::spawn(move || {
-            writer_barrier.wait();
-            let lock = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(path.join(".omgs-run.lock"))
-                .unwrap();
-            let blocked = matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock));
-            drop(lock);
-            send.send(blocked).unwrap();
-            omgs::runmeta::with_lock(&path, || {
-                // This checkpoint is after publication and before the reopen.
-                // Every actual artifact must describe the metadata saved here.
-                assert_eq!(omgs::runmeta::read(&path)?["run_status"], "complete");
-                for name in ["REPORT.md", "REPORT.html"] {
-                    let report = std::fs::read_to_string(path.join(name)).unwrap();
-                    assert!(
-                        report.contains("Completed review: no confirmed findings."),
-                        "{name}"
+    omgs::report::publish(
+        Some(&run.0),
+        None,
+        &Default::default(),
+        &Default::default(),
+        |_| {
+            let view = omgs::review::View::load_locked(&run.0)?;
+            assert!(view.complete());
+            let path = run.0.clone();
+            let barrier = Arc::new(Barrier::new(2));
+            let writer_barrier = barrier.clone();
+            let (send, receive) = mpsc::channel();
+            mutation = Some(std::thread::spawn(move || {
+                writer_barrier.wait();
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path.join(".omgs-run.lock"))
+                    .unwrap();
+                let blocked = matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+                drop(lock);
+                send.send(blocked).unwrap();
+                omgs::runmeta::with_lock(&path, || {
+                    // This checkpoint is after publication and before the reopen.
+                    // Every actual artifact must describe the metadata saved here.
+                    assert_eq!(omgs::runmeta::read(&path)?["run_status"], "complete");
+                    for name in ["REPORT.md", "REPORT.html"] {
+                        let report = std::fs::read_to_string(path.join(name)).unwrap();
+                        assert!(
+                            report.contains("Completed review: no confirmed findings."),
+                            "{name}"
+                        );
+                    }
+                    let handoff: Value =
+                        serde_json::from_slice(&std::fs::read(path.join("handoff.json")).unwrap())
+                            .unwrap();
+                    assert_eq!(handoff["review_state"], "complete");
+                    assert!(std::fs::read_to_string(path.join("HANDOFF.md"))
+                        .unwrap()
+                        .contains("complete"));
+                    let sarif: Value = serde_json::from_slice(
+                        &std::fs::read(path.join("findings.sarif.json")).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        sarif["runs"][0]["invocations"][0]["executionSuccessful"],
+                        true
                     );
-                }
-                let handoff: Value =
-                    serde_json::from_slice(&std::fs::read(path.join("handoff.json")).unwrap())
-                        .unwrap();
-                assert_eq!(handoff["review_state"], "complete");
-                assert!(std::fs::read_to_string(path.join("HANDOFF.md"))
-                    .unwrap()
-                    .contains("complete"));
-                let sarif: Value = serde_json::from_slice(
-                    &std::fs::read(path.join("findings.sarif.json")).unwrap(),
-                )
+                    omgs::status::apply_with_logs_locked(
+                        &path,
+                        &omgs::status::Update {
+                            stage: "hunt",
+                            label: None,
+                            parent: None,
+                            state: "active",
+                            detail: None,
+                            counters: &[],
+                            log: None,
+                        },
+                        &[],
+                    )
+                })
                 .unwrap();
-                assert_eq!(
-                    sarif["runs"][0]["invocations"][0]["executionSuccessful"],
-                    true
-                );
-                omgs::status::apply_with_logs_locked(
-                    &path,
-                    &omgs::status::Update {
-                        stage: "hunt",
-                        label: None,
-                        parent: None,
-                        state: "active",
-                        detail: None,
-                        counters: &[],
-                        log: None,
-                    },
-                    &[],
-                )
+            }));
+            barrier.wait();
+            assert!(
+                receive.recv_timeout(Duration::from_secs(10)).unwrap(),
+                "competing mutation acquired the lock during rendering"
+            );
+            let handoff = omgs::handoff::build_view(&run.0, &view, None)?;
+            for (name, text) in [
+                (
+                    "REPORT.md",
+                    omgs::report::render_markdown(&view.findings, &view.meta),
+                ),
+                (
+                    "REPORT.html",
+                    omgs::report::render_html(&view.findings, &view.meta),
+                ),
+                (
+                    "findings.sarif.json",
+                    omgs::report::render_sarif(&view.findings, &view.meta),
+                ),
+                ("HANDOFF.md", omgs::handoff::markdown(&handoff)),
+                ("handoff.json", serde_json::to_string(&handoff).unwrap()),
+            ] {
+                omgs::runmeta::write_atomic(&run.0.join(name), &text)?;
+            }
+            Ok(omgs::report::Completion {
+                hunters: None,
+                verifier: None,
+                complete: view.complete(),
             })
-            .unwrap();
-        }));
-        barrier.wait();
-        assert!(
-            receive.recv_timeout(Duration::from_secs(10)).unwrap(),
-            "competing mutation acquired the lock during rendering"
-        );
-        let handoff = omgs::handoff::build_view(&run.0, &view, None)?;
-        for (name, text) in [
-            (
-                "REPORT.md",
-                omgs::report::render_markdown(&view.findings, &view.meta),
-            ),
-            (
-                "REPORT.html",
-                omgs::report::render_html(&view.findings, &view.meta),
-            ),
-            (
-                "findings.sarif.json",
-                omgs::report::render_sarif(&view.findings, &view.meta),
-            ),
-            ("HANDOFF.md", omgs::handoff::markdown(&handoff)),
-            ("handoff.json", serde_json::to_string(&handoff).unwrap()),
-        ] {
-            omgs::runmeta::write_atomic(&run.0.join(name), &text)?;
-        }
-        Ok(omgs::report::Completion {
-            hunters: None,
-            verifier: None,
-            complete: view.complete(),
-        })
-    })
+        },
+    )
     .unwrap();
     mutation.unwrap().join().unwrap();
     assert!(!omgs::review::View::load(&run.0).unwrap().complete());
@@ -1724,10 +1730,16 @@ fn stale_usage_submissions_cannot_cover_continuations_or_replace_newer_totals() 
             omgs::runmeta::update(&run.0, |m| fresh.apply(m)).unwrap();
         }
         let expected = run.meta();
-        let err = omgs::report::publish(Some(&run.0), None, &Default::default(), |m| {
-            stale.apply(m)?;
-            panic!("stale submissions must be rejected before rendering");
-        })
+        let err = omgs::report::publish(
+            Some(&run.0),
+            None,
+            &Default::default(),
+            &Default::default(),
+            |m| {
+                stale.apply(m)?;
+                panic!("stale submissions must be rejected before rendering");
+            },
+        )
         .unwrap_err();
         assert!(err.contains("stale"));
         assert_eq!(run.meta(), expected);
@@ -1760,4 +1772,290 @@ fn standalone_report_keeps_supplied_usage_in_its_publication_view() {
     );
     let report = std::fs::read_to_string(run.0.join("REPORT.md")).unwrap();
     assert!(report.contains("host: tokens 7, cost USD 0.5, duration ms 9"));
+}
+
+#[test]
+fn standalone_handoff_cli_reads_findings_after_competing_stop() {
+    let run = finished_review();
+    let worker = omgs::runmeta::with_lock(&run.0, || {
+        let path = run.0.clone();
+        let worker = std::thread::spawn(move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .arg("handoff")
+                .arg("--run")
+                .arg(path)
+                .output()
+                .unwrap()
+        });
+        // Replace findings as part of the competing stop transaction. A
+        // publisher must not retain findings read before acquiring this lock.
+        let mut file = confirmed_fixture(&run);
+        file.findings[0].verification = Some(omgs::model::Verification {
+            state: "final".into(),
+            attempt: "blue".into(),
+        });
+        run.put("findings.json", json!(file));
+        let mut meta = run.meta();
+        meta["attempts"].as_array_mut().unwrap().push(json!({
+            "at":"2026-01-01T00:00:00Z", "record":stop("blue", "policy")
+        }));
+        meta.insert("run_status".into(), json!("partial"));
+        run.put("run-metadata.json", json!(meta));
+        Ok(worker)
+    })
+    .unwrap();
+    let result = worker.join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let h: Value =
+        serde_json::from_slice(&std::fs::read(run.0.join("handoff.json")).unwrap()).unwrap();
+    assert_eq!(h["review_state"], "incomplete");
+    assert_eq!(h["records"].as_array().unwrap().len(), 1);
+    assert_eq!(h["records"][0]["verdict"], "needs_validation");
+    assert!(!std::fs::read_to_string(run.0.join("HANDOFF.md"))
+        .unwrap()
+        .contains("## Confirmed"));
+}
+
+#[test]
+fn standalone_handoff_holds_family_and_run_locks_through_both_writes() {
+    use std::sync::mpsc;
+    let run = finished_review();
+    let root = run.1.join("original");
+    omgs::platform::create_private_dir(&root).unwrap();
+    omgs::runmeta::write_atomic(
+        &root.join(omgs::runmeta::FILE),
+        &json!({
+            "run_id":"original", "fix_runs":[{"path":run.0,"run_id":"child"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    omgs::runmeta::update(&run.0, |m| {
+        m.insert("run_id".into(), json!("child"));
+        m.insert("budget_parent".into(), json!(root));
+        m.insert("budget_parent_id".into(), json!("original"));
+        Ok(())
+    })
+    .unwrap();
+    run.put("stop.json", stop("blue", "policy"));
+    let mut worker = None;
+    omgs::handoff::publish(&run.0, None, |h| {
+        assert_eq!(h.review_state, "complete");
+        let path = run.0.clone();
+        let parent = root.clone();
+        let (send, receive) = mpsc::channel();
+        worker = Some(std::thread::spawn(move || {
+            for dir in [&parent, &path] {
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(dir.join(".omgs-run.lock"))
+                    .unwrap();
+                assert!(matches!(
+                    lock.try_lock(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ));
+            }
+            send.send(()).unwrap();
+            // This is a real competing CLI stop, with no timing-only barrier.
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .arg("attempt")
+                .arg("--run")
+                .arg(&path)
+                .arg("--event")
+                .arg(path.join("stop.json"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }));
+        receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        omgs::runmeta::write_atomic(&run.0.join("HANDOFF.md"), &omgs::handoff::markdown(h))?;
+        omgs::runmeta::write_atomic(
+            &run.0.join("handoff.json"),
+            &serde_json::to_string(h).unwrap(),
+        )?;
+        assert!(omgs::review::View::load_locked(&run.0)?.complete());
+        Ok(())
+    })
+    .unwrap();
+    worker.unwrap().join().unwrap();
+    let result = cli(&run, &["handoff"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let h: Value =
+        serde_json::from_slice(&std::fs::read(run.0.join("handoff.json")).unwrap()).unwrap();
+    assert_eq!(h["review_state"], "incomplete");
+}
+
+#[test]
+fn competing_publishers_keep_labels_and_saved_identity_in_one_transaction() {
+    use std::sync::mpsc;
+    let run = finished_review();
+    let labels = std::collections::BTreeMap::from([
+        ("repo", "publication-A".into()),
+        ("source_ref", "ref-A".into()),
+        ("sandbox", "sandbox-A".into()),
+    ]);
+    let mut worker = None;
+    omgs::report::publish(Some(&run.0), None, &Default::default(), &labels, |m| {
+        for (key, value) in &labels {
+            assert_eq!(m["publication"][key], value.as_str());
+        }
+        let path = run.0.clone();
+        let (send, receive) = mpsc::channel();
+        worker = Some(std::thread::spawn(move || {
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path.join(".omgs-run.lock"))
+                .unwrap();
+            send.send(matches!(
+                lock.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ))
+            .unwrap();
+            drop(lock);
+            // Inspect A's committed artifacts and identity at the first
+            // available transaction boundary, then publish B through the CLI.
+            omgs::runmeta::with_lock(&path, || {
+                assert_eq!(
+                    omgs::runmeta::read(&path)?["publication"]["source_ref"],
+                    "ref-A"
+                );
+                for name in ["REPORT.md", "REPORT.html"] {
+                    assert!(std::fs::read_to_string(path.join(name))
+                        .unwrap()
+                        .contains("ref-A"));
+                }
+                Ok(())
+            })
+            .unwrap();
+            std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .arg("report")
+                .arg("--findings")
+                .arg(path.join("findings.json"))
+                .arg("--out")
+                .arg(path)
+                .args([
+                    "--repo",
+                    "publication-B",
+                    "--ref",
+                    "ref-B",
+                    "--sandbox",
+                    "sandbox-B",
+                ])
+                .output()
+                .unwrap()
+        }));
+        assert!(receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap());
+        let mut view = omgs::review::View::load_locked(&run.0)?;
+        let meta = &mut view.meta;
+        meta.repo = m["publication"]["repo"].as_str().unwrap().into();
+        meta.source_ref = m["publication"]["source_ref"].as_str().unwrap().into();
+        meta.sandbox = m["publication"]["sandbox"].as_str().unwrap().into();
+        omgs::runmeta::write_atomic(
+            &run.0.join("REPORT.md"),
+            &omgs::report::render_markdown(&view.findings, meta),
+        )?;
+        omgs::runmeta::write_atomic(
+            &run.0.join("REPORT.html"),
+            &omgs::report::render_html(&view.findings, meta),
+        )?;
+        Ok(omgs::report::Completion {
+            hunters: None,
+            verifier: None,
+            complete: view.complete(),
+        })
+    })
+    .unwrap();
+    let result = worker.unwrap().join().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for key in ["repo", "source_ref", "sandbox"] {
+        let meta = run.meta();
+        let label = meta["publication"][key].as_str().unwrap();
+        assert!(label.ends_with('B'));
+        for name in ["REPORT.md", "REPORT.html"] {
+            assert!(std::fs::read_to_string(run.0.join(name))
+                .unwrap()
+                .contains(label));
+        }
+    }
+}
+
+#[test]
+fn batch_publication_pins_all_inputs_through_both_index_writes() {
+    let a = finished_review();
+    let b = finished_review();
+    let paths = vec![b.0.clone(), a.0.clone(), b.0.clone()];
+    let mut mutation = None;
+    omgs::runmeta::with_run_locks(&paths, false, || {
+        let runs = [&a, &b]
+            .iter()
+            .map(|run| {
+                omgs::batch::summarize_locked(
+                    &omgs::batch::BatchRun {
+                        run_dir: Some(run.0.to_string_lossy().into()),
+                        ..Default::default()
+                    },
+                    &a.1,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(runs.iter().all(|run| run.state == "complete"));
+        let (send, receive) = std::sync::mpsc::channel();
+        let path = a.0.clone();
+        mutation = Some(std::thread::spawn(move || {
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path.join(".omgs-run.lock"))
+                .unwrap();
+            send.send(matches!(
+                lock.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ))
+            .unwrap();
+            drop(lock);
+            attempts::append(
+                &path,
+                serde_json::from_value(stop("blue", "policy")).unwrap(),
+            )
+            .unwrap();
+        }));
+        assert!(receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap());
+        omgs::runmeta::write_atomic(
+            &a.1.join("INDEX.md"),
+            &omgs::batch::render_index_markdown(&runs),
+        )?;
+        omgs::runmeta::write_atomic(
+            &a.1.join("INDEX.html"),
+            &omgs::batch::render_index_html(&runs),
+        )?;
+        assert!(omgs::review::View::load_locked(&a.0)?.complete());
+        Ok(())
+    })
+    .unwrap();
+    mutation.unwrap().join().unwrap();
+    assert!(!omgs::review::View::load(&a.0).unwrap().complete());
 }

@@ -273,7 +273,12 @@ pub fn critique(
 /// Load a run directory's `findings.json` and critique it together with the
 /// ledger and candidates beside it.
 pub fn critique_run(dir: &Path) -> Result<CriticReport, String> {
-    published_report(crate::review::View::load(dir)?)
+    crate::runmeta::with_lock(dir, || critique_run_locked(dir))
+}
+
+/// Caller holds the run lock until the diagnostic is emitted.
+pub fn critique_run_locked(dir: &Path) -> Result<CriticReport, String> {
+    published_report(crate::review::View::load_locked(dir)?)
 }
 
 /// Critique exactly the supplied findings through the publication view.

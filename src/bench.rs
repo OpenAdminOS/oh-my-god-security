@@ -590,7 +590,7 @@ fn source_findings(dir: &Path, observation: &Value) -> Result<(crate::review::Vi
     // Admit the archive boundary, then read publication inputs under its lock.
     crate::run_artifact::text(&root, &relative, crate::run_artifact::FINDINGS_BYTES)?;
     let source = root.join(source);
-    let view = crate::review::View::load_archive(&source)?;
+    let view = crate::review::View::load_archive_locked(&source)?;
     if !view.strict_errors.is_empty() {
         return Err(view.strict_errors.join("; "));
     }
@@ -742,7 +742,7 @@ fn evidence_errors(dir: &Path, r: &Value, manifest: &Value) -> Result<Evidence> 
 
 // Use the same cumulative usage model as report and status.
 fn accounting(dir: &Path) -> Result<Value> {
-    let view = crate::review::View::load_archive(dir)?;
+    let view = crate::review::View::load_archive_locked(dir)?;
     let mut usage = crate::accounting::aggregate(&view.saved)?;
     if let Some(calls) = view.saved.get("agent_calls_used") {
         integer(calls)?;
@@ -753,6 +753,56 @@ fn accounting(dir: &Path) -> Result<Value> {
 
 /// Each directory is one complete repetition over all frozen snapshots.
 pub fn score(cases: &Path, dirs: &[PathBuf]) -> Result<Value> {
+    publish_score(cases, dirs, Ok)
+}
+
+/// Keep every repetition and source-run snapshot locked through output.
+pub fn publish_score<T>(
+    cases: &Path,
+    dirs: &[PathBuf],
+    publish: impl FnOnce(Value) -> Result<T>,
+) -> Result<T> {
+    let inputs = score_inputs(dirs)?;
+    crate::runmeta::with_run_locks(&inputs, true, || {
+        if score_inputs(dirs)? != inputs {
+            return Err("benchmark inputs changed before publication; retry".into());
+        }
+        publish(score_locked(cases, dirs)?)
+    })
+}
+
+fn score_inputs(dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut inputs = BTreeSet::new();
+    for dir in dirs {
+        let root = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+        inputs.insert(root.clone());
+        let r = crate::shape::strict_json(&crate::run_artifact::text(
+            &root,
+            Path::new("benchmark-run.json"),
+            crate::run_artifact::BENCHMARK_BYTES,
+        )?)?;
+        for o in list(&r["observations"])? {
+            if let Some(source) = o["source_run"].as_str() {
+                if source.contains(['\\', ':'])
+                    || source.starts_with('/')
+                    || source.split('/').any(|p| p == ".." || p.is_empty())
+                {
+                    return Err(
+                        "source_run must be a relative directory within the repetition".into(),
+                    );
+                }
+                let source = std::fs::canonicalize(root.join(source)).map_err(|e| e.to_string())?;
+                if !source.starts_with(&root) {
+                    return Err("source_run escapes repetition".into());
+                }
+                inputs.insert(source);
+            }
+        }
+    }
+    Ok(inputs.into_iter().collect())
+}
+
+fn score_locked(cases: &Path, dirs: &[PathBuf]) -> Result<Value> {
     let m = read(cases)?;
     manifest(&m)?;
     if dirs.is_empty() {

@@ -207,6 +207,14 @@ pub fn check_meta_types(meta: &serde_json::Map<String, serde_json::Value>) -> Re
 /// that exists but is malformed is an error, so the index never shows a
 /// clean row for a run whose evidence could not be read.
 pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String> {
+    match run.run_dir.as_deref() {
+        Some(dir) => crate::runmeta::with_lock(Path::new(dir), || summarize_locked(run, index_dir)),
+        None => summarize_locked(run, index_dir),
+    }
+}
+
+/// Caller holds every input run lock until the index is written.
+pub fn summarize_locked(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String> {
     let mut s = RunSummary {
         url: run.url.clone(),
         state: run.status.clone(),
@@ -219,7 +227,7 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
         return Ok(s);
     };
     let at = |name: &str, e: String| format!("{}: {name}: {e}", dir.display());
-    let view = crate::review::View::load(dir)?;
+    let view = crate::review::View::load_locked(dir)?;
     if !view.saved.is_empty() {
         let meta = &view.saved;
         check_meta_types(meta).map_err(|e| at(crate::runmeta::FILE, e))?;

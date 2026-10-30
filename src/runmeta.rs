@@ -238,6 +238,74 @@ pub fn with_lock<T>(dir: &Path, f: impl FnOnce() -> Result<T, String>) -> Result
     with_lock_file(&dir.join(LOCK), f)
 }
 
+/// Hold all input locks through a multi-run publication. Never wait for one
+/// lock while holding another: family writers acquire parent before child.
+/// Read-only archives without a lock are frozen inputs, as in with_archive_lock.
+pub fn with_run_locks<T>(
+    dirs: &[std::path::PathBuf],
+    archive: bool,
+    publish: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let input_paths = || -> Result<std::collections::BTreeSet<std::path::PathBuf>, String> {
+        let mut paths = std::collections::BTreeSet::new();
+        for dir in dirs {
+            let dir = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+            if !archive && read_optional(&dir)?.is_some() {
+                paths.insert(crate::budget::original(&dir)?.join(LOCK));
+            }
+            paths.insert(dir.join(LOCK));
+        }
+        Ok(paths)
+    };
+    let paths = input_paths()?;
+    let start = std::time::Instant::now();
+    loop {
+        let mut held = Vec::new();
+        let mut blocked = false;
+        for path in &paths {
+            let file = if archive {
+                crate::platform::open_single_link(path).map_err(|e| e.to_string())?
+            } else {
+                // Create and admit the lock without retaining any other lock.
+                if !path.try_exists().map_err(|e| e.to_string())? {
+                    blocked = true;
+                    break;
+                }
+                crate::platform::open_single_link(path).map_err(|e| e.to_string())?
+            };
+            let Some(file) = file else { continue };
+            crate::platform::check_private_file(&file).map_err(|e| e.to_string())?;
+            match file.try_lock_shared() {
+                Ok(()) => held.push(file),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    blocked = true;
+                    break;
+                }
+                Err(e) => return Err(format!("publication input lock: {e}")),
+            }
+        }
+        if !blocked {
+            if input_paths()? != paths {
+                return Err("publication input family changed; retry".into());
+            }
+            return publish();
+        }
+        drop(held);
+        // No lock remains held during creation or waiting.
+        if !archive {
+            for path in &paths {
+                if !path.try_exists().map_err(|e| e.to_string())? {
+                    with_lock_file(path, || Ok(()))?;
+                }
+            }
+        }
+        if start.elapsed().as_secs() >= 30 {
+            return Err("timed out waiting for publication inputs".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Read archived data without creating a lock file or requiring write access.
 /// If a writer creates the lock during an unlocked read, retry under that lock.
 pub fn with_archive_lock<T>(dir: &Path, read: impl Fn() -> Result<T, String>) -> Result<T, String> {

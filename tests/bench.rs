@@ -866,3 +866,59 @@ fn scoring_archives_never_creates_lock_files_and_preserves_token_splits() {
         assert!(result.is_ok(), "{result:?}");
     }
 }
+
+#[test]
+fn benchmark_retains_all_source_locks_until_output_is_written() {
+    let saved = SavedRuns::new();
+    let mut inputs = Vec::new();
+    for repetition in ["run-1", "run-2"] {
+        let dir = saved.0.join(repetition);
+        inputs.push(dir.clone());
+        let export: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("benchmark-run.json")).unwrap())
+                .unwrap();
+        for observation in export["observations"].as_array().unwrap() {
+            if let Some(source) = observation["source_run"].as_str() {
+                inputs.push(dir.join(source));
+            }
+        }
+    }
+    inputs.sort();
+    inputs.dedup();
+    for dir in &inputs {
+        omgs::runmeta::with_lock(dir, || Ok(())).unwrap();
+    }
+    let mut mutation = None;
+    omgs::bench::publish_score(
+        &saved.0.join("cases.json"),
+        &[saved.0.join("run-1"), saved.0.join("run-2")],
+        |score| {
+            let paths = inputs.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            mutation = Some(std::thread::spawn(move || {
+                for dir in &paths {
+                    let lock = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(dir.join(".omgs-run.lock"))
+                        .unwrap();
+                    assert!(matches!(
+                        lock.try_lock(),
+                        Err(std::fs::TryLockError::WouldBlock)
+                    ));
+                }
+                send.send(()).unwrap();
+                omgs::runmeta::with_lock(&paths[0], || Ok(())).unwrap();
+            }));
+            receive
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            // Both output formats are materialized while every source is pinned.
+            assert!(!serde_json::to_vec(&score).unwrap().is_empty());
+            assert!(!omgs::bench::markdown(&score).is_empty());
+            Ok(())
+        },
+    )
+    .unwrap();
+    mutation.unwrap().join().unwrap();
+}
