@@ -21,6 +21,13 @@ impl Fixture {
         }
         root
     }
+    /// An owner-private run directory below the fixture root. The OS temp
+    /// root itself is shared (root-owned /tmp on Linux), so runs never sit there.
+    fn run(&self) -> PathBuf {
+        let run = self.0.join("run");
+        omgs::platform::create_private_dir(&run).unwrap();
+        run
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -134,11 +141,12 @@ fn counter_help_lists_every_accepted_name_and_invalid_updates_are_atomic() {
         assert!(text.contains(counter));
     }
     let fixture = Fixture::new();
-    omgs::runmeta::write_atomic(&fixture.0.join(omgs::runmeta::FILE), "{}").unwrap();
+    let run = fixture.run();
+    omgs::runmeta::write_atomic(&run.join(omgs::runmeta::FILE), "{}").unwrap();
     let output = cli()
         .arg("status")
         .arg("--run")
-        .arg(&fixture.0)
+        .arg(&run)
         .args([
             "--stage",
             "hunt",
@@ -152,9 +160,13 @@ fn counter_help_lists_every_accepted_name_and_invalid_updates_are_atomic() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert!(!fixture.0.join(omgs::status::FILE).exists());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unsupported"),
+        "{output:?}"
+    );
+    assert!(!run.join(omgs::status::FILE).exists());
     assert_eq!(
-        std::fs::read_to_string(fixture.0.join(omgs::runmeta::FILE)).unwrap(),
+        std::fs::read_to_string(run.join(omgs::runmeta::FILE)).unwrap(),
         "{}"
     );
 }
@@ -164,7 +176,8 @@ fn counter_help_lists_every_accepted_name_and_invalid_updates_are_atomic() {
 fn status_closed_stdout_succeeds_after_saving_mutation() {
     use std::os::fd::FromRawFd;
     let fixture = Fixture::new();
-    omgs::runmeta::write_atomic(&fixture.0.join(omgs::runmeta::FILE), "{}").unwrap();
+    let run = fixture.run();
+    omgs::runmeta::write_atomic(&run.join(omgs::runmeta::FILE), "{}").unwrap();
     let mut fds = [0; 2];
     // SAFETY: writable descriptor array; this test owns both returned descriptors.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -175,7 +188,7 @@ fn status_closed_stdout_succeeds_after_saving_mutation() {
     let output = cli()
         .arg("status")
         .arg("--run")
-        .arg(&fixture.0)
+        .arg(&run)
         .args([
             "--stage",
             "hunt",
@@ -189,8 +202,7 @@ fn status_closed_stdout_succeeds_after_saving_mutation() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     let status: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(fixture.0.join(omgs::status::FILE)).unwrap())
-            .unwrap();
+        serde_json::from_slice(&std::fs::read(run.join(omgs::status::FILE)).unwrap()).unwrap();
     assert_eq!(status["counters"]["candidates"], 2);
     assert_eq!(status["stages"][0]["status"], "active");
 }
