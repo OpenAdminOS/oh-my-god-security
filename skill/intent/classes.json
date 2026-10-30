@@ -36,5 +36,11 @@
     "unbounded_import_recursion",
     "webhook_replay",
     "webhook_signature"
-  ]
+  ],
+  "deprecated_aliases": {
+    "idor": "idor_tenant_isolation",
+    "missing_authorization": "missing_authz",
+    "client_only_authorization": "client_only_auth",
+    "webhook_verification": "webhook_signature"
+  }
 }

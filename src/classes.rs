@@ -11,11 +11,26 @@ pub fn all() -> &'static [String] {
             .expect("classes")
             .iter()
             .map(|c| c.as_str().expect("class").to_string())
+            .chain(
+                v["deprecated_aliases"]
+                    .as_object()
+                    .expect("aliases")
+                    .keys()
+                    .cloned(),
+            )
             .collect()
     })
 }
+/// Guidance only: aliases remain unchanged in persisted finding identities.
+pub fn replacement(class: &str) -> Option<String> {
+    let registry: serde_json::Value =
+        serde_json::from_str(include_str!("../skill/intent/classes.json")).expect("class registry");
+    registry["deprecated_aliases"][class]
+        .as_str()
+        .map(str::to_owned)
+}
 pub fn known(class: &str) -> bool {
-    all().iter().any(|c| c == class)
+    all().iter().any(|c| c == class) || replacement(class).is_some()
 }
 /// Syntax check for registry maintenance. Registration is required before an
 /// identifier can be used in candidate or finding identity.

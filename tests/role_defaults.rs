@@ -1075,6 +1075,19 @@ fn build_names_and_txt_configuration_are_code_before_docs_or_data() {
     let out = cli(&["critic", "--run", run.to_str().unwrap()]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("project:.:generic"));
+    let parent_classes = ledger["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == "project:.:generic")
+        .unwrap()["attack_classes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .chain(std::iter::once("command_injection"))
+        .collect::<Vec<_>>()
+        .join(",");
     assert!(cli(&[
         "ledger",
         "add",
@@ -1085,7 +1098,7 @@ fn build_names_and_txt_configuration_are_code_before_docs_or_data() {
         "--surface",
         "CMakeLists.txt:execute_process",
         "--classes",
-        "command_injection",
+        &parent_classes,
         "--mapping",
         r##"{"scope_paths":["CMakeLists.txt#execute_process"]}"##
     ])

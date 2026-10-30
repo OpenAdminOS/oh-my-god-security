@@ -213,6 +213,16 @@ pub fn sensors(text: &str) -> Result<crate::sensors::SensorsReport, String> {
         let hits = top.get("hits").ok_or("hits is required")?;
         objects(hits, "hits")?;
         for hit in hits.as_array().unwrap() {
+            if hit.get("tool").and_then(|v| v.as_str()) != Some("osv-scanner")
+                && !hit
+                    .get("occurrence")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Err(
+                    "sensor hit lacks occurrence identity; regenerate sensor artifacts".into(),
+                );
+            }
             if hit.get("tool").and_then(|v| v.as_str()) == Some("osv-scanner") {
                 let package = hit
                     .get("package")

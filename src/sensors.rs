@@ -11,6 +11,10 @@ pub struct SensorHit {
     pub fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<PackageIdentity>,
+    /// Digest of the scanner occurrence, including its span and match data.
+    /// Raw match data is never retained. Absent on legacy artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence: Option<String>,
     /// Safe provenance only. Indices refer to the ordered normalized input
     /// hit stream before deduplication, never to secret-bearing match text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,6 +54,11 @@ pub fn deduplicate_hits(hits: &mut Vec<SensorHit>) {
     let mut retained = 0usize;
     for (source_index, mut hit) in std::mem::take(hits).into_iter().enumerate() {
         hit.fingerprint = hit_fingerprint(&hit);
+        // Legacy line-only identities cannot establish occurrence equality.
+        if hit.package.is_none() && hit.occurrence.is_none() {
+            unique.push(hit);
+            continue;
+        }
         if let Some(&(position, first_index)) = seen.get(&hit.fingerprint) {
             let first: &mut SensorHit = &mut unique[position];
             let sources = first
@@ -95,7 +104,7 @@ use crate::platform::which;
 
 /// Run deterministic sensor tools against source text. Sensors never execute
 /// target code. Raw scanner output can contain matched secret values, so only
-/// rule, file and line metadata is retained and the raw report is deleted.
+/// rule, file, line and occurrence digests are retained; the raw report is deleted.
 pub fn run_sensors(target: &Path, artifacts: &Path) -> SensorsReport {
     let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
     let target = target.as_path();
@@ -133,7 +142,7 @@ pub fn parse_semgrep(text: &str, target: &Path, report: &mut SensorsReport) {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if let Ok(hit) = metadata_hit(
+        if let Ok(mut hit) = metadata_hit(
             "semgrep",
             item.get("check_id")
                 .and_then(|v| v.as_str())
@@ -144,15 +153,33 @@ pub fn parse_semgrep(text: &str, target: &Path, report: &mut SensorsReport) {
                 .and_then(|v| v.as_u64()),
             target,
         ) {
+            identify_occurrence(&mut hit, item);
             report.hits.push(hit);
         }
     }
 }
 
-/// Identity is derived from retained metadata, never from a secret value.
+// Hash the complete occurrence conservatively: any differing scanner match,
+// column, span or metadata keeps separate accountability. Exact repeats merge.
+fn identify_occurrence(hit: &mut SensorHit, item: &serde_json::Value) {
+    hit.occurrence = Some(crate::sha256::digest(&serde_json::to_vec(item).unwrap()));
+    hit.fingerprint = hit_fingerprint(hit);
+}
+
+/// Identity uses retained metadata and a digest, never persisted match text.
 pub fn hit_fingerprint(hit: &SensorHit) -> String {
     let identity = if let Some(package) = &hit.package {
         serde_json::to_vec(&(&hit.tool, &hit.rule, &hit.file, hit.line, package)).unwrap()
+    } else if let Some(occurrence) = &hit.occurrence {
+        serde_json::to_vec(&(
+            "occurrence-v1",
+            &hit.tool,
+            &hit.rule,
+            &hit.file,
+            hit.line,
+            occurrence,
+        ))
+        .unwrap()
     } else {
         serde_json::to_vec(&(&hit.tool, &hit.rule, &hit.file, hit.line)).unwrap()
     };
@@ -205,6 +232,7 @@ fn metadata_hit(
         class,
         fingerprint: String::new(),
         package: None,
+        occurrence: None,
         duplicate_sources: None,
     };
     hit.fingerprint = hit_fingerprint(&hit);
@@ -241,7 +269,9 @@ fn trufflehog_hits(output: &str, target: &Path) -> Result<Vec<SensorHit>, ()> {
         {
             return Err(());
         }
-        hits.push(metadata_hit("trufflehog", rule, file, Some(line), target)?);
+        let mut hit = metadata_hit("trufflehog", rule, file, Some(line), target)?;
+        identify_occurrence(&mut hit, &v);
+        hits.push(hit);
     }
     Ok(hits)
 }
@@ -496,7 +526,9 @@ fn simple_hits(tool: &str, output: &str, target: &Path) -> Result<Vec<SensorHit>
         };
         // Semgrep paths in the disposable copy are returned relative to the
         // scan root by requesting a relative target from that copy's parent.
-        hits.push(metadata_hit(tool, rule, file, Some(line), target)?);
+        let mut hit = metadata_hit(tool, rule, file, Some(line), target)?;
+        identify_occurrence(&mut hit, item);
+        hits.push(hit);
     }
     Ok(hits)
 }
@@ -636,6 +668,106 @@ keywords = ["azurewebsites.net"]
 mod offline_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn same_line_occurrences_remain_distinct_and_exact_repeats_merge() {
+        let target = Path::new("/target");
+        for tool in ["gitleaks", "semgrep", "trufflehog"] {
+            let first = match tool {
+                "gitleaks" => json!({"RuleID":"fixture", "File":"src/app.rs", "StartLine":2,
+                    "StartColumn":1, "EndColumn":8, "Secret":"first-synthetic-match"}),
+                "semgrep" => json!({"check_id":"fixture", "path":"src/app.rs",
+                    "start":{"line":2,"col":1}, "end":{"line":2,"col":8},
+                    "extra":{"lines":"first-synthetic-match"}}),
+                _ => truffle(),
+            };
+            let mut second = first.clone();
+            let mut third = first.clone();
+            match tool {
+                "gitleaks" => {
+                    second["Secret"] = json!("second-synthetic-match");
+                    third["StartColumn"] = json!(20);
+                }
+                "semgrep" => {
+                    second["extra"]["lines"] = json!("second-synthetic-match");
+                    third["start"]["col"] = json!(20);
+                }
+                _ => {
+                    second["Raw"] = json!("second-synthetic-match");
+                    third["SourceMetadata"]["Data"]["Filesystem"]["column"] = json!(20);
+                }
+            }
+            let items = vec![first.clone(), second, third, first];
+            let mut hits = if tool == "trufflehog" {
+                trufflehog_hits(
+                    &items
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    target,
+                )
+                .unwrap()
+            } else {
+                let value = if tool == "semgrep" {
+                    json!({"results":items})
+                } else {
+                    json!(items)
+                };
+                simple_hits(tool, &value.to_string(), target).unwrap()
+            };
+            deduplicate_hits(&mut hits);
+            assert_eq!(hits.len(), 3, "{tool}");
+            assert_eq!(hits[0].duplicate_sources.as_ref().unwrap().count, 1);
+            let serialized = serde_json::to_string(&hits).unwrap();
+            for secret in [
+                "first-synthetic-match",
+                "second-synthetic-match",
+                "secret-value",
+            ] {
+                assert!(!serialized.contains(secret));
+            }
+            let mut ledger = crate::ledger::Ledger::default();
+            seed_units(
+                &SensorsReport {
+                    tools_run: vec![],
+                    tools_unavailable: vec![],
+                    hits,
+                    gaps: vec![],
+                },
+                &mut ledger,
+            );
+            assert_eq!(ledger.units.len(), 3);
+        }
+    }
+
+    #[test]
+    fn legacy_line_only_identity_requires_regeneration_without_merging() {
+        let hit = metadata_hit(
+            "gitleaks",
+            "fixture",
+            "src/app.rs",
+            Some(1),
+            Path::new("/target"),
+        )
+        .unwrap();
+        let fingerprint = hit.fingerprint.clone();
+        let mut hits = vec![hit.clone(), hit];
+        deduplicate_hits(&mut hits);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].fingerprint, fingerprint);
+        let report = SensorsReport {
+            tools_run: vec![],
+            tools_unavailable: vec![],
+            hits,
+            gaps: vec![],
+        };
+        assert!(
+            crate::shape::sensors(&serde_json::to_string(&report).unwrap())
+                .unwrap_err()
+                .contains("regenerate")
+        );
+    }
 
     fn truffle() -> serde_json::Value {
         json!({"DetectorName":"fixture","Raw":"secret-value","SourceMetadata":{"Data":{"Filesystem":{"file":"src/app.rs","line":2}}}})

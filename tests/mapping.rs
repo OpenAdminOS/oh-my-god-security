@@ -372,7 +372,7 @@ fn t10_t48_cli_mapping_updates_are_atomic_and_route_seeds_need_methods() {
         "--surface",
         "GET items",
         "--classes",
-        "missing_authz",
+        "missing_authz,idor_tenant_isolation,client_only_auth",
         "--mapping",
         r##"{"scope_paths":["app/api/items/route.ts#GET"]}"##
     ])
@@ -417,9 +417,26 @@ fn t52_pack_class_names_and_bundled_registry_stay_aligned() {
             .split('`')
             .skip(1)
             .step_by(2)
-            .filter(|t| t.contains('_') && omgs::classes::valid_identifier(t))
+            .filter(|t| omgs::classes::valid_identifier(t))
         {
-            if ["intent_id", "needs_validation"].contains(&token) {
+            if [
+                "intent_id",
+                "needs_validation",
+                "catch",
+                "delete",
+                "eval",
+                "fetch",
+                "iex",
+                "params",
+                "relforcerowsecurity",
+                "relrowsecurity",
+                "replace",
+                "rolbypassrls",
+                "rolsuper",
+                "update",
+            ]
+            .contains(&token)
+            {
                 continue;
             }
             assert!(omgs::classes::known(token), "{name}: {token}");
@@ -569,6 +586,80 @@ fn additional_a_unknown_classes_fail_validation_and_fingerprint_creation() {
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
             omgs::fingerprint(class, "GET /x", "db.x", "owner")
+        );
+    }
+}
+
+#[test]
+fn parent_classes_survive_nested_partitions_and_reasoned_exclusions() {
+    let mut parent = unit("stack:node", "covered");
+    parent.attack_classes.push("input_validation".into());
+    parent.extra.insert("child_units".into(), json!(["middle"]));
+    let mut middle = unit("middle", "covered");
+    let child = unit("leaf", "covered");
+    let mut l = ledger(vec![parent, middle.clone(), child]);
+    assert!(has(
+        &validate_ledger(&l),
+        "input_validation' is unaccounted"
+    ));
+    assert!(!omgs::critic::critique(&l, 1, &[], &Default::default()).passed());
+    middle.attack_classes.push("input_validation".into());
+    middle.extra.insert("child_units".into(), json!(["leaf"]));
+    l.units[1] = middle;
+    assert!(has(
+        &validate_ledger(&l),
+        "middle: parent class 'input_validation'"
+    ));
+    let mut excluded = unit("validation-excluded", "out_of_scope");
+    excluded.attack_classes = vec!["input_validation".into()];
+    excluded.note = Some("Reviewed source accepts no external input".into());
+    l.units[1]
+        .extra
+        .insert("child_units".into(), json!(["leaf", "validation-excluded"]));
+    l.units.push(excluded);
+    assert!(validate_ledger(&l).is_empty(), "{:?}", validate_ledger(&l));
+    l.units[3].note = None;
+    assert!(has(
+        &validate_ledger(&l),
+        "input_validation' is unaccounted"
+    ));
+}
+
+#[test]
+fn equivalent_scope_spellings_cannot_duplicate_ownership() {
+    let mut spellings = vec!["src/./decision.ts#GET", "src//decision.ts#GET"];
+    if cfg!(windows) {
+        spellings.push(r"src\decision.ts#GET");
+    }
+    for spelling in spellings {
+        let mut parent = unit("stack:node", "covered");
+        parent.extra.insert("child_units".into(), json!(["a", "b"]));
+        let a = unit("a", "covered");
+        let mut b = unit("b", "covered");
+        b.extra.insert("scope_paths".into(), json!([spelling]));
+        assert!(
+            has(
+                &validate_ledger(&ledger(vec![parent, a, b])),
+                "overlapping ownership"
+            ),
+            "{spelling}"
+        );
+    }
+}
+
+#[test]
+fn documented_legacy_classes_keep_their_identity() {
+    for (old, new) in [
+        ("idor", "idor_tenant_isolation"),
+        ("missing_authorization", "missing_authz"),
+        ("client_only_authorization", "client_only_auth"),
+        ("webhook_verification", "webhook_signature"),
+    ] {
+        assert!(omgs::classes::validate(old).is_ok());
+        assert_eq!(omgs::classes::replacement(old).as_deref(), Some(new));
+        assert_ne!(
+            omgs::fingerprint(old, "entry", "sink", "boundary"),
+            omgs::fingerprint(new, "entry", "sink", "boundary")
         );
     }
 }

@@ -1307,7 +1307,15 @@ fn sensors_documents_must_be_objects() {
         omgs::shape::sensors(r#"{"tools_run":[],"tools_unavailable":[],"hits":[],"hits":[]}"#)
             .is_err()
     );
-    assert!(omgs::shape::sensors(r#"{"tools_run":["gitleaks"],"tools_unavailable":[],"hits":[{"tool":"gitleaks","rule":"r","file":"f","line":1,"vendored":false,"class":"code","fingerprint":"f"}]}"#).is_ok());
+    let mut report = serde_json::json!({"tools_run":["gitleaks"],"tools_unavailable":[],"hits":[{
+        "tool":"gitleaks","rule":"r","file":"f","line":1,"vendored":false,
+        "class":"code","fingerprint":"f"
+    }]});
+    assert!(omgs::shape::sensors(&report.to_string())
+        .unwrap_err()
+        .contains("regenerate"));
+    report["hits"][0]["occurrence"] = serde_json::json!("a".repeat(64));
+    assert!(omgs::shape::sensors(&report.to_string()).is_ok());
     let dir = scratch("sensors-array");
     write_private_fixture(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
     write_private_fixture(dir.join("sensors.json"), "[[],[],[]]").unwrap();

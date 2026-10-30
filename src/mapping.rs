@@ -101,6 +101,16 @@ pub fn unit_errors(u: &Unit) -> Vec<String> {
     errors
 }
 
+fn normalized_scope(scope: &str) -> String {
+    let (path, operation) = scope.split_once('#').unwrap_or((scope, ""));
+    let mut normalized = crate::paths::display(Path::new(path));
+    if scope.contains('#') {
+        normalized.push('#');
+        normalized.push_str(operation);
+    }
+    normalized
+}
+
 fn overlap(a: &str, b: &str) -> bool {
     a == b
         || a.strip_prefix(b).is_some_and(|s| s.starts_with(['/', '#']))
@@ -113,7 +123,7 @@ pub fn partition_errors(ledger: &Ledger) -> Vec<String> {
     let mut errors = Vec::new();
     let index: BTreeMap<_, _> = ledger.units.iter().map(|u| (u.id.as_str(), u)).collect();
     let mut edges: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    let mut owners: BTreeMap<(&str, &str), &str> = BTreeMap::new();
+    let mut owners: BTreeMap<(String, &str), &str> = BTreeMap::new();
     for u in &ledger.units {
         for key in ["child_units", "residual_units"] {
             if !u.extra.contains_key(key) {
@@ -126,6 +136,23 @@ pub fn partition_errors(ledger: &Ledger) -> Vec<String> {
                     continue;
                 }
             };
+            if key == "child_units" && ["covered", "out_of_scope"].contains(&u.status.as_str()) {
+                for class in &u.attack_classes {
+                    if !ids.iter().any(|id| {
+                        index.get(id).is_some_and(|child| {
+                            child.attack_classes.contains(class)
+                                && (child.status == "covered"
+                                    || (child.status == "out_of_scope"
+                                        && child
+                                            .note
+                                            .as_deref()
+                                            .is_some_and(|n| !n.trim().is_empty())))
+                        })
+                    }) {
+                        errors.push(format!("{}: parent class '{class}' is unaccounted for by examined children or reasoned exclusions", u.id));
+                    }
+                }
+            }
             for id in ids {
                 edges.entry(&u.id).or_default().push(id);
                 let Some(child) = index.get(id) else {
@@ -161,16 +188,17 @@ pub fn partition_errors(ledger: &Ledger) -> Vec<String> {
                     }
                     if let Some(scopes) = scopes {
                         for scope in scopes.iter().filter_map(Value::as_str) {
+                            let scope = normalized_scope(scope);
                             for class in &child.attack_classes {
                                 for ((prior_scope, prior_class), prior_id) in &owners {
                                     if *prior_id != id
                                         && *prior_class == class
-                                        && overlap(scope, prior_scope)
+                                        && overlap(&scope, prior_scope)
                                     {
                                         errors.push(format!("overlapping ownership: '{prior_id}' and '{id}' for {scope} class {class}"));
                                     }
                                 }
-                                owners.insert((scope, class), id);
+                                owners.insert((scope.clone(), class), id);
                             }
                         }
                     }

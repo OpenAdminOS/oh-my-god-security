@@ -281,6 +281,16 @@ fn offline_tools_feed_redacted_artifacts_reports_and_critic() {
             .count(),
         2
     );
+    // Preserve all broad parent classes when closing the inventory fixture.
+    let mapped_classes: std::collections::BTreeSet<_> = units
+        .iter()
+        .filter(|u| {
+            u["id"].as_str().unwrap().starts_with("stack:")
+                || u["id"].as_str().unwrap().starts_with("project:")
+        })
+        .flat_map(|u| u["attack_classes"].as_array().unwrap().iter())
+        .map(|class| class.as_str().unwrap().to_string())
+        .collect();
     // Close unrelated inventory units to isolate the sensor requirement.
     for u in units
         .iter_mut()
@@ -294,7 +304,7 @@ fn offline_tools_feed_redacted_artifacts_reports_and_critic() {
             u["child_units"] = json!(["mapped:source"]);
         }
     }
-    units.push(json!({"id":"mapped:source","surface":"src/main.rs","attack_classes":["input_validation"],"status":"covered","evidence":["src/main.rs"],"scope_paths":["src/main.rs"]}));
+    units.push(json!({"id":"mapped:source","surface":"src/main.rs","attack_classes":mapped_classes,"status":"covered","evidence":["src/main.rs"],"scope_paths":["src/main.rs"]}));
     write_private_fixture(run.join("coverage-ledger.json"), ledger.to_string()).unwrap();
     write_private_fixture(run.join("candidates-empty.json"), r#"{"candidates":[]}"#).unwrap();
     let critic = omgs::critic::critique_run(&run).unwrap();
