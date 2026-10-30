@@ -342,7 +342,8 @@ run/tool or set an unprotected OMGS_HOME. The terminal-side parent may copy a
 protected target into unprotected staging using its existing access; a failed
 copy blocks execution. No privacy permissions are requested or changed.
 `launchd_tcc_path_admission` is required alongside coalition ownership in proof
-validation. Tests use unprotected temp/data paths and check TCC unified logs.
+validation. Tests use unprotected temp and data paths and assert that protected
+storage is refused before launchd submission.
 
 There is no stronger claim against a same-user process with arbitrary file
 access: it can replace the executable, private state or all local proof records.

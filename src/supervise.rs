@@ -894,7 +894,7 @@ fn wait(
         capture.drain(rx, notes);
         if cancellation.is_some_and(|stop| stop.load(Ordering::Acquire)) {
             waited.interrupted = true;
-            notes.push("scratch limit inspection requested workload shutdown".into());
+            notes.push("supervisor requested workload shutdown".into());
             break;
         }
         #[cfg(any(unix, windows))]
