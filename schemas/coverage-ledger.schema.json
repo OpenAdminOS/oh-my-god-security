@@ -4,7 +4,7 @@
   "type": "object",
   "required": ["units"],
   "properties": {
-    "scope_root": {"type": "string", "description": "Absolute target root used to resolve filesystem spelling of scope paths. Unavailable paths fail mapping validation; legacy ledgers without scope_root must migrate before closing partitions."},
+    "scope_root": {"type": "string", "description": "Absolute target root used to resolve filesystem spelling of scope paths. Unavailable paths fail mapping validation; legacy ledgers without scope_root must run omgs ledger migrate --run <run-dir> before closing partitions. Migration sets only the target from run-metadata.json after validation. CLI transitions and the critic require scope_root to identify that same filesystem directory before resolution."},
     "units": {
       "type": "array",
       "items": {

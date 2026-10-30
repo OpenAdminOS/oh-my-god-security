@@ -158,6 +158,14 @@ with
 
 Create and reconcile children before closing their checklist. A rejected update writes nothing.
 
+For a legacy ledger without `scope_root`, run `omgs ledger migrate --run <run-dir>` before
+closing partitions. Migration reads only that run's `run-metadata.json` target, requires an
+available absolute directory without a root link or reparse point, validates the resulting ledger,
+and writes under the run lock. It preserves other fields and never accepts a caller-supplied root.
+An existing root must identify the same filesystem object as the recorded target. Missing metadata,
+unavailable targets and invalid mapping must be repaired before migration; rejection writes nothing.
+CLI transitions and the critic verify this binding before resolving scope paths.
+
 Partial examination is recorded with `partial: true` and `residual_units` naming 1 to 256 separate
 units for every unexamined remainder before marking the examined unit covered. A candidate does
 not close its residuals. Missing, self, duplicate or cyclic references fail validation. Planned

@@ -255,10 +255,11 @@ is a gap. OMGS does not retain raw stdout, stderr or diagnostics. It preserves
 only metadata and generic gap reasons. Custom seccomp and sandbox-exec sensor
 paths have been removed in favor of MXC.
 
-Input is bounded to 16 MiB per file, 64 MiB total, 10,000 entries and 64 directory
-levels per scanner; links, special files, unreadable files and entries exceeding
-these bounds are skipped with an explicit gap. A skipped directory accounts for
-its entire subtree. Copied files are read with no-follow bounded reads. Runtime
+Input is bounded to 16 MiB per file, 64 MiB total, 100,000 enumerated entries, 10,000 staged files
+and 64 directory levels per scanner; links, special files, unreadable files and entries exceeding
+these bounds are skipped with an explicit gap. Up to 128 per path skip records per scanner
+retain paths of at most 1024 characters and reasons, with omitted record counts. A skipped directory describes an unenumerated
+subtree, never a count of all its files. Copied files are read with no-follow bounded reads. Runtime
 and database installations are operator-supplied readable inputs, not part of
 this source byte budget. They can affect parser memory usage. No total process
 memory cap is claimed on macOS or Windows. Semgrep additionally uses
@@ -278,8 +279,9 @@ explicit gaps. No sensor is a successful zero-hit scan merely because it failed.
 `sensors.json` records successful tools, unavailable tools, gaps and redacted
 hits; `sensor-hits.json` lists the same hits separately. Each hit keeps the tool,
 detector or advisory ID, relative file, line when supplied, shared path class and
-a SHA-256 fingerprint of that metadata. OSV hits also retain package name, version
-and ecosystem in JSON, fingerprints and reports, so distinct affected versions
+a SHA-256 fingerprint of that metadata plus a per run keyed occurrence identity for
+non-package hits, keeping distinct matches separate without storing match text. OSV hits also
+retain package name, version and ecosystem in JSON, fingerprints and reports, so distinct affected versions
 require separate ledger resolutions. Raw secrets and scanner output are never
 saved by the sensors. Both reports list hits from every class and all gaps.
 Each code hit seeds a `sensor:<tool>:<fingerprint>` candidate ledger unit. Hunt it
@@ -293,9 +295,10 @@ must be regenerated.
 
 `omgs audit init --target <repo> --persona builder|inheritor|team` records the persona and selects presentation and spending defaults. Builder uses concise coverage detail and a budget of 24 calls/proofs, inheritor uses full detail and 64, and team uses full detail and 96. Without a committed base policy, every persona defaults to advisory and explicit `--mode` and `--budget` override the defaults. Without `--persona`, the existing budget behavior is unchanged. A committed base policy takes precedence and conflicting overrides fail before run creation. Proof rules, verdict semantics and the evidence required to confirm a finding are identical.
 
-Inventory uses a heuristic path classifier for stack detection, first-party size statistics and hunting priority only. Code is the default, including unknown formats, SQL, HTML and templates. JSON, JSONL, NDJSON, CSV and TSV files of at least 1 MiB are prioritized as data, even though they may contain interpreted logic or renamed scripts. Documentation uses md, rst and adoc extensions or conventional notices. Only conventional notices such as README.txt, LICENSE.txt, NOTICE.txt, CHANGES.txt, AUTHORS.txt, CONTRIBUTING.txt and COPYING.txt classify as docs by the txt suffix; other txt files default to code. Conventional executable and build names (including CMakeLists.txt, Makefile, GNUmakefile, Dockerfile, Containerfile, Justfile, Rakefile, Gemfile, Gradle and CMake scripts, Jenkinsfile, Vagrantfile, BUILD, BUILD.bazel, WORKSPACE and meson.build) take precedence over docs/data rules. `requirements*.txt` is dependency configuration and classifies as code. Inventory-root test/spec and dependency containers and conventional test suffixes set test or vendored priority; nested directory hints, minified names and binary extensions alone cannot exclude a file.
+Inventory uses a heuristic path classifier for stack detection, first-party size statistics and hunting priority only. Code is the default, including unknown formats, SQL, HTML and templates. JSON, JSONL, NDJSON, CSV and TSV files of at least 1 MiB are prioritized as data, even though they may contain interpreted logic or renamed scripts. Documentation uses md, rst and adoc extensions or conventional notices. Only conventional notices such as README.txt, LICENSE.txt, NOTICE.txt, CHANGES.txt, AUTHORS.txt, CONTRIBUTING.txt and COPYING.txt classify as docs by the txt suffix; other txt files default to code. Conventional executable and build names (including CMakeLists.txt, Makefile, GNUmakefile, Dockerfile, Containerfile, Justfile, Rakefile, Gemfile, Gradle and CMake scripts, Jenkinsfile, Vagrantfile, BUILD, BUILD.bazel, WORKSPACE and meson.build) take precedence over docs/data rules. `requirements*.txt` is dependency configuration and classifies as code. Inventory-root test/spec and dependency containers and conventional test suffixes set test or vendored priority; nested directory hints and minified names alone cannot exclude a file. Recognized asset
+extensions such as png, woff and pdf classify as assets and require exclusion review.
 
-Classification never removes accountability. Every nonempty test, docs, data or vendored class gets a `planned` coverage unit with its total count and first 20 sorted paths across all files, plus supplemental source counts and paths. A hunter must skim or sample each group, then either hunt (`covered` with evidence) or explicitly resolve it as `out_of_scope` with `reviewed, not security relevant: <reason>`. The disposition must cite at least one sampled path in its evidence. The reason must explain the review, not repeat the classifier label. Planned, candidate, blocked and deferred exclusions fail the critic. Ledger output and both reports show review reasons. Shell scripts and browser extensions with a valid manifest version are detected alongside existing stacks. Nested project markers produce separate subproject roots in run metadata, coverage units and the architecture seed.
+Classification never removes accountability. Every nonempty test, docs, data, assets or vendored class gets a `planned` coverage unit with its total count and first 20 sorted paths across all files, plus supplemental source counts and paths. A hunter must skim or sample each group, then either hunt (`covered` with evidence) or explicitly resolve it as `out_of_scope` with `reviewed, not security relevant: <reason>`. The disposition must cite at least one sampled path in its evidence. The reason must explain the review, not repeat the classifier label. Planned, candidate, blocked and deferred exclusions fail the critic. Ledger output and both reports show review reasons. Shell scripts and browser extensions with a valid manifest version are detected alongside existing stacks. Nested project markers produce separate subproject roots in run metadata, coverage units and the architecture seed.
 
 Supply host usage cumulatively per role with `--accounting ROLE=TOKENS,COST_USD,DURATION_MS` on status or report. The roles are `red-hunter`, `blue-verifier`, `evaluator` and `green-fixer`. Repeat the option for multiple roles. For example:
 

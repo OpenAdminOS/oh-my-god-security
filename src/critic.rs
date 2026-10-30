@@ -320,6 +320,7 @@ fn critique_dir_inner(
         crate::run_artifact::LEDGER_BYTES,
     )?)
     .map_err(|e| format!("parse coverage-ledger.json: {e}"))?;
+    crate::mapping::validate_run_root(&ledger, dir)?;
     // Every candidates*.json must be a readable regular file: a symlink, a
     // directory, or an unreadable entry is an error, never silently skipped,
     // so no hunter handoff can disappear from reconciliation.

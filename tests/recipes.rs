@@ -78,6 +78,36 @@ fn ready(runtime: &str) -> bool {
     }
     true
 }
+fn node_typescript_version(version: &str) -> bool {
+    let parts: Vec<_> = version.trim().trim_start_matches('v').split('.').collect();
+    let (Some(major), Some(minor)) = (
+        parts.first().and_then(|s| s.parse::<u32>().ok()),
+        parts.get(1).and_then(|s| s.parse::<u32>().ok()),
+    ) else {
+        return false;
+    };
+    major > 23 || (major == 23 && minor >= 6) || (major == 22 && minor >= 18)
+}
+fn typescript_ready() -> bool {
+    let Some(node) = omgs::platform::which("node") else {
+        return false;
+    };
+    let available = Command::new(node).args(["--eval", "if (typeof require('node:module').registerHooks !== 'function') process.exit(1); console.log(process.version)"])
+        .output().is_ok_and(|out| out.status.success() && node_typescript_version(&String::from_utf8_lossy(&out.stdout)));
+    if !available {
+        skip("node", "TypeScript recipe requires Node 22.18+ (22.x), 23.6+ (23.x), or 24+, with registerHooks and unflagged type stripping");
+    }
+    available
+}
+#[test]
+fn typescript_runtime_version_boundaries() {
+    for version in ["v20.19.0", "v22.17.0", "v23.5.0", "invalid"] {
+        assert!(!node_typescript_version(version), "{version}");
+    }
+    for version in ["v22.18.0", "v23.6.0", "v24.0.0", "v26.7.0\n"] {
+        assert!(node_typescript_version(version), "{version}");
+    }
+}
 fn record(out: &Output, expected: i32, test: bool) {
     let output = text(out);
 
@@ -125,7 +155,7 @@ struct Recipe {
     dependency_failure: &'static str,
 }
 fn check(recipe: Recipe) -> bool {
-    if !ready(recipe.runtime) {
+    if !ready(recipe.runtime) || (recipe.source == "target.ts" && !typescript_ready()) {
         return false;
     }
     let d = omgs::platform::temp_root().unwrap().join(format!(

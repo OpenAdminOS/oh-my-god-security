@@ -140,6 +140,12 @@ offers no way to release them.
 
 ### TypeScript and Next.js decision imports
 
+The recipe requires Node 22.18 or newer on 22.x, 23.6 or newer on 23.x, or Node 24 or newer,
+with `module.registerHooks` and unflagged type stripping. Local recipe tests print a skip reason
+when this capability is missing; `OMGS_REQUIRE_RECIPES=node` makes that skip a failure in CI.
+See [Node type stripping](https://nodejs.org/docs/latest-v22.x/api/typescript.html#type-stripping)
+and [registerHooks](https://nodejs.org/download/release/v22.18.0/docs/api/module.html#moduleregisterhooksoptions).
+
 Use the already available Node runtime only when its built-in type stripping supports the actual
 source syntax. No installation, transpiler download or package fetching is allowed. Type stripping
 does not implement TypeScript path aliases, decorators, arbitrary compiler transforms or framework

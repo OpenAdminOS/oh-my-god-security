@@ -163,7 +163,7 @@ fn parse_scopes(value: &Value) -> Result<Vec<Scope>, String> {
 }
 
 fn normalized_scope(mut scope: Scope, root: Option<&Path>) -> Result<Scope, String> {
-    let root = root.ok_or("closing partitions requires scope_root target context; migrate the legacy ledger before closure")?;
+    let root = root.ok_or("closing partitions requires scope_root target context; run omgs ledger migrate --run <dir> before closure")?;
     scope.path = canonical_scope_path(root, Path::new(&scope.path))?;
     Ok(scope)
 }
@@ -250,6 +250,55 @@ fn same_object(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Bind editable mapping context to the target recorded by this run before
+/// any scope paths are resolved. Legacy ledgers may remain open until migration.
+pub fn validate_run_root(ledger: &Ledger, run: &Path) -> Result<(), String> {
+    let Some(value) = ledger.extra.get("scope_root") else {
+        return Ok(());
+    };
+    let root = value
+        .as_str()
+        .map(Path::new)
+        .ok_or("scope_root must be an absolute target path")?;
+    let target = run_target(run)?;
+    if !root.is_absolute() || !same_object(root, &target) {
+        return Err("scope_root must identify this run's target from run-metadata.json".into());
+    }
+    reject_scope_link(root)?;
+    Ok(())
+}
+
+/// Migration accepts only the run's recorded, available target directory.
+fn run_target(run: &Path) -> Result<PathBuf, String> {
+    let meta = crate::runmeta::read(run)?;
+    let target = meta
+        .get("target")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or("run-metadata.json requires target")?;
+    if !target.is_absolute() || !target.is_dir() {
+        return Err("run target must be an available absolute directory".into());
+    }
+    reject_scope_link(&target)?;
+    Ok(target)
+}
+
+pub fn migrate(ledger: &mut Ledger, run: &Path) -> Result<(), String> {
+    validate_run_root(ledger, run)?;
+    let target = run_target(run)?;
+    let mut trial = ledger.clone();
+    trial.extra.insert(
+        "scope_root".into(),
+        Value::from(target.to_str().ok_or("run target must be UTF-8")?),
+    );
+    let errors = crate::ledger::validate_ledger(&trial);
+    if !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    *ledger = trial;
+    Ok(())
+}
+
 fn overlap(a: &Scope, b: &Scope) -> bool {
     if a.path == b.path {
         return a.operation.is_none() || b.operation.is_none() || a.operation == b.operation;
@@ -294,7 +343,7 @@ pub fn partition_errors(ledger: &Ledger) -> Vec<String> {
             };
             if key == "child_units" && ["covered", "out_of_scope"].contains(&u.status.as_str()) {
                 if root.is_none() {
-                    errors.push(format!("{}: closing partitions requires scope_root target context; migrate the legacy ledger before closure", u.id));
+                    errors.push(format!("{}: closing partitions requires scope_root target context; run omgs ledger migrate --run <dir> before closure", u.id));
                 }
                 for class in &u.attack_classes {
                     if !ids.iter().any(|id| {

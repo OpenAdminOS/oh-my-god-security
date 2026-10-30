@@ -731,7 +731,7 @@ fn legacy_partitions_require_target_context_before_closure() {
         l.extra.remove("scope_root");
         assert!(has(
             &validate_ledger(&l),
-            "migrate the legacy ledger before closure"
+            "omgs ledger migrate --run <dir> before closure"
         ));
         assert!(!omgs::critic::critique(&l, 1, &[], &Default::default()).passed());
         l.extra.insert("scope_root".into(), json!("relative"));
@@ -1090,4 +1090,203 @@ fn links_beneath_hash_directories_cannot_bypass_scope_validation() {
     std::fs::remove_file(link).unwrap();
     #[cfg(windows)]
     std::fs::remove_dir(link).unwrap();
+}
+
+fn command(t: &Temp) -> std::process::Command {
+    let home = t.0.join("home");
+    omgs::platform::private_dir(&home).unwrap();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"));
+    cmd.env("OMGS_HOME", home).env("RUSTUP_AUTO_INSTALL", "0");
+    cmd
+}
+fn write_json(path: &std::path::Path, value: &impl serde::Serialize) {
+    omgs::runmeta::write_atomic(path, &serde_json::to_string(value).unwrap()).unwrap();
+}
+
+#[test]
+fn legacy_cli_migration_binds_metadata_and_allows_partition_closure() {
+    let t = Temp::new();
+    let run = t.0.join("run");
+    let target = t.0.join("target");
+    omgs::platform::private_dir(&run).unwrap();
+    omgs::platform::private_dir(&target).unwrap();
+    omgs::platform::private_dir(&target.join("src")).unwrap();
+    std::fs::write(target.join("src/decision.ts"), "source").unwrap();
+    let mut parent = unit("stack:node", "planned");
+    parent.extra.insert("child_units".into(), json!(["child"]));
+    let mut l = ledger(vec![parent, unit("child", "covered")]);
+    l.extra.remove("scope_root");
+    l.extra.insert("custom".into(), json!("preserved"));
+    let path = run.join("coverage-ledger.json");
+    write_json(&path, &l);
+    let close = || {
+        command(&t)
+            .args(["ledger", "set", "--ledger"])
+            .arg(&path)
+            .args([
+                "--unit",
+                "stack:node",
+                "--status",
+                "covered",
+                "--evidence",
+                "src/decision.ts",
+            ])
+            .output()
+            .unwrap()
+    };
+    assert!(!close().status.success());
+    let original = std::fs::read(&path).unwrap();
+    let migrate = || {
+        command(&t)
+            .args(["ledger", "migrate", "--run"])
+            .arg(&run)
+            .output()
+            .unwrap()
+    };
+    assert!(!migrate().status.success());
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    write_json(&run.join("run-metadata.json"), &json!({"target": target}));
+    // A malformed existing partition cannot be published by migration.
+    let mut invalid = l.clone();
+    invalid.units[0]
+        .extra
+        .insert("child_units".into(), json!(["missing"]));
+    write_json(&path, &invalid);
+    let invalid_bytes = std::fs::read(&path).unwrap();
+    assert!(!migrate().status.success());
+    assert_eq!(std::fs::read(&path).unwrap(), invalid_bytes);
+    write_json(&path, &l);
+    let out = migrate();
+    assert!(out.status.success(), "{out:?}");
+    assert!(close().status.success());
+    let migrated: Ledger = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(migrated.extra["custom"], "preserved");
+    assert_eq!(migrated.extra["scope_root"], json!(target));
+    assert!(validate_ledger(&migrated).is_empty());
+    let out = command(&t)
+        .args(["ledger", "migrate", "--run"])
+        .arg(&run)
+        .arg("--ledger")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn edited_scope_root_cannot_redirect_cli_or_critic_resolution() {
+    let t = Temp::new();
+    let target = t.0.join("target");
+    let other = t.0.join("other");
+    for dir in [&target, &other] {
+        omgs::platform::private_dir(dir).unwrap();
+    }
+    write_json(&t.0.join("run-metadata.json"), &json!({"target": target}));
+    let mut l = Ledger::default();
+    l.extra.insert("scope_root".into(), json!(target.join(".")));
+    assert!(omgs::mapping::validate_run_root(&l, &t.0).is_ok());
+    l.extra.insert("scope_root".into(), json!(other));
+    write_json(&t.0.join("coverage-ledger.json"), &l);
+    let before = std::fs::read(t.0.join("coverage-ledger.json")).unwrap();
+    for args in [
+        vec!["ledger", "list", "--ledger"],
+        vec!["ledger", "migrate", "--run"],
+    ] {
+        let path = if args[1] == "list" {
+            t.0.join("coverage-ledger.json")
+        } else {
+            t.0.clone()
+        };
+        let out = command(&t).args(args).arg(path).output().unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("this run's target"));
+    }
+    assert!(omgs::critic::critique_dir(&t.0, &Default::default())
+        .unwrap_err()
+        .contains("this run's target"));
+    assert_eq!(
+        std::fs::read(t.0.join("coverage-ledger.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn ledger_add_rejects_unregistered_classes_and_intent_resolves_aliases() {
+    let t = Temp::new();
+    let path = t.0.join("coverage-ledger.json");
+    write_json(&path, &Ledger::default());
+    let before = std::fs::read(&path).unwrap();
+    let out = command(&t)
+        .args(["ledger", "add", "--ledger"])
+        .arg(&path)
+        .args([
+            "--unit",
+            "test",
+            "--surface",
+            "src/a.ts",
+            "--classes",
+            "missing_authz,typo_class",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown attack class typo_class; expected")
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    for (alias, replacement) in [
+        ("idor", "idor_tenant_isolation"),
+        ("fail-closed", "fail_closed_semantics"),
+    ] {
+        let list = |class| {
+            command(&t)
+                .args(["intent", "list", "--attack-class", class])
+                .output()
+                .unwrap()
+        };
+        let aliased = list(alias);
+        let registered = list(replacement);
+        assert!(aliased.status.success());
+        assert_eq!(aliased.stdout, registered.stdout);
+        assert!(!String::from_utf8_lossy(&aliased.stdout).contains("no intent questions"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn audit_init_rejects_non_utf8_canonical_target_without_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+    let t = Temp::new();
+    let target =
+        t.0.join(std::ffi::OsString::from_vec(b"target-\xff".to_vec()));
+    use std::os::unix::fs::DirBuilderExt;
+    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&target) {
+        #[cfg(target_os = "macos")]
+        if e.raw_os_error() == Some(92) {
+            eprintln!("non UTF-8 fixture unavailable on this filesystem: {e}");
+            return;
+        }
+        panic!("non UTF-8 fixture creation failed: {e}");
+    }
+    let direct = command(&t)
+        .args(["audit", "init", "--target"])
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert_eq!(direct.status.code(), Some(2), "{direct:?}");
+    assert!(String::from_utf8_lossy(&direct.stderr).contains("arguments must be UTF-8"));
+    let alias = t.0.join("alias");
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    let run = t.0.join("run");
+    let out = command(&t)
+        .args(["audit", "init", "--target"])
+        .arg(alias)
+        .arg("--out")
+        .arg(&run)
+        .arg("--no-sensors")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("UTF-8 target path"));
+    assert!(!run.exists());
 }
