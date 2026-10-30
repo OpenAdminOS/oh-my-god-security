@@ -22,7 +22,7 @@ fn limits() -> Limits {
 #[test]
 fn spawn_failure_is_reported() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let result = run(Command::new("/omgs/nonexistent/executor"), &limits(), None);
     assert!(!result.success);
     assert!(!result.capture_complete);
@@ -71,7 +71,7 @@ fn output_pid(result: &omgs::supervise::Supervised) -> i32 {
 #[test]
 fn rlimits_are_inherited() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut limits = limits();
     limits.open_files = Some(64);
     limits.file_size_bytes = Some(1024 * 1024);
@@ -96,7 +96,7 @@ fn rlimits_are_inherited() {
 #[test]
 fn invalid_rlimit_fails_without_panicking() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut limits = limits();
     limits.open_files = Some(u64::MAX);
     let result = run(shell("exit 0"), &limits, None);
@@ -108,7 +108,7 @@ fn invalid_rlimit_fails_without_panicking() {
 #[test]
 fn timeout_kills_background_tree() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut limits = limits();
     limits.wall_ms = 500;
     let result = run(shell("sleep 30 & echo $!; wait"), &limits, None);
@@ -124,7 +124,7 @@ fn timeout_kills_background_tree() {
 #[test]
 fn normal_exit_kills_background_tree_before_reaping_leader() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let result = run(shell("sleep 30 & echo $!; exit 0"), &limits(), None);
     assert!(result.success, "{result:?}");
     assert_eq!(result.exit_code, Some(0));
@@ -136,7 +136,7 @@ fn normal_exit_kills_background_tree_before_reaping_leader() {
 #[test]
 fn output_is_capped_and_all_bytes_are_counted() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut limits = limits();
     limits.output_cap_bytes = 37;
     let result = run(
@@ -153,7 +153,7 @@ fn output_is_capped_and_all_bytes_are_counted() {
 #[test]
 fn zero_cap_still_drains_and_counts() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut limits = limits();
     limits.output_cap_bytes = 0;
     let result = run(shell("printf output; printf error >&2"), &limits, None);
@@ -166,7 +166,7 @@ fn zero_cap_still_drains_and_counts() {
 #[test]
 fn stdout_precedes_stderr() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let result = run(shell("printf error >&2; printf output"), &limits(), None);
     assert!(result.success, "{result:?}");
     assert_eq!(result.output, "outputerror");
@@ -176,7 +176,7 @@ fn stdout_precedes_stderr() {
 #[test]
 fn nonzero_exit_is_preserved() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let result = run(shell("exit 7"), &limits(), None);
     assert_eq!(result.exit_code, Some(7));
     assert!(!result.success);
@@ -187,7 +187,7 @@ fn nonzero_exit_is_preserved() {
 #[test]
 fn sweep_kills_detached_sandbox_process_and_spares_unrelated_process() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.write().unwrap();
+    let _activity = PROCESS_ACTIVITY.write().unwrap_or_else(|e| e.into_inner());
     use omgs::supervise::SweepMarkers;
     use std::process::Child;
 
@@ -267,7 +267,7 @@ fn sweep_kills_detached_sandbox_process_and_spares_unrelated_process() {
 #[test]
 fn inherited_pipe_from_detached_process_has_a_bounded_drain() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     if !std::path::Path::new("/usr/bin/perl").is_file() {
         eprintln!("skipping bounded drain test: perl is unavailable");
         return;
@@ -292,7 +292,7 @@ fn inherited_pipe_from_detached_process_has_a_bounded_drain() {
 #[test]
 fn cgroup_limits_are_applied_or_explained_without_environment_leaks() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut limits = limits();
     limits.memory_bytes = Some(128 * 1024 * 1024);
     limits.tasks = Some(32);
@@ -316,7 +316,7 @@ fn cgroup_limits_are_applied_or_explained_without_environment_leaks() {
 #[test]
 fn executor_text_errors_and_outer_exit_codes_cannot_substitute_for_markers() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     use omgs::supervise::run_marked;
     let scripts = if cfg!(windows) {
         [
@@ -353,7 +353,7 @@ fn executor_text_errors_and_outer_exit_codes_cannot_substitute_for_markers() {
 #[test]
 fn timeout_words_and_signal_death_are_not_timeouts() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let nonce = "nonce";
     let cmd = shell("printf 'OMGS_START_nonce\nscript timed out after 1ms\nOMGS_END_nonce:0\n'");
     let result = omgs::supervise::run_marked(cmd, &limits(), None, nonce);
@@ -381,7 +381,7 @@ fn timeout_words_and_signal_death_are_not_timeouts() {
 #[test]
 fn windows_wall_clock_kills_executor_and_discloses_owner_job() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new("cmd.exe");
     cmd.args(["/d", "/q", "/c", "for /l %i in (1,0,2) do @rem"]);
     let mut limits = limits();
@@ -418,7 +418,7 @@ fn windows_wall_clock_kills_executor_and_discloses_owner_job() {
 #[test]
 fn executor_does_not_inherit_another_spawns_pipe() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     // Other tests deliberately spawn children without the supervisor. Isolate
     // the intentionally inheritable descriptor so it cannot leak into them.
     if std::env::var_os("OMGS_INHERITANCE_CHILD").is_none() {
@@ -498,7 +498,7 @@ fn executor_does_not_inherit_another_spawns_pipe() {
 #[test]
 fn concurrent_short_marked_runs_complete_capture() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     std::thread::scope(|scope| {
         // Unmarked calls can spawn concurrently with marked calls even though
         // the process-wide signal guard serializes marked supervisors.
@@ -534,7 +534,7 @@ fn concurrent_short_marked_runs_complete_capture() {
 #[test]
 fn unsupervised_spawns_do_not_delay_capture() {
     #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap();
+    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     if std::env::var_os("OMGS_CAPTURE_STRESS_CHILD").is_none() {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -601,7 +601,7 @@ fn unsupervised_spawns_do_not_delay_capture() {
                             command.pre_exec(|| Ok(()));
                         }
                         let mut child = {
-                            let _lock = spawning.lock().unwrap();
+                            let _lock = spawning.lock().unwrap_or_else(|e| e.into_inner());
                             Held(command.spawn().unwrap())
                         };
                         let mut line = String::new();
