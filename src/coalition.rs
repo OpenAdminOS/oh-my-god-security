@@ -43,17 +43,19 @@ struct AdmittedRequest<'a> {
 }
 impl Request {
     fn admit<'a>(&'a self, dir: &'a Path) -> io::Result<AdmittedRequest<'a>> {
-        self.admit_with(dir, &mut |path, grant| {
-            if grant {
-                crate::tcc::admit_grant(path)
-            } else {
-                crate::tcc::admit_path(path)
-            }
-        })
+        self.admit_with(dir, &mut crate::tcc::admit_executor_path)
     }
     fn admit_with<'a>(
         &'a self,
         dir: &'a Path,
+        visit: &mut impl FnMut(&Path, bool) -> io::Result<()>,
+    ) -> io::Result<AdmittedRequest<'a>> {
+        self.admit_with_mxc(dir, &mut crate::tcc::HostMxcFilesystem, visit)
+    }
+    fn admit_with_mxc<'a>(
+        &'a self,
+        dir: &'a Path,
+        fs: &mut impl crate::tcc::MxcFilesystem,
         visit: &mut impl FnMut(&Path, bool) -> io::Result<()>,
     ) -> io::Result<AdmittedRequest<'a>> {
         // Exhaustive destructuring makes a new handoff field a compile error
@@ -147,11 +149,75 @@ impl Request {
                     CONTROL_BYTES,
                 )?)
                 .map_err(io::Error::other)?;
-            crate::tcc::visit_config(&config, visit)?;
+            let mut implicit_grants = Vec::new();
+            let executor_home = env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == b"HOME")
+                .map(|(_, value)| PathBuf::from(OsStr::from_bytes(value)))
+                .unwrap_or_else(|| dir.join("executor-home"));
+            crate::tcc::visit_mxc_implicit(&config, &executor_home, fs, &mut |path, grant| {
+                visit(path, grant)?;
+                if grant {
+                    implicit_grants.push(path.to_path_buf());
+                }
+                Ok(())
+            })?;
+            // Include config grants too: the serialized handoff's separate
+            // grant list must never hide a wider effective MXC grant.
+            crate::tcc::visit_config_at(&config, &executor_home, &mut |path, grant| {
+                visit(path, grant)?;
+                if grant {
+                    implicit_grants.push(path.to_path_buf());
+                }
+                Ok(())
+            })?;
+            for storage in [
+                root.to_path_buf(),
+                dir.to_path_buf(),
+                capture.root().to_path_buf(),
+            ] {
+                validate_mxc_grants(&storage, &implicit_grants)?;
+            }
         }
         Ok(AdmittedRequest { request: self, dir })
     }
 }
+// Resolve existing ancestors too, since optional MXC grants can name paths
+// which have not been created yet (for example executor HOME/Library/Keychains).
+fn validate_mxc_grants(root: &Path, grants: &[PathBuf]) -> io::Result<()> {
+    for grant in grants {
+        let mut ancestor = grant.as_path();
+        let mut suffix = Vec::new();
+        let mut resolved = loop {
+            match std::fs::canonicalize(ancestor) {
+                Ok(path) => break path,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    suffix.push(
+                        ancestor
+                            .file_name()
+                            .ok_or_else(|| io::Error::other("invalid MXC grant"))?,
+                    );
+                    ancestor = ancestor
+                        .parent()
+                        .ok_or_else(|| io::Error::other("missing MXC grant ancestor"))?;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        for part in suffix.into_iter().rev() {
+            resolved.push(part);
+        }
+        if crate::tcc::overlaps(root, grant) || crate::tcc::overlaps(root, &resolved) {
+            return Err(io::Error::other(format!(
+                "private storage overlaps MXC grant {}",
+                grant.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl AdmittedRequest<'_> {
     fn command(&self) -> Command {
         let req = self.request;
@@ -1375,6 +1441,35 @@ mod tests {
             self.elapsed += Duration::from_millis(50);
         }
     }
+    struct SelectedDeveloper {
+        targets: [Option<PathBuf>; 2],
+        trusted: [bool; 2],
+        inspected: Vec<PathBuf>,
+    }
+    impl SelectedDeveloper {
+        fn new(target: PathBuf) -> Self {
+            Self {
+                targets: [Some(target), None],
+                trusted: [true, true],
+                inspected: Vec::new(),
+            }
+        }
+    }
+    impl crate::tcc::MxcFilesystem for SelectedDeveloper {
+        fn root_controlled_link(&mut self, path: &Path) -> bool {
+            self.trusted[usize::from(path.ends_with("developer_dir"))]
+        }
+        fn read_link(&mut self, path: &Path) -> io::Result<PathBuf> {
+            let index = usize::from(path.ends_with("developer_dir"));
+            self.targets[index]
+                .clone()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+        }
+        fn is_dir(&mut self, path: &Path) -> bool {
+            self.inspected.push(path.to_path_buf());
+            path.is_dir()
+        }
+    }
     #[test]
     fn every_handoff_path_must_pass_admission() {
         use std::collections::BTreeSet;
@@ -1439,9 +1534,12 @@ mod tests {
         // Exercise the real wire round trip, not a separate test-only builder.
         let request: Request =
             serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        let developer = data.join("Xcode.APP/Contents/Developer");
+        platform::create_private_tree(&developer).unwrap();
+        let mut selection = SelectedDeveloper::new(developer.clone());
         let mut checked = BTreeSet::new();
         let admitted = request
-            .admit_with(&dir, &mut |path, _| {
+            .admit_with_mxc(&dir, &mut selection, &mut |path, _| {
                 checked.insert(path.to_path_buf());
                 Ok(())
             })
@@ -1527,6 +1625,24 @@ mod tests {
             "/usr/lib",
             "/System/Library/Frameworks",
             "/usr/local/rust",
+            "/",
+            "/bin/sh",
+            "/usr/libexec",
+            "/usr/share",
+            "/System",
+            "/Library",
+            "/private/var/db/timezone",
+            "/private/var/db/dyld",
+            "/private/var/select",
+            "/private/etc",
+            "/dev",
+            "/dev/zero",
+            "/dev/random",
+            "/dev/urandom",
+            "/dev/tty",
+            "/dev/fd",
+            "/dev/ptmx",
+            "/private/var/db/xcode_select_link",
         ] {
             expected.insert(path.into());
         }
@@ -1557,17 +1673,27 @@ mod tests {
             expected.insert(dir.join("pipe"));
             expected.insert(dir);
         }
+        expected.insert(developer.clone());
+        expected.insert(data.join("Xcode.APP"));
+        assert_eq!(
+            selection.inspected.as_slice(),
+            std::slice::from_ref(&developer)
+        );
         assert_eq!(checked, expected);
         // Refusing any one path must prevent obtaining the submission token.
         for rejected in expected {
             let error = request
-                .admit_with(&dir, &mut |path, _| {
-                    if path == rejected {
-                        Err(io::Error::other("injected handoff refusal"))
-                    } else {
-                        Ok(())
-                    }
-                })
+                .admit_with_mxc(
+                    &dir,
+                    &mut SelectedDeveloper::new(developer.clone()),
+                    &mut |path, _| {
+                        if path == rejected {
+                            Err(io::Error::other("injected handoff refusal"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
                 .err()
                 .unwrap();
             assert!(
@@ -1576,6 +1702,145 @@ mod tests {
                 rejected.display()
             );
         }
+        // Candidate metadata must never touch protected or external storage,
+        // including the legacy selection when the first link is absent.
+        for target in [
+            "/Volumes/Build/Xcode.app/Contents/Developer",
+            "/Users/example/Documents/Xcode.app/Contents/Developer",
+        ] {
+            for legacy in [false, true] {
+                let mut selection = SelectedDeveloper::new(target.into());
+                if legacy {
+                    selection.targets.swap(0, 1);
+                }
+                let error = request
+                    .admit_with_mxc(&dir, &mut selection, &mut crate::tcc::admit_executor_path)
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().contains("TCC consent"), "{error}");
+                assert!(
+                    selection.inspected.is_empty(),
+                    "candidate stat preceded admission"
+                );
+            }
+        }
+        // Widened bundles may not overlap registry, job or capture storage.
+        for storage in [dir.parent().unwrap(), dir.as_path(), request.capture.root()] {
+            let developer = storage.join("Xcode.app/Contents/Developer");
+            platform::create_private_tree(&developer).unwrap();
+            let error = request
+                .admit_with_mxc(
+                    &dir,
+                    &mut SelectedDeveloper::new(developer.clone()),
+                    &mut crate::tcc::admit_executor_path,
+                )
+                .err()
+                .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("private storage overlaps MXC grant"),
+                "{error}"
+            );
+            std::fs::remove_dir_all(developer.parent().unwrap().parent().unwrap()).unwrap();
+        }
+        // The developer subtree is disjoint from this job, but MXC's widened
+        // bundle includes SharedFrameworks and therefore includes the registry.
+        let sibling_job = data.join("Xcode.APP/Contents/SharedFrameworks/launchd/job");
+        let error = request
+            .admit_with_mxc(
+                &sibling_job,
+                &mut SelectedDeveloper::new(developer.clone()),
+                &mut crate::tcc::admit_executor_path,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("private storage overlaps MXC grant"),
+            "{error}"
+        );
+        // Canonical selection aliases must also participate in overlap checks.
+        let alias = data.join("developer-alias");
+        std::os::unix::fs::symlink(request.capture.root(), &alias).unwrap();
+        assert!(request
+            .admit_with_mxc(
+                &dir,
+                &mut SelectedDeveloper::new(alias.clone()),
+                &mut crate::tcc::admit_executor_path
+            )
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("private storage overlaps MXC grant"));
+        std::fs::remove_file(alias).unwrap();
+        // Root ownership checks, first-valid selection and legacy fallback use
+        // the same order as MXC, without touching a real selection or volume.
+        let mut selection =
+            SelectedDeveloper::new("/Volumes/Untrusted/Xcode.app/Contents/Developer".into());
+        selection.trusted[0] = false;
+        selection.targets[1] = Some(developer.clone());
+        request
+            .admit_with_mxc(&dir, &mut selection, &mut crate::tcc::admit_executor_path)
+            .unwrap();
+        assert_eq!(
+            selection.inspected.as_slice(),
+            std::slice::from_ref(&developer)
+        );
+        let mut selection = SelectedDeveloper::new(data.join("missing-developer"));
+        selection.targets[1] = Some(developer.clone());
+        request
+            .admit_with_mxc(&dir, &mut selection, &mut crate::tcc::admit_executor_path)
+            .unwrap();
+        assert_eq!(
+            selection.inspected,
+            [data.join("missing-developer"), developer.clone()]
+        );
+        // HOME-expanded config grants must not escape the private-storage
+        // overlap check, even though the serialized spelling is only `~`.
+        let mut home_config = config.clone();
+        home_config["filesystem"]["readonlyPaths"] = serde_json::json!(["~"]);
+        std::fs::write(
+            run.join("mxc-config.json"),
+            serde_json::to_vec(&home_config).unwrap(),
+        )
+        .unwrap();
+        let error = request
+            .admit_with_mxc(
+                &dir,
+                &mut SelectedDeveloper::new(developer.clone()),
+                &mut crate::tcc::admit_executor_path,
+            )
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("private storage overlaps MXC grant"),
+            "{error}"
+        );
+        std::fs::write(
+            run.join("mxc-config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        // The same gate is repeated by the anchor. A changed selection after a
+        // successful admission must not reuse an earlier submission token.
+        request
+            .admit_with_mxc(
+                &dir,
+                &mut SelectedDeveloper::new(developer.clone()),
+                &mut crate::tcc::admit_executor_path,
+            )
+            .unwrap();
+        assert!(request
+            .admit_with_mxc(
+                &dir,
+                &mut SelectedDeveloper::new("/Volumes/Changed/Xcode.app/Contents/Developer".into()),
+                &mut crate::tcc::admit_executor_path
+            )
+            .is_err());
         // The production gate must also inspect config contents, not just its filename.
         let mut protected = config;
         protected["process"]["env"][0] = "HOME=/Users/omgs-tcc-refusal/Documents".into();

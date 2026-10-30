@@ -260,6 +260,217 @@ pub(crate) fn admit_grant(path: &Path) -> io::Result<()> {
     inspect(path, true)
 }
 
+/// MXC 1.0.1 profile_builder.rs:148-208. Keep discovery injectable without
+/// changing the machine's root-owned developer selection in tests.
+pub(crate) trait MxcFilesystem {
+    fn root_controlled_link(&mut self, path: &Path) -> bool;
+    fn read_link(&mut self, path: &Path) -> io::Result<PathBuf>;
+    fn is_dir(&mut self, path: &Path) -> bool;
+}
+pub(crate) struct HostMxcFilesystem;
+impl MxcFilesystem for HostMxcFilesystem {
+    fn root_controlled_link(&mut self, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).is_ok_and(|meta| {
+            meta.file_type().is_symlink()
+                && meta.uid() == 0
+                && path.ancestors().skip(1).all(|dir| {
+                    std::fs::metadata(dir)
+                        .is_ok_and(|meta| meta.uid() == 0 && meta.mode() & 0o022 == 0)
+                })
+        })
+    }
+    fn read_link(&mut self, path: &Path) -> io::Result<PathBuf> {
+        std::fs::read_link(path)
+    }
+    fn is_dir(&mut self, path: &Path) -> bool {
+        path.is_dir()
+    }
+}
+
+/// Exact lexical bundle widening from MXC profile_builder.rs:223-240.
+fn developer_grant(dir: &Path) -> &Path {
+    if dir.file_name().is_some_and(|name| name == "Developer") {
+        if let Some(contents) = dir
+            .parent()
+            .filter(|p| p.file_name().is_some_and(|n| n == "Contents"))
+        {
+            if let Some(bundle) = contents.parent().filter(|p| {
+                p.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+            }) {
+                return bundle;
+            }
+        }
+    }
+    dir
+}
+
+/// All implicit storage and device paths in MXC 1.0.1's Seatbelt backend.
+/// The caller validates grants against private storage as well as TCC.
+pub(crate) fn visit_mxc_implicit(
+    config: &serde_json::Value,
+    executor_home: &Path,
+    fs: &mut impl MxcFilesystem,
+    visit: &mut impl FnMut(&Path, bool) -> io::Result<()>,
+) -> io::Result<()> {
+    // A custom profile would replace this inventory with arbitrary grants.
+    if config
+        .pointer("/seatbelt/profileOverride")
+        .is_some_and(|p| !p.is_null())
+    {
+        return Err(io::Error::other(
+            "launchd does not admit MXC profile overrides",
+        ));
+    }
+    // SYSTEM_READ_ALLOW, profile_builder.rs:116-144. `/` is literal only.
+    visit(Path::new("/"), false)?;
+    for path in [
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/lib",
+        "/usr/libexec",
+        "/usr/share",
+        "/System",
+        "/Library",
+        "/private/var/db/timezone",
+        "/private/var/db/dyld",
+        "/private/var/select",
+        "/private/etc",
+    ] {
+        visit(Path::new(path), true)?;
+    }
+    // Literal devices and the TTY regex namespace, lines 139-143, 258-263,
+    // 561-564, 612-613. These are verified devfs nodes, never storage grants.
+    for path in [
+        "/dev",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+        "/dev/tty",
+        "/dev/fd",
+        "/dev/ptmx",
+        "/bin/sh",
+    ] {
+        visit(Path::new(path), false)?;
+    }
+    for link in [
+        "/private/var/db/xcode_select_link",
+        "/private/var/select/developer_dir",
+    ] {
+        let link = Path::new(link);
+        // Check the location before MXC's metadata/readlink operations. Admission
+        // also follows aliases; MXC itself retains the readlink spelling.
+        visit(link, false)?;
+        if !fs.root_controlled_link(link) {
+            continue;
+        }
+        if let Ok(target) = fs.read_link(link) {
+            if target.is_absolute() {
+                // Must precede is_dir: even a rejected candidate can request TCC.
+                visit(&target, true)?;
+                if fs.is_dir(&target) {
+                    visit(developer_grant(&target), true)?;
+                    break;
+                }
+            }
+        }
+    }
+    // Optional GUI and keychain grants, lines 554-556 and 669-683.
+    if config.pointer("/ui/disable").and_then(|v| v.as_bool()) == Some(false)
+        && config
+            .pointer("/seatbelt/guiAccess")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+    {
+        visit(Path::new("/private/tmp"), true)?;
+        visit(Path::new("/private/var/folders"), true)?;
+    }
+    if config
+        .pointer("/seatbelt/keychainAccess")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        for path in [
+            "/private/var/protected/trustd",
+            "/private/var/db/mds",
+            "/private/var/folders",
+        ] {
+            visit(Path::new(path), true)?;
+        }
+        visit(&executor_home.join("Library/Keychains"), true)?;
+    }
+    Ok(())
+}
+
+/// Only the fixed MXC device namespace is exempt from storage volume checks.
+/// General admit_path intentionally continues to reject arbitrary devfs paths.
+pub(crate) fn admit_executor_path(path: &Path, grant: bool) -> io::Result<()> {
+    if !grant && path == Path::new("/dev/null") {
+        // Preserve the existing exact Darwin null-device identity check.
+        return admit_path(path);
+    }
+    if !grant
+        && [
+            "/private/var/db/xcode_select_link",
+            "/private/var/select/developer_dir",
+        ]
+        .iter()
+        .any(|link| path == Path::new(link))
+    {
+        // MXC lstat/readlink the leaf, not its target. Do not realpath the
+        // selection link here: a newly changed target must first pass the
+        // lexical TCC check in visit_mxc_implicit, before any target metadata.
+        return admit_path(
+            path.parent()
+                .ok_or_else(|| io::Error::other("missing selection parent"))?,
+        );
+    }
+    if !grant
+        && [
+            "/dev",
+            "/dev/null",
+            "/dev/zero",
+            "/dev/random",
+            "/dev/urandom",
+            "/dev/tty",
+            "/dev/fd",
+            "/dev/ptmx",
+        ]
+        .iter()
+        .any(|p| path == Path::new(p))
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let meta = std::fs::symlink_metadata(path)?;
+        let dev = std::fs::symlink_metadata("/dev")?;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: statfs writes one valid output object, with a live C path.
+        let mut volume: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(name.as_ptr(), &mut volume) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: Darwin statfs returns a NUL-terminated filesystem name.
+        let devfs = unsafe { CStr::from_ptr(volume.f_fstypename.as_ptr()) } == c"devfs";
+        if devfs
+            && meta.uid() == 0
+            && meta.dev() == dev.dev()
+            && (meta.file_type().is_char_device()
+                || (path == Path::new("/dev") || path == Path::new("/dev/fd")) && meta.is_dir())
+        {
+            return Ok(());
+        }
+        return Err(io::Error::other("invalid MXC system device"));
+    }
+    if grant {
+        admit_grant(path)
+    } else {
+        admit_path(path)
+    }
+}
+
 /// Inspect path lists and single path values without losing a colon in a
 /// literal HOME, TMPDIR or other single-path environment value.
 pub(crate) fn visit_environment(
@@ -283,6 +494,30 @@ pub(crate) fn admit_config(config: &serde_json::Value) -> io::Result<()> {
         } else {
             admit_path(path)
         }
+    })
+}
+
+/// MXC profile_builder.rs:711-713, 758-803 and seatbelt_runner.rs:932-960
+/// expand config paths using the executor's HOME, not the workload's HOME.
+/// OMGS emits absolute paths; refuse other relative paths rather than checking
+/// them against a different launching directory in the parent and anchor.
+pub(crate) fn visit_config_at(
+    config: &serde_json::Value,
+    executor_home: &Path,
+    visit: &mut impl FnMut(&Path, bool) -> io::Result<()>,
+) -> io::Result<()> {
+    visit_config(config, &mut |path, grant| {
+        let expanded = if let Ok(suffix) = path.strip_prefix("~") {
+            executor_home.join(suffix)
+        } else {
+            path.to_path_buf()
+        };
+        if !expanded.is_absolute() {
+            return Err(io::Error::other(
+                "launchd MXC paths must be absolute after HOME expansion",
+            ));
+        }
+        visit(&expanded, grant)
     })
 }
 
@@ -350,6 +585,124 @@ pub(crate) fn visit_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mxc_home_expansion_is_admitted_with_the_effective_executor_home() {
+        let config = serde_json::json!({
+            "filesystem": {"readonlyPaths": ["~/sdk"], "readwritePaths": ["/workspace"], "deniedPaths": ["~/denied"]},
+            "process": {"cwd": "~/work", "env": ["HOME=/workload-home", "TMPDIR=/workload-temp"]}
+        });
+        let mut paths = Vec::new();
+        visit_config_at(&config, Path::new("/executor-home"), &mut |path, grant| {
+            paths.push((path.to_path_buf(), grant));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                (PathBuf::from("/executor-home/sdk"), true),
+                (PathBuf::from("/workspace"), true),
+                (PathBuf::from("/executor-home/denied"), false),
+                (PathBuf::from("/executor-home/work"), false),
+                (PathBuf::from("/workload-home"), false),
+                (PathBuf::from("/workload-home"), false),
+                (PathBuf::from("/workload-temp"), false),
+                (PathBuf::from("/workload-temp"), false),
+            ]
+        );
+        let mut relative = config;
+        relative["process"]["cwd"] = "relative".into();
+        assert!(
+            visit_config_at(&relative, Path::new("/executor-home"), &mut |_, _| Ok(())).is_err()
+        );
+    }
+    #[test]
+    fn mxc_bundle_widening_matches_exact_suffix_only() {
+        for (selected, granted) in [
+            (
+                "/Applications/Xcode.app/Contents/Developer",
+                "/Applications/Xcode.app",
+            ),
+            (
+                "/Applications/Xcode.APP/Contents/Developer",
+                "/Applications/Xcode.APP",
+            ),
+            (
+                "/Library/Developer/CommandLineTools",
+                "/Library/Developer/CommandLineTools",
+            ),
+            ("/a.app/contents/Developer", "/a.app/contents/Developer"),
+            ("/a.app/Contents/developer", "/a.app/Contents/developer"),
+            (
+                "/a.app/Contents/Developer/SDKs",
+                "/a.app/Contents/Developer/SDKs",
+            ),
+        ] {
+            assert_eq!(developer_grant(Path::new(selected)), Path::new(granted));
+        }
+    }
+    #[test]
+    fn mxc_optional_paths_are_inventoried_and_overrides_refused() {
+        struct NoSelection;
+        impl MxcFilesystem for NoSelection {
+            fn root_controlled_link(&mut self, _: &Path) -> bool {
+                false
+            }
+            fn read_link(&mut self, _: &Path) -> io::Result<PathBuf> {
+                panic!("untrusted link read")
+            }
+            fn is_dir(&mut self, _: &Path) -> bool {
+                panic!("unselected directory inspected")
+            }
+        }
+        let config = serde_json::json!({"ui": {"disable": false}, "seatbelt": {"guiAccess": true, "keychainAccess": true}});
+        let mut paths = Vec::new();
+        visit_mxc_implicit(
+            &config,
+            Path::new("/executor-home"),
+            &mut NoSelection,
+            &mut |path, grant| {
+                paths.push((path.to_path_buf(), grant));
+                Ok(())
+            },
+        )
+        .unwrap();
+        for link in [
+            "/private/var/db/xcode_select_link",
+            "/private/var/select/developer_dir",
+        ] {
+            assert!(paths.contains(&(link.into(), false)), "{link}");
+        }
+        for path in [
+            "/private/tmp",
+            "/private/var/folders",
+            "/private/var/protected/trustd",
+            "/private/var/db/mds",
+            "/executor-home/Library/Keychains",
+        ] {
+            assert!(paths.contains(&(path.into(), true)), "{path}");
+        }
+        assert!(visit_mxc_implicit(
+            &serde_json::json!({"seatbelt": {"profileOverride": "(allow default)"}}),
+            Path::new("/executor-home"),
+            &mut NoSelection,
+            &mut |_, _| Ok(())
+        )
+        .is_err());
+        for device in [
+            "/dev",
+            "/dev/null",
+            "/dev/zero",
+            "/dev/random",
+            "/dev/urandom",
+            "/dev/tty",
+            "/dev/fd",
+            "/dev/ptmx",
+        ] {
+            admit_executor_path(Path::new(device), false).unwrap();
+        }
+        assert!(admit_executor_path(Path::new("/dev/disk0"), false).is_err());
+    }
     #[test]
     fn protected_folders_aliases_and_broad_grants_are_rejected_lexically() {
         let home = Path::new("/Users/example");
