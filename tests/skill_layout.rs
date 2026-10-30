@@ -497,3 +497,78 @@ fn dashboard_announces_summary_only_when_it_changes() {
     // No other assignment may bypass the change guard on each two-second poll.
     assert_eq!(render.matches("summary.textContent=").count(), 1);
 }
+
+#[test]
+fn role_reading_uses_one_contract_and_preserves_full_safety_context() {
+    let entry = normalized(include_str!("../skill/SKILL.md"));
+    let pipeline = normalized(include_str!("../skill/PIPELINE.md"));
+    let red = normalized(include_str!("../skill/agents/red-hunter.md"));
+    let safety = normalized(include_str!("../skill/EXECUTION-SAFETY.md"));
+    let setup = normalized(include_str!("../skill/SETUP.md"));
+    assert!(entry.contains("required reading matrix"));
+    for rule in [
+        "Required reading by role",
+        "once per fresh role context",
+        "Every role reads all of",
+        "authoritative proof contract",
+        "Required safety content",
+        "role separation, independent replay",
+    ] {
+        assert!(pipeline.contains(rule), "missing {rule}");
+    }
+    for (name, phases) in [
+        ("red-hunter", vec!["hunt"]),
+        ("blue-verifier", vec!["challenge", "prove"]),
+        ("evaluator", vec!["adjudicate", "prove"]),
+        ("green-fixer", vec!["prove"]),
+    ] {
+        let path = format!("agents/{name}.md");
+        let bytes = omgs::setup::BUNDLED
+            .iter()
+            .find(|(p, _)| *p == path)
+            .unwrap()
+            .1;
+        let role = normalized(std::str::from_utf8(bytes).unwrap());
+        assert!(!role.contains("the full pipeline"), "{name}");
+        for section in [
+            "the-pipeline-multi-agent-by-default",
+            "required-progress-at-every-transition",
+            "required-reading-by-role",
+        ]
+        .into_iter()
+        .chain(phases)
+        {
+            assert!(
+                role.contains(&format!("../PIPELINE.md#{section}")),
+                "{name}: {section}"
+            );
+        }
+        for required in [
+            "plus all of",
+            "../EXECUTION-SAFETY.md",
+            "../PROOF-CONTRACT.md",
+            "once in this context",
+        ] {
+            assert!(role.contains(required), "{name}: {required}");
+        }
+    }
+    for rule in [
+        "plus all of",
+        "execution safety",
+        "decision rules",
+        "when planning a recipe",
+        "omgs validate --candidates OUTPUT_DIR/candidates-HUNTER.json",
+        "omgs validate --dispositions OUTPUT_DIR/dispositions-HUNTER.json",
+    ] {
+        assert!(red.contains(rule), "missing {rule}");
+    }
+    assert!(safety.contains("outer-directory containment, not automatic permission repair"));
+    assert!(safety.contains("moving individual artifacts loses its containment guarantee"));
+    assert!(setup.contains("identity --skill-dir"));
+    assert!(setup.contains("Never bypass a mismatch with version equality"));
+    assert!(entry.contains("bundled digest matching"));
+    assert!(!pipeline.contains("A recipe contract requires exit 1"));
+    assert!(
+        include_str!("../skill/PROOF-CONTRACT.md").contains("A recipe contract requires exit 1")
+    );
+}

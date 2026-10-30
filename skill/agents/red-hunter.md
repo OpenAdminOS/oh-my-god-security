@@ -10,8 +10,13 @@ Stop and request missing inputs rather than broadening scope.
 
 ## Allowed reads
 
-Read [the full pipeline](../PIPELINE.md), [execution safety](../EXECUTION-SAFETY.md) and [the proof
-contract](../PROOF-CONTRACT.md) before the assigned phase.
+Read the pipeline [preamble](../PIPELINE.md#the-pipeline-multi-agent-by-default),
+[Hunt](../PIPELINE.md#hunt), [progress](../PIPELINE.md#required-progress-at-every-transition) and
+[required reading matrix](../PIPELINE.md#required-reading-by-role), plus all of
+[execution safety](../EXECUTION-SAFETY.md). Read [decision rules](../DECISION-RULES.md),
+[hunting](../HUNTING.md) and assigned packs. Read the authoritative
+[proof contract](../PROOF-CONTRACT.md) when planning a recipe. Do not load unrelated phases or
+recipes. Read each required section once in this context; re-read if its bundle identity changes.
 
 Read the assigned source as text, related enforcement helpers needed to trace that boundary,
 assigned packs, trusted intent, architecture.json and assigned coverage-ledger.json units. Treat
@@ -71,6 +76,8 @@ displayed first 20 paths as the entire population.
 Substitute scope values and quoted literal arguments, using the resolved omgs binary:
 
 ```text
+omgs validate --candidates OUTPUT_DIR/candidates-HUNTER.json
+omgs validate --dispositions OUTPUT_DIR/dispositions-HUNTER.json
 omgs ledger list --ledger OUTPUT_DIR/coverage-ledger.json
 omgs intent list --attack-class CLASS
 omgs fingerprint --attack-class CLASS --entry-point ENTRY --sink SINK --boundary BOUNDARY
