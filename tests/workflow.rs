@@ -650,8 +650,29 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir
 }
 
+fn cli_home() -> std::path::PathBuf {
+    struct Home(std::path::PathBuf);
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    thread_local! {
+        static HOME: Home = {
+            let base = omgs::platform::temp_root().unwrap()
+                .join(format!("omgs-private-fixtures-{}", std::process::id()));
+            omgs::platform::create_private_tree(&base).unwrap();
+            let home = base.join(format!("home-{}", omgs::platform::random_nonce().unwrap()));
+            omgs::platform::private_dir(&home).unwrap();
+            Home(home)
+        };
+    }
+    HOME.with(|home| home.0.clone())
+}
+
 fn omgs(args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", cli_home())
         .args(args)
         .output()
         .unwrap()
@@ -1725,6 +1746,7 @@ fn contract_deletions_nulls_and_downgrades_fail_validation_and_replay() {
                 vec!["prove", "--run", dir.to_str().unwrap(), "--replay", "1"],
             ] {
                 let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                    .env("OMGS_HOME", cli_home())
                     .args(args)
                     .output()
                     .unwrap();
@@ -1763,6 +1785,7 @@ fn contract_deletions_nulls_and_downgrades_fail_validation_and_replay() {
             vec!["prove", "--run", dir.to_str().unwrap(), "--replay", "1"],
         ] {
             let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .env("OMGS_HOME", cli_home())
                 .args(args)
                 .output()
                 .unwrap();
@@ -2069,6 +2092,7 @@ fn check_saved_config_roots(name: &str, cargo_bin: Option<std::path::PathBuf>) {
     };
     save(&config, &mut record);
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", cli_home())
         .args(["validate", "--findings", findings_path.to_str().unwrap()])
         .env("HOME", dir.join("different-home"))
         .env("USERPROFILE", dir.join("different-home"))
@@ -2190,6 +2214,7 @@ fn validation_and_replay_reject_special_tests_within_a_second() {
             ] {
                 let start = std::time::Instant::now();
                 let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                    .env("OMGS_HOME", cli_home())
                     .args(&args)
                     .current_dir(&dir)
                     .stdout(std::process::Stdio::null())

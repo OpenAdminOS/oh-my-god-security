@@ -24,8 +24,30 @@ fn scratch(name: &str) -> PathBuf {
     omgs::platform::private_dir(&path).unwrap();
     path
 }
+
+fn cli_home() -> std::path::PathBuf {
+    struct Home(std::path::PathBuf);
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    thread_local! {
+        static HOME: Home = {
+            let base = omgs::platform::temp_root().unwrap()
+                .join(format!("omgs-private-fixtures-{}", std::process::id()));
+            omgs::platform::create_private_tree(&base).unwrap();
+            let home = base.join(format!("home-{}", omgs::platform::random_nonce().unwrap()));
+            omgs::platform::private_dir(&home).unwrap();
+            Home(home)
+        };
+    }
+    HOME.with(|home| home.0.clone())
+}
+
 fn cli(args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", cli_home())
         .args(args)
         .output()
         .unwrap()
@@ -1639,5 +1661,52 @@ fn budget_refuses_storage_writable_by_other_principals() {
         omgs::platform::private_dir(unsafe_dir).unwrap();
     }
     assert!(omgs::budget::charge_proof(&fix).is_ok());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn cli_helper_overrides_inherited_home_with_private_fixture_state() {
+    if std::env::var_os("OMGS_TEST_HOME_ISOLATION").is_some() {
+        let inherited = PathBuf::from(std::env::var_os("OMGS_HOME").unwrap());
+        assert!(inherited.is_file());
+        let home = cli_home();
+        assert_ne!(home, inherited);
+        omgs::platform::check_private_dir(&home).unwrap();
+        let dir = scratch("home-isolation-child");
+        let target = dir.join("target");
+        omgs::platform::private_dir(&target).unwrap();
+        init(&target, &dir.join("run"), &[]);
+        assert!(std::fs::read_dir(home).unwrap().next().is_some());
+        assert_eq!(
+            std::fs::read(&inherited).unwrap(),
+            b"inherited state must remain untouched"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    }
+    let dir = scratch("home-isolation-parent");
+    let inherited = dir.join("inherited-home");
+    std::fs::write(&inherited, b"inherited state must remain untouched").unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cli_helper_overrides_inherited_home_with_private_fixture_state",
+            "--nocapture",
+        ])
+        .env("OMGS_TEST_HOME_ISOLATION", "1")
+        .env("OMGS_HOME", &inherited)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(inherited).unwrap(),
+        b"inherited state must remain untouched"
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }

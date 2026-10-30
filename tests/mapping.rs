@@ -11,10 +11,20 @@ fn unit(id: &str, status: &str) -> Unit {
     u
 }
 fn ledger(units: Vec<Unit>) -> Ledger {
-    Ledger {
+    thread_local! {
+        static TARGET: Temp = {
+            let t = Temp::new();
+            omgs::platform::private_dir(&t.0.join("src")).unwrap();
+            std::fs::write(t.0.join("src/decision.ts"), "source").unwrap();
+            t
+        };
+    }
+    let mut ledger = Ledger {
         units,
         ..Default::default()
-    }
+    };
+    TARGET.with(|t| ledger.extra.insert("scope_root".into(), json!(t.0)));
+    ledger
 }
 fn has(errors: &[String], text: &str) -> bool {
     errors.iter().any(|e| e.contains(text))
@@ -691,4 +701,104 @@ fn filesystem_case_aliases_cannot_duplicate_ownership() {
         .extra
         .insert("scope_paths".into(), json!(["src/decision.ts#get"]));
     assert!(validate_ledger(&l).is_empty());
+}
+
+#[test]
+fn legacy_partitions_require_target_context_before_closure() {
+    for scope in [
+        "src/café.ts#GET",
+        "src/cafe\u{301}.ts#GET",
+        "src/nonexistent.ts#GET",
+    ] {
+        let mut parent = unit("stack:node", "covered");
+        parent.extra.insert("child_units".into(), json!(["a", "b"]));
+        let mut a = unit("a", "covered");
+        a.extra
+            .insert("scope_paths".into(), json!(["src/café.ts#GET"]));
+        let mut b = unit("b", "covered");
+        b.extra.insert("scope_paths".into(), json!([scope]));
+        let mut l = ledger(vec![parent, a, b]);
+        l.extra.remove("scope_root");
+        assert!(has(
+            &validate_ledger(&l),
+            "migrate the legacy ledger before closure"
+        ));
+        assert!(!omgs::critic::critique(&l, 1, &[], &Default::default()).passed());
+        l.extra.insert("scope_root".into(), json!("relative"));
+        assert!(has(
+            &validate_ledger(&l),
+            "scope target and relative path are invalid"
+        ));
+    }
+}
+
+#[test]
+fn target_context_rejects_absent_scopes_and_resolves_unicode_aliases() {
+    let t = Temp::new();
+    omgs::platform::private_dir(&t.0.join("src")).unwrap();
+    std::fs::write(t.0.join("src/café.ts"), "source").unwrap();
+    let mut parent = unit("stack:node", "covered");
+    parent.extra.insert("child_units".into(), json!(["a", "b"]));
+    let mut a = unit("a", "covered");
+    a.extra
+        .insert("scope_paths".into(), json!(["src/café.ts#GET"]));
+    let mut b = unit("b", "covered");
+    b.extra
+        .insert("scope_paths".into(), json!(["src/cafe\u{301}.ts#GET"]));
+    let mut l = ledger(vec![parent, a, b]);
+    l.extra.insert("scope_root".into(), json!(t.0));
+    if t.0.join("src/cafe\u{301}.ts").exists() {
+        assert!(has(&validate_ledger(&l), "overlapping ownership"));
+    } else {
+        assert!(has(&validate_ledger(&l), "absent from target"));
+    }
+    l.units[2]
+        .extra
+        .insert("scope_paths".into(), json!(["src/nonexistent.ts#GET"]));
+    assert!(has(&validate_ledger(&l), "absent from target"));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn scope_directory_aliases_never_escape_or_duplicate_target_ownership() {
+    let t = Temp::new();
+    let target = t.0.join("target");
+    // Build each directory separately so Windows inheritance stays private.
+    for dir in [&target, &target.join("src"), &t.0.join("outside")] {
+        omgs::platform::private_dir(dir).unwrap();
+    }
+    std::fs::write(target.join("src/decision.ts"), "internal").unwrap();
+    std::fs::write(t.0.join("outside/decision.ts"), "external").unwrap();
+    for (alias, destination) in [
+        ("internal", target.join("src")),
+        ("external", t.0.join("outside")),
+    ] {
+        let link = target.join(alias);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&destination, &link).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&destination)
+            .status()
+            .unwrap()
+            .success());
+        let mut parent = unit("stack:node", "covered");
+        parent.extra.insert("child_units".into(), json!(["a", "b"]));
+        let a = unit("a", "covered");
+        let mut b = unit("b", "covered");
+        b.extra.insert(
+            "scope_paths".into(),
+            json!([format!("{alias}/decision.ts#GET")]),
+        );
+        let mut l = ledger(vec![parent, a, b]);
+        l.extra.insert("scope_root".into(), json!(target));
+        assert!(has(&validate_ledger(&l), "symlinks or reparse points"));
+        assert!(!omgs::critic::critique(&l, 1, &[], &Default::default()).passed());
+        #[cfg(unix)]
+        std::fs::remove_file(link).unwrap();
+        #[cfg(windows)]
+        std::fs::remove_dir(link).unwrap();
+    }
 }

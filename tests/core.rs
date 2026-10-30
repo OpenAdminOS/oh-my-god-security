@@ -618,7 +618,12 @@ fn semgrep_parser_keeps_only_metadata() {
         at("src/Helper.swift"),
         at("lib/foo.min.js")
     );
-    parse_semgrep(&json, &root, &mut report);
+    parse_semgrep(
+        &json,
+        &root,
+        &mut report,
+        &mut omgs::sensors::OccurrenceCoordinator::new().unwrap(),
+    );
     assert_eq!(report.hits.len(), 2);
     let h = &report.hits[0];
     assert_eq!(h.tool, "semgrep");

@@ -307,6 +307,7 @@ fn registered_gate_executes_immutable_head_and_ignores_advisory_artifacts() {
     gate(&root, &repo, &base, &base, Some(&run), 1);
     std::fs::write(repo.join(&t.test), test_source(true)).unwrap();
     let unavailable = Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", root.join("omgs-data"))
         .args([
             "gate",
             "--target",

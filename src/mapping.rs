@@ -103,18 +103,8 @@ pub fn unit_errors(u: &Unit) -> Vec<String> {
 
 fn normalized_scope(scope: &str, root: Option<&Path>) -> Result<String, String> {
     let (path, operation) = scope.split_once('#').unwrap_or((scope, ""));
-    let mut normalized = if let Some(root) = root {
-        canonical_scope_path(root, Path::new(path))?
-    } else {
-        let path = crate::paths::display(Path::new(path));
-        // Legacy ledgers lack a target root. Fail conservatively on platforms
-        // commonly using case-insensitive volumes until regenerated with context.
-        if cfg!(any(target_os = "macos", windows)) {
-            path.to_lowercase()
-        } else {
-            path
-        }
-    };
+    let root = root.ok_or("closing partitions requires scope_root target context; migrate the legacy ledger before closure")?;
+    let mut normalized = canonical_scope_path(root, Path::new(path))?;
     if scope.contains('#') {
         normalized.push('#');
         normalized.push_str(operation);
@@ -129,7 +119,11 @@ fn canonical_scope_path(root: &Path, path: &Path) -> Result<String, String> {
     if !root.is_absolute() || !crate::paths::safe_relative(path) {
         return Err("scope target and relative path are invalid".into());
     }
-    let mut current = root.to_path_buf();
+    // Inspect the root itself before enumerating any target entries.
+    reject_scope_link(root)?;
+    let canonical_root =
+        std::fs::canonicalize(root).map_err(|_| "scope target directory is unavailable")?;
+    let mut current = canonical_root.clone();
     let mut relative = PathBuf::new();
     for component in path.components() {
         let std::path::Component::Normal(name) = component else {
@@ -146,9 +140,24 @@ fn canonical_scope_path(root: &Path, path: &Path) -> Result<String, String> {
         })
         .ok_or("scope path is absent from target")?;
         current.push(&name);
+        reject_scope_link(&current)?;
+        let resolved =
+            std::fs::canonicalize(&current).map_err(|_| "scope path is absent from target")?;
+        if !resolved.starts_with(&canonical_root) {
+            return Err("scope path escapes target".into());
+        }
         relative.push(name);
     }
     Ok(crate::paths::display(&relative))
+}
+
+fn reject_scope_link(path: &Path) -> Result<(), String> {
+    let metadata =
+        std::fs::symlink_metadata(path).map_err(|_| "scope path is absent from target")?;
+    if crate::platform::is_link(&metadata) {
+        return Err("scope paths must not contain symlinks or reparse points".into());
+    }
+    Ok(())
 }
 
 fn scope_component(
@@ -219,6 +228,9 @@ pub fn partition_errors(ledger: &Ledger) -> Vec<String> {
                 }
             };
             if key == "child_units" && ["covered", "out_of_scope"].contains(&u.status.as_str()) {
+                if root.is_none() {
+                    errors.push(format!("{}: closing partitions requires scope_root target context; migrate the legacy ledger before closure", u.id));
+                }
                 for class in &u.attack_classes {
                     if !ids.iter().any(|id| {
                         index.get(id).is_some_and(|child| {
