@@ -66,8 +66,10 @@ Fresh objects belong to the staging user and receive the destination environment
 metadata; no source security descriptors or alternate data streams are imported.
 
 On Unix, links bind and preserve their exact stored link text and kind, including dangling links
-and `./` prefixes. On Windows, all target links and reparse points (file, directory, junction,
-outside and dangling) are rejected before execution with an unsupported-input message. Manifest
+and `./` prefixes, with fixed link permissions of 0777 independent of source mode or umask.
+Scratch cache links use the same fixed link mode. On Windows, all target links and reparse points
+(file, directory, junction, outside and dangling) are rejected before execution with an
+unsupported-input message. Manifest
 validation uses the same admission rule, so no link is converted, rewritten or silently omitted.
 After hashing and all harness staging, access and modification times on workspace files,
 directories and links are reset to 2000-01-01 UTC without following links. Creation times are
@@ -107,7 +109,14 @@ are refused. Case aliases, overlapping harness paths and ambiguous Unicode sibli
 refused. Move the harness to an unambiguous fresh path when admission fails.
 Retained files live beneath `proofs/N/harness/`;
 replay reads them through the private artifact boundary and never reads the original draft path.
-Single-file drafts retain the existing `test-draft` representation. Replay output says
+Single-file drafts retain the existing `test-draft` representation and bind bytes only.
+They always stage with mode 0755 on Unix or writable on Windows, regardless of source or retained
+file permissions. Use a directory harness when a specific per-file mode matters. Every new harness
+directory ancestor uses mode 0755 on Unix or writable on Windows; existing target ancestors retain
+their identity-bound modes. Scratch directories use the same fixed directory policy. The empty
+macOS OpenSSL config and Windows command wrapper use mode 0644 on Unix or writable on Windows.
+The wrapper content and name derive from the recorded command, test path and fresh marker nonce.
+These constants do not change the version 3 identity representation. Replay output says
 `replay record` and names the original path; it never offers a replacement `proof_ref`.
 
 ## Redaction and marker observations

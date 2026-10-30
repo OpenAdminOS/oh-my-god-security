@@ -381,7 +381,7 @@ fn rust_root<'a>(os: &str, readonly: &'a [PathBuf], suffix: &str) -> Option<&'a 
 fn link_dir(to: &Path, link: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(to, link)
+        create_staging_link(to, link)
     }
     #[cfg(windows)]
     {
@@ -429,7 +429,7 @@ fn link_dir(to: &Path, link: &Path) -> std::io::Result<()> {
         for c in sub.into_iter().chain([0]).chain(print).chain([0]) {
             data.extend_from_slice(&c.to_le_bytes());
         }
-        std::fs::create_dir(link)?;
+        create_staging_dir(link)?;
         let result = (|| {
             let file = std::fs::OpenOptions::new()
                 .write(true)
@@ -787,7 +787,13 @@ fn write_wrapper(
             format!("if not exist \"{t}\" goto omgs_unreachable\r\nif exist \"{t}\\\" goto omgs_unreachable\r\nset \"omgs_readable=\"\r\n(set \"omgs_readable=1\") <\"{t}\"\r\nif not defined omgs_readable goto omgs_unreachable\r\necho OMGS_TEST_{nonce}:1\r\n")
         }).unwrap_or_default();
         let wrapper = format!("@echo off\r\necho OMGS_START_{nonce}\r\n{check}\"{root}\\System32\\cmd.exe\" /d /v:off /s /c \"{command}\"\r\nset \"omgs_exit=%errorlevel%\"\r\necho(\r\necho OMGS_END_{nonce}:%omgs_exit%\r\nexit /b %omgs_exit%\r\n:omgs_unreachable\r\necho OMGS_TEST_{nonce}:0\r\necho OMGS_END_{nonce}:126\r\nexit /b 126\r\n");
-        std::fs::write(workspace.join(format!("{name}.cmd")), wrapper)?;
+        let permissions = std::fs::metadata(workspace)?.permissions();
+        stage_content(
+            workspace,
+            &format!("{name}.cmd"),
+            std::io::Cursor::new(wrapper),
+            crate::proof_inputs::permissions(fixed_file_mode(), permissions),
+        )?;
     }
     Ok(())
 }
@@ -865,6 +871,7 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
     }
     supervise::check_interrupted().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
+    set_input_permissions(dst, root_mode())?;
     let roots = (root, dst.to_path_buf());
     copy_recursive(&roots.0, dst, &roots, None)?;
     set_input_permissions(dst, root_mode())?;
@@ -881,6 +888,7 @@ fn copy_selected(
 ) -> Result<Vec<String>, String> {
     selection.validate()?;
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    set_input_permissions(dst, root_mode())?;
     let mut paths = selection.paths.clone();
     if root.join(".git").try_exists().map_err(|e| e.to_string())?
         && !paths.iter().any(|p| p == ".git")
@@ -945,6 +953,22 @@ fn copy_selected(
 fn root_mode() -> u32 {
     if cfg!(unix) {
         0o755
+    } else {
+        0
+    }
+}
+
+// Runner-created directories and single-file harnesses are always searchable
+// and executable on Unix, writable on Windows. Never inherit the host umask.
+fn create_staging_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)?;
+    let current = std::fs::symlink_metadata(path)?.permissions();
+    std::fs::set_permissions(path, crate::proof_inputs::permissions(root_mode(), current))
+}
+
+fn fixed_file_mode() -> u32 {
+    if cfg!(unix) {
+        0o644
     } else {
         0
     }
@@ -1063,7 +1087,7 @@ fn copy_recursive(
             crate::proof_inputs::admit_link(&path)?;
             copy_link(&path, &to)?;
         } else if meta.is_dir() {
-            std::fs::create_dir(&to).map_err(|e| e.to_string())?;
+            create_staging_dir(&to).map_err(|e| e.to_string())?;
             copy_recursive(&path, &to, roots, selection)?;
             set_input_permissions(&to, crate::proof_inputs::mode(&meta))?;
         } else if meta.is_file() {
@@ -1088,11 +1112,29 @@ fn copy_recursive(
     Ok(())
 }
 
+// Linux creates symlinks as 0777 regardless of umask. macOS filters their
+// initial permissions through umask, so reset the link itself without following it.
+#[cfg(unix)]
+fn create_staging_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(link.as_os_str().as_bytes())?;
+        // SAFETY: path is NUL terminated. lchmod changes only the new link,
+        // including dangling and outside links, never its referent.
+        if unsafe { libc::lchmod(path.as_ptr(), 0o777) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Preserve exact link text, including dangling and outside links.
 #[cfg(unix)]
 fn copy_link(link: &Path, to: &Path) -> Result<(), String> {
     let target = std::fs::read_link(link).map_err(|e| e.to_string())?;
-    std::os::unix::fs::symlink(target, to).map_err(|e| format!("link {}: {e}", to.display()))
+    create_staging_link(&target, to).map_err(|e| format!("link {}: {e}", to.display()))
 }
 
 #[cfg(windows)]
@@ -1152,7 +1194,7 @@ fn stage_content(
                     dir.display()
                 )))
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => std::fs::create_dir(&dir)?,
+            Err(e) if e.kind() == ErrorKind::NotFound => create_staging_dir(&dir)?,
             Err(e) => return Err(e),
         }
     }
@@ -1366,7 +1408,7 @@ fn stage_workspace(
             started.elapsed().as_millis()
         );
     } else {
-        std::fs::create_dir_all(workspace).map_err(|e| e.to_string())?;
+        create_staging_dir(workspace).map_err(|e| e.to_string())?;
     }
     eprintln!("proof inputs: hash started");
     let started = std::time::Instant::now();
@@ -1442,23 +1484,41 @@ fn stage_workspace(
             crate::run_artifact::DRAFT_BYTES,
         )
         .map_err(|e| e.to_string())?;
-        stage_content(workspace, rel, std::io::Cursor::new(bytes), permissions)
-            .map_err(|e| format!("cannot stage the draft test at {rel}: {e}"))?;
+        // Single-file drafts bind bytes only. Their staged mode is a fixed
+        // policy constant, never retained evidence or source permissions.
+        stage_content(
+            workspace,
+            rel,
+            std::io::Cursor::new(bytes),
+            crate::proof_inputs::permissions(root_mode(), permissions),
+        )
+        .map_err(|e| format!("cannot stage the draft test at {rel}: {e}"))?;
     }
     for dir in [
         scratch.to_path_buf(),
         scratch.join("cache"),
         scratch.join("clang-cache"),
     ] {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        create_staging_dir(&dir).map_err(|e| e.to_string())?;
     }
     if cfg!(target_os = "macos") {
-        std::fs::write(scratch.join("openssl.cnf"), b"").map_err(|e| e.to_string())?;
+        stage_content(
+            scratch,
+            "openssl.cnf",
+            std::io::empty(),
+            crate::proof_inputs::permissions(
+                fixed_file_mode(),
+                std::fs::metadata(scratch)
+                    .map_err(|e| e.to_string())?
+                    .permissions(),
+            ),
+        )
+        .map_err(|e| e.to_string())?;
     }
     let os = std::env::consts::OS;
     let rust = select_rust_homes(os, readonly, &scratch.join("cargo-home"));
     if let Some(rust) = &rust {
-        std::fs::create_dir_all(&rust.cargo_home).map_err(|e| e.to_string())?;
+        create_staging_dir(&rust.cargo_home).map_err(|e| e.to_string())?;
         for sub in RUST_CACHES {
             if let Some(real) = rust_root(os, readonly, &format!("/.cargo/{sub}")) {
                 link_dir(real, &rust.cargo_home.join(sub))
@@ -2152,6 +2212,104 @@ mod tests {
             .unwrap()
             .iter()
             .any(|p| p == "/usr/include"));
+    }
+
+    #[test]
+    fn harness_modes_are_fixed_or_identity_bound_on_every_platform() {
+        let base = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-harness-modes-{}", std::process::id()));
+        platform::create_private_tree(&base).unwrap();
+        for directory in [false, true] {
+            let run = base.join(if directory { "directory" } else { "single" });
+            let proof_dir = run.join("proofs/1");
+            platform::create_private_tree(&proof_dir).unwrap();
+            let retained = if directory {
+                proof_dir.join("harness/checks/deep/test")
+            } else {
+                proof_dir.join("test-draft")
+            };
+            platform::create_private_tree(retained.parent().unwrap()).unwrap();
+            crate::runmeta::write_atomic_bytes(&retained, b"harness bytes").unwrap();
+            let bound_mode = if cfg!(unix) { 0o640 } else { 1 };
+            let req = ProveRequest {
+                expect_marker: None,
+                command: "echo fixture".into(),
+                test: Some("checks/deep/test".into()),
+                timeout_ms: 1000,
+                target: None,
+                run_dir: proof_dir.clone(),
+                tier: Tier::Test,
+                stage: (!directory).then(|| (retained.clone(), "checks/deep/test".into())),
+                expected_tree_sha256: None,
+                inputs: None,
+                expected_inputs: None,
+                harness: if directory {
+                    vec![crate::proof::HarnessFile {
+                        path: "checks/deep/test".into(),
+                        sha256: sha256::digest(b"harness bytes"),
+                        mode: bound_mode,
+                    }]
+                } else {
+                    vec![]
+                },
+            };
+            for (i, retained_mode) in [
+                if cfg!(unix) { 0o600 } else { 0 },
+                if cfg!(unix) { 0o700 } else { 1 },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                set_input_permissions(&retained, retained_mode).unwrap();
+                let workspace = proof_dir.join(format!("workspace{i}"));
+                let scratch = proof_dir.join(format!("scratch{i}"));
+                stage_workspace(&req, &workspace, &scratch, &[], "fixture-nonce").unwrap();
+                for path in [
+                    workspace.clone(),
+                    workspace.join("checks"),
+                    workspace.join("checks/deep"),
+                    scratch.clone(),
+                    scratch.join("cache"),
+                    scratch.join("clang-cache"),
+                ] {
+                    assert_eq!(
+                        crate::proof_inputs::mode(&std::fs::metadata(path).unwrap()),
+                        root_mode()
+                    );
+                }
+                let file = workspace.join("checks/deep/test");
+                assert_eq!(std::fs::read(&file).unwrap(), b"harness bytes");
+                assert_eq!(
+                    crate::proof_inputs::mode(&std::fs::metadata(&file).unwrap()),
+                    if directory { bound_mode } else { root_mode() }
+                );
+                // Exercise the Windows wrapper materialization even on Unix.
+                write_wrapper(
+                    "windows",
+                    &workspace,
+                    "echo fixture",
+                    "fixture-nonce",
+                    req.test.as_deref(),
+                )
+                .unwrap();
+                let wrapper = workspace.join(format!(
+                    "{}.cmd",
+                    wrapper_name("echo fixture", "fixture-nonce", req.test.as_deref())
+                ));
+                assert_eq!(
+                    crate::proof_inputs::mode(&std::fs::metadata(&wrapper).unwrap()),
+                    fixed_file_mode()
+                );
+                assert!(std::fs::read_to_string(wrapper)
+                    .unwrap()
+                    .contains("OMGS_START_fixture-nonce"));
+                // Read-only Windows fixtures must be restored before cleanup.
+                set_input_permissions(&file, fixed_file_mode()).unwrap();
+            }
+            set_input_permissions(&retained, fixed_file_mode()).unwrap();
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

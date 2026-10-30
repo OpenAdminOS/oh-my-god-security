@@ -2571,6 +2571,138 @@ fn protected_launchd_storage_is_refused_before_creation_or_executor_discovery() 
     std::fs::remove_dir_all(d).unwrap();
 }
 
+// Set umask only in the CLI child, never in the parallel test process.
+#[cfg(unix)]
+fn omgs_with_umask(home: &Path, args: &[&str], mask: u32) -> Output {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"));
+    command.args(args).env("OMGS_HOME", home);
+    command.env(
+        "OMGS_MXC_EXEC",
+        omgs::sandbox::locate_executor().unwrap().path,
+    );
+    // SAFETY: umask is async-signal-safe and runs only in the forked child.
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(mask as libc::mode_t);
+            Ok(())
+        });
+    }
+    command.output().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn harness_modes_and_scratch_setup_are_independent_of_umask_and_retained_single_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("harness-umask");
+    for directory in [false, true] {
+        let base = d.join(if directory { "directory" } else { "single" });
+        omgs::platform::private_dir(&base).unwrap();
+        let target = base.join("target");
+        let run = base.join("run");
+        std::fs::create_dir_all(target.join("existing")).unwrap();
+        std::fs::set_permissions(
+            target.join("existing"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        omgs::platform::private_dir(&run).unwrap();
+        write_private_fixture(
+            run.join(omgs::runmeta::FILE),
+            serde_json::json!({"target":target}).to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("existing", target.join("linked")).unwrap();
+        std::os::unix::fs::symlink("missing", target.join("dangling")).unwrap();
+        let draft = base.join("draft");
+        let body = "#!/bin/sh\necho stable-harness\n";
+        if directory {
+            std::fs::create_dir_all(draft.join("nested")).unwrap();
+            std::fs::write(draft.join("main.sh"), body).unwrap();
+            std::fs::write(draft.join("nested/helper"), "helper").unwrap();
+            std::fs::set_permissions(
+                draft.join("main.sh"),
+                std::fs::Permissions::from_mode(0o640),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                draft.join("nested/helper"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        } else {
+            std::fs::write(&draft, body).unwrap();
+            std::fs::set_permissions(&draft, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let stat = if cfg!(target_os = "macos") {
+            "stat -f %Lp"
+        } else {
+            "stat -c %a"
+        };
+        let mode = if directory { "640" } else { "755" };
+        // All target code runs through prove. Inspect actual staged modes from
+        // inside MXC, including every newly created ancestor and scratch entry.
+        let mut command = format!("test \"$({stat} .)\" = 755 && test \"$({stat} existing)\" = 750 && test \"$({stat} existing/checks)\" = 755 && test \"$({stat} existing/checks/deep)\" = 755 && test \"$({stat} existing/checks/deep/main.sh)\" = {mode} || exit 2; ");
+        if directory {
+            command.push_str(&format!("test \"$({stat} existing/checks/deep/nested)\" = 755 && test \"$({stat} existing/checks/deep/nested/helper)\" = 700 || exit 2; "));
+        }
+        command.push_str(&format!("for p in \"$HOME\" \"$HOME/cache\" \"$HOME/clang-cache\"; do test \"$({stat} \"$p\")\" = 755 || exit 2; done; "));
+        if cfg!(target_os = "macos") {
+            command.push_str(&format!(
+                "test \"$({stat} \"$HOME/openssl.cnf\")\" = 644 || exit 2; "
+            ));
+        }
+        command.push_str(&format!("test \"$({stat} linked)\" = 777 && test \"$({stat} dangling)\" = 777 || exit 2; if test -d \"$CARGO_HOME\"; then test \"$({stat} \"$CARGO_HOME\")\" = 755 || exit 2; for p in \"$CARGO_HOME/registry\" \"$CARGO_HOME/git\"; do if test -L \"$p\"; then test \"$({stat} \"$p\")\" = 777 || exit 2; fi; done; fi; "));
+        command.push_str("sh existing/checks/deep/main.sh; exit 1");
+        let out = omgs_with_umask(
+            &base,
+            &[
+                "prove",
+                "--run",
+                run.to_str().unwrap(),
+                "--test",
+                "existing/checks/deep/main.sh",
+                "--test-from",
+                draft.to_str().unwrap(),
+                "--cmd",
+                &command,
+            ],
+            0o022,
+        );
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        let original = omgs::proof::load(&run, "proofs/1.json").unwrap();
+        assert_eq!(original.exit_code, Some(1));
+        assert!(original.output.contains("stable-harness"));
+        for (index, mask) in [0o022, 0o077, 0o027].into_iter().enumerate() {
+            if !directory {
+                // Bytes and identity stay unchanged when only evidence mode changes.
+                std::fs::set_permissions(
+                    run.join("proofs/1/test-draft"),
+                    std::fs::Permissions::from_mode(if index == 1 { 0o600 } else { 0o700 }),
+                )
+                .unwrap();
+            }
+            let out = omgs_with_umask(
+                &base,
+                &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+                mask,
+            );
+            assert!(out.status.success(), "umask {mask:o}: {}", text(&out));
+            let replay = omgs::proof::load(&run, &format!("proofs/{}.json", index + 2)).unwrap();
+            assert_eq!(original.execution_inputs, replay.execution_inputs);
+            assert_eq!(original.harness, replay.harness);
+            assert_eq!(replay.exit_code, Some(1));
+            assert!(replay.output.contains("stable-harness"));
+            assert!(omgs::proof::runner_evidence(&run, &replay).is_empty());
+        }
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn selected_multifile_harness_replays_exactly_with_redacted_marker_observations() {
