@@ -250,6 +250,9 @@ pub struct ProveRequest {
     /// the given target-relative path before the command runs.
     pub stage: Option<(PathBuf, String)>,
     pub expected_tree_sha256: Option<String>,
+    pub inputs: Option<crate::proof_inputs::Selection>,
+    pub expected_inputs: Option<crate::proof_inputs::Manifest>,
+    pub harness: Vec<crate::proof::HarnessFile>,
 }
 
 pub struct ProveResult {
@@ -262,6 +265,7 @@ pub struct ProveResult {
     pub system_root: Option<String>,
     pub marker_nonce: String,
     pub target_sha256: Option<String>,
+    pub input_manifest: Option<crate::proof_inputs::Manifest>,
     pub enforced: Vec<String>,
     pub gaps: Vec<String>,
     pub notes: Vec<String>,
@@ -912,6 +916,74 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
     Ok(gaps)
 }
 
+// Explicit selections omit everything else from the sandbox. Always include root
+// Git metadata. Refuse links in scoped inputs, including ancestor components.
+fn copy_selected(
+    root: &Path,
+    dst: &Path,
+    selection: &crate::proof_inputs::Selection,
+) -> Result<Vec<String>, String> {
+    selection.validate()?;
+    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    let mut paths = selection.paths.clone();
+    if root.join(".git").try_exists().map_err(|e| e.to_string())?
+        && !paths.iter().any(|p| p == ".git")
+    {
+        paths.retain(|p| !p.starts_with(".git/"));
+        paths.push(".git".into());
+    }
+    let mut gaps = Vec::new();
+    for rel in paths {
+        let mut from = root.to_path_buf();
+        for part in Path::new(&rel) {
+            from.push(part);
+            let meta = std::fs::symlink_metadata(&from).map_err(|e| e.to_string())?;
+            if platform::is_link(&meta) {
+                return Err("scoped inputs cannot contain links".into());
+            }
+        }
+        // Keep ancestor directory modes as part of the selected identity.
+        let relative = Path::new(&rel);
+        let mut ancestors: Vec<_> = relative
+            .ancestors()
+            .skip(1)
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        ancestors.reverse();
+        for parent in ancestors {
+            std::fs::create_dir_all(dst.join(parent)).map_err(|e| e.to_string())?;
+            let mode = std::fs::metadata(root.join(parent))
+                .map_err(|e| e.to_string())?
+                .permissions();
+            std::fs::set_permissions(dst.join(parent), mode).map_err(|e| e.to_string())?;
+        }
+        let meta = std::fs::symlink_metadata(&from).map_err(|e| e.to_string())?;
+        let to = dst.join(&rel);
+        if meta.is_dir() {
+            let mut special = Vec::new();
+            let mut links = Vec::new();
+            let mut outside = 0;
+            inspect_target(&from, &from, &mut special, &mut links, &mut outside)?;
+            if !links.is_empty() {
+                return Err("scoped inputs cannot contain links".into());
+            }
+            gaps.extend(copy_tree_with_gaps(&from, &to)?);
+            std::fs::set_permissions(&to, meta.permissions()).map_err(|e| e.to_string())?;
+        } else if meta.is_file() {
+            if rel == ".git" {
+                return Err(
+                    "external Git directories are not execution inputs; use a standalone checkout"
+                        .into(),
+                );
+            }
+            stage_file(dst, &rel, &from).map_err(|e| e.to_string())?;
+        } else {
+            return Err("selected input must be a file or directory".into());
+        }
+    }
+    Ok(gaps)
+}
+
 fn inspect_target(
     root: &Path,
     dir: &Path,
@@ -1162,6 +1234,7 @@ impl Drop for BlockedCleanup {
 
 struct StagedWorkspace {
     digest: Option<String>,
+    manifest: Option<crate::proof_inputs::Manifest>,
     rust: Option<RustHomes>,
     gaps: Vec<String>,
 }
@@ -1182,24 +1255,81 @@ fn stage_workspace(
         if workspace.starts_with(&target) {
             return Err("the proof directory must be outside the target tree".into());
         }
-        gaps = copy_tree_with_gaps(&target, workspace)?;
+        eprintln!(
+            "proof inputs: copy started ({})",
+            if req.inputs.is_some() {
+                "selected paths"
+            } else {
+                "full target"
+            }
+        );
+        let started = std::time::Instant::now();
+        if target.join(".git").is_file()
+            || std::fs::symlink_metadata(target.join(".git")).is_ok_and(|m| platform::is_link(&m))
+        {
+            return Err(
+                "external Git directories are not execution inputs; use a standalone checkout"
+                    .into(),
+            );
+        }
+        gaps = match &req.inputs {
+            Some(selection) => copy_selected(&target, workspace, selection)?,
+            None => copy_tree_with_gaps(&target, workspace)?,
+        };
+        eprintln!(
+            "proof inputs: copy complete ({} ms)",
+            started.elapsed().as_millis()
+        );
     } else {
         std::fs::create_dir_all(workspace).map_err(|e| e.to_string())?;
     }
-    let digest = if req.target.is_some() {
-        Some(
-            crate::proof::tree_digest(workspace)
-                .map_err(|e| format!("cannot digest target snapshot: {e}"))?,
-        )
-    } else {
-        None
-    };
+    eprintln!("proof inputs: hash started");
+    let started = std::time::Instant::now();
+    let manifest = req
+        .target
+        .as_ref()
+        .map(|_| crate::proof_inputs::manifest(workspace, req.inputs.clone(), true))
+        .transpose()?;
+    let digest = manifest
+        .as_ref()
+        .map(crate::proof_inputs::Manifest::digest)
+        .transpose()?;
+    eprintln!(
+        "proof inputs: hash complete ({} entries, {} ms)",
+        manifest.as_ref().map(|m| m.entries.len()).unwrap_or(0),
+        started.elapsed().as_millis()
+    );
     if req
         .expected_tree_sha256
         .as_ref()
         .is_some_and(|want| Some(want) != digest.as_ref())
     {
-        return Err("target snapshot differs from the recorded tree; refusing to replay".into());
+        let details = match (&req.expected_inputs, &manifest) {
+            (Some(old), Some(new)) => old.differences(new),
+            _ => "input identity mismatch".into(),
+        };
+        return Err(format!(
+            "target snapshot differs from the recorded tree; refusing to replay; {details}"
+        ));
+    }
+    for file in &req.harness {
+        let rel = Path::new("harness").join(&file.path);
+        let (bytes, permissions) = crate::run_artifact::read_with_permissions(
+            &req.run_dir,
+            &rel,
+            crate::run_artifact::DRAFT_BYTES,
+        )
+        .map_err(|e| e.to_string())?;
+        if sha256::digest(&bytes) != file.sha256 {
+            return Err("retained harness digest mismatch".into());
+        }
+        stage_content(
+            workspace,
+            &file.path,
+            std::io::Cursor::new(bytes),
+            crate::proof_inputs::permissions(file.mode, permissions),
+        )
+        .map_err(|e| e.to_string())?;
     }
     if let Some((draft, rel)) = &req.stage {
         // CLI drafts were retained beneath run_dir. Pin the original run
@@ -1250,7 +1380,12 @@ fn stage_workspace(
         req.test.as_deref(),
     )
     .map_err(|e| format!("cannot write command wrapper: {e}"))?;
-    Ok(StagedWorkspace { digest, rust, gaps })
+    Ok(StagedWorkspace {
+        digest,
+        manifest,
+        rust,
+        gaps,
+    })
 }
 
 pub fn prove(req: &ProveRequest) -> ProveOutcome {
@@ -1415,6 +1550,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     let denied = Vec::new();
     let StagedWorkspace {
         digest: target_sha256,
+        manifest: input_manifest,
         rust,
         gaps: mut extra_gaps,
     } = match stage_workspace(req, &workspace, &scratch, &readonly, &nonce) {
@@ -1539,6 +1675,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             }
             let StagedWorkspace {
                 digest,
+                manifest: _,
                 rust,
                 gaps: retry_gaps,
             } = match stage_workspace(req, &workspace, &scratch, &input.readonly, &nonce) {
@@ -1622,6 +1759,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             .then(|| std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into())),
         marker_nonce: nonce,
         target_sha256,
+        input_manifest,
         enforced,
         gaps,
         notes,
@@ -1739,6 +1877,9 @@ mod tests {
                     tier: Tier::Test,
                     stage: None,
                     expected_tree_sha256: None,
+                    inputs: None,
+                    expected_inputs: None,
+                    harness: vec![],
                 };
                 let readonly: Vec<_> = toolchain_roots("macos", discovered.as_deref())
                     .into_iter()
@@ -1845,7 +1986,8 @@ mod tests {
                     "executor": executor.file, "executor_sha256": executor.sha256,
                     "config_sha256": sha256::digest(config_text.as_bytes()),
                     "enforced": enforced, "gaps": gaps, "output_sha256": sha256::digest(b""),
-                    "output_bytes_total": 0, "output": "", "omgs_version": env!("CARGO_PKG_VERSION")
+                    "output_bytes_total": 0, "output": "", "omgs_version": env!("CARGO_PKG_VERSION"),
+                    "output_audit": {"version":1,"marker_observations":[],"stream_bytes":[0,0],"retained_stream_bytes":[0,0],"redactions":[],"captured_text_bytes":0,"decoded_capture_bytes":0}
                 })).unwrap();
                 crate::proof::write(&run, &record).unwrap();
                 let saved = crate::proof::load(&run, "proofs/1.json").unwrap();
@@ -1932,6 +2074,9 @@ mod tests {
             tier: Tier::Test,
             stage: None,
             expected_tree_sha256: None,
+            inputs: None,
+            expected_inputs: None,
+            harness: vec![],
         };
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("test-draft"), b"draft").unwrap();
@@ -2202,6 +2347,10 @@ mod tests {
             test_reachable: None,
             boundary_marker_seen: false,
             authorized_control_seen: false,
+            marker_observations: vec![],
+            stream_bytes: [0; 2],
+            retained_stream_bytes: [0; 2],
+            decoded_capture_bytes: 0,
             enumerate_rejected: true,
             executor_error: true,
             killed: false,
@@ -2258,6 +2407,9 @@ mod tests {
             tier: Tier::Test,
             stage: None,
             expected_tree_sha256: None,
+            inputs: None,
+            expected_inputs: None,
+            harness: vec![],
         };
         let ProveOutcome::Blocked { reason } = prove(&request) else {
             panic!("augmented tier ran");

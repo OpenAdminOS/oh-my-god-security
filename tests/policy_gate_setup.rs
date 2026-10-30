@@ -229,7 +229,15 @@ fn evidence(run: &Path, target: &Path) {
     }
     let mut proof = read(&run.join("proofs/1.json"));
     proof["target"] = json!(target);
-    proof["target_sha256"] = json!("a".repeat(64));
+    let manifest = omgs::proof_inputs::manifest(target, None, false).unwrap();
+    let digest = manifest.digest().unwrap();
+    proof["target_sha256"] = json!(digest);
+    proof["execution_inputs"] = json!({"version": omgs::proof_inputs::VERSION, "sha256": digest});
+    omgs::runmeta::write_atomic_bytes(
+        &run.join("proofs/1/input-manifest.json"),
+        &manifest.bytes().unwrap(),
+    )
+    .unwrap();
     write(&run.join("proofs/1.json"), &proof);
     let findings = json!({"findings":[{
         "fingerprint": proof["finding"], "title":"Boundary read", "verdict":"confirmed", "severity":"high",

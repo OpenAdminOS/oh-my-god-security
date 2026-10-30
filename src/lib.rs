@@ -19,6 +19,7 @@ pub mod persona;
 pub mod platform;
 pub mod policy;
 pub mod proof;
+pub mod proof_inputs;
 pub mod report;
 pub mod route;
 pub mod run_artifact;

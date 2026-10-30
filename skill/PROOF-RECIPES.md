@@ -23,7 +23,7 @@ succeeds. Print `OMGS_BOUNDARY_<nonce>_<label>` immediately before exit 1 when t
 on vulnerable source. Fixed source prints `BOUNDARY_ASSERTION_OK` and exits 0. Import, compile, load
 and authorized control failures exit 2 and earn no proof support.
 
-Proof schema `omgs-proof/2` requires a `contract` object with `kind: "recipe"`, `expect_marker`,
+Proof schema `omgs-proof/3` requires a `contract` object with `kind: "recipe"`, `expect_marker`,
 `boundary_marker_seen` and `authorized_control_seen`. All four fields are required and non-null.
 Runs without a declaration store the explicit `{"kind":"none"}` variant. The saved config
 environment binds the declaration and nonce to its digest, and validation reconstructs it with the
@@ -137,6 +137,17 @@ timed out run never supports a proof, even with both markers printed. Close targ
 in the harness through the target's own cleanup API (for example `server.close()` or
 `clearInterval`) before `check()` returns, and record the timeout as the blocker if the target
 offers no way to release them.
+
+#### Child process environment
+
+A child process must inherit the sandbox environment. In Node use
+`spawnSync(process.execPath, args, {env: process.env})`, or omit `env` to inherit it.
+A deliberately reduced environment must forward the safe runner keys it needs, including
+`PATH`, `HOME`, `TMPDIR`, `TMP`, `TEMP`, `OPENSSL_CONF`, and the proof contract variables.
+On macOS, `OPENSSL_CONF` points at the runner's scratch configuration. Dropping it can make
+Node read a denied host OpenSSL configuration and exit before reaching target code. That is a
+harness failure, never evidence of target protection. Keep the host configuration denied;
+do not add a grant or install a replacement dependency to repair the harness.
 
 ### Python
 

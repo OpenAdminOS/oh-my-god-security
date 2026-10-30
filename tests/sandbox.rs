@@ -125,6 +125,9 @@ fn assert_augmented_tier_refusal(tier: &str, caller: u32) {
         tier: Tier::Test,
         stage: None,
         expected_tree_sha256: None,
+        inputs: None,
+        expected_inputs: None,
+        harness: vec![],
     };
     let ProveOutcome::Blocked { reason } = prove(&request) else {
         panic!("augmentation tier executed");
@@ -1560,6 +1563,9 @@ fn unreachable_tests_never_run_the_command() {
             tier: Tier::Test,
             stage: None,
             expected_tree_sha256: None,
+            inputs: None,
+            expected_inputs: None,
+            harness: vec![],
         };
         let ProveOutcome::Ran(result) = prove(&request) else {
             panic!("the wrapper must run with the real executor");
@@ -2081,7 +2087,13 @@ fn socket_and_fifo_gaps_survive_validation_and_replay() {
         assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
         assert_eq!(
             record.target_sha256.as_deref(),
-            Some(omgs::proof::tree_digest(&target).unwrap().as_str())
+            Some(
+                omgs::proof_inputs::manifest(&target, None, false)
+                    .unwrap()
+                    .digest()
+                    .unwrap()
+                    .as_str()
+            )
         );
         for path in ["socket", "pipe"] {
             assert!(
@@ -2556,5 +2568,211 @@ fn protected_launchd_storage_is_refused_before_creation_or_executor_discovery() 
         assert!(!output.contains("proof record:"), "{output}");
         assert!(!d.join("home").exists());
     }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_multifile_harness_replays_exactly_with_redacted_marker_observations() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("selected-harness");
+    let target = d.join("target");
+    let run = d.join("run");
+    let draft = d.join("draft");
+    std::fs::create_dir_all(target.join(".git/hooks")).unwrap();
+    std::fs::create_dir_all(draft.join("nested")).unwrap();
+    std::fs::write(target.join("source"), "synthetic\n").unwrap();
+    std::fs::write(target.join("asset"), "omitted\n").unwrap();
+    std::fs::write(target.join(".git/config"), "config\n").unwrap();
+    std::fs::write(target.join(".git/hooks/check"), "hook\n").unwrap();
+    std::fs::write(
+        draft.join("nested/helper.sh"),
+        "test \"$(cat source)\" = synthetic || exit 2\n",
+    )
+    .unwrap();
+    std::fs::write(draft.join("main.sh"), "#!/bin/sh\n. checks/nested/helper.sh\ntest ! -e asset || exit 2\nprintf '%s\\n' '-----BEGIN PRIVATE KEY-----' 'DO_NOT_RETAIN_SYNTHETIC_SECRET'\nprintf 'OMGS_CONTROL_%s\\nOMGS_BOUNDARY_%s_%s\\n' \"$OMGS_PROOF_NONCE\" \"$OMGS_PROOF_NONCE\" \"$OMGS_PROOF_CONTRACT\"\nexit 1\n").unwrap();
+    let selection = d.join("selection.json");
+    std::fs::write(&selection, r#"{"version":1,"paths":["source"]}"#).unwrap();
+    omgs::platform::private_dir(&run).unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "checks/main.sh",
+            "--test-from",
+            draft.to_str().unwrap(),
+            "--inputs-from",
+            selection.to_str().unwrap(),
+            "--expect-marker",
+            "BOUNDARY_ASSERTION_FAILED",
+            "--cmd",
+            "sh checks/main.sh",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("copy complete") && text(&out).contains("hash complete"));
+    let original = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert_eq!(original.harness.len(), 2);
+    assert!(original.clean() && original.assertion_failure());
+    assert!(!original.output.contains("DO_NOT_RETAIN_SYNTHETIC_SECRET"));
+    assert!(!original.output.contains("OMGS_BOUNDARY_"));
+    let audit = original.output_audit.as_ref().unwrap();
+    assert_eq!(audit.marker_observations.len(), 2);
+    assert_eq!(audit.redactions.len(), 1);
+    assert!(omgs::proof::runner_evidence(&run, &original).is_empty());
+    let mut unsupported = original.clone();
+    unsupported.execution_inputs.as_mut().unwrap().version = 99;
+    assert!(omgs::proof::runner_evidence(&run, &unsupported)
+        .iter()
+        .any(|e| e.contains("unsupported execution input identity version")));
+    let mut invalid_audit = original.clone();
+    invalid_audit
+        .output_audit
+        .as_mut()
+        .unwrap()
+        .marker_observations[0]
+        .end += 1;
+    assert!(omgs::proof::runner_evidence(&run, &invalid_audit)
+        .iter()
+        .any(|e| e.contains("invalid attested marker observation")));
+    std::fs::remove_dir_all(&draft).unwrap();
+    std::fs::remove_file(&selection).unwrap();
+    std::fs::write(target.join("asset"), "irrelevant change\n").unwrap();
+    let out = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("replay record:") && text(&out).contains("original "));
+    assert!(!text(&out).contains("proof_ref") && !text(&out).contains("proof record:"));
+    let replay = omgs::proof::load(&run, "proofs/2.json").unwrap();
+    assert_eq!(original.execution_inputs, replay.execution_inputs);
+    assert_eq!(original.harness, replay.harness);
+    for path in ["source", ".git/config", ".git/hooks/check"] {
+        let saved = std::fs::read(target.join(path)).unwrap();
+        std::fs::write(target.join(path), "changed").unwrap();
+        let errors = omgs::proof::runner_evidence(&run, &original).join("; ");
+        assert!(errors.contains(path), "{errors}");
+        let refused = omgs(
+            &d,
+            &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+        );
+        assert!(
+            !refused.status.success() && text(&refused).contains(path),
+            "{}",
+            text(&refused)
+        );
+        assert!(!run.join("proofs/3.json").exists());
+        std::fs::write(target.join(path), saved).unwrap();
+    }
+    write_private_fixture(
+        run.join("proofs/1/harness/checks/nested/helper.sh"),
+        "changed",
+    )
+    .unwrap();
+    let refused = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(!refused.status.success() && text(&refused).contains("harness identity mismatch"));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn incidental_git_status_refresh_replays_but_staged_index_changes_do_not() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("index-refresh");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(&target).unwrap();
+    // These commands only construct a synthetic repository. No audited source
+    // or repository-supplied configuration is executed on the host.
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-C",
+            ])
+            .arg(&target)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+    };
+    git(&["init", "--quiet", "--template="]);
+    std::fs::write(target.join("source"), "synthetic\n").unwrap();
+    std::fs::write(
+        target.join("test.sh"),
+        "test \"$(cat source)\" = synthetic\n",
+    )
+    .unwrap();
+    git(&["add", "--", "source", "test.sh"]);
+    omgs::platform::private_dir(&run).unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "test.sh",
+            "--cmd",
+            "sh test.sh && GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git ls-files --stage >/dev/null",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let before = std::fs::read(target.join(".git/index")).unwrap();
+    // Same source bytes, new stat metadata: status refreshes only incidental data.
+    std::fs::write(target.join("source"), "synthetic\n").unwrap();
+    git(&["status", "--porcelain"]);
+    let after = std::fs::read(target.join(".git/index")).unwrap();
+    assert_ne!(before, after, "fixture must exercise a real index refresh");
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+    let replay = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(replay.status.success(), "{}", text(&replay));
+    // Restore source bytes after staging different content. Only the meaningful
+    // index identity differs from the original, and both paths must refuse it.
+    std::fs::write(target.join("source"), "different\n").unwrap();
+    git(&["add", "--", "source"]);
+    std::fs::write(target.join("source"), "synthetic\n").unwrap();
+    assert!(omgs::proof::runner_evidence(&run, &record)
+        .join("; ")
+        .contains(".git/index"));
+    let refused = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(
+        !refused.status.success() && text(&refused).contains(".git/index"),
+        "{}",
+        text(&refused)
+    );
     std::fs::remove_dir_all(d).unwrap();
 }

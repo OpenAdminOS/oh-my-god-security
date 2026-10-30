@@ -667,7 +667,7 @@ fn evidence_errors(
                             vec!["exported finding does not match source findings.json (identity, verdict, tier or proof_ref)".into()]
                         } else {
                             // The same offline proof validator used by `omgs validate`, including
-                            // runner artifacts and omgs-proof/2 contract rules. No replay.
+                            // runner artifacts and versioned proof contract rules. No replay.
                             let mut proof_errors = crate::proof::validate_proofs(
                                 &crate::model::FindingsFile {
                                     findings: vec![finding.clone()],

@@ -105,7 +105,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "validate" => ("--findings --candidates --dispositions --evaluation", false),
         "fingerprint" => ("--attack-class --entry-point --sink --boundary", false),
         "prove" => (
-            "--cmd --target --run --finding --test --test-from --expect-marker --replay --tier --timeout-ms",
+            "--cmd --target --run --finding --test --test-from --inputs-from --expect-marker --replay --tier --timeout-ms",
             false,
         ),
         "approve" => ("--target", false),
@@ -517,6 +517,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
                 "--tier",
                 "--target",
                 "--timeout-ms",
+                "--inputs-from",
             ] {
                 if flag(args, conflicting).is_some() {
                     return Err(format!(
@@ -650,12 +651,56 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         }
         let errors = omgs::proof::runner_evidence(run.as_ref().unwrap(), r);
         if !errors.is_empty() {
+            if errors
+                .iter()
+                .any(|e| e.starts_with("target snapshot differs"))
+            {
+                eprintln!(
+                    "needs_validation: target code was not executed. {}",
+                    errors.join("; ")
+                );
+                return Err("__EXIT3__".into());
+            }
             return Err(format!(
                 "cannot replay invalid record: {}",
                 errors.join("; ")
             ));
         }
     }
+    let expected_inputs = replay
+        .as_ref()
+        .map(|r| omgs::proof_inputs::retained(run.as_ref().unwrap(), r))
+        .transpose()?
+        .flatten();
+    let inputs = match (&expected_inputs, flag(args, "--inputs-from")) {
+        (Some(manifest), _) => manifest.selection.clone(),
+        (None, Some(path)) => {
+            if target.is_none() {
+                return Err("--inputs-from requires a target".into());
+            }
+            let selection = omgs::proof_inputs::read_selection(Path::new(&path))?;
+            Some(selection)
+        }
+        _ => None,
+    };
+    let harness = match &replay {
+        Some(r) if !r.harness.is_empty() => {
+            Some(omgs::proof::retained_harness(run.as_ref().unwrap(), r)?)
+        }
+        None => match flag(args, "--test-from").map(PathBuf::from) {
+            Some(path) if path.is_dir() => {
+                if target.as_ref().is_some_and(|t| canon(&path).starts_with(t)) {
+                    return Err("--test-from must be outside the target".into());
+                }
+                Some(omgs::proof::prepare_harness(
+                    &path,
+                    test.as_deref().ok_or("--test-from needs --test")?,
+                )?)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
     // The proof test is either already in the target or a draft kept
     // outside it (`--test-from`) that the runner stages into the workspace
     // copy at the `--test` path. Its digest goes on the record so a reader can
@@ -671,7 +716,13 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
                 .map(|d| d.join("proofs").join(r.n.to_string()).join("test-draft"))
                 .unwrap_or_default()
         }),
-        (None, d) => d.map(PathBuf::from),
+        (None, d) => {
+            if harness.is_some() {
+                None
+            } else {
+                d.map(PathBuf::from)
+            }
+        }
     };
     if draft.is_some() && test.is_none() {
         return Err("--test-from needs --test <target-relative path> to stage it at".into());
@@ -691,44 +742,51 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         ),
         _ => None,
     };
-    let test_sha256 = match (&test, &draft) {
-        (Some(_), Some(d)) => {
-            let digest = match &replay_draft {
-                Some((bytes, _)) => omgs::sha256::digest(bytes),
-                // A caller-supplied draft is source input, not retained evidence.
-                None => omgs::sha256::digest_file(d)
-                    .map_err(|e| format!("--test-from {}: {e}", d.display()))?,
-            };
-            let d = std::fs::canonicalize(d)
-                .map_err(|e| format!("--test-from {}: {e}", d.display()))?;
-            if target.as_ref().is_some_and(|base| d.starts_with(base)) {
-                return Err("--test-from must be a draft outside the target; drop it to use a test already in the target".into());
+    let test_sha256 = if let Some(h) = &harness {
+        test.as_ref()
+            .and_then(|t| h.files.iter().find(|f| &f.path == t))
+            .map(|f| f.sha256.clone())
+    } else {
+        match (&test, &draft) {
+            (Some(_), Some(d)) => {
+                let digest = match &replay_draft {
+                    Some((bytes, _)) => omgs::sha256::digest(bytes),
+                    // A caller-supplied draft is source input, not retained evidence.
+                    None => omgs::sha256::digest_file(d)
+                        .map_err(|e| format!("--test-from {}: {e}", d.display()))?,
+                };
+                let d = std::fs::canonicalize(d)
+                    .map_err(|e| format!("--test-from {}: {e}", d.display()))?;
+                if target.as_ref().is_some_and(|base| d.starts_with(base)) {
+                    return Err("--test-from must be a draft outside the target; drop it to use a test already in the target".into());
+                }
+                if !d.is_file() {
+                    return Err(format!("--test-from {} is not a file", d.display()));
+                }
+                Some(digest)
             }
-            if !d.is_file() {
-                return Err(format!("--test-from {} is not a file", d.display()));
-            }
-            Some(digest)
-        }
-        (Some(t), None) => {
-            let base = target
-                .as_ref()
-                .ok_or("--test needs a target to find the test in")?;
-            let path = base.join(t);
-            if !path.is_file() {
-                return Err(format!(
+            (Some(t), None) => {
+                let base = target
+                    .as_ref()
+                    .ok_or("--test needs a target to find the test in")?;
+                let path = base.join(t);
+                if !path.is_file() {
+                    return Err(format!(
                     "--test {t} does not resolve to a regular file at {}; stage a draft with --test-from <file>",
                     omgs::platform::describe_path(&path)
                 ));
+                }
+                if std::fs::symlink_metadata(&path).is_ok_and(|m| omgs::platform::is_link(&m)) {
+                    eprintln!("proof test: {}", omgs::platform::describe_path(&path));
+                }
+                Some(
+                    omgs::sha256::digest_file(&path).map_err(|e| {
+                        format!("read {}: {e}", omgs::platform::describe_path(&path))
+                    })?,
+                )
             }
-            if std::fs::symlink_metadata(&path).is_ok_and(|m| omgs::platform::is_link(&m)) {
-                eprintln!("proof test: {}", omgs::platform::describe_path(&path));
-            }
-            Some(
-                omgs::sha256::digest_file(&path)
-                    .map_err(|e| format!("read {}: {e}", omgs::platform::describe_path(&path)))?,
-            )
+            (None, _) => None,
         }
-        (None, _) => None,
     };
     let draft = match draft {
         Some(d) => Some(
@@ -838,6 +896,12 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         }
         None => None,
     };
+    if let Some(harness) = &harness {
+        if let Err(e) = omgs::proof::keep_harness(&run_dir, harness) {
+            release();
+            return Err(e);
+        }
+    }
     let request = ProveRequest {
         expect_marker: expect_marker.clone(),
         command: command.clone(),
@@ -848,6 +912,12 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         tier,
         stage: staged_draft.zip(test.clone()),
         expected_tree_sha256: replay.as_ref().and_then(|r| r.target_sha256.clone()),
+        inputs,
+        expected_inputs,
+        harness: harness
+            .as_ref()
+            .map(|h| h.files.clone())
+            .unwrap_or_default(),
     };
     let started_at_ms = omgs::runmeta::now_ms();
     let result = match prove(&request) {
@@ -885,6 +955,18 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         target: target.as_ref().map(|t| t.to_string_lossy().to_string()),
         target_head,
         target_sha256: result.target_sha256.clone(),
+        execution_inputs: result
+            .input_manifest
+            .as_ref()
+            .map(|_| omgs::proof::ExecutionInputs {
+                version: omgs::proof_inputs::VERSION,
+                sha256: result.target_sha256.clone().unwrap(),
+            }),
+        harness: harness
+            .as_ref()
+            .map(|h| h.files.clone())
+            .unwrap_or_default(),
+        output_audit: Some(omgs::proof::output_audit(s)),
         proof_dir: std::fs::canonicalize(&run_dir)
             .map_err(|e| e.to_string())?
             .to_string_lossy()
@@ -932,6 +1014,10 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         output,
         omgs_version: env!("CARGO_PKG_VERSION").into(),
     };
+    if let Some(manifest) = &result.input_manifest {
+        omgs::runmeta::write_atomic_bytes(&run_dir.join("input-manifest.json"), &manifest.bytes()?)
+            .map_err(|e| e.to_string())?;
+    }
     let record_path = match (&run, &proof_dir) {
         (Some(r), Some(_)) => omgs::proof::write(r, &record)?,
         _ => {
@@ -990,18 +1076,23 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         },
         s.duration_ms
     );
-    match &proof_dir {
-        Some((n, _)) => eprintln!(
+    match (&proof_dir, &replay) {
+        (_, Some(original)) => eprintln!(
+            "replay record: {} (original {})",
+            record_path.display(),
+            omgs::proof::record_path(run.as_ref().unwrap(), original.n).display()
+        ),
+        (Some((n, _)), None) => eprintln!(
             "proof record: {} (proof_ref {})",
             record_path.display(),
             omgs::proof::reference(*n)
         ),
-        None => eprintln!(
+        (None, None) => eprintln!(
             "proof record: {} (not linked to a run)",
             record_path.display()
         ),
     }
-    if record.finding.is_some() {
+    if record.finding.is_some() && replay.is_none() {
         let rejected = match &run {
             Some(d) => omgs::run_artifact::optional_text(
                 d,
@@ -1329,6 +1420,9 @@ fn cmd_doctor_inner(args: &[String], remaining: &mut Vec<String>) -> Result<(), 
             tier: Tier::Test,
             stage: None,
             expected_tree_sha256: None,
+            inputs: None,
+            expected_inputs: None,
+            harness: vec![],
         };
         let outcome = match prove(&request) {
             ProveOutcome::Ran(r) => r,
@@ -1405,6 +1499,9 @@ fn cmd_doctor_inner(args: &[String], remaining: &mut Vec<String>) -> Result<(), 
                 tier: Tier::Test,
                 stage: None,
                 expected_tree_sha256: None,
+                inputs: None,
+                expected_inputs: None,
+                harness: vec![],
             };
             let result = match prove(&reach) {
                 ProveOutcome::Ran(r) => doctor_probe_result(&r.run),

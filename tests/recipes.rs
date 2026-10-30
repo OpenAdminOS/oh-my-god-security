@@ -415,7 +415,8 @@ fn check(recipe: Recipe) -> bool {
     mismatch.exit_code = Some(2);
     assert!(!omgs::proof::reproduces(&original, &mismatch));
     assert_ne!(replayed.marker_nonce, original.marker_nonce);
-    assert!(text(&replay).contains("proof support for test_proven: yes"));
+    assert!(text(&replay).contains("replay record:"));
+    assert!(!text(&replay).contains("proof_ref"));
     assert!(text(&replay).contains(": reproduced"), "{}", text(&replay));
     std::fs::remove_dir_all(d).unwrap();
     true
@@ -570,4 +571,86 @@ fn required_skip_and_failed_probe_are_fatal() {
         };
         assert!(std::panic::catch_unwind(|| record(&out, 0, false)).is_err());
     }
+}
+
+#[test]
+fn child_node_inherits_sandbox_environment() {
+    if !ready("node") {
+        return;
+    }
+    let d = omgs::platform::temp_root()
+        .unwrap()
+        .join(format!("omgs-child-node-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    let target = d.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("child.cjs"), r#"
+const {spawnSync} = require('node:child_process');
+const fs = require('node:fs');
+if (process.platform === 'darwin') {
+  if (!process.env.OPENSSL_CONF || !process.env.OPENSSL_CONF.startsWith(process.env.TMPDIR)) process.exit(2);
+  fs.readFileSync(process.env.OPENSSL_CONF);
+}
+const result = spawnSync(process.execPath, ['-e', 'console.log("CHILD_SANDBOX_OK")'], {env: process.env, encoding: 'utf8'});
+if (result.error || result.status !== 0 || !result.stdout.includes('CHILD_SANDBOX_OK')) {
+  console.error(result.error || result.stderr); process.exitCode = 2;
+} else { console.log(result.stdout); }
+"#).unwrap();
+    let out = cli(
+        &d.join("home"),
+        &[
+            "prove",
+            "--target",
+            target.to_str().unwrap(),
+            "--test",
+            "child.cjs",
+            "--cmd",
+            "node child.cjs",
+        ],
+    );
+    record(&out, 0, true);
+    assert!(text(&out).contains("CHILD_SANDBOX_OK"), "{}", text(&out));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn foundation_temporary_directory_resolves_to_redirected_scratch() {
+    if !ready("swiftc") {
+        return;
+    }
+    let d = omgs::platform::temp_root()
+        .unwrap()
+        .join(format!("omgs-temp-recipe-{}", std::process::id()));
+    let target = d.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("temp.swift"), r#"
+import Foundation
+let expected = URL(fileURLWithPath: ProcessInfo.processInfo.environment["TMPDIR"]!).standardizedFileURL
+let actual = URL(fileURLWithPath: NSTemporaryDirectory()).standardizedFileURL
+guard expected == actual else { exit(2) }
+let file = actual.appendingPathComponent("synthetic-temp-check")
+do {
+    try Data("synthetic".utf8).write(to: file)
+    try FileManager.default.removeItem(at: file)
+    print("REDIRECTED_TEMP_OK")
+} catch { exit(2) }
+"#).unwrap();
+    let out = cli(
+        &d.join("home"),
+        &[
+            "prove",
+            "--target",
+            target.to_str().unwrap(),
+            "--test",
+            "temp.swift",
+            "--timeout-ms",
+            "60000",
+            "--cmd",
+            "swiftc temp.swift -o temp-check && ./temp-check",
+        ],
+    );
+    record(&out, 0, true);
+    assert!(text(&out).contains("REDIRECTED_TEMP_OK"), "{}", text(&out));
+    std::fs::remove_dir_all(d).unwrap();
 }

@@ -53,7 +53,15 @@ omgs critic --run OUTPUT_DIR
 ```
 
 Replay every proof you uphold. Do not override the saved timeout. Replay consumes proof budget and
-requires unchanged commit and target snapshot. Confirm the command executed the real target and
+requires unchanged commit and versioned execution inputs. Inspect the retained input selection,
+per-path manifest and every harness file; confirm the real enforcement dependencies are included.
+Incidental Git index stat refreshes are tolerated, while source, config, hooks and meaningful Git
+state changes invalidate replay. Never execute Git against TARGET, since config or hooks can run
+programs. Old proof schemas and unsupported identity versions require a fresh proof. The replay
+record names its original; keep `proof_ref` on that original and cite the replay in evaluation.
+If output is redacted or truncated, inspect the separate bounded `output_audit` marker observations
+and omission ranges. Never treat a marker as a safe end to a private key block. Confirm the command
+executed the real target and
 intended invariant with synthetic state, rather than trusting markers or exit code alone. A
 non-reproducing proof overturns its tier; unavailable replay remains an explicit gap and cannot be
 upheld. Re-evaluate every semantic change before the host reports. Critic checks provenance and
