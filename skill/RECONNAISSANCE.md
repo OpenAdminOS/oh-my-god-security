@@ -189,3 +189,10 @@ Partition listener/caller authorization as `ipc_authorization`, credential-retur
 `secret_disclosure`, and privileged effects as `privileged_local_ops`. Source hints seed native
 operation checklists but never prove their enumeration complete. Ask `native.accepted-callers`,
 `native.secret-disclosure` and `native.privileged-operations` when policy is unresolved.
+
+Sensor hit counts use distinct fingerprints. Repeated observations retain `duplicate_sources` on
+the surviving hit: the original `first_source_index`, duplicate `count`, sampled `source_indexes`
+and `omitted` count. Indices address the ordered normalized scanner metadata stream before
+compaction. Up to 128 duplicate indices are retained across the whole report. The surviving hit
+supplies the shared tool, rule, path, line and package identity. Matched values and raw scanner
+content remain discarded. Removing duplicate observations never closes their ledger unit.

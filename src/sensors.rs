@@ -11,6 +11,18 @@ pub struct SensorHit {
     pub fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<PackageIdentity>,
+    /// Safe provenance only. Indices refer to the ordered normalized input
+    /// hit stream before deduplication, never to secret-bearing match text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_sources: Option<DuplicateSources>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DuplicateSources {
+    pub first_source_index: usize,
+    pub count: u64,
+    pub source_indexes: Vec<usize>,
+    pub omitted: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -28,6 +40,55 @@ pub struct SensorsReport {
     /// Older runs predate explicit failure reasons. New runs always write gaps.
     #[serde(default)]
     pub gaps: Vec<String>,
+}
+
+/// Collapse identity-equal hits across the normalized scanner stream. The
+/// global source-index sample is bounded even when many fingerprints repeat.
+pub fn deduplicate_hits(hits: &mut Vec<SensorHit>) {
+    let mut unique: Vec<SensorHit> = Vec::new();
+    let mut seen = std::collections::BTreeMap::new();
+    let mut retained = 0usize;
+    for (source_index, mut hit) in std::mem::take(hits).into_iter().enumerate() {
+        hit.fingerprint = hit_fingerprint(&hit);
+        if let Some(&(position, first_index)) = seen.get(&hit.fingerprint) {
+            let first: &mut SensorHit = &mut unique[position];
+            let sources = first
+                .duplicate_sources
+                .get_or_insert_with(|| DuplicateSources {
+                    first_source_index: first_index,
+                    count: 0,
+                    source_indexes: Vec::new(),
+                    omitted: 0,
+                });
+            sources.count = sources.count.saturating_add(1);
+            let mut indices = vec![source_index];
+            if let Some(prior) = hit.duplicate_sources {
+                sources.count = sources.count.saturating_add(prior.count);
+                sources.omitted = sources.omitted.saturating_add(prior.omitted);
+                indices.extend(prior.source_indexes);
+            }
+            for index in indices {
+                if retained < 128 {
+                    sources.source_indexes.push(index);
+                    retained += 1;
+                } else {
+                    sources.omitted = sources.omitted.saturating_add(1);
+                }
+            }
+        } else {
+            if let Some(sources) = &mut hit.duplicate_sources {
+                let available = 128usize.saturating_sub(retained);
+                sources.omitted = sources
+                    .omitted
+                    .saturating_add(sources.source_indexes.len().saturating_sub(available) as u64);
+                sources.source_indexes.truncate(available);
+                retained += sources.source_indexes.len();
+            }
+            seen.insert(hit.fingerprint.clone(), (unique.len(), source_index));
+            unique.push(hit);
+        }
+    }
+    *hits = unique;
 }
 
 use crate::platform::which;
@@ -53,9 +114,7 @@ pub fn run_sensors(target: &Path, artifacts: &Path) -> SensorsReport {
     for tool in ["gitleaks", "semgrep", "trufflehog", "osv-scanner"] {
         run_offline(tool, target, artifacts, &mut report);
     }
-    for hit in &mut report.hits {
-        hit.fingerprint = hit_fingerprint(hit);
-    }
+    deduplicate_hits(&mut report.hits);
     report
 }
 
@@ -146,6 +205,7 @@ fn metadata_hit(
         class,
         fingerprint: String::new(),
         package: None,
+        duplicate_sources: None,
     };
     hit.fingerprint = hit_fingerprint(&hit);
     Ok(hit)

@@ -199,7 +199,7 @@ pub fn candidates(text: &str) -> Result<crate::critic::CandidatesFile, String> {
 
 /// Parse a sensors summary (`{"tools_run": [...], "tools_unavailable": [...], "hits": [...]}`).
 pub fn sensors(text: &str) -> Result<crate::sensors::SensorsReport, String> {
-    parse(text, "sensors", |v| {
+    let mut report: crate::sensors::SensorsReport = parse(text, "sensors", |v| {
         let top = object(v, "document")?;
         for key in ["tools_run", "tools_unavailable"] {
             let ok = top
@@ -232,7 +232,9 @@ pub fn sensors(text: &str) -> Result<crate::sensors::SensorsReport, String> {
             }
         }
         Ok(())
-    })
+    })?;
+    crate::sensors::deduplicate_hits(&mut report.hits);
+    Ok(report)
 }
 
 /// Proof records and every nested survivor must be objects, never positional arrays.
