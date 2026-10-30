@@ -38,6 +38,8 @@ pub mod supervise;
 pub mod tcc;
 pub mod update;
 pub mod watch;
+#[cfg(windows)]
+mod windows_path;
 
 /// Stable, non cryptographic fingerprint for finding identity across runs.
 /// Inputs are the semantic identity of a finding, never prose or line numbers.
