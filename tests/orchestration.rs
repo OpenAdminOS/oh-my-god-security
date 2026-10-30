@@ -161,7 +161,8 @@ fn batch_summary_reads_a_run_directory() {
         &index,
     )
     .unwrap();
-    assert_eq!(s.state, "complete");
+    // A run saved as complete still publishes as partial while it has blockers.
+    assert_eq!(s.state, "partial");
     assert_eq!(s.agent_calls, Some(12));
     assert_eq!(s.reroutes, 1);
     assert!(s.blockers.iter().any(|b| b.contains("route exhausted")));

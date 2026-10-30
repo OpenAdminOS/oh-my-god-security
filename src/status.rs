@@ -96,7 +96,13 @@ pub fn apply(dir: &Path, u: &Update) -> Result<(), String> {
 
 /// Append all supplied log messages in the same status transaction.
 pub fn apply_with_logs(dir: &Path, u: &Update, logs: &[String]) -> Result<(), String> {
-    with_lock(dir, || apply_locked(dir, u, logs))
+    with_lock(dir, || {
+        apply_locked(dir, u, logs)?;
+        if u.state != "done" {
+            crate::runmeta::invalidate_completion_locked(dir)?;
+        }
+        Ok(())
+    })
 }
 
 /// Check an existing status document against the status schema before it is

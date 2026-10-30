@@ -254,6 +254,16 @@ pub fn update<T>(
     })
 }
 
+/// Invalidate a published completion before reopening work, under the run lock.
+pub fn invalidate_completion_locked(dir: &Path) -> Result<(), String> {
+    if let Some(mut meta) = read_optional(dir)? {
+        meta.insert("run_status".into(), serde_json::json!("in_progress"));
+        let text = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
+        write_atomic(&dir.join(FILE), &text)?;
+    }
+    Ok(())
+}
+
 /// Clock time of day in UTC for log lines, for example "14:03:09".
 pub fn clock(ms: u64) -> String {
     let secs = ms / 1000;

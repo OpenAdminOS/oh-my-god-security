@@ -219,6 +219,7 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
         return Ok(s);
     };
     let at = |name: &str, e: String| format!("{}: {name}: {e}", dir.display());
+    let mut findings = crate::model::FindingsFile::default();
     match crate::run_artifact::optional_text(
         dir,
         Path::new("findings.json"),
@@ -228,6 +229,7 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
             use crate::model::Verdict;
             let f = crate::shape::findings(&text).map_err(|e| at("findings.json", e))?;
             let f = crate::attempts::publication(dir, &f)?;
+            findings = f.clone();
             for x in &f.findings {
                 match x.verdict {
                     Verdict::Confirmed => s.confirmed += 1,
@@ -287,6 +289,9 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
             .strip_prefix(index_dir)
             .ok()
             .map(|rel| format!("{}/REPORT.html", rel.to_string_lossy()));
+    }
+    if let Some(state) = crate::report::run_review_state(dir, &findings)? {
+        s.blockers.push(state);
     }
     if s.state == "complete" && (s.needs_validation > 0 || !s.blockers.is_empty()) {
         s.state = "partial".into();

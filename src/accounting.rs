@@ -222,3 +222,73 @@ pub fn lines(values: &Accounting) -> Vec<String> {
     }
     lines
 }
+
+/// Sum cumulative entries once, preferring attempt totals over historical role
+/// totals. Retain known subtotals when a continuation has unreported usage.
+pub fn aggregate(meta: &Map<String, Value>) -> Result<Value, String> {
+    let values = read(meta)?;
+    let mut entries = Vec::new();
+    for role in ROLES {
+        let parts: Vec<_> = values
+            .iter()
+            .filter(|(key, _)| key.starts_with(&format!("{role}@")))
+            .map(|(_, usage)| usage)
+            .collect();
+        if parts.is_empty() {
+            if let Some(usage) = values.get(role) {
+                // Host accounting is optional in historical runs.
+                if role != "host"
+                    || meta
+                        .get("accounting")
+                        .is_some_and(|v| v.get("host").is_some())
+                {
+                    entries.push(usage);
+                }
+            }
+        } else {
+            entries.extend(parts);
+        }
+    }
+    let mut out = serde_json::json!({"tokens":null,"input_tokens":null,"output_tokens":null,"calls":null,"cost_usd":null,"duration_ms":null,"roles":values,"known_subtotals":{},"unknown_usage":{}});
+    for field in ["tokens", "cost_usd", "duration_ms"] {
+        let mut total = 0u64;
+        let mut cost = 0.0;
+        let mut unknown = 0;
+        for usage in &entries {
+            let known = match field {
+                "cost_usd" => {
+                    cost += usage.cost_usd.unwrap_or_default();
+                    usage.cost_usd.is_some()
+                }
+                _ => {
+                    let value = if field == "tokens" {
+                        usage.tokens
+                    } else {
+                        usage.duration_ms
+                    };
+                    total = total
+                        .checked_add(value.unwrap_or_default())
+                        .ok_or("accounting integer overflow")?;
+                    value.is_some()
+                }
+            };
+            if !known || usage.unreported {
+                unknown += 1;
+            }
+        }
+        if !cost.is_finite() {
+            return Err("accounting sum overflow".into());
+        }
+        let subtotal = if field == "cost_usd" {
+            serde_json::json!(cost)
+        } else {
+            serde_json::json!(total)
+        };
+        out["known_subtotals"][field] = subtotal.clone();
+        out["unknown_usage"][field] = serde_json::json!(unknown);
+        if unknown == 0 {
+            out[field] = subtotal;
+        }
+    }
+    Ok(out)
+}

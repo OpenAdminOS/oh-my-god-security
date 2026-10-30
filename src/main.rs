@@ -2987,7 +2987,9 @@ fn read_ledger(path: &str) -> Result<Ledger, String> {
 
 fn write_ledger(path: &str, ledger: &Ledger) -> Result<(), String> {
     let text = serde_json::to_string_pretty(ledger).map_err(|e| e.to_string())?;
-    omgs::runmeta::write_atomic(Path::new(path), &format!("{text}\n"))
+    let path = Path::new(path);
+    omgs::runmeta::invalidate_completion_locked(path.parent().unwrap_or(Path::new(".")))?;
+    omgs::runmeta::write_atomic(path, &format!("{text}\n"))
 }
 
 /// Every value given for a repeatable flag, in order.

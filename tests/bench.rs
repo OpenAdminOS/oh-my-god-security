@@ -587,3 +587,88 @@ fn missing_or_invalid_source_findings_are_reported() {
     });
     assert_invalid_positive(&saved, "does not match source");
 }
+
+#[test]
+fn archived_verifier_lifecycle_controls_scoring() {
+    for state in ["active", "stopped", "missing"] {
+        let saved = SavedRuns::new();
+        for snapshot in ["positive", "fixed"] {
+            saved.edit(&format!("run-1/{snapshot}/run-metadata.json"), |meta| {
+                let records = meta["attempts"].as_array_mut().unwrap();
+                match state {
+                    "active" => { records.pop(); }
+                    "stopped" => records.push(json!({"at":"2026-01-01T00:00:02Z","record":{
+                        "event":"stop","id":"fixture-verifier","actor":"host","kind":"policy",
+                        "reason":"Stop archived output","artifacts":["findings.json"],"disposition":"quarantined"
+                    }})),
+                    _ => records.clear(),
+                }
+            });
+        }
+        assert_invalid_positive(
+            &saved,
+            if state == "missing" {
+                "no recorded attempt"
+            } else {
+                "completed attempt"
+            },
+        );
+        assert_invalid_fixed(
+            &saved,
+            if state == "missing" {
+                "no recorded attempt"
+            } else {
+                "completed attempt"
+            },
+        );
+    }
+    // The unchanged completed archive remains eligible.
+    assert_eq!(score()["cohorts"][0]["runs"][0]["recall"]["numerator"], 1);
+}
+
+#[test]
+fn benchmark_accounting_uses_host_attempt_subtotals_and_cumulative_turns() {
+    let saved = SavedRuns::new();
+    saved.edit("run-1/run-metadata.json", |meta| {
+        meta["accounting"]["host"] = json!({"tokens":50,"cost_usd":0.25,"duration_ms":500});
+        meta["accounting"]["blue-verifier@blue"] = json!({"tokens":150,"cost_usd":0.75,"duration_ms":1500,"covered_turn":"one","unreported":false});
+        meta["attempts"] = json!([
+            {"at":"first","record":{"event":"start","id":"blue","role":"verifier","identity":"blue","context":"synthetic","inputs":["in"],"outputs":["out"],"isolation":"procedural"}},
+            {"at":"first","record":{"event":"dispatch","id":"blue","turn":"one","actor":"host","reason":"Authorized turn"}}
+        ]);
+    });
+    let usage = |score: Value| score["cost_per_run"][0]["numerator"].clone();
+    let first = usage(saved.score());
+    assert_eq!(first["tokens"], 500);
+    assert_eq!(first["cost_usd"], 2.5);
+    assert_eq!(first["duration_ms"], 5000);
+    saved.edit("run-1/run-metadata.json", |meta| {
+        meta["attempts"].as_array_mut().unwrap().push(json!({"at":"later","record":{"event":"dispatch","id":"blue","turn":"two","actor":"host","reason":"Authorized continuation"}}));
+    });
+    let later = usage(saved.score());
+    assert!(later["tokens"].is_null());
+    assert!(later["cost_usd"].is_null());
+    assert_eq!(later["known_subtotals"]["tokens"], 500);
+    assert_eq!(later["unknown_usage"]["tokens"], 1);
+    assert_eq!(later["roles"]["blue-verifier@blue"]["unreported"], true);
+    saved.edit("run-1/run-metadata.json", |meta| {
+        meta["accounting"]["blue-verifier@blue"] =
+            json!({"tokens":200,"cost_usd":1.0,"duration_ms":2000,"covered_turn":"two"});
+    });
+    let refreshed = usage(saved.score());
+    assert_eq!(refreshed["tokens"], 550);
+    assert_eq!(refreshed["cost_usd"], 2.75);
+    saved.edit("run-1/run-metadata.json", |meta| {
+        meta["accounting"]["blue-verifier@unknown"] =
+            json!({"tokens":null,"cost_usd":null,"duration_ms":null});
+        meta["attempts"].as_array_mut().unwrap().push(json!({"at":"later","record":{"event":"start","id":"unknown","role":"verifier","identity":"unknown","context":"synthetic","inputs":["in"],"outputs":["out"],"isolation":"procedural"}}));
+    });
+    let unknown = usage(saved.score());
+    assert!(unknown["cost_usd"].is_null());
+    assert_eq!(unknown["known_subtotals"]["cost_usd"], 2.75);
+    assert_eq!(unknown["unknown_usage"]["cost_usd"], 1);
+    saved.edit("run-1/run-metadata.json", |meta| {
+        meta["accounting"]["host"] = json!({"tokens":null,"cost_usd":null,"duration_ms":null});
+    });
+    assert_eq!(usage(saved.score())["unknown_usage"]["cost_usd"], 2);
+}

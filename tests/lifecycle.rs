@@ -713,8 +713,8 @@ fn additional_e_each_reused_proof_stage_round_remains_visible() {
 fn additional_f_persona_defaults_and_custom_combined_allowances_are_explicit() {
     let root = Run::new();
     let target = root.0.join("target");
-    std::fs::create_dir(&target).unwrap();
-    std::fs::write(target.join("source.rs"), "pub fn sample() {}\n").unwrap();
+    omgs::platform::create_private_dir(&target).unwrap();
+    omgs::runmeta::write_atomic_bytes(&target.join("source.rs"), b"pub fn sample() {}\n").unwrap();
     for (name, extra, cap, profile) in [
         ("default", None, 64, "deep"),
         ("custom", Some("40"), 40, "custom"),
@@ -946,16 +946,16 @@ fn draft_and_stopped_verdicts_are_pending_in_publications_and_batch_counts() {
                 .unwrap();
         let mut confirmed = archived.findings[0].clone();
         confirmed.verified_by = Some("blue".into());
-        std::fs::create_dir_all(run.0.join("proofs/1")).unwrap();
+        omgs::platform::create_private_tree(&run.0.join("proofs/1")).unwrap();
         for name in [
             "1.json",
             "1/command.txt",
             "1/mxc-config.json",
             "1/test-draft",
         ] {
-            std::fs::copy(
-                fixture.join("proofs").join(name),
-                run.0.join("proofs").join(name),
+            omgs::runmeta::write_atomic_bytes(
+                &run.0.join("proofs").join(name),
+                &std::fs::read(fixture.join("proofs").join(name)).unwrap(),
             )
             .unwrap();
         }
@@ -1031,4 +1031,102 @@ fn draft_and_stopped_verdicts_are_pending_in_publications_and_batch_counts() {
             .iter()
             .all(|r| r["verdict"] == "needs_validation"));
     }
+}
+
+#[test]
+fn batch_completion_matches_report_for_reopened_work_and_reasoned_deferrals() {
+    let run = Run::new();
+    for (id, role) in [
+        ("red", "hunter"),
+        ("blue", "verifier"),
+        ("independent", "evaluator"),
+    ] {
+        run.event(start(id, role)).unwrap();
+        run.event(complete(id)).unwrap();
+    }
+    let file = FindingsFile::default();
+    run.put("findings.json", json!({"findings":[]}));
+    run.put("candidates-red.json", json!({"candidates":[]}));
+    run.put("coverage-ledger.json", json!({"units":[{"id":"surface","surface":"source","attack_classes":["input_validation"],"status":"covered","evidence":["source.rs"]}]}));
+    run.put("evaluation.json", json!({"evaluator":"independent","attempt":"independent","source_ref":"synthetic","decisions":[],"gaps":[]}));
+    let report = || {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .arg("report")
+            .arg("--findings")
+            .arg(run.0.join("findings.json"))
+            .arg("--out")
+            .arg(&run.0)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    let summary = || {
+        omgs::batch::summarize(
+            &omgs::batch::BatchRun {
+                run_dir: Some(run.0.to_str().unwrap().into()),
+                ..Default::default()
+            },
+            &run.0,
+        )
+        .unwrap()
+    };
+    report();
+    assert_eq!(run.meta()["run_status"], "complete");
+    assert_eq!(summary().state, "complete");
+    assert!(omgs::report::run_review_state(&run.0, &file)
+        .unwrap()
+        .is_none());
+    stage(&run, "hunt", None, "active", None).unwrap();
+    assert_eq!(run.meta()["run_status"], "in_progress");
+    // Even a stale external completion flag cannot override the current stage.
+    omgs::runmeta::update(&run.0, |m| {
+        m.insert("run_status".into(), json!("complete"));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(summary().state, "partial");
+    assert!(omgs::report::run_review_state(&run.0, &file)
+        .unwrap()
+        .is_some());
+    report();
+    assert_eq!(run.meta()["run_status"], "partial");
+    stage(&run, "hunt", None, "done", None).unwrap();
+    report();
+    assert_eq!(summary().state, "complete");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["ledger", "set", "--ledger"])
+        .arg(run.0.join("coverage-ledger.json"))
+        .args([
+            "--unit",
+            "surface",
+            "--status",
+            "deferred",
+            "--note",
+            "Review in next authorized scope",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(run.meta()["run_status"], "in_progress");
+    assert!(omgs::critic::critique_dir(&run.0, &file).unwrap().passed());
+    omgs::runmeta::update(&run.0, |m| {
+        m.insert("run_status".into(), json!("complete"));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(summary().state, "partial");
+    assert!(omgs::report::run_review_state(&run.0, &file)
+        .unwrap()
+        .unwrap()
+        .contains("1 deferred"));
+    report();
+    assert_eq!(run.meta()["run_status"], "partial");
 }

@@ -199,6 +199,35 @@ pub fn timeline(run: &std::path::Path) -> Result<Vec<TimelineRow>, String> {
     Ok(rows)
 }
 
+/// Build the completion inputs from current run artifacts for every index consumer.
+pub fn run_review_state(
+    run: &std::path::Path,
+    file: &FindingsFile,
+) -> Result<Option<String>, String> {
+    let published = crate::attempts::publication(run, file)?;
+    let saved = crate::runmeta::read_optional(run)?.unwrap_or_default();
+    let mut meta = ReportMeta {
+        review_limits: crate::attempts::gaps(&saved)?,
+        timeline: timeline(run)?,
+        ..Default::default()
+    };
+    if let Some(text) = crate::run_artifact::optional_text(
+        run,
+        std::path::Path::new("coverage-ledger.json"),
+        crate::run_artifact::LEDGER_BYTES,
+    )? {
+        let ledger = crate::shape::ledger(&text)?;
+        meta.coverage = crate::ledger::coverage_lines(&ledger);
+        meta.critic = Some(crate::critic::critique_run(run)?);
+    }
+    meta.review_limits.extend(
+        crate::adjudication::report_lines(run, &published)?
+            .into_iter()
+            .filter(|s| s.starts_with("Unexamined:") || s.starts_with("Adjudication gap:")),
+    );
+    Ok(review_state(&published, &meta))
+}
+
 pub fn review_state(file: &FindingsFile, meta: &ReportMeta) -> Option<String> {
     let blocked = meta
         .review_limits

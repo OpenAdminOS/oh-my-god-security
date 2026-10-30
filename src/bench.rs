@@ -668,12 +668,11 @@ fn evidence_errors(
                         } else {
                             // The same offline proof validator used by `omgs validate`, including
                             // runner artifacts and omgs-proof/2 contract rules. No replay.
-                            let mut proof_errors = crate::proof::validate_proofs(
-                                &crate::model::FindingsFile {
-                                    findings: vec![finding.clone()],
-                                },
-                                source,
-                            );
+                            let one = crate::model::FindingsFile {
+                                findings: vec![finding.clone()],
+                            };
+                            let mut proof_errors = crate::attempts::finding_gaps(source, &one)?;
+                            proof_errors.extend(crate::proof::validate_proofs(&one, source));
                             if let Some(proof_ref) = finding.proof_ref.as_deref() {
                                 // Load errors are already reported by validate_proofs.
                                 if let Ok(record) = crate::proof::load(source, proof_ref) {
@@ -704,98 +703,13 @@ fn evidence_errors(
     Ok(errors)
 }
 
-// Consume the host accounting shape without depending on report/status modules.
+// Use the same cumulative usage model as report and status.
 fn accounting(dir: &Path) -> Result<Value> {
-    let meta = match crate::run_artifact::optional_text(
-        dir,
-        Path::new(crate::runmeta::FILE),
-        crate::run_artifact::METADATA_BYTES,
-    )? {
-        Some(text) => crate::shape::strict_json(&text)?,
-        None => json!({}),
-    };
-    if !meta.is_object() {
-        return Err("run metadata must be object".into());
-    }
-    let mut usage = json!({"tokens":null,"input_tokens":null,"output_tokens":null,"calls":null,"cost_usd":null,"duration_ms":null,"roles":null});
+    let meta = crate::runmeta::read_optional(dir)?.unwrap_or_default();
+    let mut usage = crate::accounting::aggregate(&meta)?;
     if let Some(calls) = meta.get("agent_calls_used") {
         integer(calls)?;
         usage["calls"] = calls.clone();
-    }
-    if let Some(roles) = meta.get("accounting") {
-        let roles = roles.as_object().ok_or("accounting must be object")?;
-        for (role, entry) in roles {
-            if !["red-hunter", "blue-verifier", "evaluator", "green-fixer"].contains(&role.as_str())
-            {
-                return Err(format!("unknown accounting role {role}"));
-            }
-            let entry = entry.as_object().ok_or("accounting role must be object")?;
-            for (field, value) in entry {
-                if ![
-                    "tokens",
-                    "input_tokens",
-                    "output_tokens",
-                    "cost_usd",
-                    "duration_ms",
-                ]
-                .contains(&field.as_str())
-                {
-                    return Err(format!("unknown accounting field {field}"));
-                }
-                if !value.is_null() {
-                    if field == "cost_usd" {
-                        number(value)?;
-                    } else {
-                        integer(value)?;
-                    }
-                }
-            }
-        }
-        usage["roles"] = Value::Object(roles.clone());
-        for field in [
-            "tokens",
-            "input_tokens",
-            "output_tokens",
-            "cost_usd",
-            "duration_ms",
-        ] {
-            let mut sum = 0.0;
-            let mut sum_integer = 0u64;
-            let mut complete = true;
-            for role in ["red-hunter", "blue-verifier", "evaluator", "green-fixer"] {
-                match roles
-                    .get(role)
-                    .and_then(|v| v.get(field))
-                    .filter(|v| !v.is_null())
-                {
-                    Some(v) => {
-                        if field == "cost_usd" {
-                            number(v)?;
-                        } else {
-                            integer(v)?;
-                        }
-                        if field == "cost_usd" {
-                            sum += v.as_f64().unwrap();
-                        } else {
-                            sum_integer = sum_integer
-                                .checked_add(v.as_u64().unwrap())
-                                .ok_or("accounting integer overflow")?;
-                        }
-                    }
-                    None => complete = false,
-                }
-            }
-            if !sum.is_finite() {
-                return Err("accounting sum overflow".into());
-            }
-            if complete {
-                usage[field] = if field == "cost_usd" {
-                    json!(sum)
-                } else {
-                    json!(sum_integer)
-                };
-            }
-        }
     }
     Ok(usage)
 }
