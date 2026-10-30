@@ -300,6 +300,7 @@ pub fn toolchain_roots(os: &str, home: Option<&Path>) -> Vec<PathBuf> {
             "/opt/homebrew/bin".into(),
             "/opt/homebrew/lib".into(),
             "/opt/homebrew/opt".into(),
+            HOMEBREW_RUSTUP_BIN.into(),
             "/opt/homebrew/Cellar".into(),
             "/opt/homebrew/share".into(),
             "/opt/homebrew/include".into(),
@@ -330,14 +331,45 @@ pub fn toolchain_roots(os: &str, home: Option<&Path>) -> Vec<PathBuf> {
 }
 
 const RUST_CACHES: [&str; 2] = ["registry", "git"];
+pub(crate) const HOMEBREW_RUSTUP_BIN: &str = "/opt/homebrew/opt/rustup/bin";
 
 /// Rust locations for the sandboxed environment.
 pub struct RustHomes {
-    /// The real `~/.cargo/bin`, put first on PATH.
+    /// The admitted Rust proxy directory, put first on PATH.
     pub bin: PathBuf,
     /// A per-run CARGO_HOME in scratch, linking to the readable caches.
     pub cargo_home: PathBuf,
     pub rustup_home: Option<PathBuf>,
+}
+
+/// Select only explicitly admitted Rust roots, without probing the host or
+/// consulting HOME. Proof validation uses the same selection as staging.
+pub(crate) fn select_rust_homes(
+    os: &str,
+    readonly: &[PathBuf],
+    cargo_home: &Path,
+) -> Option<RustHomes> {
+    let bin = rust_root(os, readonly, "/.cargo/bin").or_else(|| {
+        readonly
+            .iter()
+            .find(|p| os == "macos" && p.as_path() == Path::new(HOMEBREW_RUSTUP_BIN))
+    })?;
+    Some(RustHomes {
+        bin: bin.clone(),
+        cargo_home: cargo_home.to_path_buf(),
+        rustup_home: rust_root(os, readonly, "/.rustup").cloned(),
+    })
+}
+
+fn rust_root<'a>(os: &str, readonly: &'a [PathBuf], suffix: &str) -> Option<&'a PathBuf> {
+    readonly.iter().find(|p| {
+        let path = mxc_path(p).replace('\\', "/");
+        if os == "windows" {
+            path.to_ascii_lowercase().ends_with(suffix)
+        } else {
+            path.ends_with(suffix)
+        }
+    })
 }
 
 /// Link `link` to the directory `to`: a symlink on Unix, a junction on
@@ -1190,28 +1222,17 @@ fn stage_workspace(
     if cfg!(target_os = "macos") {
         std::fs::write(scratch.join("openssl.cnf"), b"").map_err(|e| e.to_string())?;
     }
-    let home = platform::home();
-    let rust = match home.as_ref().map(|h| h.join(".cargo")) {
-        Some(cargo) if readonly.contains(&cargo.join("bin")) => {
-            let cargo_home = scratch.join("cargo-home");
-            std::fs::create_dir_all(&cargo_home).map_err(|e| e.to_string())?;
-            for sub in RUST_CACHES {
-                let real = cargo.join(sub);
-                if readonly.contains(&real) {
-                    link_dir(&real, &cargo_home.join(sub))
-                        .map_err(|e| format!("cannot link the cargo {sub} cache: {e}"))?;
-                }
+    let os = std::env::consts::OS;
+    let rust = select_rust_homes(os, readonly, &scratch.join("cargo-home"));
+    if let Some(rust) = &rust {
+        std::fs::create_dir_all(&rust.cargo_home).map_err(|e| e.to_string())?;
+        for sub in RUST_CACHES {
+            if let Some(real) = rust_root(os, readonly, &format!("/.cargo/{sub}")) {
+                link_dir(real, &rust.cargo_home.join(sub))
+                    .map_err(|e| format!("cannot link the cargo {sub} cache: {e}"))?;
             }
-            Some(RustHomes {
-                bin: cargo.join("bin"),
-                cargo_home,
-                rustup_home: home
-                    .map(|h| h.join(".rustup"))
-                    .filter(|r| readonly.contains(r)),
-            })
         }
-        _ => None,
-    };
+    }
     write_wrapper(
         std::env::consts::OS,
         workspace,
@@ -1627,6 +1648,226 @@ mod tests {
             assert!(!roots.iter().any(|r| Path::new(denied).starts_with(r)));
         }
         assert!(roots.contains(&PathBuf::from("/opt/homebrew/Cellar")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rust_layouts_round_trip_staging_and_proof_validation_without_host_discovery() {
+        const CHILD: &str = "OMGS_TEST_RUST_LAYOUT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let absolute = platform::temp_root()
+                .unwrap()
+                .join(format!("omgs-rust-layouts-home-{}", std::process::id()));
+            let absolute_home = absolute.join("host-home");
+            for (home, discovered) in [
+                (None, "0"),
+                (Some(""), "0"),
+                (Some("relative-home"), "0"),
+                (absolute_home.to_str(), "1"),
+            ] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child.args([
+                    "--exact",
+                    "sandbox::tests::rust_layouts_round_trip_staging_and_proof_validation_without_host_discovery",
+                    "--nocapture",
+                ]).env(CHILD, discovered).env_remove("HOME");
+                if let Some(home) = home {
+                    child.env("HOME", home);
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "HOME={home:?}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let _ = std::fs::remove_dir_all(absolute);
+            return;
+        }
+        // Discovery decides whether HOME contributes roots: missing, empty and
+        // relative values must yield none, an absolute one its Rust roots.
+        let discovered = platform::home();
+        assert_eq!(
+            discovered.is_some(),
+            std::env::var(CHILD).unwrap() == "1",
+            "{discovered:?}"
+        );
+        let dir = platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-rust-layouts-{}", std::process::id()));
+        platform::create_private_tree(&dir).unwrap();
+        let home = discovered.clone().unwrap_or_else(|| dir.join("host-home"));
+        for sub in ["bin", "registry", "git"] {
+            std::fs::create_dir_all(home.join(".cargo").join(sub)).unwrap();
+        }
+        std::fs::create_dir_all(home.join(".rustup")).unwrap();
+        for name in ["config.toml", "credentials", "credentials.toml"] {
+            std::fs::write(home.join(".cargo").join(name), b"host secret").unwrap();
+        }
+        let brew_bin = PathBuf::from(HOMEBREW_RUSTUP_BIN);
+        // Subprocesses isolate HOME changes; no installed Rust tools are needed.
+        for has_home in [discovered.is_some()] {
+            for layout in ["cargo", "homebrew", "both"] {
+                let run = dir.join(format!("{layout}-{has_home}"));
+                let proof_dir = run.join("proofs/1");
+                platform::create_private_tree(&proof_dir).unwrap();
+                let req = ProveRequest {
+                    expect_marker: None,
+                    command: "cargo run --offline".into(),
+                    test: None,
+                    timeout_ms: 1000,
+                    target: None,
+                    run_dir: proof_dir.clone(),
+                    tier: Tier::Test,
+                    stage: None,
+                    expected_tree_sha256: None,
+                };
+                let readonly: Vec<_> = toolchain_roots("macos", discovered.as_deref())
+                    .into_iter()
+                    .filter(|p| {
+                        if p == &brew_bin {
+                            layout != "cargo"
+                        } else if p == &home.join(".cargo/bin") {
+                            layout != "homebrew"
+                        } else {
+                            p.starts_with(&home)
+                        }
+                    })
+                    .collect();
+                for name in ["config.toml", "credentials", "credentials.toml"] {
+                    let secret = home.join(".cargo").join(name);
+                    assert!(!readonly.iter().any(|root| secret.starts_with(root)));
+                }
+                let workspace = proof_dir.join("workspace");
+                let scratch = proof_dir.join("scratch");
+                let nonce = "a".repeat(64);
+                let staged =
+                    stage_workspace(&req, &workspace, &scratch, &readonly, &nonce).unwrap();
+                let expected_bin = if has_home && layout != "homebrew" {
+                    Some(home.join(".cargo/bin"))
+                } else if layout != "cargo" {
+                    Some(brew_bin.clone())
+                } else {
+                    None
+                };
+                assert_eq!(staged.rust.as_ref().map(|r| &r.bin), expected_bin.as_ref());
+                if let Some(rust) = &staged.rust {
+                    assert_eq!(rust.cargo_home, scratch.join("cargo-home"));
+                    assert_eq!(rust.rustup_home, has_home.then(|| home.join(".rustup")));
+                    for sub in RUST_CACHES {
+                        let link = rust.cargo_home.join(sub);
+                        if has_home {
+                            assert_eq!(
+                                std::fs::read_link(link).unwrap(),
+                                home.join(".cargo").join(sub)
+                            );
+                        } else {
+                            assert!(!link.exists());
+                        }
+                    }
+                    for name in ["config.toml", "credentials", "credentials.toml"] {
+                        assert!(!rust.cargo_home.join(name).exists());
+                    }
+                } else {
+                    assert!(!scratch.join("cargo-home").exists());
+                }
+                let wrapped = wrapped_command("macos", &req.command, &nonce, None);
+                let config = mxc_config_at(
+                    &ConfigInput {
+                        os: "macos",
+                        contract: None,
+                        containment: "seatbelt",
+                        command: &wrapped,
+                        timeout_ms: req.timeout_ms,
+                        workspace: &workspace,
+                        scratch: &scratch,
+                        allowed_marker: Some(&proof_dir.join("markers/allowed")),
+                        readonly: readonly.clone(),
+                        denied: vec![proof_dir.join("markers/denied")],
+                        rust: staged.rust,
+                        list_parents: false,
+                    },
+                    "",
+                );
+                let env = config["process"]["env"].as_array().unwrap();
+                assert!(env.contains(&serde_json::json!("RUSTUP_AUTO_INSTALL=0")));
+                assert_eq!(
+                    env.contains(&serde_json::json!("CARGO_NET_OFFLINE=true")),
+                    expected_bin.is_some()
+                );
+                assert_eq!(
+                    env.iter()
+                        .any(|v| v.as_str().unwrap().starts_with("CARGO_HOME=")),
+                    expected_bin.is_some()
+                );
+                if let Some(bin) = expected_bin {
+                    assert!(env.iter().any(|v| v
+                        .as_str()
+                        .unwrap()
+                        .starts_with(&format!("PATH={}:", bin.display()))));
+                }
+                let config_text = serde_json::to_string_pretty(&config).unwrap();
+                crate::runmeta::write_atomic(&proof_dir.join("mxc-config.json"), &config_text)
+                    .unwrap();
+                crate::runmeta::write_atomic(&proof_dir.join("command.txt"), &req.command).unwrap();
+                let (enforced, gaps) = declared_controls("macos", Tier::Test);
+                let executor = pinned_executors()
+                    .into_iter()
+                    .find(|e| e.containment == "seatbelt")
+                    .unwrap();
+                let record: crate::proof::ProofRecord = serde_json::from_value(serde_json::json!({
+                    "schema": crate::proof::SCHEMA, "n": 1, "tier": "test",
+                    "command": req.command, "command_sha256": sha256::digest(req.command.as_bytes()),
+                    "wrapped_command_sha256": sha256::digest(wrapped.as_bytes()),
+                    "readable_roots": readonly.iter().map(|p| mxc_path(p)).collect::<Vec<_>>(),
+                    "proof_dir": mxc_path(&proof_dir), "marker_nonce": nonce,
+                    "command_started": true, "command_finished": true, "timeout_ms": req.timeout_ms,
+                    "started_at_ms": 0, "duration_ms": 0, "exit_code": 0, "contract": {"kind": "none"},
+                    "timed_out": false, "capture_complete": true, "cleanup_complete": true,
+                    "survivors": [], "mxc_version": MXC_VERSION, "containment": "seatbelt",
+                    "executor": executor.file, "executor_sha256": executor.sha256,
+                    "config_sha256": sha256::digest(config_text.as_bytes()),
+                    "enforced": enforced, "gaps": gaps, "output_sha256": sha256::digest(b""),
+                    "output_bytes_total": 0, "output": "", "omgs_version": env!("CARGO_PKG_VERSION")
+                })).unwrap();
+                crate::proof::write(&run, &record).unwrap();
+                let saved = crate::proof::load(&run, "proofs/1.json").unwrap();
+                let errors = crate::proof::runner_evidence(&run, &saved);
+                assert!(
+                    errors.is_empty(),
+                    "layout={layout}, has_home={has_home}: {errors:?}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rust_selection_prefers_cargo_and_limits_homebrew_fallback_to_macos() {
+        let cargo_home = Path::new("/run/scratch/cargo-home");
+        let brew_bin = PathBuf::from(HOMEBREW_RUSTUP_BIN);
+        let cargo_bin = PathBuf::from("/home/u/.cargo/bin");
+        for os in ["macos", "linux", "windows"] {
+            let roots = vec![brew_bin.clone()];
+            assert_eq!(
+                select_rust_homes(os, &roots, cargo_home).is_some(),
+                os == "macos"
+            );
+            let roots = vec![brew_bin.clone(), cargo_bin.clone()];
+            let rust = select_rust_homes(os, &roots, cargo_home).unwrap();
+            assert_eq!(rust.bin, cargo_bin);
+            assert_eq!(rust.cargo_home, cargo_home);
+            assert!(rust.rustup_home.is_none());
+            assert!(select_rust_homes(os, &[], cargo_home).is_none());
+        }
+        let roots = vec![
+            PathBuf::from(r"C:\Users\U\.CARGO\BIN"),
+            PathBuf::from(r"C:\Users\U\.RUSTUP"),
+        ];
+        let rust = select_rust_homes("windows", &roots, cargo_home).unwrap();
+        assert_eq!(rust.bin, roots[0]);
+        assert_eq!(rust.rustup_home.as_ref(), Some(&roots[1]));
     }
 
     #[test]

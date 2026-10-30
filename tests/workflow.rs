@@ -1983,7 +1983,20 @@ fn traced_findings_forbid_proof_references() {
 
 #[test]
 fn saved_configs_use_recorded_roots_full_env_and_a_closed_schema() {
-    let dir = scratch("recorded-home");
+    check_saved_config_roots("recorded-home", None);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn saved_homebrew_rustup_configs_use_recorded_roots() {
+    check_saved_config_roots(
+        "recorded-homebrew",
+        Some("/opt/homebrew/opt/rustup/bin".into()),
+    );
+}
+
+fn check_saved_config_roots(name: &str, cargo_bin: Option<std::path::PathBuf>) {
+    let dir = scratch(name);
     let (_, _, findings) = complete_run();
     let findings = attest(&dir, findings);
     let mut record = omgs::proof::load(&dir, "proofs/1.json").unwrap();
@@ -1995,7 +2008,8 @@ fn saved_configs_use_recorded_roots_full_env_and_a_closed_schema() {
     } else {
         "/source-home"
     };
-    let cargo = std::path::Path::new(source_home).join(".cargo").join("bin");
+    let cargo =
+        cargo_bin.unwrap_or_else(|| std::path::Path::new(source_home).join(".cargo").join("bin"));
     let rustup = std::path::Path::new(source_home).join(".rustup");
     record.readable_roots = vec![
         cargo.to_string_lossy().into(),
