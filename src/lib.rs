@@ -5,6 +5,8 @@ pub mod architecture;
 pub mod batch;
 pub mod bench;
 pub mod budget;
+#[cfg(target_os = "macos")]
+pub mod coalition;
 pub mod critic;
 pub mod handoff;
 pub mod help;
@@ -30,6 +32,8 @@ pub mod shape;
 pub mod stacks;
 pub mod status;
 pub mod supervise;
+#[cfg(target_os = "macos")]
+pub mod tcc;
 pub mod update;
 pub mod watch;
 

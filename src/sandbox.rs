@@ -243,7 +243,7 @@ pub struct ProveRequest {
     /// Copied into the per-run workspace, which becomes the cwd. The original
     /// is not mounted into the sandbox at all.
     pub target: Option<PathBuf>,
-    /// Per-proof directory: holds workspace, scratch, markers and the config.
+    /// Per-proof directory: holds workspace, scratch and the config.
     pub run_dir: PathBuf,
     pub tier: Tier,
     /// A draft test kept outside the target, copied into the workspace at
@@ -474,7 +474,6 @@ pub struct ConfigInput<'a> {
     pub timeout_ms: u64,
     pub workspace: &'a Path,
     pub scratch: &'a Path,
-    pub allowed_marker: Option<&'a Path>,
     pub readonly: Vec<PathBuf>,
     pub denied: Vec<PathBuf>,
     pub rust: Option<RustHomes>,
@@ -603,10 +602,7 @@ pub fn mxc_config_at(input: &ConfigInput, system_root: &str) -> serde_json::Valu
     if let Some((_, nonce)) = input.contract {
         env.push(format!("OMGS_PROOF_NONCE={nonce}"));
     }
-    let mut readonly: Vec<String> = input.readonly.iter().map(|p| mxc_path(p)).collect();
-    if let Some(m) = input.allowed_marker {
-        readonly.push(mxc_path(m));
-    }
+    let readonly: Vec<String> = input.readonly.iter().map(|p| mxc_path(p)).collect();
     let mut config = serde_json::json!({
         "version": "1.0.0",
         "containment": input.containment,
@@ -693,6 +689,12 @@ pub fn declared_controls(os: &str, tier: Tier) -> (Vec<String>, Vec<String>) {
         enforced.push(
             "loopback private to the sandbox network namespace; host services unreachable".into(),
         );
+    }
+    if os == "macos" {
+        enforced.extend([
+            "launchd_resource_coalition".into(),
+            "launchd_tcc_path_admission".into(),
+        ]);
     }
     if os == "linux" {
         enforced
@@ -811,7 +813,7 @@ pub fn declared_limits(os: &str) -> Vec<String> {
         v.push("process group signalled before the leader is reaped".into());
     }
     if os == "macos" {
-        v.push("survivor sweep: sandboxed processes that left the group are found and killed, and the run fails".into());
+        v.push("launchd resource coalition: sealed anchor task count certifies cleanup; survivors are killed and fail the run".into());
     }
     v
 }
@@ -1134,7 +1136,14 @@ fn overlapping_root<'a>(run_dir: &Path, readonly: &'a [PathBuf]) -> Option<&'a P
     let run_dir = normalize(run_dir);
     readonly.iter().find(|r| {
         let root = normalize(r);
-        run_dir.starts_with(&root) || root.starts_with(&run_dir)
+        #[cfg(target_os = "macos")]
+        {
+            crate::tcc::overlaps(&run_dir, &root)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            run_dir.starts_with(&root) || root.starts_with(&run_dir)
+        }
     })
 }
 
@@ -1278,6 +1287,12 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     if let Err(reason) = validate_input(&req.command, req.timeout_ms) {
         return ProveOutcome::Blocked { reason };
     }
+    #[cfg(target_os = "macos")]
+    if let Err(e) = crate::tcc::admit_path(&req.run_dir) {
+        return ProveOutcome::Blocked {
+            reason: e.to_string(),
+        };
+    }
     let nonce = match platform::random_nonce() {
         Ok(n) => n,
         Err(e) => {
@@ -1346,7 +1361,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         .filter(|p| p.exists())
         .collect();
     // A run directory under a readable root would make the workspace, the
-    // config and both sweep markers readable to every sandbox.
+    // config readable to every sandbox.
     if let Some(root) = overlapping_root(&run_dir, &readonly) {
         return blocked(format!(
             "the proof directory {} overlaps the readable toolchain root {}; put OMGS_HOME or --run elsewhere",
@@ -1384,27 +1399,20 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         Err(e) => return blocked(format!("cannot hash the staged MXC executor: {e}")),
     }
 
-    let markers = if os == "macos" {
-        let dir = run_dir.join("markers");
-        let m = supervise::SweepMarkers {
-            allowed: dir.join("allowed"),
-            denied: dir.join("denied"),
-        };
-        let made = std::fs::create_dir_all(&dir)
-            .and_then(|_| std::fs::write(&m.allowed, b"omgs"))
-            .and_then(|_| std::fs::write(&m.denied, b"omgs"));
-        if let Err(e) = made {
-            return blocked(format!("cannot create survivor markers: {e}"));
+    #[cfg(target_os = "macos")]
+    for path in [&run_dir].into_iter().chain(readonly.iter()) {
+        if let Err(e) = crate::tcc::admit_path(path) {
+            return blocked(e.to_string());
         }
-        Some(m)
-    } else {
-        None
-    };
-
-    // The sweep tells this run's processes apart by a read the policy allows
-    // (allowed marker) next to one it denies; deny it explicitly so no
-    // readable root can ever grant it.
-    let denied: Vec<PathBuf> = markers.iter().map(|m| m.denied.clone()).collect();
+    }
+    let ownership = (os == "macos").then(|| supervise::MacOwnership {
+        grants: readonly
+            .iter()
+            .cloned()
+            .chain([workspace.clone(), scratch.clone()])
+            .collect(),
+    });
+    let denied = Vec::new();
     let StagedWorkspace {
         digest: target_sha256,
         rust,
@@ -1420,7 +1428,6 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
                 .into_iter()
                 .chain(readonly.iter())
                 .cloned()
-                .chain(markers.iter().map(|m| m.allowed.clone()))
                 .collect();
             supervise::validate_capture_grants(&root, &grants)
         });
@@ -1437,7 +1444,6 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         timeout_ms: req.timeout_ms,
         workspace: &workspace,
         scratch: &scratch,
-        allowed_marker: markers.as_ref().map(|m| m.allowed.as_path()),
         readonly,
         denied,
         rust,
@@ -1468,6 +1474,10 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     }
     let (config_text, mut run) = loop {
         let config = mxc_config(&input);
+        #[cfg(target_os = "macos")]
+        if let Err(error) = crate::tcc::admit_config(&config) {
+            return blocked(error.to_string());
+        }
         let config_text = serde_json::to_string_pretty(&config).unwrap_or_default();
         let config_path = run_dir.join("mxc-config.json");
         if let Err(e) = crate::runmeta::write_atomic_bytes(&config_path, config_text.as_bytes()) {
@@ -1509,7 +1519,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         let run = supervise::run_contracted(
             cmd,
             &limits,
-            markers.as_ref(),
+            ownership.as_ref(),
             &nonce,
             req.expect_marker.as_deref(),
         );
@@ -1574,7 +1584,19 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             .push("named proof test readability was not established inside the sandbox".into());
     }
     let (mut enforced, mut gaps) = declared_controls(os, req.tier);
-    enforced.extend(run.enforced.iter().cloned());
+    enforced.retain(|control| {
+        !matches!(
+            control.as_str(),
+            "launchd_resource_coalition" | "launchd_tcc_path_admission"
+        ) || run.enforced.contains(control)
+    });
+    enforced.extend(
+        run.enforced
+            .iter()
+            .filter(|c| !enforced.contains(c))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
     gaps.extend(extra_gaps);
     for note in &run.notes {
         if note.starts_with("Windows executor shutdown:") {
@@ -1588,11 +1610,6 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     let _ = std::fs::remove_dir_all(&workspace);
     let _ = std::fs::remove_dir_all(&scratch);
     let _ = std::fs::remove_dir_all(&exec_dir);
-    if let Some(m) = &markers {
-        if let Some(dir) = m.allowed.parent() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
     cleanup.armed = false;
     ProveOutcome::Ran(Box::new(ProveResult {
         executor: located.path,
@@ -1782,9 +1799,8 @@ mod tests {
                         timeout_ms: req.timeout_ms,
                         workspace: &workspace,
                         scratch: &scratch,
-                        allowed_marker: Some(&proof_dir.join("markers/allowed")),
                         readonly: readonly.clone(),
-                        denied: vec![proof_dir.join("markers/denied")],
+                        denied: vec![],
                         rust: staged.rust,
                         list_parents: false,
                     },
@@ -1881,7 +1897,6 @@ mod tests {
             timeout_ms: 1000,
             workspace: Path::new("/tmp/workspace"),
             scratch: Path::new("/tmp/scratch"),
-            allowed_marker: None,
             readonly: vec![PathBuf::from("/usr/include")],
             denied: vec![],
             rust: None,
@@ -1958,7 +1973,6 @@ mod tests {
                     timeout_ms: 1000,
                     workspace: Path::new("/run/workspace"),
                     scratch: Path::new("/run/scratch"),
-                    allowed_marker: None,
                     readonly: vec![],
                     denied: vec![],
                     rust: Some(RustHomes {
@@ -2326,6 +2340,8 @@ mod tests {
         assert!(overlapping_root(Path::new("/opt/x"), &roots).is_some());
         assert!(overlapping_root(Path::new("/home/u"), &roots).is_some());
         assert!(overlapping_root(Path::new("/home/u/.local/share/omgs/run"), &roots).is_none());
+        #[cfg(target_os = "macos")]
+        assert!(overlapping_root(Path::new("/system/volumes/data/OPT/x"), &roots).is_some());
     }
 
     #[test]

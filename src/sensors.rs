@@ -742,4 +742,66 @@ mod offline_tests {
         assert!(!markdown.contains(['\r', '\u{1b}']));
         assert!(!markdown.contains("new\nline"));
     }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_result_transport_preserves_sensor_capture_caps() {
+        use crate::supervise::{run, MacOwnership};
+        use std::process::Command;
+        let dir = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-result-output-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&dir).unwrap();
+        let payload = dir.join("payload");
+        let command = || {
+            let mut cmd = Command::new("/bin/cat");
+            cmd.arg(&payload).env_clear().current_dir(&dir);
+            cmd
+        };
+        // Use the owning sensor policy, including its unchanged deadline.
+        let limits = sensor_limits();
+        let cap = limits.output_cap_bytes;
+        for count in [1024 * 1024, cap - 1, cap, cap + 1] {
+            // ASCII, JSON's worst-case control escaping, and lossy UTF-8.
+            for byte in [b'A', 0, 255] {
+                std::fs::write(&payload, vec![byte; count]).unwrap();
+                let direct = run(command(), &limits, None);
+                let owned = run(command(), &limits, Some(&MacOwnership::default()));
+                assert!(
+                    direct.success && owned.success,
+                    "cap={cap}, count={count}, byte={byte}; direct exit={:?}, timeout={}, capture={}, cleanup={}, notes={:?}; launchd exit={:?}, timeout={}, capture={}, cleanup={}, notes={:?}",
+                    direct.exit_code, direct.timed_out, direct.capture_complete, direct.cleanup_complete, direct.notes,
+                    owned.exit_code, owned.timed_out, owned.capture_complete, owned.cleanup_complete, owned.notes
+                );
+                if cap == 4 * 1024 * 1024 && count == 1024 * 1024 && byte == b'A' {
+                    assert!(serde_json::to_vec(&owned).unwrap().len() > 4 * 1024 * 1024);
+                }
+                assert_eq!(owned.output_bytes_total, count as u64);
+                assert_eq!(owned.stdout_bytes, vec![byte; cap.min(count)]);
+                let mut expected = serde_json::to_value(&direct).unwrap();
+                let mut actual = serde_json::to_value(&owned).unwrap();
+                for value in [&mut expected, &mut actual] {
+                    let object = value.as_object_mut().unwrap();
+                    object.remove("duration_ms");
+                    object.remove("enforced");
+                }
+                assert!(
+                    actual == expected,
+                    "output or status changed: cap={cap}, count={count}, byte={byte}"
+                );
+                assert!(owned.cleanup_complete && owned.capture_complete);
+                assert!(direct
+                    .enforced
+                    .iter()
+                    .all(|control| owned.enforced.contains(control)));
+                assert!(owned
+                    .enforced
+                    .contains(&"launchd_resource_coalition".into()));
+                assert!(owned
+                    .enforced
+                    .contains(&"launchd_tcc_path_admission".into()));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

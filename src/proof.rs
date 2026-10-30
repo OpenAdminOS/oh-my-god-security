@@ -651,8 +651,6 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
     let dir = recorded_dir;
     let workspace = format!("{dir}/workspace");
     let scratch = format!("{dir}/scratch");
-    let allowed = format!("{dir}/markers/allowed");
-    let denied = format!("{dir}/markers/denied");
     let roots: Vec<String> = record.readable_roots.iter().map(|p| norm(p)).collect();
     let static_roots: Vec<String> = crate::sandbox::toolchain_roots(os, None)
         .iter()
@@ -686,25 +684,16 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
         paths.iter().any(|p| {
             p.as_str().is_none_or(|p| {
                 let p = norm(p);
-                !(roots.contains(&p) || os == "macos" && p == allowed)
+                !roots.contains(&p)
             })
         })
     }) {
-        errors.push("MXC config readonlyPaths must be limited to toolchain roots and this proof's allowed marker".into());
-    }
-    if os == "macos"
-        && readonly.is_none_or(|paths| {
-            !paths
-                .iter()
-                .any(|p| p.as_str().map(norm).as_ref() == Some(&allowed))
-        })
-    {
-        errors.push("MXC config readonlyPaths must include this proof's allowed marker".into());
+        errors.push("MXC config readonlyPaths must be limited to toolchain roots".into());
     }
     let denied_paths = config
         .pointer("/filesystem/deniedPaths")
         .and_then(|v| v.as_array());
-    let expected_denied = if os == "macos" { vec![denied] } else { vec![] };
+    let expected_denied: Vec<String> = vec![];
     if denied_paths.is_none_or(|paths| {
         paths
             .iter()
@@ -713,7 +702,7 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
             .as_ref()
             != Some(&expected_denied)
     }) {
-        errors.push("MXC config deniedPaths must match this proof's denied marker policy".into());
+        errors.push("MXC config deniedPaths must match the empty denied-path policy".into());
     }
     let path_at = |suffix: &str| {
         let separator = if os == "windows" { "\\" } else { "/" };
@@ -725,7 +714,6 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
     };
     let readonly: Vec<PathBuf> = record.readable_roots.iter().map(PathBuf::from).collect();
     let rust = crate::sandbox::select_rust_homes(os, &readonly, &path_at("scratch/cargo-home"));
-    let allowed_path = path_at("markers/allowed");
     let expected = crate::sandbox::mxc_config_at(
         &crate::sandbox::ConfigInput {
             os,
@@ -738,13 +726,8 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
             timeout_ms: record.timeout_ms,
             workspace: &path_at("workspace"),
             scratch: &path_at("scratch"),
-            allowed_marker: (os == "macos").then_some(allowed_path.as_path()),
             readonly,
-            denied: if os == "macos" {
-                vec![path_at("markers/denied")]
-            } else {
-                vec![]
-            },
+            denied: vec![],
             rust,
             list_parents: config.pointer("/processContainer/filesystem").is_some(),
         },

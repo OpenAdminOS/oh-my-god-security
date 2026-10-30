@@ -1,12 +1,6 @@
 use omgs::supervise::{run, Limits};
 use std::process::Command;
 
-// A successful global survivor scan requires a quiescent process population.
-// Keep the single real sweep fixture apart from deliberate spawn stress in
-// sibling tests. Internal concurrency and all sweep assertions stay intact.
-#[cfg(target_os = "macos")]
-static PROCESS_ACTIVITY: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
 fn limits() -> Limits {
     Limits {
         wall_ms: 5000,
@@ -21,8 +15,6 @@ fn limits() -> Limits {
 
 #[test]
 fn spawn_failure_is_reported() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let result = run(Command::new("/omgs/nonexistent/executor"), &limits(), None);
     assert!(!result.success);
     assert!(!result.capture_complete);
@@ -35,7 +27,8 @@ fn spawn_failure_is_reported() {
 fn shell(script: &str) -> Command {
     let mut cmd = Command::new("/bin/sh");
     cmd.env_clear().env("PATH", "/usr/bin:/bin");
-    cmd.args(["-c", script]);
+    cmd.args(["-c", script])
+        .current_dir(omgs::platform::temp_root().unwrap());
     cmd
 }
 
@@ -70,8 +63,6 @@ fn output_pid(result: &omgs::supervise::Supervised) -> i32 {
 #[cfg(unix)]
 #[test]
 fn rlimits_are_inherited() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut limits = limits();
     limits.open_files = Some(64);
     limits.file_size_bytes = Some(1024 * 1024);
@@ -95,8 +86,6 @@ fn rlimits_are_inherited() {
 #[cfg(unix)]
 #[test]
 fn invalid_rlimit_fails_without_panicking() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut limits = limits();
     limits.open_files = Some(u64::MAX);
     let result = run(shell("exit 0"), &limits, None);
@@ -107,8 +96,6 @@ fn invalid_rlimit_fails_without_panicking() {
 #[cfg(unix)]
 #[test]
 fn timeout_kills_background_tree() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut limits = limits();
     limits.wall_ms = 500;
     let result = run(shell("sleep 30 & echo $!; wait"), &limits, None);
@@ -123,8 +110,6 @@ fn timeout_kills_background_tree() {
 #[cfg(unix)]
 #[test]
 fn normal_exit_kills_background_tree_before_reaping_leader() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let result = run(shell("sleep 30 & echo $!; exit 0"), &limits(), None);
     assert!(result.success, "{result:?}");
     assert_eq!(result.exit_code, Some(0));
@@ -135,8 +120,6 @@ fn normal_exit_kills_background_tree_before_reaping_leader() {
 #[cfg(unix)]
 #[test]
 fn output_is_capped_and_all_bytes_are_counted() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut limits = limits();
     limits.output_cap_bytes = 37;
     let result = run(
@@ -152,8 +135,6 @@ fn output_is_capped_and_all_bytes_are_counted() {
 #[cfg(unix)]
 #[test]
 fn zero_cap_still_drains_and_counts() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut limits = limits();
     limits.output_cap_bytes = 0;
     let result = run(shell("printf output; printf error >&2"), &limits, None);
@@ -165,8 +146,6 @@ fn zero_cap_still_drains_and_counts() {
 #[cfg(unix)]
 #[test]
 fn stdout_precedes_stderr() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let result = run(shell("printf error >&2; printf output"), &limits(), None);
     assert!(result.success, "{result:?}");
     assert_eq!(result.output, "outputerror");
@@ -175,8 +154,6 @@ fn stdout_precedes_stderr() {
 #[cfg(unix)]
 #[test]
 fn nonzero_exit_is_preserved() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let result = run(shell("exit 7"), &limits(), None);
     assert_eq!(result.exit_code, Some(7));
     assert!(!result.success);
@@ -186,9 +163,7 @@ fn nonzero_exit_is_preserved() {
 #[cfg(target_os = "macos")]
 #[test]
 fn sweep_kills_detached_sandbox_process_and_spares_unrelated_process() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.write().unwrap_or_else(|e| e.into_inner());
-    use omgs::supervise::SweepMarkers;
+    use omgs::supervise::MacOwnership;
     use std::process::Child;
 
     struct Unrelated(Child);
@@ -215,14 +190,9 @@ fn sweep_kills_detached_sandbox_process_and_spares_unrelated_process() {
     let path = std::env::temp_dir().join(format!("omgs-supervise-{}", std::process::id()));
     std::fs::create_dir_all(&path).unwrap();
     let path = path.canonicalize().unwrap();
-    let markers = SweepMarkers {
-        allowed: path.join("allowed"),
-        denied: path.join("denied"),
-    };
-    std::fs::write(&markers.allowed, b"allowed").unwrap();
-    std::fs::write(&markers.denied, b"denied").unwrap();
-    let denied = markers
-        .denied
+    let denied = path.join("denied");
+    std::fs::write(&denied, b"denied").unwrap();
+    let denied = denied
         .to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
@@ -232,6 +202,7 @@ fn sweep_kills_detached_sandbox_process_and_spares_unrelated_process() {
     let perl_script = "$|=1; pipe(R,W) or die; my $pid=fork(); defined($pid) or die; if($pid==0){close R; defined(POSIX::setsid()) or die; print W 'x'; close W; sleep 30; POSIX::_exit(0);} close W; read(R,my $x,1); print \"$pid\\n\"; POSIX::_exit(0);";
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
     cmd.env_clear()
+        .current_dir(&path)
         .env("PATH", "/usr/bin:/bin")
         .args(["-p", &profile]);
     if let Some(interpreter) = interpreter {
@@ -239,25 +210,28 @@ fn sweep_kills_detached_sandbox_process_and_spares_unrelated_process() {
     } else {
         cmd.args([perl, "-MPOSIX", "-e", perl_script]);
     }
-    let result = run(cmd, &limits(), Some(&markers));
+    let result = run(cmd, &limits(), Some(&MacOwnership::default()));
     assert!(!result.success, "{result:?}");
     assert!(result.capture_complete, "{result:?}");
-    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.exit_code, Some(0), "{result:?}");
     let escaped = output_pid(&result);
     assert!(
         result.survivors.iter().any(|s| s.pid == escaped),
         "{result:?}"
     );
-    assert!(result.enforced.contains(&"survivor_sweep".into()));
+    assert!(result
+        .enforced
+        .contains(&"launchd_resource_coalition".into()));
     assert!(result.notes.is_empty(), "{result:?}");
     assert_gone(escaped);
     assert!(unrelated.0.try_wait().unwrap().is_none());
     assert_eq!(unsafe { libc::kill(unrelated.0.id() as i32, 0) }, 0);
     let mut clean = Command::new("/usr/bin/sandbox-exec");
     clean
+        .current_dir(&path)
         .env_clear()
         .args(["-p", &profile, "/bin/sh", "-c", "exit 0"]);
-    let clean = run(clean, &limits(), Some(&markers));
+    let clean = run(clean, &limits(), Some(&MacOwnership::default()));
     assert!(clean.success, "{clean:?}");
     assert!(clean.survivors.is_empty());
     std::fs::remove_dir_all(path).unwrap();
@@ -266,8 +240,6 @@ fn sweep_kills_detached_sandbox_process_and_spares_unrelated_process() {
 #[cfg(target_os = "macos")]
 #[test]
 fn inherited_pipe_from_detached_process_has_a_bounded_drain() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     if !std::path::Path::new("/usr/bin/perl").is_file() {
         eprintln!("skipping bounded drain test: perl is unavailable");
         return;
@@ -291,8 +263,6 @@ fn inherited_pipe_from_detached_process_has_a_bounded_drain() {
 #[cfg(target_os = "linux")]
 #[test]
 fn cgroup_limits_are_applied_or_explained_without_environment_leaks() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut limits = limits();
     limits.memory_bytes = Some(128 * 1024 * 1024);
     limits.tasks = Some(32);
@@ -315,8 +285,6 @@ fn cgroup_limits_are_applied_or_explained_without_environment_leaks() {
 
 #[test]
 fn executor_text_errors_and_outer_exit_codes_cannot_substitute_for_markers() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     use omgs::supervise::run_marked;
     let scripts = if cfg!(windows) {
         [
@@ -352,8 +320,6 @@ fn executor_text_errors_and_outer_exit_codes_cannot_substitute_for_markers() {
 #[cfg(unix)]
 #[test]
 fn timeout_words_and_signal_death_are_not_timeouts() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let nonce = "nonce";
     let cmd = shell("printf 'OMGS_START_nonce\nscript timed out after 1ms\nOMGS_END_nonce:0\n'");
     let result = omgs::supervise::run_marked(cmd, &limits(), None, nonce);
@@ -380,8 +346,6 @@ fn timeout_words_and_signal_death_are_not_timeouts() {
 #[cfg(windows)]
 #[test]
 fn windows_wall_clock_kills_executor_and_discloses_owner_job() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new("cmd.exe");
     cmd.args(["/d", "/q", "/c", "for /l %i in (1,0,2) do @rem"]);
     let mut limits = limits();
@@ -417,8 +381,6 @@ fn windows_wall_clock_kills_executor_and_discloses_owner_job() {
 #[cfg(target_os = "macos")]
 #[test]
 fn executor_does_not_inherit_another_spawns_pipe() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     // Other tests deliberately spawn children without the supervisor. Isolate
     // the intentionally inheritable descriptor so it cannot leak into them.
     if std::env::var_os("OMGS_INHERITANCE_CHILD").is_none() {
@@ -497,8 +459,6 @@ fn executor_does_not_inherit_another_spawns_pipe() {
 #[cfg(unix)]
 #[test]
 fn concurrent_short_marked_runs_complete_capture() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     std::thread::scope(|scope| {
         // Unmarked calls can spawn concurrently with marked calls even though
         // the process-wide signal guard serializes marked supervisors.
@@ -533,8 +493,6 @@ fn concurrent_short_marked_runs_complete_capture() {
 #[cfg(target_os = "macos")]
 #[test]
 fn unsupervised_spawns_do_not_delay_capture() {
-    #[cfg(target_os = "macos")]
-    let _activity = PROCESS_ACTIVITY.read().unwrap_or_else(|e| e.into_inner());
     if std::env::var_os("OMGS_CAPTURE_STRESS_CHILD").is_none() {
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
@@ -648,4 +606,114 @@ fn unsupervised_spawns_do_not_delay_capture() {
         drop(held);
         eprintln!("capture stress: all unmanaged children reaped");
     });
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn launchd_coalition_runtime_is_required_and_certifies_cleanup() {
+    let result = run(
+        shell("echo coalition-capability-ok"),
+        &limits(),
+        Some(&omgs::supervise::MacOwnership::default()),
+    );
+    assert!(
+        result.success && result.cleanup_complete && result.capture_complete,
+        "launchd domain or coalition interfaces unavailable: {result:?}"
+    );
+    assert!(result
+        .enforced
+        .contains(&"launchd_resource_coalition".into()));
+    assert!(result
+        .enforced
+        .contains(&"launchd_tcc_path_admission".into()));
+    assert!(result.survivors.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn protected_launchd_working_directory_and_environment_are_refused() {
+    use omgs::supervise::MacOwnership;
+    let protected = "/Users/omgs-tcc-refusal/Documents/input";
+    for environment in [false, true] {
+        let mut cmd = shell("echo MUST_NOT_EXECUTE");
+        if environment {
+            cmd.env("TMPDIR", protected);
+        } else {
+            cmd.current_dir(protected);
+        }
+        let result = run(cmd, &limits(), Some(&MacOwnership::default()));
+        assert!(
+            !result.success && !result.command_started && !result.cleanup_complete,
+            "{result:?}"
+        );
+        assert!(result.enforced.is_empty(), "{result:?}");
+        assert!(
+            result.output.contains(protected) && result.output.contains("TCC consent"),
+            "{result:?}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn launchd_result_transport_preserves_output_at_capture_caps() {
+    use omgs::supervise::MacOwnership;
+    let dir = omgs::platform::temp_root().unwrap().join(format!(
+        "omgs-result-output-{}",
+        omgs::platform::random_nonce().unwrap()
+    ));
+    omgs::platform::create_private_dir_new(&dir).unwrap();
+    let payload = dir.join("payload");
+    let command = || {
+        let mut cmd = Command::new("/bin/cat");
+        cmd.arg(&payload).env_clear().current_dir(&dir);
+        cmd
+    };
+    // Supervisor default and proof caps, plus zero/tiny capture.
+    for cap in [0usize, 37, 65536, 256 * 1024] {
+        let mut limits = limits();
+        limits.output_cap_bytes = cap;
+        let mut counts = vec![cap.saturating_sub(1), cap, cap + 1];
+        counts.sort_unstable();
+        counts.dedup();
+        for count in counts {
+            // ASCII, JSON's worst-case control escaping, and lossy UTF-8.
+            for byte in [b'A', 0, 255] {
+                std::fs::write(&payload, vec![byte; count]).unwrap();
+                let direct = run(command(), &limits, None);
+                let owned = run(command(), &limits, Some(&MacOwnership::default()));
+                assert!(
+                    direct.success && owned.success,
+                    "cap={cap}, count={count}, byte={byte}; direct exit={:?}, timeout={}, capture={}, cleanup={}, notes={:?}; launchd exit={:?}, timeout={}, capture={}, cleanup={}, notes={:?}",
+                    direct.exit_code, direct.timed_out, direct.capture_complete, direct.cleanup_complete, direct.notes,
+                    owned.exit_code, owned.timed_out, owned.capture_complete, owned.cleanup_complete, owned.notes
+                );
+                assert_eq!(owned.output_bytes_total, count as u64);
+                assert_eq!(owned.stdout_bytes, vec![byte; cap.min(count)]);
+                let mut expected = serde_json::to_value(&direct).unwrap();
+                let mut actual = serde_json::to_value(&owned).unwrap();
+                for value in [&mut expected, &mut actual] {
+                    let object = value.as_object_mut().unwrap();
+                    object.remove("duration_ms");
+                    object.remove("enforced");
+                }
+                assert!(
+                    actual == expected,
+                    "output or status changed: cap={cap}, count={count}, byte={byte}"
+                );
+                assert!(owned.cleanup_complete && owned.capture_complete);
+                assert!(direct
+                    .enforced
+                    .iter()
+                    .all(|control| owned.enforced.contains(control)));
+                assert!(owned
+                    .enforced
+                    .contains(&"launchd_resource_coalition".into()));
+                assert!(owned
+                    .enforced
+                    .contains(&"launchd_tcc_path_admission".into()));
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -78,6 +78,9 @@ jobs:
           if [[ "$RUNNER_OS" == Windows ]]; then
             "$OMGS_MXC_EXEC" --probe || echo "MXC probe returned nonzero; doctor and tests validate the response"
           fi
+      - name: Require launchd coalition ownership on macOS
+        if: runner.os == 'macOS'
+        run: cargo test --locked --test supervise launchd_coalition_runtime_is_required_and_certifies_cleanup -- --exact
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -150,6 +153,8 @@ jobs:
           echo "$MXC_EXEC_SHA256  $exe" | shasum -a 256 -c -
           chmod +x "$exe"
           echo "OMGS_MXC_EXEC=$exe" >> "$GITHUB_ENV"
+      - name: Require usable launchd domain and coalition interfaces
+        run: cargo test --locked --test supervise launchd_coalition_runtime_is_required_and_certifies_cleanup -- --exact
       - name: Repeat sandbox and supervisor isolation tests
         env:
           TEST_THREADS: ${{ matrix.threads }}

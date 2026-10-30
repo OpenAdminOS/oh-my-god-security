@@ -169,18 +169,9 @@ fn run_in_scratch(
         std::fs::write(path, script).map_err(|_| "cannot prepare redirected sensor temp")?;
     }
     let wrapped = wrapped_command(os, &command, nonce, None);
-    let markers = if os == "macos" {
-        let markers = supervise::SweepMarkers {
-            allowed: root.join("allowed"),
-            denied: root.join("denied"),
-        };
-        std::fs::write(&markers.allowed, "omgs")
-            .and_then(|_| std::fs::write(&markers.denied, "omgs"))
-            .map_err(|_| "cannot create sensor sweep markers")?;
-        Some(markers)
-    } else {
-        None
-    };
+    let ownership = (os == "macos").then(|| supervise::MacOwnership {
+        grants: readonly.iter().cloned().chain([work.clone()]).collect(),
+    });
     let input = ConfigInput {
         contract: None,
         os,
@@ -189,9 +180,8 @@ fn run_in_scratch(
         timeout_ms: req.limits.wall_ms,
         workspace: &work,
         scratch: &work,
-        allowed_marker: markers.as_ref().map(|m| m.allowed.as_path()),
         readonly,
-        denied: markers.iter().map(|m| m.denied.clone()).collect(),
+        denied: Vec::new(),
         rust: None,
         list_parents,
     };
@@ -201,6 +191,8 @@ fn run_in_scratch(
     config["filesystem"]["readwritePaths"] = serde_json::json!([mxc_path(&work)]);
     let env = config["process"]["env"].as_array_mut().unwrap();
     env.extend(req.env.into_iter().map(serde_json::Value::String));
+    #[cfg(target_os = "macos")]
+    crate::tcc::admit_config(&config).map_err(|e| e.to_string())?;
     let path = root.join("mxc-config.json");
     std::fs::write(&path, serde_json::to_vec(&config).unwrap())
         .map_err(|_| "cannot write sensor config")?;
@@ -228,7 +220,7 @@ fn run_in_scratch(
     );
     #[allow(unused_mut)]
     let mut run =
-        supervise::run_monitored(cmd, &limits, markers.as_ref(), nonce, &usage.cancellation);
+        supervise::run_monitored(cmd, &limits, ownership.as_ref(), nonce, &usage.cancellation);
     #[cfg(windows)]
     acl.verify(&mut run);
     if let Err(reason) = usage.finish() {

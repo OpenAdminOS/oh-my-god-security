@@ -59,7 +59,7 @@ Target controlled code, including builds, tests and the running app at level 2, 
 
 Declared minimum set per OS (amended on 2026-10-27, replacing the rule that every control above must hold everywhere, because no OS sandbox offers all of them). Below this set OMGS refuses to run target code:
 
-- macOS (Apple Silicon): MXC deny-by-default filesystem with the target copied into a per-run workspace, external network denied, environment cleared to an allowlist, CPU time, file size and open file limits, a wall clock with the whole process group killed, and a survivor sweep that finds and kills sandboxed processes which left the group and fails the run. Intel Macs have no MXC executor, so `omgs prove` refuses there.
+- macOS (Apple Silicon): MXC deny-by-default filesystem with the target copied into a per-run workspace, external network denied, environment cleared to an allowlist, CPU time, file size and open file limits, a wall clock with the whole process group killed, and dedicated launchd resource coalition ownership that certifies cleanup, records and kills escaped descendants and fails the run when survivors existed. Intel Macs have no MXC executor, so `omgs prove` refuses there.
 - Linux: MXC deny-by-default filesystem with a per-run workspace copy, external network denied, environment cleared to an allowlist, CPU time, file size and open file limits, process group cleanup on wall-clock expiry, and PID namespace teardown for descendants, including detached sessions. There is no macOS survivor sweep on Linux. Memory and task limits also apply through a systemd user scope where one exists.
 - Windows: only a supported, consistent MXC probe tier with `needsDaclAugmentation=false` may run proofs. Windows 11 builds reporting no augmentation remain supported. The observed `appcontainer-dacl` tier on windows-2025 is refused by `prove` and `doctor --live` with exit 3, before proof staging or any config-bearing MXC invocation, including a dry run. The message names the tier, explains that MXC 1.0.1 leaves changed ACEs on granted folders even after a successful run, and identifies the supported Windows 11 case. CI run 40663981530 observed this drift after a successful dry run on workspace, scratch and several toolchain roots. The owner decided that OMGS never writes host ACLs. Exact DACL restoration, administrator preparation and automatic ACL repair are not part of OMGS.
 
@@ -266,3 +266,97 @@ fails closed. This polling fallback can overshoot between samples and cannot
 detect a file created and deleted entirely between samples; it is not a hard
 quota. Crash recovery bounds accumulation of eligible abandoned payloads on
 the next invocation, rather than imposing a global concurrent-run quota.
+
+## macOS parallel proof ownership (0.1)
+
+Independent proofs must remain parallel. The former same-uid sandbox-policy
+marker sweep was conservative but unrelated processes that vanished before
+inspection made cleanup inconclusive. The recorded reproduction failed seven
+of ten concurrent pairs. Accepting a later clean scan is unsound: A can fork B
+and exit before inspection, B can fork C after the next enumeration and exit,
+and C can survive without appearing in either scan.
+
+Each workload now has a unique one-shot launchd job and a trusted anchor made
+from a private copy of the running executable, verified by SHA-256. No KeepAlive,
+RunAtLoad, restart or demand trigger is enabled. An explicit kickstart creates
+an isolated resource coalition. Before granting execution, both ends check
+exclusive anchor membership and a coalition different from the parent's.
+The anchor probes the private interfaces with a trusted child, checking inherited
+membership, start and exit accounting, enumeration and correct and incorrect PID-version signals.
+Only then may the pinned executor start target code with the existing controls.
+After the executor is waited for, the anchor is sealed and never spawns again.
+
+Only `tasks_started - tasks_exited == 1` while the sealed anchor remains alive
+certifies cleanup. Enumeration is for locating tasks, never for proving absence.
+The fork then exit counterexample leaves the count above one while any member
+can still execute or fork. Double forks, new sessions and posix_spawn preserve
+resource coalition membership. Signals use proc_signal_with_audittoken and
+pidversion, with identity checks surrounding membership lookup. Reused PIDs
+cannot redirect a signal to another proof or an unrelated process. Survivors
+remain recorded and fail the proof even after successful cleanup. Count-only
+activity that disappears before identification is conservatively unclean.
+Scan work and cleanup time remain bounded; unresolved owned activity fails closed.
+
+The private, long-standing PROC_PIDCOALITIONINFO and libSystem coalition and
+signal interfaces are runtime requirements, not stable public API promises.
+Symbols are resolved dynamically. If the coalition-list symbol is absent,
+process enumeration supplies candidates filtered by PROC_PIDCOALITIONINFO;
+identity is still bracketed before signalling, and the same task-count certificate
+is mandatory. This is a membership-query compatibility path, not a policy sweep.
+Unexpected layouts, unavailable required operations,
+failed accounting or launchd submission block execution or certification. There
+is no conservative-sweep fallback, since it would restore cross-run interference.
+Proof records require `launchd_resource_coalition`; old marker-based records are
+rejected for rerun. Linux and Windows ownership semantics do not change.
+The macOS CI job explicitly exercises admission and certification on macos-15
+arm64. A runner without a usable user-owned launchd domain must fail that step.
+
+IPC, the plist and the staged anchor live under admitted owner-private
+`OMGS_HOME/launchd/<nonce>` storage, outside all grants. The invoking process
+copies and SHA-256 verifies the executable before launchd starts it. Random
+labels, exclusive creation, no-follow reads and the saved launchd domain prevent
+accidental collisions. Anonymous capture pipes remain under OS-selected Darwin
+private temp storage; both locations are checked against grants. Private IPC
+storage also refuses baseline-readable system trees, including /System, /Library,
+/usr and /opt, even when an owner prepared a private directory there.
+
+macOS uses public CommonCrypto SHA-256 for content verification. Repeated full
+binary verification otherwise consumes the startup budget in unoptimized builds
+when many proofs prepare at once. Known vectors and comparisons with the portable
+implementation cover streaming and padding boundaries. Linux and Windows retain
+the in-tree implementation. Verification and fixture deadlines do not increase.
+
+Launchd owns the TCC responsible identity of its processes. It does not inherit
+the invoking terminal's Desktop access. To prevent repeated Files and Folders
+prompts after ad hoc rebuilds, nothing on the launchd side may require protected
+storage. Admission checks the binary, arguments that are absolute paths, working
+directory, environment path values, workspace, scratch and readable grants.
+Desktop, Documents, Downloads, user Library, cloud storage and media folders are
+refused, including case aliases, resolved links and Data-volume path aliases. Parent
+traversal is refused before filesystem inspection. Volume metadata
+must establish local, internal, non-removable storage. External, removable and
+network volumes are refused even when mounted at unusual paths. An unknown
+volume property fails closed. Broad grants encompassing protected folders are
+also refused. The diagnostic names the path and directs the operator to move the
+run/tool or set an unprotected OMGS_HOME. The terminal-side parent may copy a
+protected target into unprotected staging using its existing access; a failed
+copy blocks execution. No privacy permissions are requested or changed.
+`launchd_tcc_path_admission` is required alongside coalition ownership in proof
+validation. Tests use unprotected temp and data paths and assert that protected
+storage is refused before launchd submission.
+
+There is no stronger claim against a same-user process with arbitrary file
+access: it can replace the executable, private state or all local proof records.
+Sandboxed target code has no grant to these files or launchd service endpoints.
+
+The owner holds a per-job advisory lock. An anchor monitors loss of that lock or
+explicit cancellation while supervising the executor. A killed owner therefore
+causes cleanup without waiting for another invocation. The next proof or sensor invocation locks
+and recovers abandoned registry entries, terminates remaining coalition members
+with version-bound signals, removes the job and retains state on failure.
+Registry recovery and publication are serialized briefly; proof execution is not.
+Normal completion waits for the anchor to leave, removes the job, verifies it is
+absent and deletes private staging. Interruption follows the same cleanup path.
+An absent resource coalition after anchor exit is acceptable only for teardown:
+Darwin cannot reap a resource coalition while it still contains tasks. It never
+substitutes for the live sealed-anchor certificate used by a clean proof.

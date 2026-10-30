@@ -101,11 +101,28 @@ ProcessContainer only when its probe reports no DACL augmentation.
 
 Unix adds CPU, open-file and per-file size limits. Linux tears down descendants
 through a PID namespace and applies memory/task limits when a systemd user scope
-is available. macOS sweeps for escaped process-group survivors. Windows uses an
-owned kill-on-close job and a bounded cleanup grace period. Every OS has a wall
+is available. macOS certifies cleanup through a dedicated launchd resource
+coalition. Windows uses an owned kill-on-close job and a bounded cleanup grace period. Every OS has a wall
 clock. [Platform support](https://learn.microsoft.com/en-us/windows/apps/develop/mxc/platform-support)
 and `omgs doctor` explain what is enforceable on the current host. Missing controls
 block execution and leave the finding pending.
+
+On macOS launchd starts a SHA-256-verified private copy of the trusted anchor
+under `OMGS_HOME/launchd` (default `~/.local/share/omgs`), with an unprotected
+working directory. After the executor exits, the anchor stops spawning and only
+`tasks_started - tasks_exited == 1` certifies cleanup. Escaped survivors are
+recorded, killed with PID-version-bound signals and fail the proof. Independent
+proofs stay parallel in separate coalitions. Unavailable launchd domains or
+required private interfaces cause a clear refusal.
+
+Launchd does not inherit the terminal's Files and Folders access. OMGS checks
+workspace, scratch, job storage, executor and environment paths before launch,
+and refuses protected folders, cloud storage and external or network volumes
+with the offending path and a fix. The invoking process may stage a protected
+target into an unprotected workspace. Launchd never reads that source or the
+original binary, so Desktop builds do not request Files and Folders consent.
+See [macOS ownership and storage](docs/internals.md#macos-proof-ownership-and-storage)
+for admission, cleanup, recovery and proof-record requirements.
 
 Target code executes only as a sandboxed proof workload. Hunters and verifiers read
 code and write proof tests on the host, but never execute target code there.
