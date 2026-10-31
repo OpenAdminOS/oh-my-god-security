@@ -15,7 +15,7 @@ const MAX_ENTRIES: usize = 4096;
 const MAX_NOTES: usize = 16;
 const NOTE_BYTES: usize = 200;
 /// Longest a single capture may run before the helper stops the browser.
-pub const CAPTURE_SECONDS: u32 = 20;
+pub const CAPTURE_SECONDS: u32 = 30;
 /// Why Windows records a screenshot blocker instead of running a browser.
 pub const WINDOWS_UNBOUNDED: &str = "screenshots are unavailable on Windows: the capture helper cannot stop a stalled browser and its children there, so a capture could change the proof's outcome";
 /// Directory name under the sandbox scratch and under the proof directory.
@@ -289,7 +289,7 @@ fn flags(os: &str) -> Vec<String> {
         "--no-default-browser-check",
         "--hide-scrollbars",
         // Chrome stops waiting for the page before the helper's watchdog.
-        "--timeout=15000",
+        "--timeout=25000",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -334,8 +334,15 @@ pub fn helper(os: &str, browser: &Path, scratch: &Path) -> Result<(String, Strin
     } else {
         ("set -m\n", "")
     };
+    // Inside the sandbox there is no session bus; telling Chrome so up front
+    // avoids slow D-Bus connection retries during startup on Linux.
+    let dbus = if os == "linux" {
+        "DBUS_SESSION_BUS_ADDRESS=disabled: "
+    } else {
+        ""
+    };
     let text = format!(
-        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 0;; esac\nmkdir -p {tmp} && cd {tmp} || exit 0\n{monitor}TMPDIR=. {launch}{} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\" &\nbrowser=$!\n(i=0; while kill -0 \"$browser\" 2>/dev/null; do if [ \"$i\" -ge {CAPTURE_SECONDS} ]; then kill -9 -\"$browser\" 2>/dev/null || kill -9 \"$browser\" 2>/dev/null; mkdir {out}/\"$1\".timeout 2>/dev/null; break; fi; sleep 1; i=$((i + 1)); done) &\nwatchdog=$!\nwait \"$browser\"\nstatus=$?\nwait \"$watchdog\"\nkill -9 -\"$browser\" 2>/dev/null\n[ -e {out}/\"$1\".timeout ] || [ \"$status\" -eq 0 ] || mkdir {out}/\"$1\".failed-\"$status\" 2>/dev/null\nexit 0\n",
+        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 0;; esac\nmkdir -p {tmp} && cd {tmp} || exit 0\n{monitor}{dbus}TMPDIR=. {launch}{} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\" &\nbrowser=$!\n(i=0; while kill -0 \"$browser\" 2>/dev/null; do if [ \"$i\" -ge {CAPTURE_SECONDS} ]; then kill -9 -\"$browser\" 2>/dev/null || kill -9 \"$browser\" 2>/dev/null; mkdir {out}/\"$1\".timeout 2>/dev/null; break; fi; sleep 1; i=$((i + 1)); done) &\nwatchdog=$!\nwait \"$browser\"\nstatus=$?\nwait \"$watchdog\"\nkill -9 -\"$browser\" 2>/dev/null\n[ -e {out}/\"$1\".timeout ] || [ \"$status\" -eq 0 ] || mkdir {out}/\"$1\".failed-\"$status\" 2>/dev/null\nexit 0\n",
         quoted(browser)?,
         flags(os).join(" "),
         quoted(&profile)?,
@@ -721,7 +728,7 @@ mod tests {
         let (name, text) =
             helper("linux", Path::new("/opt/c/chrome"), Path::new("/r/scratch")).unwrap();
         assert_eq!(name, "omgs-screenshot");
-        assert!(text.contains("mkdir -p '/r/scratch/browser-tmp' && cd '/r/scratch/browser-tmp' || exit 0\nTMPDIR=. setsid '/opt/c/chrome' --headless"));
+        assert!(text.contains("mkdir -p '/r/scratch/browser-tmp' && cd '/r/scratch/browser-tmp' || exit 0\nDBUS_SESSION_BUS_ADDRESS=disabled: TMPDIR=. setsid '/opt/c/chrome' --headless"));
         assert!(text.contains("kill -9 -\"$browser\" 2>/dev/null || kill -9 \"$browser\""));
         assert!(text.contains("wait \"$watchdog\"\nkill -9 -\"$browser\" 2>/dev/null\n"));
         assert!(text.contains("--window-size=800,600"));
@@ -782,7 +789,7 @@ mod tests {
         let joined = skipped.join("\n");
         for needle in [
             "broken: the browser exited with status 133",
-            "slow: capture timed out after 20 s",
+            "slow: capture timed out after 30 s",
             "b.png: 900x600",
             "bad name.png: name",
             "c.txt: name",

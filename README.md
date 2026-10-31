@@ -256,9 +256,9 @@ browser already on the machine renders the page inside the same MXC sandbox at a
 into the proof record, and REPORT.html embeds verified copies inline. `validate` and
 replay fail when a kept file changes. The helper always exits 0, so a failed capture
 never changes the proof's outcome; the record names the browser's exit status instead.
-Chrome stops waiting for the page after 15 seconds, and the helper stops the browser's
-whole process group if it is still running after 20 seconds and records the timeout.
-Allow for 20 seconds per capture in `--timeout-ms`. A child that detaches from that
+Chrome stops waiting for the page after 25 seconds, and the helper stops the browser's
+whole process group if it is still running after 30 seconds and records the timeout.
+Allow for 30 seconds per capture in `--timeout-ms`. A child that detaches from that
 group and outlives the proof is a survivor like any other and makes the proof unclean.
 Screenshots must show dummy data only and never replace the failing test.
 
