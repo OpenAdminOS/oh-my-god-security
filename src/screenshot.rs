@@ -10,6 +10,8 @@ pub const WIDTH: u32 = 800;
 pub const HEIGHT: u32 = 600;
 pub const MAX_FILES: usize = 4;
 pub const MAX_BYTES: u64 = 512 * 1024;
+/// Longest a single capture may run before the helper stops the browser.
+pub const CAPTURE_SECONDS: u32 = 20;
 /// Directory name under the sandbox scratch and under the proof directory.
 pub const DIR: &str = "screenshots";
 /// Environment variable naming the capture helper inside the sandbox.
@@ -86,6 +88,7 @@ pub fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
     let mut at = 8;
     let mut dimensions = None;
     let mut color = 0u8;
+    let mut depth = 0u8;
     let mut palette = false;
     let mut image_data = false;
     let mut image_data_ended = false;
@@ -112,7 +115,7 @@ pub fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
         match (dimensions.is_none(), kind) {
             (true, b"IHDR") if length == 13 => {
                 let (width, height) = (word(at + 8), word(at + 12));
-                let depth = bytes[at + 16];
+                depth = bytes[at + 16];
                 color = bytes[at + 17];
                 let valid = match color {
                     0 => [1, 2, 4, 8, 16].contains(&depth),
@@ -135,7 +138,8 @@ pub fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
                 if palette || image_data || matches!(color, 0 | 4) {
                     return Err("PNG palette is misplaced or not allowed".into());
                 }
-                if length == 0 || length > 768 || !length.is_multiple_of(3) {
+                let limit = if color == 3 { 3usize << depth } else { 768 };
+                if length == 0 || length > limit || !length.is_multiple_of(3) {
                     return Err("PNG palette has an invalid length".into());
                 }
                 palette = true;
@@ -280,6 +284,8 @@ fn flags(os: &str) -> Vec<String> {
         "--no-first-run",
         "--no-default-browser-check",
         "--hide-scrollbars",
+        // Chrome stops waiting for the page before the helper's watchdog.
+        "--timeout=15000",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -331,7 +337,7 @@ pub fn helper(os: &str, browser: &Path, scratch: &Path) -> Result<(String, Strin
     // relative TMPDIR instead of the long absolute scratch path.
     let tmp = quoted(&PathBuf::from(format!("{scratch}{separator}browser-tmp")))?;
     let text = format!(
-        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 0;; esac\nmkdir -p {tmp} && cd {tmp} || exit 0\nTMPDIR=. {} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\"\nstatus=$?\n[ \"$status\" -eq 0 ] || echo \"$status\" > {out}/\"$1\".failed\nexit 0\n",
+        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 0;; esac\nmkdir -p {tmp} && cd {tmp} || exit 0\nTMPDIR=. {} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\" &\nbrowser=$!\n(i=0; while kill -0 \"$browser\" 2>/dev/null; do if [ \"$i\" -ge {CAPTURE_SECONDS} ]; then : > {out}/\"$1\".timeout; kill -9 \"$browser\" 2>/dev/null; break; fi; sleep 1; i=$((i + 1)); done) &\nwatchdog=$!\nwait \"$browser\"\nstatus=$?\nwait \"$watchdog\"\n[ -f {out}/\"$1\".timeout ] || [ \"$status\" -eq 0 ] || echo \"$status\" > {out}/\"$1\".failed\nexit 0\n",
         quoted(browser)?,
         flags(os).join(" "),
         quoted(&profile)?,
@@ -382,6 +388,12 @@ pub fn collect(scratch: &Path, to: &Path) -> (Vec<Shot>, Vec<String>) {
     names.sort();
     for file in names {
         let shown = crate::platform::escape_controls(&file);
+        if let Some(name) = file.strip_suffix(".timeout").filter(|n| valid_name(n)) {
+            skipped.push(format!(
+                "{name}: capture timed out after {CAPTURE_SECONDS} s and the browser was stopped"
+            ));
+            continue;
+        }
         if let Some(name) = file.strip_suffix(".failed").filter(|n| valid_name(n)) {
             let status = crate::platform::read_bounded_in(scratch, &Path::new(DIR).join(&file), 64)
                 .ok()
@@ -540,6 +552,18 @@ mod tests {
             .unwrap_err()
             .contains("no palette"));
         assert_eq!(admit(&build(3, &[plte(), idat()])).unwrap(), (10, 10));
+        // An indexed palette holds at most 2^depth entries.
+        let indexed = |depth: u8, entries: usize| {
+            let mut b = build(3, &[(b"PLTE", vec![0u8; entries * 3]), idat()]);
+            b[24] = depth;
+            let crc = crc32(&b[12..29]);
+            b[29..33].copy_from_slice(&crc.to_be_bytes());
+            admit(&b)
+        };
+        assert!(indexed(1, 2).is_ok());
+        assert!(indexed(1, 3).unwrap_err().contains("invalid length"));
+        assert!(indexed(8, 256).is_ok());
+        assert!(indexed(8, 257).unwrap_err().contains("invalid length"));
         assert!(admit(&build(2, &[idat(), plte(), idat()]))
             .unwrap_err()
             .contains("misplaced"));
@@ -679,6 +703,7 @@ mod tests {
         std::fs::write(from.join("bad name.png"), png(10, 10, 0)).unwrap();
         std::fs::write(from.join("c.txt"), "x").unwrap();
         std::fs::write(from.join("broken.failed"), "133\n").unwrap();
+        std::fs::write(from.join("slow.timeout"), "").unwrap();
         for n in ["d", "e", "f", "g"] {
             std::fs::write(from.join(format!("{n}.png")), png(10, 10, 0)).unwrap();
         }
@@ -697,6 +722,7 @@ mod tests {
         let joined = skipped.join("\n");
         for needle in [
             "broken: the browser exited with status 133",
+            "slow: capture timed out after 20 s",
             "b.png: 900x600",
             "bad name.png: name",
             "c.txt: name",

@@ -3841,13 +3841,13 @@ fn screenshots_are_kept_hashed_and_replayed_or_blocked_with_a_reason() {
         (
             "tests/shot.cmd",
             "cmd.exe /d /c tests\\shot.cmd",
-            "@call \"%OMGS_SCREENSHOT%\" page \"file:///%CD:\\=/%/page.html\"\r\n@exit /b 1\r\n",
+            "@if defined OMGS_SCREENSHOT call \"%OMGS_SCREENSHOT%\" page \"file:///%CD:\\=/%/page.html\"\r\n@echo AFTER_CAPTURE\r\n@exit /b 1\r\n",
         )
     } else {
         (
             "tests/shot.sh",
             "sh tests/shot.sh",
-            "sh \"$OMGS_SCREENSHOT\" page \"file://$PWD/page.html\"\nexit 1\n",
+            "set -e\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/page.html\"\necho AFTER_CAPTURE\nexit 1\n",
         )
     };
     std::fs::write(target.join(test), body).unwrap();
@@ -3878,6 +3878,9 @@ fn screenshots_are_kept_hashed_and_replayed_or_blocked_with_a_reason() {
         ],
     );
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    // The documented guarded call never stops a set -e harness, with or
+    // without a browser.
+    assert!(text(&out).contains("AFTER_CAPTURE"), "{}", text(&out));
     let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
     let shots = record.screenshots.clone().expect("screenshots requested");
     let expected = omgs::screenshot::browser(
@@ -4043,7 +4046,7 @@ fn a_failing_screenshot_browser_is_named_in_the_record() {
     std::fs::create_dir_all(target.join("tests")).unwrap();
     std::fs::write(
         target.join("tests/shot.sh"),
-        "set -e\nsh \"$OMGS_SCREENSHOT\" page \"file://$PWD/missing.html\"\necho AFTER_CAPTURE\nexit 1\n",
+        "set -e\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/missing.html\"\necho AFTER_CAPTURE\nexit 1\n",
     )
     .unwrap();
     let init = omgs(
@@ -4085,6 +4088,78 @@ fn a_failing_screenshot_browser_is_named_in_the_record() {
     assert_eq!(shots.browser.as_deref(), Some("/usr/bin/false"));
     assert!(shots.files.is_empty());
     assert_eq!(shots.skipped, ["page: the browser exited with status 1"]);
+    assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// A browser that never finishes is stopped by the helper's watchdog; the
+// harness still reaches its assertion and the record names the timeout.
+#[cfg(unix)]
+#[test]
+fn a_stalled_screenshot_browser_is_stopped_and_named() {
+    use std::os::unix::fs::PermissionsExt;
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("screenshot-stall");
+    let target = d.join("target");
+    let run = d.join("run");
+    let browser = d.join("browser");
+    std::fs::create_dir_all(target.join("tests")).unwrap();
+    std::fs::create_dir_all(&browser).unwrap();
+    std::fs::write(browser.join("stall"), "#!/bin/sh\nexec /bin/sleep 600\n").unwrap();
+    std::fs::set_permissions(
+        browser.join("stall"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(
+        target.join("tests/shot.sh"),
+        "set -e\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/x.html\"\necho AFTER_CAPTURE\nexit 1\n",
+    )
+    .unwrap();
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "tests/shot.sh",
+            "--screenshots",
+            "--cmd",
+            "sh tests/shot.sh",
+        ])
+        .env("OMGS_HOME", &d)
+        .env(omgs::screenshot::BROWSER_ENV, browser.join("stall"))
+        .env(
+            "OMGS_MXC_EXEC",
+            omgs::sandbox::locate_executor().unwrap().path,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("AFTER_CAPTURE"), "{}", text(&out));
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert!(record.clean(), "{record:?}");
+    let shots = record.screenshots.clone().unwrap();
+    assert!(shots.files.is_empty());
+    assert_eq!(
+        shots.skipped,
+        ["page: capture timed out after 20 s and the browser was stopped"]
+    );
     assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
     let _ = std::fs::remove_dir_all(&d);
 }
