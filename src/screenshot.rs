@@ -12,6 +12,8 @@ pub const MAX_FILES: usize = 4;
 pub const MAX_BYTES: u64 = 512 * 1024;
 /// Longest a single capture may run before the helper stops the browser.
 pub const CAPTURE_SECONDS: u32 = 20;
+/// Why Windows records a screenshot blocker instead of running a browser.
+pub const WINDOWS_UNBOUNDED: &str = "screenshots are unavailable on Windows: the capture helper cannot stop a stalled browser and its children there, so a capture could change the proof's outcome";
 /// Directory name under the sandbox scratch and under the proof directory.
 pub const DIR: &str = "screenshots";
 /// Environment variable naming the capture helper inside the sandbox.
@@ -195,11 +197,6 @@ fn default_browsers(os: &str) -> &'static [&'static str] {
             "/usr/lib/chromium/chromium",
             "/usr/lib/chromium-browser/chromium-browser",
         ],
-        "windows" => &[
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        ],
         _ => &[],
     }
 }
@@ -207,6 +204,9 @@ fn default_browsers(os: &str) -> &'static [&'static str] {
 /// The headless browser for this run, or the exact reason there is none.
 /// `OMGS_BROWSER` overrides discovery and must name an executable file.
 pub fn browser(os: &str, explicit: Option<OsString>) -> Result<PathBuf, String> {
+    if os == "windows" {
+        return Err(WINDOWS_UNBOUNDED.into());
+    }
     if let Some(raw) = explicit.filter(|v| !v.is_empty()) {
         let path = PathBuf::from(&raw);
         if !path.is_absolute() {
@@ -300,29 +300,15 @@ fn flags(os: &str) -> Vec<String> {
 }
 
 /// File name and text of the capture helper written into scratch. Callers run
-/// it as `"$OMGS_SCREENSHOT" <name> <url>` (`call "%OMGS_SCREENSHOT%" <name>
-/// <url>` on Windows). Names are checked again when files are collected.
+/// it as `sh "${OMGS_SCREENSHOT:-/dev/null}" <name> <url>`. Names are checked
+/// again when files are collected. Windows has no helper.
 pub fn helper(os: &str, browser: &Path, scratch: &Path) -> Result<(String, String), String> {
     let separator = if os == "windows" { "\\" } else { "/" };
     let scratch = scratch.to_string_lossy();
     let profile = PathBuf::from(format!("{scratch}{separator}browser-profile"));
     let out = PathBuf::from(format!("{scratch}{separator}{DIR}"));
     if os == "windows" {
-        let quoted = |p: &Path| -> Result<String, String> {
-            let s = p.to_string_lossy();
-            if s.contains(['"', '%', '\r', '\n']) {
-                return Err(format!("unsupported character in {s}"));
-            }
-            Ok(s.into_owned())
-        };
-        let out = quoted(&out)?;
-        let text = format!(
-            "@echo off\r\n\"{}\" {} \"--user-data-dir={}\" \"--screenshot={out}\\%~1.png\" \"%~2\"\r\nset omgs_status=%errorlevel%\r\nif not \"%omgs_status%\"==\"0\" (echo %omgs_status%)> \"{out}\\%~1.failed\"\r\nexit /b 0\r\n",
-            quoted(browser)?,
-            flags(os).join(" "),
-            quoted(&profile)?,
-        );
-        return Ok((helper_name(os).into(), text));
+        return Err(WINDOWS_UNBOUNDED.into());
     }
     let quoted = |p: &Path| -> Result<String, String> {
         let s = p.to_string_lossy();
@@ -336,8 +322,16 @@ pub fn helper(os: &str, browser: &Path, scratch: &Path) -> Result<(String, Strin
     // about 107 bytes, so the browser runs from a scratch directory with a
     // relative TMPDIR instead of the long absolute scratch path.
     let tmp = quoted(&PathBuf::from(format!("{scratch}{separator}browser-tmp")))?;
+    // The browser leads its own process group so the watchdog and the final
+    // sweep stop its children too: setsid on Linux, where dash refuses job
+    // control without a terminal, and job control in the macOS shell.
+    let (monitor, launch) = if os == "linux" {
+        ("", "setsid ")
+    } else {
+        ("set -m\n", "")
+    };
     let text = format!(
-        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 0;; esac\nmkdir -p {tmp} && cd {tmp} || exit 0\nTMPDIR=. {} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\" &\nbrowser=$!\n(i=0; while kill -0 \"$browser\" 2>/dev/null; do if [ \"$i\" -ge {CAPTURE_SECONDS} ]; then : > {out}/\"$1\".timeout; kill -9 \"$browser\" 2>/dev/null; break; fi; sleep 1; i=$((i + 1)); done) &\nwatchdog=$!\nwait \"$browser\"\nstatus=$?\nwait \"$watchdog\"\n[ -f {out}/\"$1\".timeout ] || [ \"$status\" -eq 0 ] || echo \"$status\" > {out}/\"$1\".failed\nexit 0\n",
+        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 0;; esac\nmkdir -p {tmp} && cd {tmp} || exit 0\n{monitor}TMPDIR=. {launch}{} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\" &\nbrowser=$!\n(i=0; while kill -0 \"$browser\" 2>/dev/null; do if [ \"$i\" -ge {CAPTURE_SECONDS} ]; then : > {out}/\"$1\".timeout; kill -9 -\"$browser\" 2>/dev/null || kill -9 \"$browser\" 2>/dev/null; break; fi; sleep 1; i=$((i + 1)); done) &\nwatchdog=$!\nwait \"$browser\"\nstatus=$?\nwait \"$watchdog\"\nkill -9 -\"$browser\" 2>/dev/null\n[ -f {out}/\"$1\".timeout ] || [ \"$status\" -eq 0 ] || echo \"$status\" > {out}/\"$1\".failed\nexit 0\n",
         quoted(browser)?,
         flags(os).join(" "),
         quoted(&profile)?,
@@ -659,7 +653,9 @@ mod tests {
         let (name, text) =
             helper("linux", Path::new("/opt/c/chrome"), Path::new("/r/scratch")).unwrap();
         assert_eq!(name, "omgs-screenshot");
-        assert!(text.contains("mkdir -p '/r/scratch/browser-tmp' && cd '/r/scratch/browser-tmp' || exit 0\nTMPDIR=. '/opt/c/chrome' --headless"));
+        assert!(text.contains("mkdir -p '/r/scratch/browser-tmp' && cd '/r/scratch/browser-tmp' || exit 0\nTMPDIR=. setsid '/opt/c/chrome' --headless"));
+        assert!(text.contains("kill -9 -\"$browser\" 2>/dev/null || kill -9 \"$browser\""));
+        assert!(text.contains("wait \"$watchdog\"\nkill -9 -\"$browser\" 2>/dev/null\n"));
         assert!(text.contains("--window-size=800,600"));
         assert!(text.contains("--screenshot='/r/scratch/screenshots'/\"$1\".png \"$2\""));
         assert!(!text.contains("--single-process"));
@@ -673,17 +669,12 @@ mod tests {
         )
         .unwrap();
         assert!(mac.contains("--single-process"));
+        assert!(mac.contains("|| exit 0\nset -m\nTMPDIR=. '/a/chrome-headless-shell'"));
         assert!(helper("linux", Path::new("/o'x/chrome"), Path::new("/r")).is_err());
-        let (win, text) = helper(
-            "windows",
-            Path::new(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-            Path::new(r"C:\r\scratch"),
-        )
-        .unwrap();
-        assert_eq!(win, "omgs-screenshot.cmd");
-        assert!(text.contains(r#""--screenshot=C:\r\scratch\screenshots\%~1.png" "%~2""#));
-        assert!(text.contains(r#"(echo %omgs_status%)> "C:\r\scratch\screenshots\%~1.failed""#));
-        assert!(helper("windows", Path::new(r"C:\a%b\c.exe"), Path::new(r"C:\r")).is_err());
+        // Windows cannot bound a stalled browser, so it never gets a helper.
+        let err = helper("windows", Path::new(r"C:\b\chrome.exe"), Path::new(r"C:\r")).unwrap_err();
+        assert_eq!(err, WINDOWS_UNBOUNDED);
+        assert_eq!(browser("windows", None).unwrap_err(), WINDOWS_UNBOUNDED);
     }
 
     #[test]

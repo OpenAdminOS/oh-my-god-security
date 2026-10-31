@@ -4107,7 +4107,13 @@ fn a_stalled_screenshot_browser_is_stopped_and_named() {
     let browser = d.join("browser");
     std::fs::create_dir_all(target.join("tests")).unwrap();
     std::fs::create_dir_all(&browser).unwrap();
-    std::fs::write(browser.join("stall"), "#!/bin/sh\nexec /bin/sleep 600\n").unwrap();
+    // The stub starts a child of its own before stalling; the watchdog must
+    // stop the whole capture process group so the proof stays clean.
+    std::fs::write(
+        browser.join("stall"),
+        "#!/bin/sh\n/bin/sleep 600 &\nexec /bin/sleep 601\n",
+    )
+    .unwrap();
     std::fs::set_permissions(
         browser.join("stall"),
         std::fs::Permissions::from_mode(0o755),
