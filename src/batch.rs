@@ -154,21 +154,17 @@ pub fn is_public(ip: &std::net::IpAddr) -> bool {
                 return v4(&mapped);
             }
             let s = ip.segments();
-            let embedded = |hi: u16, lo: u16| Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
-            if s[0] == 0x2002 {
-                return v4(&embedded(s[1], s[2]));
-            }
-            if s[0] == 0x64 && s[1] == 0xff9b {
-                return v4(&embedded(s[6], s[7]));
-            }
-            !(ip.is_unspecified()
-                || ip.is_loopback()
-                || ip.is_multicast()
-                || s[0] & 0xfe00 == 0xfc00
-                || s[0] & 0xffc0 == 0xfe80
-                || s[0] & 0xffc0 == 0xfec0
-                || (s[0] == 0x2001 && s[1] == 0xdb8)
-                || s[..6] == [0, 0, 0, 0, 0, 0])
+            // Only global unicast (2000::/3) is public. Inside it, IETF
+            // protocol assignments (2001::/23, including Teredo and
+            // benchmarking), documentation (2001:db8::/32), 6to4 (2002::/16)
+            // and 3ff0::/12 (documentation 3fff::/20, the retired 6bone
+            // 3ffe::/16 and unallocated space) are refused. Translation
+            // prefixes such as 64:ff9b::/96 lie outside 2000::/3.
+            s[0] & 0xe000 == 0x2000
+                && !(s[0] == 0x2001 && s[1] < 0x0200)
+                && !(s[0] == 0x2001 && s[1] == 0x0db8)
+                && s[0] != 0x2002
+                && s[0] & 0xfff0 != 0x3ff0
         }
     }
 }

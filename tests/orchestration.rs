@@ -136,6 +136,17 @@ fn only_publicly_routable_addresses_are_cloned() {
         "::ffff:10.0.0.1",
         "2002:7f00:1::1",
         "64:ff9b::a00:1",
+        "64:ff9b::808:808",
+        "64:ff9b:1::808:808",
+        "64:ff9b:1::8c52:7003",
+        "2001::1",
+        "2001:2::1",
+        "2001:1ff::1",
+        "3fff::1",
+        "3ffe::1",
+        "100::1",
+        "::ffff:0:127.0.0.1",
+        "::ffff:0:8.8.8.8",
         "::127.0.0.1",
     ] {
         assert!(!is_public(&private.parse().unwrap()), "{private}");

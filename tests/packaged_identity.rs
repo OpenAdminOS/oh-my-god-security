@@ -251,10 +251,17 @@ fn clone_progress_has_bounded_start_completion_reuse_and_failure_phases() {
     let bin = fixture.0.join("bin");
     std::fs::create_dir(&bin).unwrap();
     let stub = bin.join("git");
-    std::fs::write(&stub, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.50.0'; exit 0; fi\nfor arg in \"$@\"; do last=\"$arg\"; done\ncase \" $* \" in\n*' clone '*) case \" $* \" in *' --attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904 '*) ;; *) exit 8 ;; esac; case \" $* \" in *' http.followRedirects=false '*) ;; *) exit 7 ;; esac; case \" $* \" in *' http.curloptResolve=example.invalid:443:93.184.215.14 '*) ;; *) exit 6 ;; esac; case \" $* \" in *' --quiet --depth 1 --no-recurse-submodules -- '*) ;; *) exit 9 ;; esac; if [ \"$FAIL_CLONE\" = yes ]; then exit 1; fi; mkdir -p \"$last\" ;;\n*' get-url '*) echo https://example.invalid/owner/repo ;;\n*) exit 1 ;;\nesac\n").unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.50.0'; exit 0; fi\nfor arg in \"$@\"; do last=\"$arg\"; done\ncase \" $* \" in\n*' clone '*) case \" $* \" in *' --attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904 '*) ;; *) exit 8 ;; esac; case \" $* \" in *' http.followRedirects=false '*) ;; *) exit 7 ;; esac; case \" $* \" in *' http.curloptResolve=example.invalid:443:93.184.215.14 '*) ;; *) exit 6 ;; esac; case \" $* \" in *' --quiet --depth 1 --no-recurse-submodules --template='*' -- '*) ;; *) exit 9 ;; esac; case \" $* \" in *' fetch.uriProtocols= '*) ;; *) exit 5 ;; esac; [ \"$GIT_CONFIG_GLOBAL\" = /dev/null ] && [ \"$GIT_CONFIG_NOSYSTEM\" = 1 ] || exit 4; if [ -f \"${0%/*}/fail\" ]; then exit 1; fi; mkdir -p \"$last\" ;;\n*' get-url '*) echo https://example.invalid/owner/repo ;;\n*) exit 1 ;;\nesac\n").unwrap();
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     let skill = fixture.skill();
     let invoke = |home: &Path, fail: bool| {
+        // The isolated clone keeps no unknown environment, so the stub reads
+        // a marker file instead.
+        if fail {
+            std::fs::write(bin.join("fail"), "").unwrap();
+        } else {
+            let _ = std::fs::remove_file(bin.join("fail"));
+        }
         cli()
             .env("OMGS_SKILL_DIR", fixture.0.join("missing-skill"))
             .env("OMGS_HOME", home)
@@ -1029,7 +1036,7 @@ fn a_stalled_clone_fails_at_its_deadline() {
     let bin = fixture.0.join("bin");
     std::fs::create_dir(&bin).unwrap();
     let stub = bin.join("git");
-    std::fs::write(&stub, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.50.0'; exit 0; fi\nfor arg in \"$@\"; do last=\"$arg\"; done\nmkdir -p \"$last\"\nexec /bin/sleep 30\n").unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.50.0'; exit 0; fi\nif [ \"$1\" = config ]; then exit 1; fi\nfor arg in \"$@\"; do last=\"$arg\"; done\nmkdir -p \"$last\"\nexec /bin/sleep 30\n").unwrap();
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     let home = fixture.0.join("home");
     let started = std::time::Instant::now();

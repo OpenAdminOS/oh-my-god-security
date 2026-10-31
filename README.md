@@ -75,14 +75,17 @@ OSV availability and never downloads its database. Proofs never download target
 dependencies or access the external network. Review clones resolve the repository
 host once, refuse it when any address is loopback, private, link-local or otherwise
 not publicly routable (and refuse local names such as `*.localhost`, `*.local` and
-`*.internal`), pin Git to those addresses, follow no redirects, and stop after 10
-minutes or a 1 GiB file. The clone reads attributes from the empty tree, so the
-repository cannot select filters such as git-lfs that would run host programs or
-contact other URLs; LFS pointers stay pointers. This needs Git 2.42 or later. The
-clone still inherits your git configuration and credential helpers so private
-repositories work; use an appropriate review account. A configured HTTP proxy
-resolves the host itself, so the address check cannot cover proxied clones.
-The update lookup ignores that configuration and disables credential helpers and prompts.
+`*.internal`), pin Git to those addresses, follow no redirects and stop after 10
+minutes; on macOS and Linux a single file is also capped at 1 GiB (Windows has no
+per-file cap). Git runs with no inherited configuration, environment injection,
+templates or attribute files, and reads attributes from the empty tree, so URL
+rewrites, URL-specific HTTP settings, filters such as git-lfs and server-chosen
+packfile or bundle URLs cannot move or extend the clone; LFS pointers stay pointers.
+Only your system and global `credential.*` settings and the generic `http.proxy` and
+CA settings are carried over, so private repositories work; use an appropriate review
+account. A configured proxy resolves the host itself, so the address check cannot
+cover proxied clones. This needs Git 2.42 or later.
+The update lookup carries none of your git configuration and disables credential helpers and prompts.
 
 ## Why a binary at all?
 

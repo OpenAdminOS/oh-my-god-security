@@ -7,6 +7,7 @@ pub mod batch;
 pub mod bench;
 pub mod budget;
 pub mod classes;
+pub mod clone;
 #[cfg(target_os = "macos")]
 pub mod coalition;
 pub mod critic;
