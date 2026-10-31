@@ -1670,7 +1670,7 @@ fn confirmed_fixture(run: &Run) -> FindingsFile {
     file
 }
 
-fn assert_dashboard_render(data: &Value) {
+fn render_dashboard(data: &Value) -> Value {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let script = include_str!("../skill/progress/dashboard.html")
@@ -1704,14 +1704,18 @@ console.log(JSON.stringify(elements));
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    let rendered: Value = serde_json::from_slice(&output.stdout).unwrap();
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn assert_dashboard_render(data: &Value) {
+    let rendered = render_dashboard(data);
     assert_eq!(
         rendered["c-conf"]["textContent"],
-        data["counters"]["confirmed"]
+        data["counters"]["confirmed"].to_string()
     );
     assert_eq!(
         rendered["c-needs"]["textContent"],
-        data["counters"]["needs_validation"]
+        data["counters"]["needs_validation"].to_string()
     );
     let headline = rendered["happening"]["textContent"].as_str().unwrap();
     assert_eq!(
@@ -2531,4 +2535,70 @@ fn ledger_migration_validates_before_committing_and_reopens_saved_completion() {
             .unwrap();
     assert_eq!(ledger["scope_root"], json!(target));
     assert_eq!(run.meta()["run_status"], "in_progress");
+}
+
+#[test]
+fn relative_ledger_mutation_invalidates_saved_completion() {
+    let run = finished_review();
+    assert!(publish_report(&run, &[], &run.0).status.success());
+    assert_eq!(run.meta()["run_status"], "complete");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .current_dir(&run.0)
+        .args([
+            "ledger",
+            "set",
+            "--ledger",
+            "coverage-ledger.json",
+            "--unit",
+            "surface",
+            "--status",
+            "deferred",
+            "--note",
+            "Review in next authorized scope",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(run.meta()["run_status"], "in_progress");
+    assert_eq!(
+        serde_json::from_slice::<Value>(
+            &std::fs::read(run.0.join("coverage-ledger.json")).unwrap()
+        )
+        .unwrap()["units"][0]["status"],
+        "deferred"
+    );
+}
+
+#[test]
+fn dashboard_controls_are_visible_at_every_dynamic_sink_and_json_is_lossless() {
+    let mut data: Value =
+        serde_json::from_str(include_str!("fixtures/dashboard-controls.json")).unwrap();
+    let original = data.clone();
+    let controls = data["target"].as_str().unwrap();
+    let visible = omgs::platform::escape_controls(controls);
+    let rendered = render_dashboard(&data);
+    assert_eq!(data, original);
+    assert_eq!(
+        rendered["meta"]["textContent"],
+        format!("{visible} / {visible}")
+    );
+    for id in ["c-cand", "c-conf", "c-needs", "c-rej"] {
+        assert_eq!(rendered[id]["textContent"], visible);
+    }
+    for id in ["flow", "log"] {
+        let html = rendered[id]["innerHTML"].as_str().unwrap();
+        assert!(html.contains(&omgs::html_escape(&visible)));
+        assert!(!html.chars().any(omgs::platform::display_control));
+    }
+    assert!(rendered["happening"]["textContent"]
+        .as_str()
+        .unwrap()
+        .contains(&visible));
+    data["stages"] = json!([]);
+    let rendered = render_dashboard(&data);
+    assert_eq!(rendered["happening"]["textContent"], visible);
 }

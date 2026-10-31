@@ -1,0 +1,35 @@
+{
+  "target": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9",
+  "run": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9",
+  "review_complete": false,
+  "review_state": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9",
+  "counters": {
+    "candidates": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9",
+    "confirmed": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9",
+    "needs_validation": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9",
+    "rejected": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9"
+  },
+  "stages": [
+    {
+      "id": "custom",
+      "label": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9",
+      "detail": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9",
+      "status": "active",
+      "children": [
+        {
+          "id": "custom-child",
+          "label": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9",
+          "detail": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9",
+          "status": "active"
+        }
+      ]
+    }
+  ],
+  "log": [
+    {
+      "ts": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9",
+      "m": "a\u0000\t\n\r\u001b\u007f\u0085\u009f\u202e\u200b\u2066\ufeff\u2028\u2029\udb40\udc01 caf\u00e9",
+      "kind": "info"
+    }
+  ]
+}

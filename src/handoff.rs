@@ -420,9 +420,13 @@ pub fn markdown_at(h: &Handoff, artifact_base: &str) -> String {
                 &serde_json::to_string(&a.recipe_contract).unwrap(),
             ));
             out.push_str("Exact command (use the new FIX_RUN after an authorized edit, retain every other argument):\n\n");
-            if display_text(&a.command) != a.command {
+            let command_preview = crate::platform::escape_controls(&a.command);
+            if command_preview != a.command {
                 out.push_str("Warning: command contains escaped control or Unicode formatting characters. The escaped preview is not executable. Decode the adjacent JSON string for the exact command, or read command and command_args from handoff.json.\n\n");
-                out.push_str(&markdown_data("Acceptance command preview", &a.command));
+                out.push_str(&markdown_data(
+                    "Acceptance command preview",
+                    &command_preview,
+                ));
                 out.push_str(&markdown_data(
                     "Exact command JSON string",
                     &command_json(&a.command),

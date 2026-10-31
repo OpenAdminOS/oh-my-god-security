@@ -543,16 +543,16 @@ fn cmd_architecture(args: &[String]) -> Result<(), String> {
         }
         let dir = Path::new(&out);
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        write_out(
+        let mut writes = omgs::runmeta::Transaction::default();
+        writes.text(
             dir.join("ARCHITECTURE.md"),
             render_architecture_markdown(&file),
-        )
-        .map_err(|e| e.to_string())?;
-        write_out(
+        );
+        writes.text(
             dir.join("ARCHITECTURE.html"),
             render_architecture_html(&file),
-        )
-        .map_err(|e| e.to_string())?;
+        );
+        writes.commit()?;
         omgs::out::line(&format!(
             "wrote {}, {}",
             dir.join("ARCHITECTURE.md").display(),
@@ -3147,7 +3147,10 @@ fn write_ledger(path: &str, ledger: &Ledger) -> Result<(), String> {
     if !errors.is_empty() {
         return Err(errors.join("; "));
     }
-    let dir = path.parent().unwrap_or(Path::new("."));
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let mut writes = omgs::runmeta::Transaction::default();
     writes.text(path, format!("{text}\n"));
     if let Some(mut saved) = omgs::runmeta::read_optional(dir)? {
@@ -3719,10 +3722,10 @@ fn cmd_batch(args: &[String]) -> Result<(), String> {
                 .iter()
                 .map(|r| omgs::batch::summarize_locked(r, &out))
                 .collect::<Result<Vec<_>, String>>()?;
-            write_out(out.join("INDEX.md"), omgs::batch::render_index_markdown(&runs))
-                .map_err(|e| e.to_string())?;
-            write_out(out.join("INDEX.html"), omgs::batch::render_index_html(&runs))
-                .map_err(|e| e.to_string())?;
+            let mut writes = omgs::runmeta::Transaction::default();
+            writes.text(out.join("INDEX.md"), omgs::batch::render_index_markdown(&runs));
+            writes.text(out.join("INDEX.html"), omgs::batch::render_index_html(&runs));
+            writes.commit()?;
             Ok(())
             })?;
             omgs::out::line(&format!(

@@ -3062,7 +3062,9 @@ fn unicode_formatting_controls_are_visible_in_all_display_formats() {
         .contains("Warning: command contains escaped control or Unicode formatting characters"));
     let (_, _, blocks) = markdown_structure(&handoff);
     let a = h.records[0].acceptance.as_ref().unwrap();
-    assert!(blocks.iter().any(|b| b.contains("src/<U+202E>txt.exe")));
+    assert!(blocks
+        .iter()
+        .any(|b| b.contains(&omgs::platform::escape_controls(&a.command))));
     assert!(blocks
         .iter()
         .any(|b| serde_json::from_str::<String>(b).ok().as_deref() == Some(&a.command)));
@@ -3276,12 +3278,24 @@ fn finding_content_cannot_forge_markdown_structure() {
                                 a.command.contains(payload),
                                 "the quoted command must be retained"
                             );
-                            assert!(
-                                handoff.contains(&format!("\n{}\n", a.command)),
-                                "the command bytes must remain exact"
-                            );
-                            assert!(blocks
-                                .contains(&format!("{}\n", omgs::handoff::normalized(&a.command))));
+                            if omgs::platform::escape_controls(&a.command) != a.command {
+                                assert!(
+                                    blocks.iter().any(|block| {
+                                        serde_json::from_str::<String>(block).ok().as_deref()
+                                            == Some(a.command.as_str())
+                                    }),
+                                    "the command JSON must preserve exact bytes"
+                                );
+                            } else {
+                                assert!(
+                                    handoff.contains(&format!("\n{}\n", a.command)),
+                                    "the command bytes must remain exact"
+                                );
+                                assert!(blocks.contains(&format!(
+                                    "{}\n",
+                                    omgs::handoff::normalized(&a.command)
+                                )));
+                            }
                             assert_eq!(
                                 a.command_args.last().unwrap(),
                                 &format!("--cmd=printf original{payload}")
@@ -3762,7 +3776,9 @@ fn replay_fixture_relocates_windows_and_unix_paths_exactly_once() {
 
 #[test]
 fn handoff_exact_command_survives_each_control_class() {
-    for c in ['\u{1}', '\u{85}', '\u{202e}', '\u{2028}', '\u{2029}'] {
+    for c in [
+        "\r", "\r\n", "\n", "\t", "\u{1}", "\u{85}", "\u{202e}", "\u{2028}", "\u{2029}",
+    ] {
         let (dir, file) = report_fixture("exact-control-command");
         let mut proof = omgs::proof::load(&dir, "proofs/1.json").unwrap();
         proof.command = format!("printf 'a{c}b'");
@@ -3772,9 +3788,10 @@ fn handoff_exact_command_survives_each_control_class() {
         let handoff = omgs::handoff::build(&dir, &file, None).unwrap();
         let rendered = omgs::handoff::markdown(&handoff);
         assert!(rendered.contains("escaped preview is not executable"));
-        assert!(!rendered.contains(c));
+        assert!(!rendered.contains(&format!("printf 'a{c}b'")));
         let (_, _, blocks) = markdown_structure(&rendered);
         let exact = &handoff.records[0].acceptance.as_ref().unwrap().command;
+        assert!(rendered.contains(&omgs::platform::escape_controls(exact)));
         assert!(blocks
             .iter()
             .any(|block| serde_json::from_str::<String>(block).ok().as_deref() == Some(exact)));

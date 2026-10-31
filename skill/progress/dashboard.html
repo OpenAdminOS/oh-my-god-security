@@ -104,7 +104,8 @@ function now(){return Date.now();}
 // Escape every value interpolated into innerHTML. The status file is written by
 // the orchestrator, but its detail/label/log fields carry target-derived text
 // (candidate titles, file paths), so treat all of it as untrusted.
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];});}
+function display(s){return String(s==null?"":s).replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu,function(c){return {"\0":"\\u{0}","\t":"\\t","\n":"\\n","\r":"\\r"}[c]||"\\u{"+c.codePointAt(0).toString(16)+"}";});}
+function esc(s){return display(s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];});}
 const STATES={pending:"Waiting",active:"In progress",done:"Done",failed:"Stopped"};
 const STAGES={
   initialize:{label:"Prepare the review",area:"omgs",detail:"OMGS is recording the project and review settings."},
@@ -154,33 +155,33 @@ function renderNode(st){
     +'<div class="tm">'+esc(elapsed(st))+'</div>'+kids+'</div>';
 }
 function render(d){
-  document.getElementById("meta").textContent=[d.target,d.run].filter(Boolean).join(" / ");
+  document.getElementById("meta").textContent=display([d.target,d.run].filter(Boolean).join(" / "));
   const c=d.counters||{};
-  document.getElementById("c-cand").textContent=c.candidates??0;
-  document.getElementById("c-conf").textContent=c.confirmed??0;
-  document.getElementById("c-needs").textContent=c.needs_validation??0;
-  document.getElementById("c-rej").textContent=c.rejected??0;
+  document.getElementById("c-cand").textContent=display(c.candidates??0);
+  document.getElementById("c-conf").textContent=display(c.confirmed??0);
+  document.getElementById("c-needs").textContent=display(c.needs_validation??0);
+  document.getElementById("c-rej").textContent=display(c.rejected??0);
   const stages=d.stages||[],active=activeStage(stages);
-  const summary=document.getElementById("happening"),sentence=happening(stages,active,d.review_state,d.review_complete);
+  const summary=document.getElementById("happening"),sentence=display(happening(stages,active,d.review_state,d.review_complete));
   if(summary.textContent!==sentence)summary.textContent=sentence;
   const info=active&&stageInfo(active.owner);
   for(const area of ["agent","omgs","sandbox"]){
     const el=document.getElementById("area-"+area),current=!!info&&info.area===area;
     el.classList.toggle("active",current);
-    el.querySelector(".current").textContent=current?"Working now":"";
+    el.querySelector(".current").textContent=display(current?"Working now":"");
   }
   document.getElementById("flow").innerHTML=stages.map(renderNode).join("")||'<p class="note">Review steps will appear here when the agent sends an update.</p>';
   document.getElementById("log").innerHTML=(d.log||[]).slice().reverse().map(e=>
     '<div class="e k-'+kindClass(e.kind)+'"><span class="t">'+esc(e.ts||"")+'</span><span class="m">'+esc(e.m||"")+'</span></div>').join("")||'<div class="e"><span class="m">No activity yet</span></div>';
   const upd=document.getElementById("upd"),dot=document.getElementById("dot");
-  if(typeof d.updated_ms==="number"&&isFinite(d.updated_ms)&&d.updated_ms>0){const age=now()-d.updated_ms;upd.textContent=(age>120000?"No recent updates; last updated ":"Updated ")+fmtDur(age)+" ago";dot.classList.toggle("stale",age>120000);}
-  else{upd.textContent="No updates yet";dot.classList.add("stale");}
+  if(typeof d.updated_ms==="number"&&isFinite(d.updated_ms)&&d.updated_ms>0){const age=now()-d.updated_ms;upd.textContent=display((age>120000?"No recent updates; last updated ":"Updated ")+fmtDur(age)+" ago");dot.classList.toggle("stale",age>120000);}
+  else{upd.textContent=display("No updates yet");dot.classList.add("stale");}
 }
 async function tick(){
   // A stopped orchestrator leaves old JSON, which must still read as stale.
   // A fetch failure marks stale directly. Keep the last progress visible.
   try{const r=await fetch("pipeline-status.json?_="+now());if(!r.ok)throw new Error("Status unavailable");const d=await r.json();render(d);}
-  catch(e){document.getElementById("upd").textContent="Waiting for status";document.getElementById("dot").classList.add("stale");}
+  catch(e){document.getElementById("upd").textContent=display("Waiting for status");document.getElementById("dot").classList.add("stale");}
 }
 tick();setInterval(tick,2000);
 </script></body></html>

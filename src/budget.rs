@@ -318,35 +318,42 @@ pub fn init_fix(
         if child.parent() != root.parent() || child == root {
             return Err("fix run must be a distinct sibling in the trusted runs directory".into());
         }
-        let child_id = run_id(&read_run(&child)?)?.to_string();
-        runmeta::with_lock(&child, || {
-            let mut m = read_run(&child)?;
-            m.insert(
-                "budget_parent".into(),
-                Value::from(root.to_string_lossy().as_ref()),
-            );
-            m.insert("budget_parent_id".into(), Value::from(run_id(&meta)?));
-            if run_id(&m)? != child_id {
-                return Err("linked run identity changed during registration".into());
-            }
-            runmeta::write_atomic(
-                &child.join(runmeta::FILE),
-                &serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?,
-            )
-        })?;
-        let mut runs = fix_runs(&meta, root.parent().unwrap())?;
-        runs.push(RegisteredRun {
-            path: child.clone(),
-            run_id: child_id,
-        });
-        meta.insert(
-            "fix_runs".into(),
-            serde_json::to_value(runs).map_err(|e| e.to_string())?,
-        );
-        runmeta::write_atomic(
-            &root.join(runmeta::FILE),
-            &serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
-        )?;
+        let registration = (|| {
+            let child_id = run_id(&read_run(&child)?)?.to_string();
+            runmeta::with_lock(&child, || {
+                let mut m = read_run(&child)?;
+                if run_id(&m)? != child_id {
+                    return Err("linked run identity changed during registration".into());
+                }
+                m.insert(
+                    "budget_parent".into(),
+                    Value::from(root.to_string_lossy().as_ref()),
+                );
+                m.insert("budget_parent_id".into(), Value::from(run_id(&meta)?));
+                let mut runs = fix_runs(&meta, root.parent().unwrap())?;
+                runs.push(RegisteredRun {
+                    path: child.clone(),
+                    run_id: child_id,
+                });
+                meta.insert(
+                    "fix_runs".into(),
+                    serde_json::to_value(runs).map_err(|e| e.to_string())?,
+                );
+                let mut writes = runmeta::Transaction::default();
+                writes.metadata(&child, &m)?;
+                writes.metadata(&root, &meta)?;
+                writes.commit()
+            })
+        })();
+        if let Err(error) = registration {
+            std::fs::remove_dir_all(&child).map_err(|cleanup| {
+                format!(
+                    "{error}; remove unsuccessful fix {}: {cleanup}",
+                    child.display()
+                )
+            })?;
+            return Err(error);
+        }
         Ok(child)
     })
 }
@@ -475,6 +482,49 @@ mod regressions {
         )
         .unwrap();
         (dir, root, child)
+    }
+
+    #[test]
+    fn failed_parent_registration_removes_unregistered_child() {
+        let (dir, root, child) = family("registration-parent-failure");
+        std::fs::remove_dir_all(&child).unwrap();
+        runmeta::write_atomic(
+            &root.join(runmeta::FILE),
+            &json!({
+                "run_id":"original", "budget_agent_calls":2, "agent_calls_used":1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let original = std::fs::read(root.join(runmeta::FILE)).unwrap();
+        let result = init_fix(
+            &root,
+            |_| Ok(Some(2)),
+            |_, _, remaining| {
+                assert_eq!(remaining, Some(1));
+                crate::platform::create_private_dir(&child).unwrap();
+                runmeta::write_atomic(
+                    &child.join(runmeta::FILE),
+                    &json!({"run_id":"new-child"}).to_string(),
+                )?;
+                // Fail only the parent publication after initialization has succeeded.
+                std::fs::rename(root.join(runmeta::FILE), root.join("saved-metadata.json"))
+                    .unwrap();
+                crate::platform::create_private_dir(&root.join(runmeta::FILE)).unwrap();
+                Ok(child.clone())
+            },
+        );
+        assert!(result.unwrap_err().contains("destination is a directory"));
+        assert!(!child.exists());
+        assert!(root.join(runmeta::FILE).is_dir());
+        assert_eq!(
+            std::fs::read(root.join("saved-metadata.json")).unwrap(),
+            original
+        );
+        std::fs::remove_dir(root.join(runmeta::FILE)).unwrap();
+        std::fs::rename(root.join("saved-metadata.json"), root.join(runmeta::FILE)).unwrap();
+        assert_eq!(allowance(&root).unwrap().run_count, 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

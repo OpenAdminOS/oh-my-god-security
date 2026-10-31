@@ -440,7 +440,7 @@ fn dashboard_escapes_stage_and_log_values_before_html_rendering() {
         .unwrap()
         .0;
     for code in [
-        "String(s==null?\"\":s).replace(/[&<>\"']/g",
+        "display(s).replace(/[&<>\"']/g",
         "\"&\":\"&amp;\"",
         "\"<\":\"&lt;\"",
         "\">\":\"&gt;\"",
@@ -491,7 +491,7 @@ fn dashboard_announces_summary_only_when_it_changes() {
         .unwrap()
         .0;
     assert!(render.contains(
-        "const summary=document.getElementById(\"happening\"),sentence=happening(stages,active,d.review_state,d.review_complete);"
+        "const summary=document.getElementById(\"happening\"),sentence=display(happening(stages,active,d.review_state,d.review_complete));"
     ));
     assert!(render.contains("if(summary.textContent!==sentence)summary.textContent=sentence;"));
     // No other assignment may bypass the change guard on each two-second poll.

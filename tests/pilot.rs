@@ -909,3 +909,50 @@ fn output_paths_reject_controls_before_creating_artifacts() {
         assert!(!out_path.exists());
     }
 }
+
+#[test]
+fn paired_exports_preserve_markdown_when_html_destination_is_a_directory() {
+    let f = Fixture::new();
+    let batch = f.root.join("batch.json");
+    std::fs::write(&batch, json!({"runs":[]}).to_string()).unwrap();
+    let architecture = f.run.join("architecture.json");
+    omgs::runmeta::write_atomic(
+        &architecture,
+        include_str!("../examples/architecture.sample.json"),
+    )
+    .unwrap();
+    for (name, args) in [
+        (
+            "ARCHITECTURE",
+            vec!["architecture", "--in", architecture.to_str().unwrap()],
+        ),
+        (
+            "INDEX",
+            vec!["batch", "index", "--batch", batch.to_str().unwrap()],
+        ),
+    ] {
+        let out_dir = f.root.join(name);
+        omgs::platform::create_private_dir(&out_dir).unwrap();
+        let md = out_dir.join(format!("{name}.md"));
+        let html = out_dir.join(format!("{name}.html"));
+        omgs::runmeta::write_atomic(&md, "retained markdown").unwrap();
+        omgs::platform::create_private_dir(&html).unwrap();
+        std::fs::write(html.join("retained"), "retained html").unwrap();
+        let mut args = args;
+        args.extend(["--out", out_dir.to_str().unwrap()]);
+        let result = f.cli(&args);
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("destination is a directory"));
+        assert_eq!(std::fs::read_to_string(md).unwrap(), "retained markdown");
+        assert_eq!(
+            std::fs::read_to_string(html.join("retained")).unwrap(),
+            "retained html"
+        );
+        assert_eq!(std::fs::read_dir(out_dir).unwrap().count(), 2);
+    }
+}
