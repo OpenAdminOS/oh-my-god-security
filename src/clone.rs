@@ -134,7 +134,11 @@ fn bounded(mut cmd: Command, deadline: &Deadline, cap: u64) -> Result<Vec<u8>, S
         return Err("clone interrupted".into());
     }
     if result.timed_out {
-        return Err("clone deadline exceeded".into());
+        return Err(if deadline.left(1).is_err() {
+            "clone deadline exceeded".into()
+        } else {
+            format!("git did not answer within {} s", wall_ms / 1000)
+        });
     }
     // A drained stream can still have been cut at the cap; parsing a
     // truncated configuration could drop a later reset of a setting.
@@ -240,12 +244,22 @@ fn host_git(git: &Path) -> Command {
     let mut c = Command::new(git);
     c.env_clear();
     for (key, value) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        if ENV_KEEP.contains(&name.as_ref()) || name.starts_with("GCM_") {
+        if kept(&key.to_string_lossy(), cfg!(windows)) {
             c.env(&key, value);
         }
     }
     c
+}
+
+/// Windows variable names are case-insensitive (`Path`, `windir`), so the
+/// allowlist matches them without case there and exactly elsewhere.
+fn kept(name: &str, windows: bool) -> bool {
+    if windows {
+        ENV_KEEP.iter().any(|k| k.eq_ignore_ascii_case(name))
+            || name.to_ascii_uppercase().starts_with("GCM_")
+    } else {
+        ENV_KEEP.contains(&name) || name.starts_with("GCM_")
+    }
 }
 
 /// An isolated Git command for a review clone.
@@ -390,6 +404,8 @@ mod tests {
             "transfer.bundleURI=false",
             "core.fsmonitor=false",
             "http.curloptResolve=example.com:443:1.1.1.1",
+            &format!("core.attributesFile={}", null_device()),
+            &format!("core.hooksPath={}", null_device()),
         ] {
             assert!(args.iter().any(|a| a == want), "{want}: {args:?}");
         }
@@ -467,6 +483,25 @@ mod tests {
             assert!(listed.contains(present), "{present}: {listed}");
         }
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn the_environment_allowlist_ignores_case_only_on_windows() {
+        for name in ["Path", "windir", "SystemDrive", "gcm_interactive"] {
+            assert!(kept(name, true), "{name}");
+        }
+        assert!(kept("PATH", false) && kept("GCM_TRACE", false));
+        for name in [
+            "Path",
+            "git_config_global",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_TRACE",
+        ] {
+            assert!(!kept(name, false), "{name}");
+        }
+        for name in ["git_config_global", "Git_Trace", "GIT_DIR"] {
+            assert!(!kept(name, true), "{name}");
+        }
     }
 
     #[cfg(unix)]

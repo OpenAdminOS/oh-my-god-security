@@ -84,7 +84,8 @@ packfile or bundle URLs cannot move or extend the clone; LFS pointers stay point
 Only your system and global `credential.*` settings and the generic `http.proxy` and
 CA settings are carried over, so private repositories work; use an appropriate review
 account. A configured proxy resolves the host itself, so the address check cannot
-cover proxied clones. This needs Git 2.42 or later.
+cover proxied clones. Because redirects are refused, use the canonical repository URL
+(for example with `.git` when the host redirects without it). This needs Git 2.42 or later.
 The update lookup carries none of your git configuration and disables credential helpers and prompts.
 
 ## Why a binary at all?
