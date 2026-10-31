@@ -682,7 +682,24 @@ fn export_head_bounded(
         }
         let file = out.join(path);
         std::fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
-        std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
+        // Never overwrite: a path this filesystem treats as an existing one
+        // (case or Unicode folding, normalization, short names) must not
+        // replace a registered test with pull request content.
+        {
+            use std::io::Write;
+            let mut handle = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&file)
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        format!("head paths alias the same file on this filesystem: {path}; gate export is blocked")
+                    } else {
+                        e.to_string()
+                    }
+                })?;
+            handle.write_all(&bytes).map_err(|e| e.to_string())?;
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1129,6 +1146,63 @@ mod scratch_tests {
             "{error}"
         );
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // A head path that the filesystem folds onto a registered test must
+    // never replace that test's exported content.
+    #[test]
+    fn gate_export_never_overwrites_a_filesystem_alias() {
+        let parent = if cfg!(windows) {
+            crate::platform::home().unwrap()
+        } else {
+            crate::platform::temp_root().unwrap()
+        };
+        let root = parent.join(format!(
+            "omgs-export-alias-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&root).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_fixture(&repo, &["init"]);
+        std::fs::create_dir(repo.join("checks")).unwrap();
+        std::fs::write(repo.join("checks/entry.sh"), "registered\n").unwrap();
+        git_fixture(&repo, &["add", "."]);
+        git_fixture(&repo, &["commit", "-m", "Fixture"]);
+        let replaced = {
+            std::fs::write(root.join("replaced"), "replaced\n").unwrap();
+            git_fixture(
+                &repo,
+                &["hash-object", "-w", root.join("replaced").to_str().unwrap()],
+            )
+        };
+        git_fixture(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                &replaced,
+                "check\u{17f}/entry.sh",
+            ],
+        );
+        let tree = git_fixture(&repo, &["write-tree"]);
+        let head = git_fixture(&repo, &["commit-tree", &tree, "-m", "Alias fixture"]);
+        let out = root.join("out");
+        std::fs::create_dir(&out).unwrap();
+        match export_head(&repo, &head, &out) {
+            Err(error) => assert!(error.contains("alias the same file"), "{error}"),
+            // A filesystem that keeps both names apart exports both intact.
+            Ok(paths) => {
+                assert_eq!(paths.len(), 2);
+                assert_eq!(
+                    std::fs::read(out.join("checks/entry.sh")).unwrap(),
+                    b"registered\n"
+                );
+            }
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }
