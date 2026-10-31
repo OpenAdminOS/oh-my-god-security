@@ -1756,6 +1756,52 @@ pub fn prepare_harness(dir: &Path, test: &str) -> Result<PreparedHarness, String
     Ok(prepared)
 }
 
+/// Recognize a retained harness argument, including one from the original run
+/// passed to a separate fix run. Read bytes and modes from its admitted record.
+pub fn harness_artifact(dir: &Path, test: &str) -> Result<Option<PreparedHarness>, String> {
+    crate::proof_inputs::safe_path(test)?;
+    let parent = Path::new(test).parent().unwrap_or(Path::new(""));
+    let mut root = dir;
+    for part in parent.components().rev() {
+        if root.file_name() != Some(part.as_os_str()) {
+            return Ok(None);
+        }
+        root = root.parent().ok_or("invalid retained harness directory")?;
+    }
+    let Some((run, relative)) = artifact_location(root, "harness") else {
+        return Ok(None);
+    };
+    let number = relative
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        .ok_or("invalid proof number")?;
+    let record = load(run, &format!("proofs/{number}.json"))?;
+    if record.test.as_deref() != Some(test) || record.harness.is_empty() {
+        return Err("retained harness does not match proof test".into());
+    }
+    retained_harness(run, &record).map(Some)
+}
+
+/// Identify a proof artifact by its structural path, without resolving away
+/// symlinks before the run-artifact admission boundary can reject them.
+fn artifact_location<'a>(path: &'a Path, leaf: &str) -> Option<(&'a Path, std::path::PathBuf)> {
+    if path.file_name()? != leaf {
+        return None;
+    }
+    let proof = path.parent()?;
+    let number = proof.file_name()?.to_str()?;
+    if number.parse::<u32>().ok()? == 0 {
+        return None;
+    }
+    let proofs = proof.parent()?;
+    if proofs.file_name()? != DIR {
+        return None;
+    }
+    let run = proofs.parent()?;
+    Some((run, Path::new(DIR).join(number).join(leaf)))
+}
+
 pub fn retained_harness(run: &Path, record: &ProofRecord) -> Result<PreparedHarness, String> {
     let mut contents = Vec::new();
     let mut total = 0;

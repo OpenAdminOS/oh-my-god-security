@@ -171,7 +171,21 @@ pub fn build_view(
                     "--test".into(),
                     path_text(test),
                 ];
-                if p.test_from.is_some() {
+                if !p.harness.is_empty() {
+                    crate::proof::retained_harness(run, &p)?;
+                    // prepare_harness maps the supplied directory to the test's parent.
+                    let parent = Path::new(test).parent().ok_or("proof test has no parent")?;
+                    args.extend([
+                        "--test-from".into(),
+                        path_text(
+                            &run.join("proofs")
+                                .join(p.n.to_string())
+                                .join("harness")
+                                .join(parent)
+                                .to_string_lossy(),
+                        ),
+                    ]);
+                } else if p.test_from.is_some() {
                     args.extend([
                         "--test-from".into(),
                         path_text(
@@ -180,6 +194,24 @@ pub fn build_view(
                                 .join("test-draft")
                                 .to_string_lossy(),
                         ),
+                    ]);
+                }
+                if let Some(selection) = p
+                    .execution_inputs
+                    .as_ref()
+                    .and_then(|i| i.selection.as_ref())
+                {
+                    let relative = Path::new("proofs")
+                        .join(p.n.to_string())
+                        .join(crate::proof_inputs::SELECTION_FILE);
+                    let bytes = crate::run_artifact::read(run, &relative, 65536)
+                        .map_err(|e| e.to_string())?;
+                    if &crate::proof_inputs::parse_selection(&bytes)? != selection {
+                        return Err("retained input selection does not match proof record".into());
+                    }
+                    args.extend([
+                        "--inputs-from".into(),
+                        path_text(&run.join(relative).to_string_lossy()),
                     ]);
                 }
                 args.extend([
@@ -491,6 +523,15 @@ pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
         let target = PathBuf::from(p.target.as_deref().ok_or("proof has no target")?);
         outside(run, &target)?;
         target_known = true;
+        if !p.harness.is_empty() {
+            let harness = crate::proof::retained_harness(run, &p)?;
+            for (file, bytes) in harness.files.iter().zip(harness.contents) {
+                // Git records the executable bit; the proof record retains the full mode.
+                let executable = cfg!(unix) && file.mode & 0o111 != 0;
+                add_staged_test(&mut tests, &target, &file.path, bytes, executable)?;
+            }
+            continue;
+        }
         let source = if p.test_from.is_some() {
             run.join("proofs").join(p.n.to_string()).join("test-draft")
         } else {
@@ -524,22 +565,7 @@ pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
         };
         #[cfg(not(unix))]
         let executable = false;
-        // Never propose replacement of an existing target entry, including dangling symlinks.
-        if std::fs::symlink_metadata(target.join(&test)).is_ok() {
-            return Err(format!("proposed path already exists in target: {test}"));
-        }
-        let text = String::from_utf8(bytes)
-            .map_err(|_| "proof test is not UTF-8; cannot emit text patch")?;
-        if text.contains('\0') {
-            return Err("proof test contains NUL; cannot emit text patch".into());
-        }
-        if tests
-            .get(&test)
-            .is_some_and(|prior| prior != &(text.clone(), executable))
-        {
-            return Err(format!("conflicting proof tests for {test}"));
-        }
-        tests.insert(test, (text, executable));
+        add_staged_test(&mut tests, &target, &test, bytes, executable)?;
     }
     if !target_known {
         return Err("stage needs a recorded target to establish that the run is outside it".into());
@@ -565,6 +591,33 @@ pub fn stage(run: &Path, file: &FindingsFile) -> Result<String, String> {
         }
     }
     Ok(patch)
+}
+
+fn add_staged_test(
+    tests: &mut BTreeMap<String, (String, bool)>,
+    target: &Path,
+    path: &str,
+    bytes: Vec<u8>,
+    executable: bool,
+) -> Result<(), String> {
+    let test = relative_test(path)?;
+    // Never propose replacement of an existing target entry, including dangling symlinks.
+    if std::fs::symlink_metadata(target.join(&test)).is_ok() {
+        return Err(format!("proposed path already exists in target: {test}"));
+    }
+    let text =
+        String::from_utf8(bytes).map_err(|_| "proof test is not UTF-8; cannot emit text patch")?;
+    if text.contains('\0') {
+        return Err("proof test contains NUL; cannot emit text patch".into());
+    }
+    if tests
+        .get(&test)
+        .is_some_and(|prior| prior != &(text.clone(), executable))
+    {
+        return Err(format!("conflicting proof tests for {test}"));
+    }
+    tests.insert(test, (text, executable));
+    Ok(())
 }
 
 pub struct StagedTests {

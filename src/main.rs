@@ -805,10 +805,11 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
                         return Err("--test-from must be outside the target".into());
                     }
                 }
-                Some(omgs::proof::prepare_harness(
-                    &path,
-                    test.as_deref().ok_or("--test-from needs --test")?,
-                )?)
+                let test = test.as_deref().ok_or("--test-from needs --test")?;
+                Some(match omgs::proof::harness_artifact(&path, test)? {
+                    Some(harness) => harness,
+                    None => omgs::proof::prepare_harness(&path, test)?,
+                })
             }
             _ => None,
         },
@@ -1022,6 +1023,22 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     };
     if let Some(harness) = &harness {
         if let Err(e) = omgs::proof::keep_harness(&run_dir, harness) {
+            release();
+            return Err(e);
+        }
+    }
+    // Handoff acceptance commands reuse the exact selection through --inputs-from.
+    if let (Some(selection), Some(_)) = (&inputs, &proof_dir) {
+        let kept = serde_json::to_string(selection)
+            .map_err(|e| e.to_string())
+            .and_then(|text| {
+                omgs::runmeta::write_atomic_bytes(
+                    &run_dir.join(omgs::proof_inputs::SELECTION_FILE),
+                    text.as_bytes(),
+                )
+                .map_err(|e| e.to_string())
+            });
+        if let Err(e) = kept {
             release();
             return Err(e);
         }

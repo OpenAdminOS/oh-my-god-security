@@ -3593,3 +3593,227 @@ fn completed_verifier_fixture(run: &std::path::Path, identity: &str) {
         omgs::attempts::append(run, serde_json::from_value(value).unwrap()).unwrap();
     }
 }
+
+// Retained acceptance inputs must survive removal of the caller's draft files.
+fn acceptance_inputs_fixture(
+    name: &str,
+    scoped: bool,
+) -> (PathBuf, PathBuf, omgs::model::FindingsFile) {
+    let d = scratch(name);
+    let target = d.join("target");
+    let run = d.join("run");
+    let draft = d.join("draft");
+    std::fs::create_dir_all(target.join("asset")).unwrap();
+    std::fs::create_dir_all(&draft).unwrap();
+    std::fs::write(target.join("source"), "synthetic\n").unwrap();
+    let (test, command, entry, helper) = if cfg!(windows) {
+        (
+            "checks/main.cmd",
+            "cmd.exe /d /c checks\\main.cmd",
+            "@echo off\r\ncall checks\\helper.cmd\r\nexit /b %errorlevel%\r\n",
+            if scoped {
+                "@echo off\r\nif exist asset exit /b 2\r\nexit /b 1\r\n"
+            } else {
+                "@echo off\r\nexit /b 1\r\n"
+            },
+        )
+    } else {
+        (
+            "checks/main.sh",
+            "sh checks/main.sh",
+            "#!/bin/sh\n. checks/helper.sh\n",
+            if scoped {
+                "test ! -d asset || exit 2\nexit 1\n"
+            } else {
+                "exit 1\n"
+            },
+        )
+    };
+    let basename = Path::new(test).file_name().unwrap();
+    let helper_name = if cfg!(windows) {
+        "helper.cmd"
+    } else {
+        "helper.sh"
+    };
+    std::fs::write(draft.join(basename), entry).unwrap();
+    std::fs::write(draft.join(helper_name), helper).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(draft.join(basename), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    completed_verifier_fixture(&run, "blue-1");
+    let fp = omgs::fingerprint("missing_authz", "GET /x", "db.x", "tenant");
+    let selection = d.join("selection.json");
+    std::fs::write(&selection, r#"{"version":1,"paths":["source"]}"#).unwrap();
+    let mut args = vec![
+        "prove",
+        "--run",
+        run.to_str().unwrap(),
+        "--finding",
+        &fp,
+        "--test",
+        test,
+        "--test-from",
+        draft.to_str().unwrap(),
+        "--cmd",
+        command,
+    ];
+    if scoped {
+        args.extend(["--inputs-from", selection.to_str().unwrap()]);
+    }
+    let out = omgs(&d, &args);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let file = omgs::shape::findings(&serde_json::json!({"findings":[{
+        "fingerprint":fp,"title":"Unauthorized read","verdict":"confirmed","severity":"high","proof_tier":"test_proven",
+        "attack_class":"missing_authz","entry_point":"GET /x","sink":"db.x","boundary":"tenant",
+        "location":{"path":"source","line":1},"evidence":"Retained test fails.","hunted_by":"red-1","verified_by":"blue-1",
+        "verification":{"state":"final","attempt":"fixture-verifier"},"proof_ref":"proofs/1.json"
+    }]}).to_string()).unwrap();
+    std::fs::remove_dir_all(draft).unwrap();
+    std::fs::remove_file(selection).unwrap();
+    (d, run, file)
+}
+
+fn rerun_acceptance_in_fix_run(
+    d: &Path,
+    run: &Path,
+    acceptance: &omgs::handoff::Acceptance,
+) -> PathBuf {
+    let fix = d.join("fix-run");
+    let target = d.join("target");
+    let init = omgs(
+        d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            fix.to_str().unwrap(),
+            "--no-sensors",
+            "--fix-of",
+            run.to_str().unwrap(),
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let mut args = acceptance.command_args.clone();
+    let index = args.iter().position(|a| a == "--run").unwrap();
+    args[index + 1] = fix.to_str().unwrap().into();
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
+    let out = omgs(d, &args);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    fix
+}
+
+#[test]
+fn retained_directory_harness_stage_exports_entry_and_helper() {
+    if !mxc_ready() {
+        return;
+    }
+    let (d, run, file) = acceptance_inputs_fixture("acceptance-stage", false);
+    let patch = omgs::handoff::stage(&run, &file).unwrap();
+    let extension = if cfg!(windows) { "cmd" } else { "sh" };
+    assert!(
+        patch.contains(&format!("b/checks/main.{extension}")),
+        "{patch}"
+    );
+    assert!(
+        patch.contains(&format!("b/checks/helper.{extension}")),
+        "{patch}"
+    );
+    #[cfg(unix)]
+    assert!(
+        patch.contains("new file mode 100755") && patch.contains("new file mode 100644"),
+        "{patch}"
+    );
+    let retained_helper = run
+        .join("proofs")
+        .join("1")
+        .join("harness")
+        .join("checks")
+        .join(format!("helper.{extension}"));
+    write_private_fixture(retained_helper, "changed").unwrap();
+    assert!(omgs::handoff::stage(&run, &file)
+        .unwrap_err()
+        .contains("harness identity mismatch"));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn retained_directory_harness_handoff_reruns_entry_and_helper() {
+    if !mxc_ready() {
+        return;
+    }
+    let (d, run, file) = acceptance_inputs_fixture("acceptance-harness", false);
+    let handoff = omgs::handoff::build(&run, &file, None).unwrap();
+    let acceptance = handoff.records[0].acceptance.as_ref().unwrap();
+    assert!(
+        acceptance.command_args.iter().any(|a| a == "--test-from"),
+        "{}",
+        acceptance.command
+    );
+    assert!(omgs::handoff::markdown(&handoff).contains("--test-from"));
+    assert!(serde_json::to_string(&handoff)
+        .unwrap()
+        .contains("--test-from"));
+    let fix = rerun_acceptance_in_fix_run(&d, &run, acceptance);
+    assert_eq!(
+        omgs::proof::load(&run, "proofs/1.json").unwrap().harness,
+        omgs::proof::load(&fix, "proofs/1.json").unwrap().harness
+    );
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn retained_scoped_selection_handoff_omits_behavior_changing_directory() {
+    if !mxc_ready() {
+        return;
+    }
+    let (d, run, file) = acceptance_inputs_fixture("acceptance-selection", true);
+    let handoff = omgs::handoff::build(&run, &file, None).unwrap();
+    let acceptance = handoff.records[0].acceptance.as_ref().unwrap();
+    let index = acceptance
+        .command_args
+        .iter()
+        .position(|a| a == "--inputs-from")
+        .expect("handoff dropped scoped execution input selection");
+    let selection = std::fs::canonicalize(&acceptance.command_args[index + 1]).unwrap();
+    assert!(selection.starts_with(run.join("proofs").join("1")));
+    let rel = selection.strip_prefix(&run).unwrap();
+    let bytes = omgs::run_artifact::read(&run, rel, 65536).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        serde_json::json!({"version":1,"paths":["source"]})
+    );
+    assert!(omgs::handoff::markdown(&handoff).contains("--inputs-from"));
+    assert!(serde_json::to_string(&handoff)
+        .unwrap()
+        .contains("--inputs-from"));
+    let fix = rerun_acceptance_in_fix_run(&d, &run, acceptance);
+    assert_eq!(
+        omgs::proof::load(&run, "proofs/1.json")
+            .unwrap()
+            .execution_inputs,
+        omgs::proof::load(&fix, "proofs/1.json")
+            .unwrap()
+            .execution_inputs
+    );
+    write_private_fixture(&selection, r#"{"version":1,"paths":["asset"]}"#).unwrap();
+    assert!(omgs::handoff::build(&run, &file, None).is_err());
+    std::fs::remove_dir_all(d).unwrap();
+}

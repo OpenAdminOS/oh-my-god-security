@@ -186,10 +186,17 @@ impl Selection {
     }
 }
 
+/// Retained beside a proof record so acceptance commands can reuse it.
+pub const SELECTION_FILE: &str = "input-selection.json";
+
 pub fn read_selection(path: &Path) -> Result<Selection, String> {
     let file = crate::platform::open_regular(path).map_err(|e| e.to_string())?;
     let bytes = crate::platform::read_bounded_file(file, 65536).map_err(|e| e.to_string())?;
-    let value = crate::shape::strict_json(std::str::from_utf8(&bytes).map_err(|e| e.to_string())?)?;
+    parse_selection(&bytes)
+}
+
+pub fn parse_selection(bytes: &[u8]) -> Result<Selection, String> {
+    let value = crate::shape::strict_json(std::str::from_utf8(bytes).map_err(|e| e.to_string())?)?;
     if !value.is_object() {
         return Err("input selection must be an object".into());
     }

@@ -164,8 +164,12 @@ acceptance checks; keep the associated findings, tests and proof artifacts
 available. Run `omgs handoff --run RUN` to generate `HANDOFF.md` and
 `handoff.json`, optionally selecting a finding with `--finding C1`. Run
 `omgs stage --run RUN` to export verified retained tests as
-`RUN/proposed-tests.patch` for review before applying them. Treat all run
-artifacts as sensitive.
+`RUN/proposed-tests.patch` for review before applying them. Directory harnesses
+export every retained file at its proposed target-relative path, including its
+recorded executable bit. Acceptance commands retain `--test-from` for the whole
+harness and `--inputs-from` for a scoped selection stored in the proof directory,
+so they reuse the original proof inputs even after the caller's drafts are removed.
+Treat all run artifacts as sensitive.
 
 ## Known limitations
 
