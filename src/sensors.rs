@@ -11,6 +11,22 @@ pub struct SensorHit {
     pub fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<PackageIdentity>,
+    /// Position identity, or an opaque identity authenticated with an ephemeral key.
+    /// Neither raw match data nor the key is retained. Absent on legacy artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence: Option<String>,
+    /// Safe provenance only. Indices refer to the ordered normalized input
+    /// hit stream before deduplication, never to secret-bearing match text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_sources: Option<DuplicateSources>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DuplicateSources {
+    pub first_source_index: usize,
+    pub count: u64,
+    pub source_indexes: Vec<usize>,
+    pub omitted: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -30,11 +46,65 @@ pub struct SensorsReport {
     pub gaps: Vec<String>,
 }
 
+/// Collapse identity-equal hits across the normalized scanner stream. The
+/// global source-index sample is bounded even when many fingerprints repeat.
+pub fn deduplicate_hits(hits: &mut Vec<SensorHit>) {
+    let mut unique: Vec<SensorHit> = Vec::new();
+    let mut seen = std::collections::BTreeMap::new();
+    let mut retained = 0usize;
+    for (source_index, mut hit) in std::mem::take(hits).into_iter().enumerate() {
+        hit.fingerprint = hit_fingerprint(&hit);
+        // Legacy line-only identities cannot establish occurrence equality.
+        if hit.package.is_none() && hit.occurrence.is_none() {
+            unique.push(hit);
+            continue;
+        }
+        if let Some(&(position, first_index)) = seen.get(&hit.fingerprint) {
+            let first: &mut SensorHit = &mut unique[position];
+            let sources = first
+                .duplicate_sources
+                .get_or_insert_with(|| DuplicateSources {
+                    first_source_index: first_index,
+                    count: 0,
+                    source_indexes: Vec::new(),
+                    omitted: 0,
+                });
+            sources.count = sources.count.saturating_add(1);
+            let mut indices = vec![source_index];
+            if let Some(prior) = hit.duplicate_sources {
+                sources.count = sources.count.saturating_add(prior.count);
+                sources.omitted = sources.omitted.saturating_add(prior.omitted);
+                indices.extend(prior.source_indexes);
+            }
+            for index in indices {
+                if retained < 128 {
+                    sources.source_indexes.push(index);
+                    retained += 1;
+                } else {
+                    sources.omitted = sources.omitted.saturating_add(1);
+                }
+            }
+        } else {
+            if let Some(sources) = &mut hit.duplicate_sources {
+                let available = 128usize.saturating_sub(retained);
+                sources.omitted = sources
+                    .omitted
+                    .saturating_add(sources.source_indexes.len().saturating_sub(available) as u64);
+                sources.source_indexes.truncate(available);
+                retained += sources.source_indexes.len();
+            }
+            seen.insert(hit.fingerprint.clone(), (unique.len(), source_index));
+            unique.push(hit);
+        }
+    }
+    *hits = unique;
+}
+
 use crate::platform::which;
 
 /// Run deterministic sensor tools against source text. Sensors never execute
 /// target code. Raw scanner output can contain matched secret values, so only
-/// rule, file and line metadata is retained and the raw report is deleted.
+/// rule, file, line and opaque occurrence identities are retained; the raw report is deleted.
 pub fn run_sensors(target: &Path, artifacts: &Path) -> SensorsReport {
     let target = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
     let target = target.as_path();
@@ -50,18 +120,27 @@ pub fn run_sensors(target: &Path, artifacts: &Path) -> SensorsReport {
             .push(format!("scratch recovery unavailable: {e}"));
         return report;
     }
+    let Ok(mut identities) = OccurrenceCoordinator::new() else {
+        report
+            .gaps
+            .push("sensor occurrence randomness unavailable".into());
+        return report;
+    };
     for tool in ["gitleaks", "semgrep", "trufflehog", "osv-scanner"] {
-        run_offline(tool, target, artifacts, &mut report);
+        run_offline(tool, target, artifacts, &mut report, &mut identities);
     }
-    for hit in &mut report.hits {
-        hit.fingerprint = hit_fingerprint(hit);
-    }
+    deduplicate_hits(&mut report.hits);
     report
 }
 
 /// Extract rule/file/line metadata from a semgrep JSON report. Split out so the
 /// parser is unit-testable without a semgrep install.
-pub fn parse_semgrep(text: &str, target: &Path, report: &mut SensorsReport) {
+pub fn parse_semgrep(
+    text: &str,
+    target: &Path,
+    report: &mut SensorsReport,
+    identities: &mut OccurrenceCoordinator,
+) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
@@ -74,7 +153,7 @@ pub fn parse_semgrep(text: &str, target: &Path, report: &mut SensorsReport) {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if let Ok(hit) = metadata_hit(
+        if let Ok(mut hit) = metadata_hit(
             "semgrep",
             item.get("check_id")
                 .and_then(|v| v.as_str())
@@ -85,15 +164,62 @@ pub fn parse_semgrep(text: &str, target: &Path, report: &mut SensorsReport) {
                 .and_then(|v| v.as_u64()),
             target,
         ) {
+            identities.identify(&mut hit, item);
             report.hits.push(hit);
         }
     }
 }
 
-/// Identity is derived from retained metadata, never from a secret value.
+/// Run-scoped occurrence identities. Keep this coordinator in the parent that
+/// parses every scanner process and batch. Its ephemeral key is never serialized.
+/// Authenticate every record, including positioned records, so conflicting input
+/// order cannot choose which record receives an unkeyed position identity.
+pub struct OccurrenceCoordinator {
+    key: String,
+}
+
+impl OccurrenceCoordinator {
+    pub fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            key: crate::platform::random_nonce()?,
+        })
+    }
+
+    fn identify(&self, hit: &mut SensorHit, item: &serde_json::Value) {
+        let record = serde_json::to_vec(item).unwrap();
+        // HMAC-SHA-256, RFC 2104. random_nonce supplies a 64-byte ASCII key.
+        let mut inner_pad = [0x36u8; 64];
+        let mut outer_pad = [0x5cu8; 64];
+        for (i, byte) in self.key.bytes().enumerate() {
+            inner_pad[i] ^= byte;
+            outer_pad[i] ^= byte;
+        }
+        let mut inner = crate::sha256::Sha256::new();
+        inner.update(&inner_pad);
+        inner.update(b"omgs-occurrence-v2\0");
+        inner.update(&record);
+        let mut outer = crate::sha256::Sha256::new();
+        outer.update(&outer_pad);
+        outer.update(&inner.finish());
+        hit.occurrence = Some(crate::sha256::hex(&outer.finish()));
+        hit.fingerprint = hit_fingerprint(hit);
+    }
+}
+
+/// Identity uses retained metadata and an opaque occurrence, never match text.
 pub fn hit_fingerprint(hit: &SensorHit) -> String {
     let identity = if let Some(package) = &hit.package {
         serde_json::to_vec(&(&hit.tool, &hit.rule, &hit.file, hit.line, package)).unwrap()
+    } else if let Some(occurrence) = &hit.occurrence {
+        serde_json::to_vec(&(
+            "occurrence-v1",
+            &hit.tool,
+            &hit.rule,
+            &hit.file,
+            hit.line,
+            occurrence,
+        ))
+        .unwrap()
     } else {
         serde_json::to_vec(&(&hit.tool, &hit.rule, &hit.file, hit.line)).unwrap()
     };
@@ -146,6 +272,8 @@ fn metadata_hit(
         class,
         fingerprint: String::new(),
         package: None,
+        occurrence: None,
+        duplicate_sources: None,
     };
     hit.fingerprint = hit_fingerprint(&hit);
     Ok(hit)
@@ -153,7 +281,11 @@ fn metadata_hit(
 
 /// TruffleHog emits JSON objects separated by newlines. An empty stream is a
 /// valid zero-hit scan, but any non-JSON line or missing identity aborts it.
-fn trufflehog_hits(output: &str, target: &Path) -> Result<Vec<SensorHit>, ()> {
+fn trufflehog_hits_with_identity(
+    output: &str,
+    target: &Path,
+    identities: &mut OccurrenceCoordinator,
+) -> Result<Vec<SensorHit>, ()> {
     let mut hits = Vec::new();
     for line in output.lines().filter(|l| !l.trim().is_empty()) {
         let v = crate::shape::strict_json(line).map_err(|_| ())?;
@@ -181,7 +313,9 @@ fn trufflehog_hits(output: &str, target: &Path) -> Result<Vec<SensorHit>, ()> {
         {
             return Err(());
         }
-        hits.push(metadata_hit("trufflehog", rule, file, Some(line), target)?);
+        let mut hit = metadata_hit("trufflehog", rule, file, Some(line), target)?;
+        identities.identify(&mut hit, &v);
+        hits.push(hit);
     }
     Ok(hits)
 }
@@ -242,7 +376,13 @@ fn sensor_limits() -> crate::supervise::Limits {
 
 pub(crate) const SEMGREP_MAX_TARGET_BYTES: usize = 1_000_000;
 
-fn run_offline(tool: &str, target: &Path, artifacts: &Path, report: &mut SensorsReport) {
+fn run_offline(
+    tool: &str,
+    target: &Path,
+    artifacts: &Path,
+    report: &mut SensorsReport,
+    identities: &mut OccurrenceCoordinator,
+) {
     let Some(executable) = which(tool) else {
         report.tools_unavailable.push(tool.into());
         report.gaps.push(format!("{tool}: not present on PATH"));
@@ -373,9 +513,9 @@ fn run_offline(tool: &str, target: &Path, artifacts: &Path, report: &mut Sensors
         Err(())
     } else {
         match tool {
-            "trufflehog" => trufflehog_hits(&output, target),
+            "trufflehog" => trufflehog_hits_with_identity(&output, target, identities),
             "osv-scanner" => osv_hits(&output, target),
-            "semgrep" | "gitleaks" => simple_hits(tool, &output, target),
+            "semgrep" | "gitleaks" => simple_hits_with_identity(tool, &output, target, identities),
             _ => unreachable!(),
         }
     };
@@ -412,7 +552,12 @@ fn run_offline(tool: &str, target: &Path, artifacts: &Path, report: &mut Sensors
     }
 }
 
-fn simple_hits(tool: &str, output: &str, target: &Path) -> Result<Vec<SensorHit>, ()> {
+fn simple_hits_with_identity(
+    tool: &str,
+    output: &str,
+    target: &Path,
+    identities: &mut OccurrenceCoordinator,
+) -> Result<Vec<SensorHit>, ()> {
     let v = crate::shape::strict_json(output).map_err(|_| ())?;
     let items = if tool == "semgrep" {
         array(field(&v, "results")?)?
@@ -436,14 +581,54 @@ fn simple_hits(tool: &str, output: &str, target: &Path) -> Result<Vec<SensorHit>
         };
         // Semgrep paths in the disposable copy are returned relative to the
         // scan root by requesting a relative target from that copy's parent.
-        hits.push(metadata_hit(tool, rule, file, Some(line), target)?);
+        let mut hit = metadata_hit(tool, rule, file, Some(line), target)?;
+        identities.identify(&mut hit, item);
+        hits.push(hit);
     }
     Ok(hits)
+}
+
+#[cfg(test)]
+fn simple_hits(tool: &str, output: &str, target: &Path) -> Result<Vec<SensorHit>, ()> {
+    simple_hits_with_identity(
+        tool,
+        output,
+        target,
+        &mut OccurrenceCoordinator::new().map_err(|_| ())?,
+    )
+}
+
+#[cfg(test)]
+fn trufflehog_hits(output: &str, target: &Path) -> Result<Vec<SensorHit>, ()> {
+    trufflehog_hits_with_identity(
+        output,
+        target,
+        &mut OccurrenceCoordinator::new().map_err(|_| ())?,
+    )
 }
 
 /// Every code hit has its own candidate unit so one resolution cannot hide
 /// another hit from the same tool. Excluded classes retain their group review.
 pub fn seed_units(report: &SensorsReport, ledger: &mut crate::ledger::Ledger) {
+    for (i, gap) in report
+        .gaps
+        .iter()
+        .enumerate()
+        .filter(|(_, gap)| gap.contains("input entries/subtrees skipped"))
+    {
+        let id = format!("inventory:sensor-input:{i}");
+        if !ledger.units.iter().any(|u| u.id == id) {
+            let mut unit = crate::ledger::Unit::new(&id, "bounded sensor input", &[], "blocked");
+            unit.note = Some(gap.clone());
+            unit.extra.insert(
+                "inventory_gap_reason".into(),
+                serde_json::json!(
+                    "sensor input skipped; reconcile retained path/reason manifest in sensors.json"
+                ),
+            );
+            ledger.units.push(unit);
+        }
+    }
     for hit in report
         .hits
         .iter()
@@ -461,12 +646,11 @@ pub fn seed_units(report: &SensorsReport, ledger: &mut crate::ledger::Ledger) {
     }
     // A scanner may see a file omitted by inventory limits or link handling.
     // It still needs an exclusion group even when inventory never seeded one.
-    for (class, id) in [
-        (crate::paths::Class::Test, "tests:excluded"),
-        (crate::paths::Class::Docs, "docs:excluded"),
-        (crate::paths::Class::Data, "data:excluded"),
-        (crate::paths::Class::Vendored, "vendored:excluded"),
-    ] {
+    let classes: std::collections::BTreeSet<_> = report.hits.iter().map(|h| h.class).collect();
+    for class in classes {
+        let Some((id, _)) = crate::paths::exclusion_group(class) else {
+            continue;
+        };
         let paths: std::collections::BTreeSet<_> = report
             .hits
             .iter()
@@ -558,6 +742,269 @@ keywords = ["azurewebsites.net"]
 mod offline_tests {
     use super::*;
     use serde_json::json;
+
+    const OCCURRENCE_FIXTURE_ENV: &str = "OMGS_TEST_OCCURRENCE_FIXTURE";
+
+    #[test]
+    fn same_line_occurrences_remain_distinct_and_exact_repeats_merge() {
+        let target = Path::new("/target");
+        for tool in ["gitleaks", "semgrep", "trufflehog"] {
+            let first = match tool {
+                "gitleaks" => json!({"RuleID":"fixture", "File":"src/app.rs", "StartLine":2,
+                    "StartColumn":1, "EndColumn":8, "Secret":"first-synthetic-match"}),
+                "semgrep" => json!({"check_id":"fixture", "path":"src/app.rs",
+                    "start":{"line":2,"col":1}, "end":{"line":2,"col":8},
+                    "extra":{"lines":"first-synthetic-match"}}),
+                _ => truffle(),
+            };
+            let mut second = first.clone();
+            let mut third = first.clone();
+            match tool {
+                "gitleaks" => {
+                    second["Secret"] = json!("second-synthetic-match");
+                    third["StartColumn"] = json!(20);
+                }
+                "semgrep" => {
+                    second["extra"]["lines"] = json!("second-synthetic-match");
+                    third["start"]["col"] = json!(20);
+                }
+                _ => {
+                    second["Raw"] = json!("second-synthetic-match");
+                    third["SourceMetadata"]["Data"]["Filesystem"]["column"] = json!(20);
+                }
+            }
+            let items = vec![first.clone(), second, third, first];
+            let mut hits = if tool == "trufflehog" {
+                trufflehog_hits(
+                    &items
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    target,
+                )
+                .unwrap()
+            } else {
+                let value = if tool == "semgrep" {
+                    json!({"results":items})
+                } else {
+                    json!(items)
+                };
+                simple_hits(tool, &value.to_string(), target).unwrap()
+            };
+            deduplicate_hits(&mut hits);
+            assert_eq!(hits.len(), 3, "{tool}");
+            assert_eq!(hits[0].duplicate_sources.as_ref().unwrap().count, 1);
+            let serialized = serde_json::to_string(&hits).unwrap();
+            for secret in [
+                "first-synthetic-match",
+                "second-synthetic-match",
+                "secret-value",
+            ] {
+                assert!(!serialized.contains(secret));
+            }
+            let mut ledger = crate::ledger::Ledger::default();
+            seed_units(
+                &SensorsReport {
+                    tools_run: vec![],
+                    tools_unavailable: vec![],
+                    hits,
+                    gaps: vec![],
+                },
+                &mut ledger,
+            );
+            assert_eq!(ledger.units.len(), 3);
+        }
+    }
+
+    #[test]
+    fn occurrence_process_fixture() {
+        if let Ok(record) = std::env::var(OCCURRENCE_FIXTURE_ENV) {
+            println!("OCCURRENCE_RECORD:{record}");
+        }
+    }
+
+    #[test]
+    fn identities_span_parser_calls_and_processes_without_order_dependence() {
+        let dir = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-occurrence-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_tree(&dir).unwrap();
+        let home = dir.join("home");
+        crate::platform::private_dir(&home).unwrap();
+        let target = &dir;
+        let mut identities = OccurrenceCoordinator::new().unwrap();
+        for tool in ["semgrep", "gitleaks", "trufflehog"] {
+            for positioned in [true, false] {
+                let first = match tool {
+                    "semgrep" => {
+                        json!({"check_id":"fixture", "path":"src/app.rs", "start":{"line":1}, "extra":{"lines":"first-private-match"}})
+                    }
+                    "gitleaks" => {
+                        json!({"RuleID":"fixture", "File":"src/app.rs", "StartLine":1, "Secret":"first-private-match"})
+                    }
+                    _ => truffle(),
+                };
+                let mut first = first;
+                if positioned {
+                    match tool {
+                        "semgrep" => first["start"]["col"] = json!(1),
+                        "gitleaks" => first["StartColumn"] = json!(1),
+                        _ => first["SourceMetadata"]["Data"]["Filesystem"]["column"] = json!(1),
+                    }
+                }
+                let mut second = first.clone();
+                match tool {
+                    "semgrep" => second["extra"]["lines"] = json!("second-private-match"),
+                    "gitleaks" => second["Secret"] = json!("second-private-match"),
+                    _ => second["Raw"] = json!("second-private-match"),
+                }
+                // A fresh coordinator with the same run key must assign the
+                // same identities even when its first conflicting record changes.
+                let reverse = OccurrenceCoordinator {
+                    key: identities.key.clone(),
+                };
+                let mut forward_hits = Vec::new();
+                let mut reverse_hits = Vec::new();
+                for item in [&first, &second] {
+                    let mut hit =
+                        metadata_hit(tool, "fixture", "src/app.rs", Some(1), target).unwrap();
+                    identities.identify(&mut hit, item);
+                    forward_hits.push(hit.occurrence);
+                }
+                for item in [&second, &first] {
+                    let mut hit =
+                        metadata_hit(tool, "fixture", "src/app.rs", Some(1), target).unwrap();
+                    reverse.identify(&mut hit, item);
+                    reverse_hits.push(hit.occurrence);
+                }
+                reverse_hits.reverse();
+                assert_eq!(forward_hits, reverse_hits);
+                let mut hits = Vec::new();
+                for item in [&first, &second, &second, &first] {
+                    // Independent scanner processes emit their batches; only the
+                    // parent owns the run key and assigns occurrence identities.
+                    let output = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args([
+                            "--exact",
+                            "sensors::offline_tests::occurrence_process_fixture",
+                            "--nocapture",
+                        ])
+                        .env("OMGS_HOME", &home)
+                        .env("RUSTUP_AUTO_INSTALL", "0")
+                        .env(OCCURRENCE_FIXTURE_ENV, item.to_string())
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success());
+                    let stdout = String::from_utf8(output.stdout).unwrap();
+                    let record = stdout
+                        .lines()
+                        .find_map(|line| line.strip_prefix("OCCURRENCE_RECORD:"))
+                        .unwrap();
+                    if tool == "trufflehog" {
+                        hits.extend(
+                            trufflehog_hits_with_identity(record, target, &mut identities).unwrap(),
+                        );
+                    } else {
+                        let item: serde_json::Value = serde_json::from_str(record).unwrap();
+                        let batch = if tool == "semgrep" {
+                            json!({"results":[item]})
+                        } else {
+                            json!([item])
+                        };
+                        hits.extend(
+                            simple_hits_with_identity(
+                                tool,
+                                &batch.to_string(),
+                                target,
+                                &mut identities,
+                            )
+                            .unwrap(),
+                        );
+                        if tool == "semgrep" {
+                            let mut report = SensorsReport {
+                                tools_run: vec![],
+                                tools_unavailable: vec![],
+                                hits: vec![],
+                                gaps: vec![],
+                            };
+                            parse_semgrep(&batch.to_string(), target, &mut report, &mut identities);
+                            assert_eq!(
+                                report.hits.last().unwrap().occurrence,
+                                hits.last().unwrap().occurrence
+                            );
+                        }
+                    }
+                }
+                assert_eq!(hits[0].occurrence, hits[3].occurrence);
+                assert_eq!(hits[1].occurrence, hits[2].occurrence);
+                assert_ne!(hits[0].occurrence, hits[1].occurrence);
+                deduplicate_hits(&mut hits);
+                assert_eq!(hits.len(), 2);
+                assert!(hits
+                    .iter()
+                    .all(|hit| hit.duplicate_sources.as_ref().unwrap().count == 1));
+                let serialized = serde_json::to_string(&hits).unwrap();
+                assert!(!serialized.contains("private-match"));
+                assert!(!serialized.contains(&identities.key));
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn positioned_identity_is_keyed_even_for_short_secret_guesses() {
+        for tool in ["gitleaks", "semgrep", "trufflehog"] {
+            let mut expected = None;
+            for guess in ["0000", "0427", "9999"] {
+                let item = match tool {
+                    "gitleaks" => json!({"StartColumn":1,"EndColumn":8,"Secret":guess}),
+                    "semgrep" => json!({"start":{"col":1},"end":{"col":8},"extra":{"lines":guess}}),
+                    _ => json!({"SourceMetadata":{"Data":{"Filesystem":{"column":1}}},"Raw":guess}),
+                };
+                let mut hit =
+                    metadata_hit(tool, "fixture", "src/app.rs", Some(2), Path::new("/target"))
+                        .unwrap();
+                OccurrenceCoordinator::new()
+                    .unwrap()
+                    .identify(&mut hit, &item);
+                if let Some(expected) = &expected {
+                    assert_ne!(&hit, expected);
+                } else {
+                    expected = Some(hit);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_line_only_identity_requires_regeneration_without_merging() {
+        let hit = metadata_hit(
+            "gitleaks",
+            "fixture",
+            "src/app.rs",
+            Some(1),
+            Path::new("/target"),
+        )
+        .unwrap();
+        let fingerprint = hit.fingerprint.clone();
+        let mut hits = vec![hit.clone(), hit];
+        deduplicate_hits(&mut hits);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].fingerprint, fingerprint);
+        let report = SensorsReport {
+            tools_run: vec![],
+            tools_unavailable: vec![],
+            hits,
+            gaps: vec![],
+        };
+        assert!(
+            crate::shape::sensors(&serde_json::to_string(&report).unwrap())
+                .unwrap_err()
+                .contains("regenerate")
+        );
+    }
 
     fn truffle() -> serde_json::Value {
         json!({"DetectorName":"fixture","Raw":"secret-value","SourceMetadata":{"Data":{"Filesystem":{"file":"src/app.rs","line":2}}}})
@@ -721,7 +1168,12 @@ mod offline_tests {
         report
             .hits
             .extend(simple_hits("gitleaks", &gitleaks.to_string(), target).unwrap());
-        parse_semgrep(&semgrep.to_string(), target, &mut report);
+        parse_semgrep(
+            &semgrep.to_string(),
+            target,
+            &mut report,
+            &mut OccurrenceCoordinator::new().unwrap(),
+        );
         assert!(report.hits.iter().all(|h| h.file == expected));
         let markdown = crate::report::sensor_section(Some(&report), false);
         assert!(!markdown.contains(['\r', '\u{1b}']));

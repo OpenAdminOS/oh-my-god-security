@@ -53,10 +53,21 @@ free-form reports. Return structured records with these fields and no severity:
 | `proof_plan` | Minimum synthetic fixture, safe invariant assertion, expected vulnerable failure and control success, local prerequisites, and stop condition. |
 | `fingerprint` | Output from `omgs fingerprint` using the four identity inputs below. |
 
-Use stable attack class names across runs, starting from the ones `omgs audit init` seeds into the
-ledger (such as `missing_authz`, `idor_tenant_isolation`, `client_only_auth`, `webhook_signature`,
-`generated_script_injection`, `feed_to_policy_write`, `privileged_local_ops`). Apply the installed
-CLI's canonicalization and accepted schema; this vocabulary does not invent extra schema fields.
+Use the shared [class registry](intent/classes.json) for attack classes across seeds, packs,
+candidates and intent filters. It includes `ssrf`, `artifact_poisoning`, `ipc_authorization` and
+`secret_disclosure`. New public classes are added to that registry with tests and relevant intent
+questions. Candidate and finding validation and fingerprint creation reject unregistered classes,
+listing the registered names. New identifiers require a registry update before use. Classes do
+not change accountability or exclusion rules. An intent filter accepts every registered class
+and explicitly reports when it has no questions.
+
+A partially examined unit declares `partial: true` and references separate `residual_units` before
+closure. Preserve every unexamined operation there. Stack and operation checklists use explicit
+`child_units`; never assign their broad scope as duplicate candidate ownership. Read the source to
+complete operation enumeration; unknown syntax remains blocked. Declare ownership using
+`scope_paths: [{"path":"src#ipc/Decision.swift","operation":"read"}]`. The optional operation
+matches `[A-Za-z_][A-Za-z0-9_.:-]{0,127}`; omit it for whole-path ownership. Literal `#`
+characters belong in `path`. Migrate ambiguous legacy strings as described in RECONNAISSANCE.md.
 
 ## Identity and deduplication
 
@@ -101,3 +112,12 @@ Hunters must not execute any probe, including synthetic non-target probes on the
 execution plans to the verifier for `omgs prove`. Context isolation is a host obligation, not an OS
 access boundary: shared output directories do not prevent cross-reading. Disclose that limitation;
 use host-enforced read scopes where available and never claim technical isolation without them.
+
+Registered classes describe different boundaries. `download_integrity` concerns payload identity
+and authenticity; `download_and_execute` concerns the input-to-execution chain. Likewise,
+`deletion_path_safety` describes path confinement and `privileged_local_ops` the privileged effect.
+Use the same class for the same boundary across runs. Do not rename a class to fit a stack seed.
+Existing shipped records use the registered legacy labels `tenant_isolation`, `export_scope` and
+`search_control`; retain their identity when comparing those records. Unknown names are rejected,
+never silently hashed into a new identity. Hyphen aliases in intent question filters do not change
+candidate identity; fingerprint creation requires the registered spelling.

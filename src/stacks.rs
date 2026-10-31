@@ -21,7 +21,7 @@ pub fn detect(target: &Path, paths: &[PathBuf]) -> Vec<Project> {
             safe_relative(p)
                 && !matches!(
                     classify_file(target, p),
-                    Class::Vendored | Class::Docs | Class::Test
+                    Class::Vendored | Class::Docs | Class::Test | Class::Asset
                 )
         })
         .collect();

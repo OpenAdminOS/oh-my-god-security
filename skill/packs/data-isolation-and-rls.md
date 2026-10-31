@@ -1,6 +1,6 @@
 # Tenant isolation and delegated authorization
 
-Use for `tenant_isolation` and ownership units that delegate to a database or external API. A missing application predicate is a lead. It is not evidence that delegated enforcement is absent.
+Use for `idor_tenant_isolation` and ownership units that delegate to a database or external API. A missing application predicate is a lead. It is not evidence that delegated enforcement is absent.
 
 ## What to hunt
 

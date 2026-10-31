@@ -30,8 +30,29 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir
 }
 
+fn cli_home() -> std::path::PathBuf {
+    struct Home(std::path::PathBuf);
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    thread_local! {
+        static HOME: Home = {
+            let base = omgs::platform::temp_root().unwrap()
+                .join(format!("omgs-private-fixtures-{}", std::process::id()));
+            omgs::platform::create_private_tree(&base).unwrap();
+            let home = base.join(format!("home-{}", omgs::platform::random_nonce().unwrap()));
+            omgs::platform::private_dir(&home).unwrap();
+            Home(home)
+        };
+    }
+    HOME.with(|home| home.0.clone())
+}
+
 fn omgs(args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", cli_home())
         .args(args)
         .output()
         .unwrap()
@@ -444,15 +465,16 @@ fn intent_library_is_well_formed() {
 }
 
 fn open_record(key: &str, intent_id: Option<&str>, path: &str) -> Finding {
-    let attack_class = format!("class_{key}");
+    let attack_class = "missing_authz".to_string();
+    let entry_point = format!("GET /{key}");
     Finding {
-        fingerprint: omgs::fingerprint(&attack_class, "GET /x", "db.x", "tenant"),
+        fingerprint: omgs::fingerprint(&attack_class, &entry_point, "db.x", "tenant"),
         title: format!("Title {key}"),
         verdict: Verdict::NeedsValidation,
         severity: None,
         proof_tier: ProofTier::Traced,
         attack_class,
-        entry_point: "GET /x".into(),
+        entry_point,
         sink: "db.x".into(),
         boundary: "tenant".into(),
         location: Location {
@@ -666,6 +688,7 @@ fn concurrent_route_and_status_updates_are_not_lost() {
     for i in 1..=4 {
         kids.push(
             std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .env("OMGS_HOME", cli_home())
                 .args(["route", "--run", &run, "--role", "hunter", "--models", &m])
                 .args(["--refused", &format!("m{i}"), "--reason", "declined"])
                 .spawn()
@@ -673,6 +696,7 @@ fn concurrent_route_and_status_updates_are_not_lost() {
         );
         kids.push(
             std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .env("OMGS_HOME", cli_home())
                 .args(["status", "--run", &run, "--parent", "hunt", "--stage"])
                 .args([&format!("red-{i}"), "--state", "active"])
                 .spawn()
@@ -1044,6 +1068,7 @@ fn concurrent_intent_answers_and_ledger_updates_are_not_lost() {
     for i in 0..20 {
         kids.push(
             std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .env("OMGS_HOME", cli_home())
                 .args(["ledger", "add", "--ledger", ledger.to_str().unwrap()])
                 .args(["--unit", &format!("u{i}"), "--surface", "."])
                 .spawn()
@@ -1153,6 +1178,7 @@ fn concurrent_inits_cannot_share_one_run_directory() {
         std::fs::create_dir_all(&t).unwrap();
         kids.push(
             std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .env("OMGS_HOME", cli_home())
                 .args(["audit", "init", "--target", t.to_str().unwrap()])
                 .args(["--out", out.to_str().unwrap(), "--no-sensors"])
                 .stdout(std::process::Stdio::null())

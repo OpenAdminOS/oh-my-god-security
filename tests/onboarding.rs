@@ -42,6 +42,7 @@ fn every_subcommand_has_help_without_initializing_state() {
         "ledger list",
         "ledger add",
         "ledger set",
+        "ledger migrate",
         "critic",
         "status",
         "watch",
