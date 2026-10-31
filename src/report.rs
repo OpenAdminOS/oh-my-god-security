@@ -8,9 +8,10 @@ fn html_escape(s: &str) -> String {
 
 #[derive(Default)]
 pub struct ReportMeta {
-    pub artifact_base: String,
-    pub timeline: Vec<TimelineRow>,
     pub accounting: crate::accounting::Accounting,
+    pub artifact_base: String,
+    pub review_limits: Vec<String>,
+    pub timeline: Vec<TimelineRow>,
     pub persona: String,
     pub report_depth: String,
     pub repo: String,
@@ -87,11 +88,21 @@ fn models_text(meta: &ReportMeta) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(". "))
 }
 
+fn coverage_counts(meta: &ReportMeta) -> (usize, usize) {
+    (
+        meta.coverage
+            .iter()
+            .filter(|s| s.starts_with("blocked:"))
+            .count(),
+        meta.coverage
+            .iter()
+            .filter(|s| s.starts_with("deferred:"))
+            .count(),
+    )
+}
 fn critic_text(meta: &ReportMeta) -> String {
-    meta.critic
-        .as_ref()
-        .map(|c| c.summary())
-        .unwrap_or_else(|| "not run".into())
+    let (blocked, deferred) = coverage_counts(meta);
+    format!("{}; blocked units: {blocked}; deferred units: {deferred}. Reconciliation does not establish complete coverage", meta.critic.as_ref().map(|c| c.summary()).unwrap_or_else(|| "not run".into()))
 }
 
 /// One line describing who ran the review and at what cost. Each unrecorded
@@ -124,8 +135,9 @@ fn confirmed(file: &FindingsFile) -> Vec<&crate::model::Finding> {
 }
 
 /// A recorded pipeline stage or child, in saved order. Times are UTC.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct TimelineRow {
+    pub historical: bool,
     pub label: String,
     pub state: String,
     pub started: String,
@@ -144,14 +156,20 @@ pub fn timeline(run: &std::path::Path) -> Result<Vec<TimelineRow>, String> {
     };
     let doc = crate::shape::strict_json(&text)?;
     crate::status::check_document(doc.as_object().ok_or("pipeline status must be an object")?)?;
-    fn row(v: &serde_json::Value, parent: &str) -> TimelineRow {
+    timeline_document(&doc)
+}
+
+pub fn timeline_document(doc: &serde_json::Value) -> Result<Vec<TimelineRow>, String> {
+    crate::status::check_document(doc.as_object().ok_or("pipeline status must be an object")?)?;
+    fn row(v: &serde_json::Value, parent: &str, historical: bool) -> TimelineRow {
         let clock = |key: &str| {
             v.get(key)
                 .and_then(|v| v.as_u64())
-                .map(crate::runmeta::clock)
+                .map(crate::runmeta::timestamp)
                 .unwrap_or_else(|| "not recorded".into())
         };
         TimelineRow {
+            historical,
             label: format!("{parent}{}", v["label"].as_str().unwrap_or_default()),
             state: v["status"].as_str().unwrap_or_default().into(),
             started: clock("started_ms"),
@@ -159,21 +177,43 @@ pub fn timeline(run: &std::path::Path) -> Result<Vec<TimelineRow>, String> {
             detail: v["detail"].as_str().unwrap_or_default().into(),
         }
     }
-    let mut rows = Vec::new();
-    if let Some(stages) = doc["stages"].as_array() {
-        for v in stages {
-            rows.push(row(v, ""));
-            if let Some(children) = v["children"].as_array() {
-                for child in children {
-                    rows.push(row(
-                        child,
-                        &format!("{} / ", v["label"].as_str().unwrap_or_default()),
-                    ));
-                }
+    fn collect(v: &serde_json::Value, parent: &str, historical: bool, rows: &mut Vec<TimelineRow>) {
+        if let Some(history) = v["history"].as_array() {
+            for old in history {
+                collect(old, parent, true, rows);
+            }
+        }
+        rows.push(row(v, parent, historical));
+        if let Some(children) = v["children"].as_array() {
+            for child in children {
+                collect(
+                    child,
+                    &format!("{parent}{} / ", v["label"].as_str().unwrap_or_default()),
+                    historical,
+                    rows,
+                );
             }
         }
     }
+    let mut rows = Vec::new();
+    if let Some(stages) = doc["stages"].as_array() {
+        for v in stages {
+            collect(v, "", false, &mut rows);
+        }
+    }
     Ok(rows)
+}
+
+/// Build the completion inputs from current run artifacts for every index consumer.
+pub fn run_review_state(
+    run: &std::path::Path,
+    file: &FindingsFile,
+) -> Result<Option<String>, String> {
+    Ok(crate::review::View::with_findings(run, file)?.state)
+}
+
+pub fn review_state(file: &FindingsFile, meta: &ReportMeta) -> Option<String> {
+    crate::review::completion_state(file, meta)
 }
 
 fn short(meta: &ReportMeta) -> bool {
@@ -210,14 +250,17 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         .iter()
         .filter(|f| f.verdict == Verdict::Rejected)
         .count();
-    let fix = if conf.is_empty() {
-        "Nothing to fix from this run. No record reached confirmed.".into()
+    let fix = if let Some(state) = review_state(file, meta) {
+        state
+    } else if conf.is_empty() {
+        "Completed review: no confirmed findings.".into()
     } else {
         format!(
             "Review {} and their fix briefs in HANDOFF.md. Obtain authorization before editing.",
             plural(conf.len(), "confirmed finding", "confirmed findings")
         )
     };
+    let fix = markdown_inline(&fix);
     let mut out = format!("# What this asks of you\n\n{fix}\n\nVerify {} before fixing. {} were rejected after verification and need no action. Answer the intent questions below where recorded.\n\nRepository: {} at {}\nMode: {}\nSandbox: {}\n\nConfirmed findings: {}\nNeeds validation: {pending}\nRejected after verification: {rejected}\n\n", plural(pending, "pending record", "pending records"), plural(rejected, "lead", "leads"), markdown_inline(&meta.repo), markdown_inline(&meta.source_ref), markdown_inline(&meta.mode), markdown_inline(&meta.sandbox), conf.len());
     if let Some(sensors) = &meta.sensors {
         out.push_str(&format!("Sensors: {}\n\n", markdown_inline(sensors)));
@@ -802,7 +845,7 @@ fn render_section(id: &str, title: &str, intro: &str, body: &str) -> String {
     let intro = if intro.is_empty() {
         String::new()
     } else {
-        format!("<p class=\"intro\">{intro}</p>")
+        format!("<p class=\"intro\">{}</p>", html_escape(intro))
     };
     format!("<section class=\"sec sec-{id}\" id=\"{id}\" aria-labelledby=\"{id}-h\"><h2 id=\"{id}-h\">{title}</h2>{intro}{body}</section>")
 }
@@ -875,14 +918,17 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
         rejected.len(),
     );
 
-    let fix_line = if conf.is_empty() {
-        "Nothing to fix from this run. No record reached confirmed.".to_string()
+    let fix_line = if let Some(state) = review_state(file, meta) {
+        state
+    } else if conf.is_empty() {
+        "Completed review: no confirmed findings.".to_string()
     } else {
         format!(
             "{}, each with the evidence that decided it.",
             plural(conf.len(), "confirmed finding", "confirmed findings")
         )
     };
+    let fix_line = html_escape(&fix_line);
     let decide_line = if groups.is_empty() {
         "No open questions about intended behavior.".to_string()
     } else {
@@ -1080,15 +1126,15 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
             format!("<details><summary>Coverage details</summary>{coverage_body}</details>");
     }
     let critic_body = match &meta.critic {
-        None => "<p class=\"note\">Coverage critic: not run for this report.</p>".to_string(),
+        None => format!("<p class=\"note\">Coverage critic: {}.</p>", html_escape(&critic_text(meta))),
         Some(c) if c.passed() => format!(
             "<p class=\"note\">Coverage critic: {}. Every candidate was verified by someone other than its hunter, and every unit was examined or closed with a reason.</p>",
-            html_escape(&c.summary())
+            html_escape(&critic_text(meta))
         ),
         Some(c) => {
             let mut items = format!(
                 "<div class=\"callout c-missing\"><h4>Coverage critic: {}</h4><ul class=\"gaps\">",
-                html_escape(&c.summary())
+                html_escape(&critic_text(meta))
             );
             for gap in &c.gaps {
                 items.push_str(&format!("<li>{}</li>", html_escape(gap)));
@@ -1287,8 +1333,13 @@ a{color:inherit;text-decoration:none}
 }
 "#;
 
-pub fn render_sarif(file: &FindingsFile, _meta: &ReportMeta) -> String {
+pub fn render_sarif(file: &FindingsFile, meta: &ReportMeta) -> String {
     use crate::model::Severity;
+    let state = review_state(file, meta);
+    let notifications: Vec<_> = state
+        .iter()
+        .map(|reason| serde_json::json!({"level":"warning", "message":{"text":reason}}))
+        .collect();
     let actionable: Vec<_> = file
         .findings
         .iter()
@@ -1325,6 +1376,7 @@ pub fn render_sarif(file: &FindingsFile, _meta: &ReportMeta) -> String {
         "version": "2.1.0",
         "runs": [{
             "tool": { "driver": { "name": "omgs", "informationUri": "https://github.com/OpenAdminOS/oh-my-god-security", "version": env!("CARGO_PKG_VERSION"), "rules": rules } },
+            "invocations": [{"executionSuccessful": state.is_none(), "toolExecutionNotifications": notifications}],
             "results": results
         }]
     })).unwrap())
@@ -1459,73 +1511,107 @@ fn tier_label(f: &Finding) -> String {
 pub struct Completion {
     pub hunters: Option<u32>,
     pub verifier: Option<String>,
-    pub accounting: crate::accounting::Accounting,
     pub complete: bool,
 }
 
-/// Publish initial counters, render without holding the run lock, then publish
-/// completion against fresh metadata under the lock. Rendering may overlap a
-/// charge from another process and must never restore its earlier allowance.
+/// Render artifacts and save completion while holding the same family/run lock.
+/// The callback must use lock-aware readers and writers throughout publication.
 pub fn publish(
     run: Option<&std::path::Path>,
     calls: Option<u32>,
     models: &std::collections::BTreeMap<String, String>,
-    render: impl FnOnce() -> Result<Completion, String>,
+    publication: &std::collections::BTreeMap<&str, String>,
+    render: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<Completion, String>,
 ) -> Result<(), String> {
+    publish_prepared(run, calls, models, publication, |meta, _| render(meta))
+}
+
+pub fn publish_prepared(
+    run: Option<&std::path::Path>,
+    calls: Option<u32>,
+    models: &std::collections::BTreeMap<String, String>,
+    publication: &std::collections::BTreeMap<&str, String>,
+    render: impl FnOnce(
+        &mut serde_json::Map<String, serde_json::Value>,
+        &mut crate::runmeta::Transaction,
+    ) -> Result<Completion, String>,
+) -> Result<(), String> {
+    let transaction = |m: &mut serde_json::Map<String, serde_json::Value>| {
+        let mut writes = crate::runmeta::Transaction::default();
+        if let Some(n) = calls {
+            let old = m
+                .get("agent_calls_used")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if u64::from(n) < old {
+                return Err("--agent-calls cannot decrease recorded usage".into());
+            }
+            m.insert("agent_calls_used".into(), serde_json::json!(n));
+        }
+        let saved = m
+            .entry("models")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or("models must be an object")?;
+        for (role, model) in models {
+            saved.insert(role.clone(), serde_json::json!(model));
+        }
+        let labels = m
+            .entry("publication")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or("publication must be an object")?;
+        for (key, value) in publication {
+            if !["repo", "source_ref", "sandbox"].contains(key)
+                || value.trim().is_empty()
+                || value.chars().any(char::is_control)
+            {
+                return Err("invalid publication label".into());
+            }
+            labels.insert((*key).into(), serde_json::json!(value));
+        }
+        crate::runmeta::check_numeric_fields(m)?;
+        let completion = render(m, &mut writes)?;
+        if let Some(n) = completion.hunters {
+            m.insert("hunters".into(), serde_json::json!(n));
+        }
+        if let Some(v) = &completion.verifier {
+            m.insert("verifier".into(), serde_json::json!(v));
+        }
+        m.insert(
+            "run_status".into(),
+            serde_json::json!(if completion.complete {
+                "complete"
+            } else {
+                "partial"
+            }),
+        );
+        m.insert(
+            "completed_unix".into(),
+            serde_json::json!(crate::runmeta::now_unix()),
+        );
+        crate::runmeta::check_numeric_fields(m)?;
+        if let Some(run) = run {
+            if crate::runmeta::read_optional(run)?.is_some() {
+                writes.metadata(run, m)?;
+            }
+        }
+        writes.commit()
+    };
     if let Some(run) = run {
-        crate::runmeta::update(run, |m| {
-            if let Some(n) = calls {
-                let old = m
-                    .get("agent_calls_used")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                if u64::from(n) < old {
-                    return Err("--agent-calls cannot decrease recorded usage".into());
+        if crate::runmeta::read_optional(run)?.is_some() {
+            crate::budget::with_family_lock(run, || transaction(&mut crate::runmeta::read(run)?))
+        } else {
+            crate::runmeta::with_lock(run, || {
+                if crate::runmeta::read_optional(run)?.is_some() {
+                    return Err("run metadata appeared before report publication; retry".into());
                 }
-                m.insert("agent_calls_used".into(), serde_json::json!(n));
-            }
-            let saved = m
-                .entry("models")
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-                .ok_or("models must be an object")?;
-            for (role, model) in models {
-                saved.insert(role.clone(), serde_json::json!(model));
-            }
-            Ok(())
-        })?;
+                transaction(&mut Default::default())
+            })
+        }
+    } else {
+        transaction(&mut Default::default())
     }
-    let completion = render()?;
-    if let Some(run) = run {
-        crate::runmeta::update(run, |m| {
-            if let Some(n) = completion.hunters {
-                m.insert("hunters".into(), serde_json::json!(n));
-            }
-            if let Some(v) = &completion.verifier {
-                m.insert("verifier".into(), serde_json::json!(v));
-            }
-            let mut usage = crate::accounting::read(m)?;
-            usage.extend(completion.accounting);
-            m.insert(
-                "accounting".into(),
-                serde_json::to_value(usage).map_err(|e| e.to_string())?,
-            );
-            m.insert(
-                "run_status".into(),
-                serde_json::json!(if completion.complete {
-                    "complete"
-                } else {
-                    "partial"
-                }),
-            );
-            m.insert(
-                "completed_unix".into(),
-                serde_json::json!(crate::runmeta::now_unix()),
-            );
-            Ok(())
-        })?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1543,19 +1629,34 @@ mod publication_tests {
             r#"{"run_id":"publication-test","budget_agent_calls":12,"agent_calls_used":0}"#,
         )
         .unwrap();
-        super::publish(Some(&run), Some(5), &Default::default(), || {
-            assert_eq!(crate::runmeta::read(&run)?["agent_calls_used"], 5);
-            crate::budget::charge_calls(&run, 1)?;
-            Ok(super::Completion {
-                hunters: None,
-                verifier: None,
-                accounting: Default::default(),
-                complete: true,
-            })
-        })
+        let mut charge = None;
+        super::publish(
+            Some(&run),
+            Some(5),
+            &Default::default(),
+            &Default::default(),
+            |m| {
+                assert_eq!(m["agent_calls_used"], 5);
+                let path = run.clone();
+                let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+                let writer_ready = ready.clone();
+                charge = Some(std::thread::spawn(move || {
+                    writer_ready.wait();
+                    crate::budget::charge_calls(&path, 1)
+                }));
+                ready.wait();
+                assert_eq!(m["agent_calls_used"], 5);
+                Ok(super::Completion {
+                    hunters: None,
+                    verifier: None,
+                    complete: false,
+                })
+            },
+        )
         .unwrap();
+        charge.unwrap().join().unwrap().unwrap();
         let meta = crate::runmeta::read(&run).unwrap();
-        assert_eq!(meta["run_status"], "complete");
+        assert_eq!(meta["run_status"], "partial");
         assert_eq!(meta["agent_calls_used"], 6);
         assert!(crate::budget::summary(&run)
             .unwrap()

@@ -442,3 +442,23 @@ Attack class packs and benchmark cases are the highest leverage contributions. E
 ## License
 
 Apache-2.0. See LICENSE and NOTICE.
+
+### Upgrading retained review runs
+
+Older findings without `verification.state: "final"` and a matching completed
+verifier attempt remain available as drafts. Reports visibly disclose that legacy
+confirmed findings were demoted to needs validation because final verification
+was not recorded. These records cannot produce retained test patches or confirmed
+fix briefs. Reverify the finding in a recorded verifier attempt, inspect its output,
+record completion, and explicitly save the final verification before republishing.
+Do not add a final marker solely to preserve a historical verdict.
+
+Archive publication establishes run locks before reading any input, including the
+first publication. Writable archives receive a lock file. For read-only archives,
+establish lock files before freezing the archive; an archive without an enforceable
+lock is refused rather than treated as an immutable snapshot.
+
+Redaction output regressions run in the normal test suite. The ignored
+`redaction_performance` timing check runs separately with one test thread.
+
+Human-facing terminal output escapes control and Unicode formatting characters. JSON output is lossless: escaped characters decode to their original values. Output paths, run directories, and clone roots must not contain control or Unicode formatting characters.

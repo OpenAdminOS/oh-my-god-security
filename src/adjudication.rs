@@ -9,6 +9,8 @@ use std::path::Path;
 #[serde(deny_unknown_fields)]
 pub struct Evaluation {
     pub evaluator: String,
+    #[serde(default)]
+    pub attempt: Option<String>,
     pub source_ref: String,
     pub decisions: Vec<Decision>,
     pub gaps: Vec<String>,
@@ -43,6 +45,10 @@ pub struct Disposition {
     pub disposition: String,
     pub evidence: Vec<String>,
     pub note: String,
+    #[serde(default)]
+    pub attempt_ref: Option<String>,
+    #[serde(default)]
+    pub blocker_ref: Option<String>,
 }
 
 fn document(text: &str, list: &str) -> Result<Value, String> {
@@ -72,6 +78,11 @@ pub fn parse(text: &str) -> Result<Evaluation, String> {
         .is_some_and(|l| !l.as_array().is_some_and(|a| a.iter().all(Value::is_object)))
     {
         return Err("leads must be an array of objects".into());
+    }
+    if v.get("attempt")
+        .is_some_and(|a| !a.as_str().is_some_and(|s| !s.trim().is_empty()))
+    {
+        return Err("attempt must be a nonblank string when present".into());
     }
     let e: Evaluation = serde_json::from_value(v).map_err(|e| e.to_string())?;
     nonblank(&e.evaluator, "evaluator")?;
@@ -103,8 +114,18 @@ pub fn parse(text: &str) -> Result<Evaluation, String> {
     Ok(e)
 }
 pub fn dispositions(text: &str) -> Result<Dispositions, String> {
-    let d: Dispositions =
-        serde_json::from_value(document(text, "units")?).map_err(|e| e.to_string())?;
+    let value = document(text, "units")?;
+    for unit in value["units"].as_array().unwrap() {
+        for key in ["attempt_ref", "blocker_ref"] {
+            if unit
+                .get(key)
+                .is_some_and(|v| !v.as_str().is_some_and(|s| !s.trim().is_empty()))
+            {
+                return Err(format!("{key} must be a nonblank string when present"));
+            }
+        }
+    }
+    let d: Dispositions = serde_json::from_value(value).map_err(|e| e.to_string())?;
     nonblank(&d.hunter, "hunter")?;
     let mut seen = BTreeSet::new();
     for u in &d.units {
@@ -193,7 +214,11 @@ pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String>
             ]
         });
     };
-    let mut gaps = Vec::new();
+    let mut gaps: Vec<String> = e
+        .gaps
+        .iter()
+        .map(|gap| format!("Evaluator gap: {gap}"))
+        .collect();
     let meta = if crate::run_artifact::optional_text(
         run,
         Path::new(crate::runmeta::FILE),
@@ -211,6 +236,14 @@ pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String>
         .is_some_and(|r| r != e.source_ref)
     {
         gaps.push("evaluation source_ref differs from run".into());
+    }
+    match e.attempt.as_deref() {
+        Some(id) => {
+            if let Err(error) = crate::attempts::final_for(&meta, id, "evaluator", &e.evaluator) {
+                gaps.push(error);
+            }
+        }
+        None => gaps.push("evaluation requires a completed attempt".into()),
     }
     for f in &findings.findings {
         let Some(d) = e.decisions.iter().find(|d| d.fingerprint == f.fingerprint) else {
@@ -301,6 +334,19 @@ pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String>
 }
 
 pub fn report_lines(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String> {
+    report_lines_inner(run, findings, false, None)
+}
+
+pub fn report_lines_view(run: &Path, view: &crate::review::View) -> Result<Vec<String>, String> {
+    report_lines_inner(run, &view.findings, true, Some(view))
+}
+
+fn report_lines_inner(
+    run: &Path,
+    findings: &FindingsFile,
+    locked: bool,
+    checked: Option<&crate::review::View>,
+) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     if let Some(e) = load(run)? {
         lines.push(format!(
@@ -327,9 +373,12 @@ pub fn report_lines(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, 
         lines.push("Evaluator: not recorded; adjudication not established".into());
     }
     lines.extend(
-        check(run, findings)?
-            .into_iter()
-            .map(|g| format!("Adjudication gap: {g}")),
+        match checked {
+            Some(view) => view.adjudication_gaps.clone(),
+            None => check(run, findings)?,
+        }
+        .into_iter()
+        .map(|g| format!("Adjudication gap: {g}")),
     );
     if crate::run_artifact::optional_text(
         run,
@@ -339,12 +388,53 @@ pub fn report_lines(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, 
     .is_some()
     {
         let meta = crate::runmeta::read(run)?;
-        if let Some(blockers) = meta.get("blockers").and_then(Value::as_array) {
-            for b in blockers {
-                lines.push(format!("Blocker: {}", b.as_str().unwrap_or("malformed")));
+        lines.extend(crate::attempts::active_blockers(&meta)?);
+        if let Some(events) = meta.get("blocker_events").and_then(Value::as_array) {
+            for event in events {
+                lines.push(format!("Blocker history: {event}"));
             }
         }
-        lines.push(crate::budget::summary(run)?);
+        for event in crate::attempts::history(&meta)? {
+            lines.push(format!("Attempt history {}: {:?}", event.at, event.record));
+        }
+        lines.push("Context isolation is procedural unless the host enforces private views. Separate identities do not attest separate contexts. The same model across roles limits adversarial independence.".into());
+        if let Some(view) = checked {
+            lines.extend(view.budget.clone());
+        } else {
+            lines.push(if locked {
+                crate::budget::summary_locked(run)?
+            } else {
+                crate::budget::summary(run)?
+            });
+        }
+    }
+    if let Some(text) = crate::run_artifact::optional_text(
+        run,
+        Path::new(crate::status::FILE),
+        crate::run_artifact::STATUS_BYTES,
+    )? {
+        let status = crate::shape::strict_json(&text)?;
+        crate::status::check_document(
+            status
+                .as_object()
+                .ok_or("pipeline status must be an object")?,
+        )?;
+        if let Some(log) = status.get("log").and_then(Value::as_array) {
+            for entry in log {
+                lines.push(format!(
+                    "Status log {} [{}]: {}",
+                    entry
+                        .get("ts")
+                        .and_then(Value::as_str)
+                        .unwrap_or("time not recorded"),
+                    entry
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("kind not recorded"),
+                    entry["m"].as_str().unwrap()
+                ));
+            }
+        }
     }
     if let Some(text) = crate::run_artifact::optional_text(
         run,

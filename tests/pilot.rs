@@ -85,7 +85,7 @@ fn refusal_without_models_survives_report_metadata_and_index() {
     assert_eq!(out.status.code(), Some(1));
     let m = read(f.run.join("run-metadata.json"));
     assert_eq!(m["reroutes"][0]["from"], "fixed-test-provider");
-    assert!(m["blockers"][0]
+    assert!(m["blocker_events"][0]["reason"]
         .as_str()
         .unwrap()
         .contains("provider eligibility block"));
@@ -115,7 +115,7 @@ fn refusal_without_models_survives_report_metadata_and_index() {
         read(f.run.join("run-metadata.json"))["run_status"],
         "partial"
     );
-    assert!(omgs::runmeta::is_complete(&f.run));
+    assert!(!omgs::runmeta::is_complete(&f.run));
     let summary = omgs::batch::summarize(
         &omgs::batch::BatchRun {
             url: "https://example.com/team/synthetic".into(),
@@ -541,6 +541,17 @@ fn guidance_preserves_probe_and_artifact_rules() {
 #[test]
 fn unresolved_evaluator_leads_keep_delivery_partial() {
     let f = Fixture::new();
+    for (id, role, identity) in [
+        ("verifier-round", "verifier", "verifier"),
+        ("evaluation-round", "evaluator", "independent"),
+    ] {
+        for event in [
+            json!({"event":"start","id":id,"role":role,"identity":identity,"context":id,"inputs":["synthetic-input"],"outputs":["synthetic-output"],"isolation":"procedural"}),
+            json!({"event":"complete","id":id,"actor":"fixture-host","reason":"Synthetic finished review"}),
+        ] {
+            omgs::attempts::append(&f.run, serde_json::from_value(event).unwrap()).unwrap();
+        }
+    }
     let source = read(f.run.join("run-metadata.json"))["source_ref"].clone();
     let mut ledger = read(f.run.join("coverage-ledger.json"));
     for u in ledger["units"].as_array_mut().unwrap() {
@@ -553,7 +564,7 @@ fn unresolved_evaluator_leads_keep_delivery_partial() {
     ledger["units"].as_array_mut().unwrap().push(json!({"id":"late-lead","surface":"sample.ps1","attack_classes":[],"status":"blocked","note":"provider block"}));
     f.put("coverage-ledger.json", ledger.clone());
     f.put("candidates-empty.json", json!({"candidates":[]}));
-    f.put("evaluation.json",json!({"evaluator":"independent","source_ref":source,"decisions":[],"gaps":[],"leads":[{"unit_id":"late-lead","reason":"new boundary"}]}));
+    f.put("evaluation.json",json!({"evaluator":"independent","attempt":"evaluation-round","source_ref":source,"decisions":[],"gaps":[],"leads":[{"unit_id":"late-lead","reason":"new boundary"}]}));
     for status in ["blocked", "deferred"] {
         ledger["units"].as_array_mut().unwrap().last_mut().unwrap()["status"] = status.into();
         f.put("coverage-ledger.json", ledger.clone());
@@ -687,4 +698,261 @@ fn batch_accepts_a_fresh_relative_clone_root_before_attempting_git() {
         .unwrap()
         .contains("git not found"));
     assert!(!f.root.join("fresh-clones").exists());
+}
+
+#[test]
+fn hostile_saved_text_is_inert_at_terminal_and_report_boundaries() {
+    let f = Fixture::new();
+    let hostile = "hostile\u{1b}[2J\n::error::forged <img src=x onerror=alert(1)> [x](javascript:alert(1)) @mention";
+    let check_terminal = |out: &Output| {
+        for bytes in [&out.stdout, &out.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            assert!(
+                !text.lines().any(|l| l.starts_with("::error::")),
+                "{text:?}"
+            );
+        }
+    };
+    let models = f.root.join("models.json");
+    omgs::runmeta::write_atomic(&models, &json!({"roles":{hostile:["test"]}}).to_string()).unwrap();
+    let out = f.cli(&[
+        "route",
+        "--run",
+        f.run_str(),
+        "--role",
+        "verifier",
+        "--models",
+        models.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("hostile"));
+    check_terminal(&out);
+
+    let ledger = f.run.join("coverage-ledger.json");
+    for args in [
+        vec![
+            "ledger",
+            "add",
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--unit",
+            hostile,
+            "--surface",
+            "sample.ps1",
+            "--note",
+            hostile,
+        ],
+        vec![
+            "ledger",
+            "set",
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--unit",
+            hostile,
+            "--status",
+            "planned",
+            "--note",
+            hostile,
+        ],
+        vec!["ledger", "list", "--ledger", ledger.to_str().unwrap()],
+    ] {
+        let out = f.cli(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("hostile"));
+        check_terminal(&out);
+    }
+
+    let summary = omgs::batch::RunSummary {
+        url: hostile.into(),
+        report_href: Some(format!("javascript:{hostile}/REPORT.html")),
+        state: hostile.into(),
+        budget: Some(hostile.into()),
+        blockers: vec![hostile.into()],
+        ..Default::default()
+    };
+    for text in [
+        omgs::batch::render_index_markdown(std::slice::from_ref(&summary)),
+        omgs::batch::render_index_html(&[summary]),
+    ] {
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.lines().any(|l| l.starts_with("::error::")));
+        assert!(!text.contains("<img src=x"));
+        assert!(!text.contains("href=\"javascript:"));
+    }
+
+    let mut findings: Value =
+        serde_json::from_str(include_str!("fixtures/report-run/findings.json")).unwrap();
+    findings["findings"].as_array_mut().unwrap().truncate(1);
+    findings["findings"][0]["title"] = hostile.into();
+    findings["findings"][0]["fingerprint"] =
+        omgs::fingerprint("export_scope", "GET /orders/:id", "orders.load", "tenant").into();
+    let input = f.root.join("findings.json");
+    omgs::runmeta::write_atomic(&input, &findings.to_string()).unwrap();
+    let report = f.root.join("report");
+    let out = f.cli(&[
+        "report",
+        "--findings",
+        input.to_str().unwrap(),
+        "--out",
+        report.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    check_terminal(&out);
+    for name in [
+        "REPORT.md",
+        "REPORT.html",
+        "HANDOFF.md",
+        "handoff.json",
+        "findings.sarif.json",
+    ] {
+        let text = std::fs::read_to_string(report.join(name)).unwrap();
+        assert!(!text.contains('\u{1b}'), "{name}");
+        assert!(!text.lines().any(|l| l.starts_with("::error::")), "{name}");
+        if name.ends_with(".json") {
+            // JSON retains data faithfully, never creates HTML or Markdown nodes.
+            serde_json::from_str::<Value>(&text).unwrap();
+        } else {
+            assert!(!text.contains("<img src=x"), "{name}");
+            assert!(!text.contains("href=\"javascript:"), "{name}");
+            if name.ends_with(".md") {
+                assert!(!text.contains("[x](javascript:"), "{name}");
+                assert!(!text.contains(" @mention"), "{name}");
+            }
+        }
+    }
+}
+
+#[test]
+fn terminal_controls_are_escaped_for_every_class() {
+    let f = Fixture::new();
+    let controls = "\u{1}\u{85}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}\u{200b}\u{200c}\u{200d}\u{200e}\u{200f}\u{feff}\u{2028}\u{2029}\u{e0001}";
+    for c in controls.chars() {
+        assert!(!omgs::platform::escape_controls(&c.to_string()).contains(c));
+        let models = f.root.join("models.json");
+        std::fs::write(
+            &models,
+            json!({"roles":{format!("hostile{c}"):["test"]}}).to_string(),
+        )
+        .unwrap();
+        let out = f.cli(&[
+            "route",
+            "--run",
+            f.run_str(),
+            "--role",
+            "verifier",
+            "--models",
+            models.to_str().unwrap(),
+        ]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(c));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("hostile"));
+    }
+}
+
+#[test]
+fn failed_stage_preserves_existing_proposal_and_policy_directory() {
+    let f = Fixture::new();
+    let proposal = f.run.join("proposed-tests.patch");
+    std::fs::write(&proposal, "previous proposal\n").unwrap();
+    let policy = f.run.join("policy.patch");
+    std::fs::create_dir(&policy).unwrap();
+    std::fs::write(policy.join("retained"), "previous policy").unwrap();
+    let meta = std::fs::read(f.run.join("run-metadata.json")).unwrap();
+    let out = f.cli(&["stage", "--run", f.run_str()]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(proposal).unwrap(),
+        "previous proposal\n"
+    );
+    assert!(policy.is_dir());
+    assert_eq!(
+        std::fs::read_to_string(policy.join("retained")).unwrap(),
+        "previous policy"
+    );
+    assert_eq!(
+        std::fs::read(f.run.join("run-metadata.json")).unwrap(),
+        meta
+    );
+}
+
+#[test]
+fn output_paths_reject_controls_before_creating_artifacts() {
+    let f = Fixture::new();
+    for c in ['\t', '\u{85}', '\u{202e}', '\u{2028}', '\u{2029}'] {
+        let out_path = f.root.join(format!("new{c}run"));
+        let out = f.cli(&[
+            "audit",
+            "init",
+            "--target",
+            f.target.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--no-sensors",
+        ]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("output paths must not contain"));
+        assert!(out.stdout.is_empty());
+        assert!(!out_path.exists());
+    }
+}
+
+#[test]
+fn paired_exports_preserve_markdown_when_html_destination_is_a_directory() {
+    let f = Fixture::new();
+    let batch = f.root.join("batch.json");
+    std::fs::write(&batch, json!({"runs":[]}).to_string()).unwrap();
+    let architecture = f.run.join("architecture.json");
+    omgs::runmeta::write_atomic(
+        &architecture,
+        include_str!("../examples/architecture.sample.json"),
+    )
+    .unwrap();
+    for (name, args) in [
+        (
+            "ARCHITECTURE",
+            vec!["architecture", "--in", architecture.to_str().unwrap()],
+        ),
+        (
+            "INDEX",
+            vec!["batch", "index", "--batch", batch.to_str().unwrap()],
+        ),
+    ] {
+        let out_dir = f.root.join(name);
+        omgs::platform::create_private_dir(&out_dir).unwrap();
+        let md = out_dir.join(format!("{name}.md"));
+        let html = out_dir.join(format!("{name}.html"));
+        omgs::runmeta::write_atomic(&md, "retained markdown").unwrap();
+        omgs::platform::create_private_dir(&html).unwrap();
+        std::fs::write(html.join("retained"), "retained html").unwrap();
+        let mut args = args;
+        args.extend(["--out", out_dir.to_str().unwrap()]);
+        let result = f.cli(&args);
+        assert_eq!(
+            result.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("destination is a directory"));
+        assert_eq!(std::fs::read_to_string(md).unwrap(), "retained markdown");
+        assert_eq!(
+            std::fs::read_to_string(html.join("retained")).unwrap(),
+            "retained html"
+        );
+        assert_eq!(std::fs::read_dir(out_dir).unwrap().count(), 2);
+    }
 }

@@ -221,7 +221,7 @@ pub fn install(from: Option<&Path>, targets: &[PathBuf], replace: bool) -> Resul
                 .filter(|p| old.get(*p) != files.get(*p))
                 .collect();
             if differences.is_empty() {
-                println!("already installed: {}", to.display());
+                crate::out::line(&format!("already installed: {}", to.display()));
                 continue;
             }
             if !replace {
@@ -258,7 +258,7 @@ pub fn install(from: Option<&Path>, targets: &[PathBuf], replace: bool) -> Resul
             return Err(e);
         }
         publish(&staged, to, &backup)?;
-        println!("installed: {}", to.display());
+        crate::out::line(&format!("installed: {}", to.display()));
     }
     Ok(())
 }
@@ -280,7 +280,7 @@ fn publish(staged: &Path, to: &Path, backup: &Path) -> Result<(), String> {
         ));
     }
     if had_old {
-        println!("skill backup: {}", backup.display());
+        crate::out::line(&format!("skill backup: {}", backup.display()));
     }
     Ok(())
 }

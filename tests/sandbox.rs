@@ -394,7 +394,10 @@ fn prove_refuses_an_executor_that_does_not_match_the_pin() {
     assert_eq!(out.status.code(), Some(3), "{t}");
     assert!(t.contains("refusing to run"), "{t}");
     assert!(t.contains("target code was not executed"), "{t}");
-    assert!(!t.lines().any(|l| l.trim() == "ran"), "{t}");
+    assert!(
+        out.stdout.is_empty(),
+        "refused executor must emit no workload output: {t}"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -486,7 +489,11 @@ fn denials_hold_and_the_target_is_untouched() {
     let t = text(&out);
     assert!(curl_works, "host loopback positive control must answer");
     assert!(
-        t.lines().any(|line| line == "CURL_EXISTS"),
+        record_from(&t)["output"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .any(|line| line == "CURL_EXISTS"),
         "sandbox curl must exist: {t}"
     );
     for leak in [
@@ -632,6 +639,7 @@ fn proof_records_back_confirmed_findings() {
         ],
     );
     assert!(init.status.success(), "{}", text(&init));
+    completed_verifier_fixture(&run, "blue-1");
     let fp = omgs::fingerprint("missing_authz", "GET /x", "db.x", "tenant");
     let out = omgs(
         &home,
@@ -679,7 +687,7 @@ fn proof_records_back_confirmed_findings() {
             "location": {"path": "app/x.ts", "line": 3},
             "evidence": "Proof test fails on the target.",
             "hunted_by": "red-1",
-            "verified_by": "blue-1"
+            "verified_by": "blue-1", "verification":{"state":"final","attempt":"fixture-verifier"}
         });
         if let Some(r) = proof_ref {
             f["proof_ref"] = serde_json::json!(r);
@@ -1138,7 +1146,7 @@ fn an_mxc_timeout_is_never_a_proof() {
             "fingerprint": fp, "title": "t", "verdict": "confirmed", "severity": "high",
             "proof_tier": "test_proven", "attack_class": "missing_authz", "entry_point": "GET /t",
             "sink": "db.t", "boundary": "tenant", "location": {"path": "a.ts", "line": 1},
-            "evidence": "e", "hunted_by": "red-1", "verified_by": "blue-1",
+            "evidence": "e", "hunted_by": "red-1", "verified_by": "blue-1", "verification":{"state":"final","attempt":"fixture-verifier"},
             "proof_ref": "proofs/1.json"
         }]})
         .to_string(),
@@ -3575,4 +3583,13 @@ fn concurrent_source_change_during_copy_refuses_a_mixed_snapshot() {
         "blocked workspace must be removed"
     );
     std::fs::remove_dir_all(d).unwrap();
+}
+
+fn completed_verifier_fixture(run: &std::path::Path, identity: &str) {
+    for value in [
+        serde_json::json!({"event":"start","id":"fixture-verifier","role":"verifier","identity":identity,"context":"fixture-context","inputs":["synthetic-input"],"outputs":["findings.json"],"isolation":"procedural"}),
+        serde_json::json!({"event":"complete","id":"fixture-verifier","actor":"fixture-host","reason":"Synthetic completion fixture"}),
+    ] {
+        omgs::attempts::append(run, serde_json::from_value(value).unwrap()).unwrap();
+    }
 }

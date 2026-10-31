@@ -559,13 +559,21 @@ fn validate_run(r: &Value, m: &Value) -> Result<()> {
 struct ScoringRun {
     export: Value,
     accounting: Value,
-    evidence_errors: BTreeMap<(String, String, String), Vec<String>>,
+    evidence_errors: Evidence,
 }
 
-fn source_findings(
-    dir: &Path,
-    observation: &Value,
-) -> Result<(crate::model::FindingsFile, PathBuf)> {
+struct Evidence {
+    findings: BTreeMap<(String, String, String), Vec<String>>,
+    observations: BTreeMap<(String, String), ObservationReview>,
+}
+
+struct ObservationReview {
+    state: Option<String>,
+    needs_validation: usize,
+    decisions: BTreeMap<String, crate::model::Verdict>,
+}
+
+fn source_findings(dir: &Path, observation: &Value) -> Result<(crate::review::View, PathBuf)> {
     let source = text(&observation["source_run"]).map_err(|_| "missing source_run".to_owned())?;
     // Archived source runs must stay within the supplied repetition, including symlinks.
     if source.contains('\\')
@@ -579,22 +587,19 @@ fn source_findings(
     }
     let root = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
     let relative = Path::new(source).join("findings.json");
-    let input = crate::run_artifact::text(&root, &relative, crate::run_artifact::FINDINGS_BYTES)?;
+    // Admit the archive boundary, then read publication inputs under its lock.
+    crate::run_artifact::text(&root, &relative, crate::run_artifact::FINDINGS_BYTES)?;
     let source = root.join(source);
-    let file = crate::shape::findings(&input)?;
-    let errors = crate::model::validate(&file);
-    if !errors.is_empty() {
-        return Err(errors.join("; "));
+    let view = crate::review::View::load_archive_locked(&source)?;
+    if !view.strict_errors.is_empty() {
+        return Err(view.strict_errors.join("; "));
     }
-    Ok((file, source))
+    Ok((view, source))
 }
 
-fn evidence_errors(
-    dir: &Path,
-    r: &Value,
-    manifest: &Value,
-) -> Result<BTreeMap<(String, String, String), Vec<String>>> {
+fn evidence_errors(dir: &Path, r: &Value, manifest: &Value) -> Result<Evidence> {
     let mut errors = BTreeMap::new();
+    let mut observations = BTreeMap::new();
     for o in list(&r["observations"])? {
         let case = list(&manifest["cases"])?
             .iter()
@@ -623,6 +628,7 @@ fn evidence_errors(
             let omitted: Vec<_> = source
                 .0
                 .findings
+                .findings
                 .iter()
                 .filter(|f| {
                     matches!(
@@ -640,10 +646,37 @@ fn evidence_errors(
             }
             Ok(source)
         };
+        // Validate every observation before inspecting exports, including empty ones.
+        let review = match &source {
+            Ok((view, _)) => ObservationReview {
+                state: view.state.clone(),
+                needs_validation: view.needs_validation,
+                decisions: view
+                    .findings
+                    .findings
+                    .iter()
+                    .flat_map(|f| {
+                        std::iter::once(&f.fingerprint)
+                            .chain(f.candidates.iter())
+                            .map(move |fp| (fp.clone(), f.verdict))
+                    })
+                    .collect(),
+            },
+            Err(e) => ObservationReview {
+                state: Some(e.clone()),
+                needs_validation: 0,
+                decisions: BTreeMap::new(),
+            },
+        };
+        observations.insert(
+            (text(&o["case_id"])?.into(), text(&o["snapshot_id"])?.into()),
+            review,
+        );
         for f in list(&o["findings"])? {
             let result = match &source {
                 Err(e) => vec![e.clone()],
-                Ok((file, source)) => match file
+                Ok((view, source)) => match view
+                    .findings
                     .findings
                     .iter()
                     .find(|s| s.fingerprint == f["fingerprint"])
@@ -664,16 +697,16 @@ fn evidence_errors(
                         .iter()
                         .any(|key| original[*key] != f[*key])
                         {
-                            vec!["exported finding does not match source findings.json (identity, verdict, tier or proof_ref)".into()]
+                            {
+                                let mut errors = view.decision_errors[&finding.fingerprint].clone();
+                                errors.push("exported finding does not match source findings.json (identity, verdict, tier or proof_ref)".into());
+                                errors
+                            }
                         } else {
                             // The same offline proof validator used by `omgs validate`, including
                             // runner artifacts and versioned proof contract rules. No replay.
-                            let mut proof_errors = crate::proof::validate_proofs(
-                                &crate::model::FindingsFile {
-                                    findings: vec![finding.clone()],
-                                },
-                                source,
-                            );
+                            let mut proof_errors =
+                                view.decision_errors[&finding.fingerprint].clone();
                             if let Some(proof_ref) = finding.proof_ref.as_deref() {
                                 // Load errors are already reported by validate_proofs.
                                 if let Ok(record) = crate::proof::load(source, proof_ref) {
@@ -701,107 +734,75 @@ fn evidence_errors(
             );
         }
     }
-    Ok(errors)
+    Ok(Evidence {
+        findings: errors,
+        observations,
+    })
 }
 
-// Consume the host accounting shape without depending on report/status modules.
+// Use the same cumulative usage model as report and status.
 fn accounting(dir: &Path) -> Result<Value> {
-    let meta = match crate::run_artifact::optional_text(
-        dir,
-        Path::new(crate::runmeta::FILE),
-        crate::run_artifact::METADATA_BYTES,
-    )? {
-        Some(text) => crate::shape::strict_json(&text)?,
-        None => json!({}),
-    };
-    if !meta.is_object() {
-        return Err("run metadata must be object".into());
-    }
-    let mut usage = json!({"tokens":null,"input_tokens":null,"output_tokens":null,"calls":null,"cost_usd":null,"duration_ms":null,"roles":null});
-    if let Some(calls) = meta.get("agent_calls_used") {
+    let view = crate::review::View::load_archive_locked(dir)?;
+    let mut usage = crate::accounting::aggregate(&view.saved)?;
+    if let Some(calls) = view.saved.get("agent_calls_used") {
         integer(calls)?;
         usage["calls"] = calls.clone();
-    }
-    if let Some(roles) = meta.get("accounting") {
-        let roles = roles.as_object().ok_or("accounting must be object")?;
-        for (role, entry) in roles {
-            if !["red-hunter", "blue-verifier", "evaluator", "green-fixer"].contains(&role.as_str())
-            {
-                return Err(format!("unknown accounting role {role}"));
-            }
-            let entry = entry.as_object().ok_or("accounting role must be object")?;
-            for (field, value) in entry {
-                if ![
-                    "tokens",
-                    "input_tokens",
-                    "output_tokens",
-                    "cost_usd",
-                    "duration_ms",
-                ]
-                .contains(&field.as_str())
-                {
-                    return Err(format!("unknown accounting field {field}"));
-                }
-                if !value.is_null() {
-                    if field == "cost_usd" {
-                        number(value)?;
-                    } else {
-                        integer(value)?;
-                    }
-                }
-            }
-        }
-        usage["roles"] = Value::Object(roles.clone());
-        for field in [
-            "tokens",
-            "input_tokens",
-            "output_tokens",
-            "cost_usd",
-            "duration_ms",
-        ] {
-            let mut sum = 0.0;
-            let mut sum_integer = 0u64;
-            let mut complete = true;
-            for role in ["red-hunter", "blue-verifier", "evaluator", "green-fixer"] {
-                match roles
-                    .get(role)
-                    .and_then(|v| v.get(field))
-                    .filter(|v| !v.is_null())
-                {
-                    Some(v) => {
-                        if field == "cost_usd" {
-                            number(v)?;
-                        } else {
-                            integer(v)?;
-                        }
-                        if field == "cost_usd" {
-                            sum += v.as_f64().unwrap();
-                        } else {
-                            sum_integer = sum_integer
-                                .checked_add(v.as_u64().unwrap())
-                                .ok_or("accounting integer overflow")?;
-                        }
-                    }
-                    None => complete = false,
-                }
-            }
-            if !sum.is_finite() {
-                return Err("accounting sum overflow".into());
-            }
-            if complete {
-                usage[field] = if field == "cost_usd" {
-                    json!(sum)
-                } else {
-                    json!(sum_integer)
-                };
-            }
-        }
     }
     Ok(usage)
 }
 
 /// Each directory is one complete repetition over all frozen snapshots.
 pub fn score(cases: &Path, dirs: &[PathBuf]) -> Result<Value> {
+    publish_score(cases, dirs, Ok)
+}
+
+/// Keep every repetition and source-run snapshot locked through output.
+pub fn publish_score<T>(
+    cases: &Path,
+    dirs: &[PathBuf],
+    publish: impl FnOnce(Value) -> Result<T>,
+) -> Result<T> {
+    let inputs = score_inputs(dirs)?;
+    crate::runmeta::with_run_locks(&inputs, true, || {
+        if score_inputs(dirs)? != inputs {
+            return Err("benchmark inputs changed before publication; retry".into());
+        }
+        publish(score_locked(cases, dirs)?)
+    })
+}
+
+fn score_inputs(dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut inputs = BTreeSet::new();
+    for dir in dirs {
+        let root = std::fs::canonicalize(dir).map_err(|e| e.to_string())?;
+        inputs.insert(root.clone());
+        let r = crate::shape::strict_json(&crate::run_artifact::text(
+            &root,
+            Path::new("benchmark-run.json"),
+            crate::run_artifact::BENCHMARK_BYTES,
+        )?)?;
+        for o in list(&r["observations"])? {
+            if let Some(source) = o["source_run"].as_str() {
+                if source.contains(['\\', ':'])
+                    || source.starts_with('/')
+                    || source.split('/').any(|p| p == ".." || p.is_empty())
+                {
+                    return Err(
+                        "source_run must be a relative directory within the repetition".into(),
+                    );
+                }
+                let source = std::fs::canonicalize(root.join(source)).map_err(|e| e.to_string())?;
+                if !source.starts_with(&root) {
+                    return Err("source_run escapes repetition".into());
+                }
+                inputs.insert(source);
+            }
+        }
+    }
+    Ok(inputs.into_iter().collect())
+}
+
+fn score_locked(cases: &Path, dirs: &[PathBuf]) -> Result<Value> {
     let m = read(cases)?;
     manifest(&m)?;
     if dirs.is_empty() {
@@ -923,14 +924,24 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[ScoringRun]) -> Result<V
                 .filter(|o| o["case_id"] == cid)
             {
                 let sid = text(&o["snapshot_id"])?;
-                if o["status"] != "complete" {
-                    blocked.push(json!({"case_id":cid,"snapshot_id":sid,"status":o["status"],"blockers":o["blockers"]}));
+                let review = &run.evidence_errors.observations[&(cid.into(), sid.into())];
+                let review_gaps: Vec<_> = review.state.iter().cloned().collect();
+                needs_validation += review.needs_validation;
+                if o["status"] != "complete" || !review_gaps.is_empty() {
+                    let mut reasons = list(&o["blockers"])?.clone();
+                    reasons.extend(review_gaps.iter().map(|s| json!(s)));
+                    blocked.push(json!({"case_id":cid,"snapshot_id":sid,"status":if o["status"] == "complete" { json!("incomplete") } else { o["status"].clone() },"blockers":reasons}));
                 }
+                let status = if o["status"] == "complete" && !review_gaps.is_empty() {
+                    json!("incomplete")
+                } else {
+                    o["status"].clone()
+                };
                 let mut invalid = BTreeSet::new();
                 let mut unresolved = BTreeSet::new();
                 for f in list(&o["findings"])? {
                     let fingerprint = text(&f["fingerprint"])?;
-                    let errors = &run.evidence_errors
+                    let errors = &run.evidence_errors.findings
                         [&(cid.to_owned(), sid.to_owned(), fingerprint.to_owned())];
                     if !errors.is_empty() {
                         invalid.insert(fingerprint);
@@ -955,10 +966,24 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[ScoringRun]) -> Result<V
                         .collect();
                     if positive && !cs.is_empty() {
                         submitted.insert(key.clone());
-                        if cs.iter().any(|c| c["verifier"] == "rejected") {
+                        if cs.iter().any(|c| {
+                            identity(c).is_ok_and(|fp| {
+                                review.decisions.get(&fp) == Some(&crate::model::Verdict::Rejected)
+                            })
+                        }) {
                             rejected.insert(key.clone());
                         }
-                        if cs.iter().any(|c| c["verifier"] == "pending") {
+                        if cs.iter().any(|c| {
+                            identity(c).is_ok_and(|fp| {
+                                !matches!(
+                                    review.decisions.get(&fp),
+                                    Some(
+                                        crate::model::Verdict::Confirmed
+                                            | crate::model::Verdict::Rejected
+                                    )
+                                )
+                            })
+                        }) {
                             pending.insert(key.clone());
                         }
                     }
@@ -987,13 +1012,10 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[ScoringRun]) -> Result<V
                         }
                     }
                     if positive || contains(&e["negative_snapshot_ids"], sid) {
-                        paired.push(json!({"case_id":cid,"defect_id":e["id"],"snapshot_id":sid,"positive":positive,"recovered":found,"status":o["status"]}));
+                        paired.push(json!({"case_id":cid,"defect_id":e["id"],"snapshot_id":sid,"positive":positive,"recovered":found,"status":status}));
                     }
                 }
                 for f in list(&o["findings"])? {
-                    if f["verdict"] == "needs_validation" {
-                        needs_validation += 1;
-                    }
                     if f["verdict"] != "confirmed" {
                         continue;
                     }
@@ -1034,7 +1056,13 @@ fn score_cohort(cohort: &str, cases: &[&Value], runs: &[ScoringRun]) -> Result<V
         fps.push(Some(fp as f64));
         let snapshot_context: Vec<Value> = list(&r["observations"])?.iter()
             .filter(|o| cases.iter().any(|c| c["id"] == o["case_id"]))
-            .map(|o| json!({"case_id":o["case_id"],"snapshot_id":o["snapshot_id"],"status":o["status"],"blockers":o["blockers"],"examined_units":o["examined_units"],"unexamined_units":o["unexamined_units"]}))
+            .map(|o| {
+                let review = &run.evidence_errors.observations[&(o["case_id"].as_str().unwrap().into(), o["snapshot_id"].as_str().unwrap().into())];
+                let gaps: Vec<_> = review.state.iter().cloned().collect();
+                let mut blockers = o["blockers"].as_array().unwrap().clone();
+                blockers.extend(gaps.iter().map(|s| json!(s)));
+                json!({"case_id":o["case_id"],"snapshot_id":o["snapshot_id"],"status":if o["status"] == "complete" && !gaps.is_empty() { json!("incomplete") } else { o["status"].clone() },"blockers":blockers,"examined_units":o["examined_units"],"unexamined_units":o["unexamined_units"]})
+            })
             .collect();
         per_run.push(json!({"run_id":r["run_id"],"recall":ratio(recovered.len(),denominator),"false_positives":ratio(fp,1),"true_positive_detections":ratio(tp.len(),1),"false_discovery_fraction":ratio(fp,tp.len()+fp),"negative_unit_rate":ratio(fp_units.len(),negative_units),"verifier_false_rejection_rate":ratio(rejected.len(),submitted.len()),"true_candidates_pending":ratio(pending.len(),submitted.len()),"needs_validation":ratio(needs_validation,1),"unexpected_confirmations":unexpected,"invalid_evidence":invalid_evidence,"pending_adjudications":pending_adjudications,"blocked_or_exhausted":blocked,"paired_outcomes":paired,"snapshot_context":snapshot_context}));
     }
@@ -1047,18 +1075,12 @@ pub fn markdown(result: &Value) -> String {
     let mut s=String::from("| Cohort | Run | Recall | FP | FDR | Negative-unit rate | Verifier rejection | Verifier pending | Pending adjudications | Invalid evidence |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
     let display = |v: &Value| format!("{}/{} ({})", v["numerator"], v["denominator"], v["value"]);
     for c in result["cohorts"].as_array().unwrap() {
-        let name = c["cohort"]
-            .as_str()
-            .unwrap()
-            .replace(['|', '\n', '\r'], " ");
+        let name = crate::handoff::markdown_inline(c["cohort"].as_str().unwrap());
         for r in c["runs"].as_array().unwrap() {
             s.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 name,
-                r["run_id"]
-                    .as_str()
-                    .unwrap()
-                    .replace(['|', '\n', '\r'], " "),
+                crate::handoff::markdown_inline(r["run_id"].as_str().unwrap()),
                 display(&r["recall"]),
                 r["false_positives"]["numerator"],
                 display(&r["false_discovery_fraction"]),
@@ -1079,10 +1101,7 @@ pub fn markdown(result: &Value) -> String {
     for c in result["cohorts"].as_array().unwrap() {
         s.push_str(&format!(
             "| {} | {} | {}/{} |\n",
-            c["cohort"]
-                .as_str()
-                .unwrap()
-                .replace(['|', '\n', '\r'], " "),
+            crate::handoff::markdown_inline(c["cohort"].as_str().unwrap()),
             c["mean_recall"]["value"],
             c["mean_recall"]["numerator"],
             c["mean_recall"]["denominator"]
@@ -1100,6 +1119,9 @@ mod tests {
         crate::platform::create_private_tree(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap() {
             let entry = entry.unwrap();
+            if entry.file_name() == ".omgs-run.lock" {
+                continue;
+            }
             let dest = to.join(entry.file_name());
             if entry.file_type().unwrap().is_dir() {
                 copy_private(&entry.path(), &dest);

@@ -1412,14 +1412,14 @@ fn stage_workspace(
             req.inputs.as_ref(),
         )?);
         source_before = Some(crate::proof_inputs::manifest(&target, req.inputs.clone())?);
-        eprintln!(
+        crate::out::err(&format!(
             "proof inputs: copy started ({})",
             if req.inputs.is_some() {
                 "selected paths"
             } else {
                 "full target"
             }
-        );
+        ));
         let started = std::time::Instant::now();
         gaps = match &req.inputs {
             Some(selection) => copy_selected(&target, workspace, selection)?,
@@ -1431,10 +1431,10 @@ fn stage_workspace(
                 hook();
             }
         });
-        eprintln!(
+        crate::out::err(&format!(
             "proof inputs: copy complete ({} ms)",
             started.elapsed().as_millis()
-        );
+        ));
     } else {
         create_staging_dir(workspace).map_err(|e| e.to_string())?;
     }
@@ -1447,7 +1447,7 @@ fn stage_workspace(
         // Selections must not let a harness impersonate omitted target files.
         preflight_harness(target, &harness_paths)?;
     }
-    eprintln!("proof inputs: hash started");
+    crate::out::err("proof inputs: hash started");
     let started = std::time::Instant::now();
     let manifest = req
         .target
@@ -1464,11 +1464,11 @@ fn stage_workspace(
         .as_ref()
         .map(crate::proof_inputs::Manifest::digest)
         .transpose()?;
-    eprintln!(
+    crate::out::err(&format!(
         "proof inputs: hash complete ({} entries, {} ms)",
         manifest.as_ref().map(|m| m.count).unwrap_or(0),
         started.elapsed().as_millis()
-    );
+    ));
     if let Some(target) = &req.target {
         let source_after = crate::proof_inputs::manifest(target, req.inputs.clone())
             .map_err(|e| format!("target changed during staging: {e}"))?;
@@ -2871,7 +2871,7 @@ mod tests {
                 // Windows symlinks need Developer Mode or SeCreateSymbolicLinkPrivilege.
                 // Junctions always exercise directory reparse admission.
                 if kind != "junction" && e.raw_os_error() == Some(1314) {
-                    eprintln!("{kind} symlink fixture unavailable: {e}");
+                    crate::out::err(&format!("{kind} symlink fixture unavailable: {e}"));
                     continue;
                 }
                 panic!("{kind}: {e}");

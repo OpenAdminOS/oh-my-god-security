@@ -32,9 +32,10 @@ authorization to fix, weaken the proof, or bypass the shared budget. Follow
 
 Report flags override saved repo, source ref, mode, persona and sandbox metadata. Builder reports
 are concise; null or absent persona reports are full. Markdown and HTML include structured evidence,
-the pipeline timeline, proof links and a glossary. A zero-confirmed report explicitly says "Nothing
-to fix". SARIF carries rule help, verdicts and severity levels; pending records are notes, never
-errors.
+the pipeline timeline, proof links and a glossary. A zero-confirmed report leads with blocked or
+incomplete state until verification, evaluation, coverage and pending work are resolved. Only a
+completed review can report no confirmed findings. SARIF carries rule help, verdicts and severity
+levels; pending records are notes, never errors.
 
 ### Status updates and optional live view
 
@@ -64,3 +65,42 @@ Watch binds `127.0.0.1` on an ephemeral port, serves just the dashboard and `pip
 (never findings or reports), rejects foreign Host headers, and exits on its own shortly after
 `omgs report` marks the run complete. Never bind a non-loopback interface or serve the run directory
 with a generic file server. The page and its status schema live in [progress/](progress/).
+
+## Attempt history and incomplete publication
+
+Record dispatch and transcript-observed completion or safety stops using the retained
+attempt contract in [BUDGETS-AND-ROUTING.md](BUDGETS-AND-ROUTING.md#retained-attempts-and-stops).
+Status clocks are progress only; marking a stage done does not complete verification.
+Reopening a done or failed stage with pending or active preserves its prior label, detail and
+time window and children in `history`, creates a new stage attempt id and resets an omitted label
+to the stage id. Supply the current worker identity in `--label` on each round.
+Omitting `--parent` updates a uniquely existing child; ambiguous ids require a parent.
+New logs and rendered timeline dates use ISO 8601 UTC, including the date and `Z`.
+
+Reports lead with blocked or incomplete state while attempts, coverage or pending
+validation remain unresolved. Draft or stopped verifier output is retained as pending
+work, never as a finalized confirmation, rejection or fix brief. Standalone reports
+without coverage reconciliation cannot claim a completed review. The handoff also
+records its review state. Zero confirmed findings does not establish completion.
+
+`--repo`, `--ref` and `--sandbox` on report persist publication labels for rerenders.
+These labels are publication metadata, not execution attestations. They do not change
+the source identity against which evaluation and proof records are checked. Omitted
+labels reuse the last saved publication values; initialization records the sandbox
+requirement without claiming a runtime version it has not observed.
+
+For a blocked ledger disposition, record `--attempt-ref ATTEMPT_ID` or
+`--blocker-ref BLOCKER_ID` with `ledger set`. Deferred dispositions caused by an
+attempt or blocker also retain that reference. Disposition ingestion preserves
+`attempt_ref` and `blocker_ref`. The critic requires reconciliation after a linked
+attempt completes or is replaced, or a blocker resolves. Reassess the unit, then
+set its current status, evidence and reason, carrying current references if still
+applicable. A fresh `ledger set` clears omitted references. A scope-only deferral
+needs an explicit scope reason and no invented attempt reference.
+
+
+Repeat `--log MESSAGE` on a status call to record multiple disclosures atomically. Both report
+formats retain saved log entries, including timestamp and state. Logs remain disclosures, never
+instructions or independent proof of completion. The critic result includes blocked and deferred
+unit counts beside its reconciliation result. Any such units lead with incomplete coverage even
+when reconciliation passes. Every completed proof-stage round remains in the timeline.

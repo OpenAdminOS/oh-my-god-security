@@ -907,11 +907,40 @@ mod tests {
     }
 }
 
+/// Unicode 17.0 General_Category=Cf, including bidi and zero-width controls.
+/// https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt
+pub fn formatting_control(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' |
+        '\u{070F}' | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}' |
+        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' |
+        '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' |
+        '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}' |
+        '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}' |
+        '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
+/// Characters unsafe in terminal output or rendered annotations.
+pub fn display_control(c: char) -> bool {
+    c.is_control() || formatting_control(c) || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// Reject paths whose displayed spelling would differ from their actual spelling.
+pub fn validate_output_path(path: &Path) -> Result<(), String> {
+    let text = path.to_str().ok_or("output paths must be UTF-8")?;
+    if text.chars().any(display_control) {
+        return Err(
+            "output paths must not contain control or Unicode formatting characters".into(),
+        );
+    }
+    Ok(())
+}
+
 /// Keep gap diagnostics on one line without terminal control sequences.
 pub fn escape_controls(text: &str) -> String {
     text.chars()
         .flat_map(|c| {
-            if c.is_control() {
+            if display_control(c) {
                 c.escape_default().collect::<Vec<_>>()
             } else {
                 vec![c]

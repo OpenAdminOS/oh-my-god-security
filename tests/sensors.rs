@@ -281,6 +281,15 @@ fn offline_tools_feed_redacted_artifacts_reports_and_critic() {
             .count(),
         2
     );
+    // Completed role fixtures isolate sensor reconciliation from lifecycle gaps.
+    for role in ["verifier", "evaluator"] {
+        for event in [
+            json!({"event":"start","id":role,"role":role,"identity":role,"context":role,"inputs":["synthetic-input"],"outputs":["synthetic-output"],"isolation":"procedural"}),
+            json!({"event":"complete","id":role,"actor":"fixture-host","reason":"Synthetic finished review"}),
+        ] {
+            omgs::attempts::append(&run, serde_json::from_value(event).unwrap()).unwrap();
+        }
+    }
     // Preserve all broad parent classes when closing the inventory fixture.
     let mapped_classes: std::collections::BTreeSet<_> = units
         .iter()

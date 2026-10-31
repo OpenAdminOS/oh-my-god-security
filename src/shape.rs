@@ -136,6 +136,9 @@ pub fn findings(text: &str) -> Result<crate::model::FindingsFile, String> {
         let list = top.get("findings").ok_or("findings is required")?;
         for (i, f) in objects(list, "findings")?.into_iter().enumerate() {
             let at = format!("findings[{i}]");
+            if let Some(v) = f.get("verification") {
+                object(v, &format!("{at}.verification"))?;
+            }
             for key in ["verdict", "proof_tier", "severity"] {
                 enum_string(f, key, &at)?;
             }

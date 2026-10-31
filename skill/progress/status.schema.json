@@ -1,46 +1,197 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "OMGS pipeline progress status",
-  "description": "Optional live-progress state the orchestrator writes at each pipeline milestone; dashboard.html polls it. Never changes a verdict; the deterministic findings.json and REPORT.html remain the record.",
+  "description": "Optional live progress. Published verdict counts and review completion come from the canonical review view; stage completion alone never establishes review completion.",
   "type": "object",
-  "required": ["stages", "updated_ms"],
+  "required": [
+    "stages",
+    "updated_ms"
+  ],
   "properties": {
-    "run": { "type": "string" },
-    "target": { "type": "string" },
-    "updated_ms": { "type": "integer", "description": "epoch milliseconds of last update; required so the view can show staleness" },
+    "run": {
+      "type": "string"
+    },
+    "target": {
+      "type": "string"
+    },
+    "updated_ms": {
+      "type": "integer",
+      "description": "epoch milliseconds of last update; required so the view can show staleness"
+    },
     "counters": {
       "type": "object",
       "properties": {
-        "candidates": { "type": "integer" },
-        "confirmed": { "type": "integer" },
-        "needs_validation": { "type": "integer" },
-        "rejected": { "type": "integer" }
+        "candidates": {
+          "type": "integer"
+        },
+        "confirmed": {
+          "type": "integer"
+        },
+        "needs_validation": {
+          "type": "integer"
+        },
+        "rejected": {
+          "type": "integer"
+        }
       }
     },
     "stages": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "label", "status"],
+        "required": [
+          "id",
+          "label",
+          "status"
+        ],
         "properties": {
-          "id": { "type": "string" },
-          "label": { "type": "string" },
-          "status": { "enum": ["pending", "active", "done", "failed"] },
-          "detail": { "type": "string" },
-          "started_ms": { "type": "integer" },
-          "ended_ms": { "type": "integer" },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "active",
+              "done",
+              "failed"
+            ]
+          },
+          "detail": {
+            "type": "string"
+          },
+          "started_ms": {
+            "type": "integer"
+          },
+          "ended_ms": {
+            "type": "integer"
+          },
           "children": {
             "type": "array",
             "description": "Parallel sub-agents of a stage, for example the isolated hunters.",
             "items": {
               "type": "object",
-              "required": ["id", "label", "status"],
+              "required": [
+                "id",
+                "label",
+                "status"
+              ],
               "properties": {
-                "id": { "type": "string" },
-                "label": { "type": "string" },
-                "status": { "enum": ["pending", "active", "done", "failed"] },
-                "detail": { "type": "string" }
+                "id": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "pending",
+                    "active",
+                    "done",
+                    "failed"
+                  ]
+                },
+                "detail": {
+                  "type": "string"
+                },
+                "attempt_id": {
+                  "type": "string"
+                },
+                "started_ms": {
+                  "type": "integer"
+                },
+                "ended_ms": {
+                  "type": "integer"
+                },
+                "history": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": [
+                      "id",
+                      "label",
+                      "status"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "label": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "enum": [
+                          "pending",
+                          "active",
+                          "done",
+                          "failed"
+                        ]
+                      },
+                      "detail": {
+                        "type": "string"
+                      },
+                      "started_ms": {
+                        "type": "integer"
+                      },
+                      "ended_ms": {
+                        "type": "integer"
+                      },
+                      "attempt_id": {
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                }
               }
+            }
+          },
+          "attempt_id": {
+            "type": "string"
+          },
+          "history": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "label",
+                "status"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "pending",
+                    "active",
+                    "done",
+                    "failed"
+                  ]
+                },
+                "detail": {
+                  "type": "string"
+                },
+                "started_ms": {
+                  "type": "integer"
+                },
+                "ended_ms": {
+                  "type": "integer"
+                },
+                "attempt_id": {
+                  "type": "string"
+                },
+                "children": {
+                  "$ref": "#/properties/stages/items/properties/children"
+                }
+              },
+              "additionalProperties": false
             }
           }
         }
@@ -50,13 +201,30 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["m"],
+        "required": [
+          "m"
+        ],
         "properties": {
-          "ts": { "type": "string" },
-          "kind": { "type": "string" },
-          "m": { "type": "string" }
+          "ts": {
+            "type": "string",
+            "description": "ISO 8601 UTC for new events. Legacy time-only strings are retained."
+          },
+          "kind": {
+            "type": "string"
+          },
+          "m": {
+            "type": "string"
+          }
         }
       }
+    },
+    "review_complete": {
+      "type": "boolean",
+      "description": "Canonical completion verdict, reconciled with attempts, stages, coverage and adjudication."
+    },
+    "review_state": {
+      "type": "string",
+      "description": "Canonical completion summary. Read incomplete or stopped state before any stage headline."
     }
   }
 }

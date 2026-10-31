@@ -198,6 +198,7 @@ fn check(recipe: Recipe) -> bool {
         ],
     );
     assert!(init.status.success(), "{}", text(&init));
+    completed_verifier_fixture(&run, "blue-1");
     let fp = omgs::fingerprint("missing_authz", "can_read", "resource", "owner");
     let findings_path = run.join("findings.json");
     let mut n = 0;
@@ -280,7 +281,7 @@ fn check(recipe: Recipe) -> bool {
             "entry_point": "can_read", "sink": "resource", "boundary": "owner",
             "location": {"path": recipe.source, "line": 1},
             "evidence": "Real target invocation with synthetic owner and intruder.",
-            "hunted_by": "red-1", "verified_by": "blue-1",
+            "hunted_by": "red-1", "verified_by": "blue-1", "verification":{"state":"final","attempt":"fixture-verifier"},
             "proof_ref": format!("proofs/{n}.json")
         }]});
         std::fs::write(&findings_path, findings.to_string()).unwrap();
@@ -367,11 +368,13 @@ fn check(recipe: Recipe) -> bool {
         );
         if exit != 2 && !variant.ends_with("cap") && variant != "queued output flood" && !collision
         {
+            // Contract evidence comes from the retained record. Terminal output
+            // deliberately escapes embedded newlines and cannot be parsed as raw markers.
             let control = omgs::proof::control_marker(&proof.marker_nonce);
             let boundary =
                 omgs::proof::boundary_marker("BOUNDARY_ASSERTION_FAILED", &proof.marker_nonce);
             assert!(
-                output.lines().any(|s| s
+                proof.output.lines().any(|s| s
                     == if variant == "missing control marker" {
                         control.replace("OMGS_CONTROL_", "CONTROL_MARKER_OMITTED_")
                     } else {
@@ -380,7 +383,7 @@ fn check(recipe: Recipe) -> bool {
                 "{output}"
             );
             assert!(
-                output.lines().any(|s| s
+                proof.output.lines().any(|s| s
                     == if variant == "missing marker" {
                         boundary.replace("OMGS_BOUNDARY_", "BOUNDARY_MARKER_OMITTED_")
                     } else if exit == 1 {
@@ -637,6 +640,15 @@ fn required_skip_and_failed_probe_are_fatal() {
             stderr: Vec::new(),
         };
         assert!(std::panic::catch_unwind(|| record(&out, 0, false)).is_err());
+    }
+}
+
+fn completed_verifier_fixture(run: &std::path::Path, identity: &str) {
+    for value in [
+        serde_json::json!({"event":"start","id":"fixture-verifier","role":"verifier","identity":identity,"context":"fixture-context","inputs":["synthetic-input"],"outputs":["findings.json"],"isolation":"procedural"}),
+        serde_json::json!({"event":"complete","id":"fixture-verifier","actor":"fixture-host","reason":"Synthetic completion fixture"}),
+    ] {
+        omgs::attempts::append(run, serde_json::from_value(value).unwrap()).unwrap();
     }
 }
 

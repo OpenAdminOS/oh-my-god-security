@@ -161,6 +161,7 @@ hunter context stays in linked evidence rather than adding unsupported fields.
 | `locations` | Further locations of the same root cause, each with `path` and `line`. One defect copied into several places stays one record and counts once; do not emit one record per copy. |
 | `hunted_by` | Identity of the hunter whose candidate produced the record, matching that candidate's `hunter`. Required. |
 | `verified_by` | Identity of the independent verifier that decided the record. Required, and `omgs validate` rejects it when it equals `hunted_by`. |
+| `verification` | Object with `state` (`draft` or `final`) and `attempt` id. Final decisions require a completed verifier attempt with matching identity. Drafts and stopped attempts cannot pass validation. |
 | `candidates` | Fingerprints of further candidates merged into this record: several hunters raising one root cause under different identities, or the original candidate fingerprint when verification changed an identity input. The record's own fingerprint is implicit. |
 | `evidence` | Source trace, attacker prerequisites, concrete result, controls/counterevidence, external artifact references and runner evidence. For pending records include the exact missing fact and blocker; for rejection include the decisive refutation. |
 | `fix_brief` | Confirmed: invariant, narrowest effective change, proof test acceptance check. Otherwise null or absent per schema. |
@@ -209,6 +210,11 @@ change the gate mode or policy source.
 Validate `evaluation.json` with `omgs validate --evaluation OUTPUT_DIR/evaluation.json`, using
 `schemas/evaluation.schema.json`. Keep one cumulative evaluation of all finalized records per run.
 The evaluator identity must be independent of every hunter and verifier whose records it judges.
+Its `attempt` names a completed evaluation attempt. Completion is recorded by the host after
+inspecting the transcript and output, under the retained attempt contract in
+[BUDGETS-AND-ROUTING.md](BUDGETS-AND-ROUTING.md#retained-attempts-and-stops).
+Publication retains unfinished verifier output as pending work, with no finalized verdict or fix
+brief. This does not rewrite the retained findings file or complete the attempt.
 The critic requires every finalized record to have an uphold decision with no outstanding changes;
 every upheld proof needs an attested reproduced replay named as an exact `proofs/N.json` evidence
 entry. Evaluator `gaps` describe evidence limits and are reported even when decisions are upheld.

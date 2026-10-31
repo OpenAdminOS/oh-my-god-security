@@ -207,6 +207,14 @@ pub fn check_meta_types(meta: &serde_json::Map<String, serde_json::Value>) -> Re
 /// that exists but is malformed is an error, so the index never shows a
 /// clean row for a run whose evidence could not be read.
 pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String> {
+    match run.run_dir.as_deref() {
+        Some(dir) => crate::runmeta::with_lock(Path::new(dir), || summarize_locked(run, index_dir)),
+        None => summarize_locked(run, index_dir),
+    }
+}
+
+/// Caller holds every input run lock until the index is written.
+pub fn summarize_locked(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String> {
     let mut s = RunSummary {
         url: run.url.clone(),
         state: run.status.clone(),
@@ -219,37 +227,11 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
         return Ok(s);
     };
     let at = |name: &str, e: String| format!("{}: {name}: {e}", dir.display());
-    match crate::run_artifact::optional_text(
-        dir,
-        Path::new("findings.json"),
-        crate::run_artifact::FINDINGS_BYTES,
-    )? {
-        Some(text) => {
-            use crate::model::Verdict;
-            let f = crate::shape::findings(&text).map_err(|e| at("findings.json", e))?;
-            for x in &f.findings {
-                match x.verdict {
-                    Verdict::Confirmed => s.confirmed += 1,
-                    Verdict::NeedsValidation => s.needs_validation += 1,
-                    Verdict::Rejected => s.rejected += 1,
-                }
-            }
-        }
-        None => s.blockers.push("findings.json missing".into()),
-    }
-    if crate::run_artifact::optional_text(
-        dir,
-        Path::new(crate::runmeta::FILE),
-        crate::run_artifact::METADATA_BYTES,
-    )?
-    .is_some()
-    {
-        let meta = crate::runmeta::read(dir)?;
-        check_meta_types(&meta).map_err(|e| at(crate::runmeta::FILE, e))?;
-        if let Some(st) = meta.get("run_status").and_then(|v| v.as_str()) {
-            s.state = st.to_string();
-        }
-        s.budget = Some(crate::budget::summary(dir)?);
+    let view = crate::review::View::load_locked(dir)?;
+    if !view.saved.is_empty() {
+        let meta = &view.saved;
+        check_meta_types(meta).map_err(|e| at(crate::runmeta::FILE, e))?;
+        s.budget = view.budget.clone();
         s.agent_calls = meta.get("agent_calls_used").and_then(|v| v.as_u64());
         s.reroutes = meta
             .get("reroutes")
@@ -263,26 +245,6 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| format!("invalid refusal history: {e}"))?;
         }
-        if let Some(blocked) = meta.get("blockers").and_then(|v| v.as_array()) {
-            s.blockers
-                .extend(blocked.iter().filter_map(|b| b.as_str()).map(String::from));
-        }
-    }
-    if let Some(text) = crate::run_artifact::optional_text(
-        dir,
-        Path::new("coverage-ledger.json"),
-        crate::run_artifact::LEDGER_BYTES,
-    )? {
-        let ledger = crate::shape::ledger(&text).map_err(|e| at("coverage-ledger.json", e))?;
-        for u in ledger.units.iter().filter(|u| u.status == "blocked") {
-            s.blockers.push(format!("blocked unit {}", u.id));
-        }
-        let c = crate::critic::critique_run(dir)?;
-        if !c.passed() {
-            s.blockers.push(format!("critic: {}", c.summary()));
-        }
-    } else {
-        s.blockers.push("coverage-ledger.json missing".into());
     }
     if dir.join("REPORT.html").is_file() {
         s.report_href = dir
@@ -290,6 +252,18 @@ pub fn summarize(run: &BatchRun, index_dir: &Path) -> Result<RunSummary, String>
             .ok()
             .map(|rel| format!("{}/REPORT.html", rel.to_string_lossy()));
     }
+    s.confirmed = view.confirmed;
+    s.needs_validation = view.needs_validation;
+    s.rejected = view.rejected;
+    s.state = if view.complete() {
+        "complete"
+    } else if s.state == "failed" {
+        "failed"
+    } else {
+        "partial"
+    }
+    .into();
+    s.blockers.extend(view.reasons);
     Ok(s)
 }
 
@@ -358,7 +332,20 @@ pub fn render_index_html(runs: &[RunSummary]) -> String {
         let repo = match &r.report_href {
             Some(href) => format!(
                 "<a href=\"{}\">{}</a>",
-                html_escape(href),
+                // A relative filesystem name can contain a colon or URL syntax.
+                // Encode it as a path and force relative-link interpretation.
+                html_escape(&format!(
+                    "./{}",
+                    href.bytes()
+                        .map(|b| {
+                            if b.is_ascii_alphanumeric() || b"/._-~".contains(&b) {
+                                (b as char).to_string()
+                            } else {
+                                format!("%{b:02X}")
+                            }
+                        })
+                        .collect::<String>()
+                )),
                 html_escape(&r.url)
             ),
             None => html_escape(&r.url),

@@ -146,7 +146,7 @@ fn batch_index_is_deterministic_offline_and_escaped() {
     }
     assert_eq!(html.matches("<a href=").count(), 1);
     assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
-    assert!(html.contains("<a href=\"github.com__a__b/REPORT.html\">"));
+    assert!(html.contains("<a href=\"./github.com__a__b/REPORT.html\">"));
     assert!(html.contains("2 repositories: 2 confirmed, 4 needs validation, 6 rejected"));
     assert!(html.contains("40 recorded, some runs not recorded"));
     let md = render_index_markdown(&runs);
@@ -182,10 +182,11 @@ fn batch_summary_reads_a_run_directory() {
         &index,
     )
     .unwrap();
-    assert_eq!(s.state, "complete");
+    // A run saved as complete still publishes as partial while it has blockers.
+    assert_eq!(s.state, "partial");
     assert_eq!(s.agent_calls, Some(12));
     assert_eq!(s.reroutes, 1);
-    assert!(s.blockers.iter().any(|b| b == "route exhausted"));
+    assert!(s.blockers.iter().any(|b| b.contains("route exhausted")));
     assert!(s.blockers.iter().any(|b| b == "blocked unit u1"));
     assert!(s.blockers.iter().any(|b| b.starts_with("critic")));
     assert_eq!(
@@ -273,7 +274,7 @@ fn watch_routes_and_host_rules() {
         r#"{"stages":[],"updated_ms":5}"#,
     )
     .unwrap();
-    write_private_fixture(dir.join("findings.json"), "secret").unwrap();
+    write_private_fixture(dir.join("findings.json"), r#"{"findings":[]}"#).unwrap();
     let req = |line: &str, host: &str| format!("{line}\r\nHost: {host}\r\n\r\n");
     let r = respond(&req("GET / HTTP/1.1", "127.0.0.1:4000"), 4000, &dir);
     assert_eq!(r.status, 200);
@@ -283,10 +284,10 @@ fn watch_routes_and_host_rules() {
         4000,
         &dir,
     );
-    assert_eq!(
-        (r.status, r.body.as_slice()),
-        (200, br#"{"stages":[],"updated_ms":5}"#.as_slice())
-    );
+    assert_eq!(r.status, 200);
+    let progress: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+    assert_eq!(progress["updated_ms"], 5);
+    assert_eq!(progress["review_complete"], false);
     for path in [
         "/findings.json",
         "/../findings.json",
@@ -348,12 +349,27 @@ fn watch_serves_loopback_and_stops_when_the_run_completes() {
     assert!(resp.starts_with("HTTP/1.1 200 OK"));
     assert!(resp.contains("Cache-Control: no-store"));
     assert!(resp.contains("X-Content-Type-Options: nosniff"));
-    assert!(resp.ends_with(r#"{"stages":[],"updated_ms":0}"#));
+    assert!(resp.contains("\"review_complete\":false"));
     write_private_fixture(
         dir.join("run-metadata.json"),
         r#"{"run_status":"complete"}"#,
     )
     .unwrap();
+    for (id, role) in [("blue", "verifier"), ("independent", "evaluator")] {
+        for event in [
+            serde_json::json!({"event":"start","id":id,"role":role,"identity":id,"context":id,"inputs":["synthetic"],"outputs":["synthetic"],"isolation":"procedural"}),
+            serde_json::json!({"event":"complete","id":id,"actor":"host","reason":"Reviewed output"}),
+        ] {
+            omgs::attempts::append(&dir, serde_json::from_value(event).unwrap()).unwrap();
+        }
+    }
+    for (name, text) in [
+        ("findings.json", r#"{"findings":[]}"#),
+        ("coverage-ledger.json", r#"{"units":[]}"#),
+        ("candidates-empty.json", r#"{"candidates":[]}"#),
+    ] {
+        write_private_fixture(dir.join(name), text).unwrap();
+    }
     let start = std::time::Instant::now();
     server.join().unwrap();
     assert!(
@@ -361,6 +377,42 @@ fn watch_serves_loopback_and_stops_when_the_run_completes() {
         "stops after the grace period"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn route_labels_never_echo_terminal_controls() {
+    let dir = scratch("route-controls");
+    write_private_fixture(
+        dir.join("run-metadata.json"),
+        r#"{"run_status":"in_progress"}"#,
+    )
+    .unwrap();
+    let run = dir.to_str().unwrap();
+    for label in ["fake\n::error::forged", "fake\rline", "fake\u{1b}[31mred"] {
+        let out = omgs(&["route", "--run", run, "--role", "hunter", "--model", label]);
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains('\u{1b}'));
+    }
+    // A hand edited models.json is printed escaped on later lookups.
+    let models = dir.join("models.json");
+    std::fs::write(
+        &models,
+        r#"{"roles":{"hunter":["model\n::error::forged\u001b[31m"]}}"#,
+    )
+    .unwrap();
+    let out = omgs(&[
+        "route",
+        "--run",
+        run,
+        "--role",
+        "hunter",
+        "--models",
+        models.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(!stdout.contains('\u{1b}'), "{stdout}");
+    assert!(stdout.contains("\\n::error::forged"), "{stdout}");
 }
 
 #[test]
@@ -429,7 +481,7 @@ fn route_follows_fallbacks_and_records_reroutes() {
     assert_eq!(meta["reroutes"].as_array().unwrap().len(), 2);
     assert_eq!(meta["reroutes"][0]["to"], "model-b");
     assert!(meta["reroutes"][1]["to"].is_null());
-    assert!(meta["blockers"][0]
+    assert!(meta["blocker_events"][0]["reason"]
         .as_str()
         .unwrap()
         .contains("every model"));
@@ -490,6 +542,10 @@ fn open_record(key: &str, intent_id: Option<&str>, path: &str) -> Finding {
         prerequisites: None,
         hunted_by: Some("red-1".into()),
         verified_by: Some("blue-1".into()),
+        verification: Some(omgs::model::Verification {
+            state: "final".into(),
+            attempt: "verify-1".into(),
+        }),
         candidates: vec![],
         proof_ref: None,
         trace: vec![],
@@ -591,7 +647,7 @@ fn answer_scopes_match_path_prefixes_only_at_boundaries() {
 }
 
 #[test]
-fn report_marks_the_run_complete_and_records_metadata() {
+fn report_records_metadata_without_completing_unexamined_coverage() {
     let dir = scratch("complete");
     write_private_fixture(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
     write_private_fixture(
@@ -615,7 +671,7 @@ fn report_marks_the_run_complete_and_records_metadata() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(omgs::runmeta::is_complete(Path::new(&dir)));
+    assert!(!omgs::runmeta::is_complete(Path::new(&dir)));
     let meta = omgs::runmeta::read(&dir).unwrap();
     assert_eq!(meta["hunters"], 3);
     assert_eq!(meta["agent_calls_used"], 41);
@@ -735,7 +791,8 @@ fn status_log_timestamps_are_strings_per_schema() {
         serde_json::from_str(&std::fs::read_to_string(dir.join("pipeline-status.json")).unwrap())
             .unwrap();
     let ts = v["log"][0]["ts"].as_str().expect("ts is a string");
-    assert_eq!(ts.len(), 8);
+    assert_eq!(ts.len(), 20);
+    assert!(ts.ends_with('Z'));
     assert_eq!(omgs::runmeta::clock(3_723_000), "01:02:03");
     let _ = std::fs::remove_dir_all(&dir);
 }

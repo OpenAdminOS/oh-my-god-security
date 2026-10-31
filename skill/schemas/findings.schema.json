@@ -21,7 +21,8 @@
           "boundary",
           "location",
           "hunted_by",
-          "verified_by"
+          "verified_by",
+          "verification"
         ],
         "properties": {
           "fingerprint": {
@@ -174,6 +175,26 @@
                   "type": "string",
                   "minLength": 1
                 }
+              }
+            }
+          },
+          "verification": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "state",
+              "attempt"
+            ],
+            "properties": {
+              "state": {
+                "enum": [
+                  "draft",
+                  "final"
+                ]
+              },
+              "attempt": {
+                "type": "string",
+                "minLength": 1
               }
             }
           }

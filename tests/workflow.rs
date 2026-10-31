@@ -39,6 +39,10 @@ fn record(key: &str) -> Finding {
         prerequisites: None,
         hunted_by: Some("red-1".into()),
         verified_by: Some("blue-1".into()),
+        verification: Some(omgs::model::Verification {
+            state: "final".into(),
+            attempt: "verify-1".into(),
+        }),
         candidates: vec![],
         proof_ref: None,
         trace: vec![],
@@ -279,7 +283,63 @@ fn candidate_json(c: &Candidate) -> serde_json::Value {
 /// A complete run: one unit covered by one verified finding from one candidate.
 /// Write a clean failing-test proof record for every record above traced and
 /// point it there, as `omgs prove --run --finding` would.
+fn record_attempt_fixture(dir: &std::path::Path, id: &str, role: &str, identity: &str) {
+    let mut meta = omgs::runmeta::read_optional(dir)
+        .unwrap()
+        .unwrap_or_default();
+    let mut history = omgs::attempts::history(&meta).unwrap();
+    if omgs::attempts::states(&history).unwrap().contains_key(id) {
+        return;
+    }
+    for record in [
+        omgs::attempts::Event::Start {
+            id: id.into(),
+            role: role.into(),
+            identity: identity.into(),
+            context: format!("fixture-{id}"),
+            inputs: vec!["synthetic-input".into()],
+            outputs: vec!["synthetic-output".into()],
+            isolation: "procedural".into(),
+        },
+        omgs::attempts::Event::Complete {
+            id: id.into(),
+            actor: "fixture-host".into(),
+            reason: "Synthetic completed output".into(),
+        },
+    ] {
+        history.push(omgs::attempts::Record {
+            at: "2026-01-01T00:00:00Z".into(),
+            record,
+        });
+    }
+    meta.insert("attempts".into(), serde_json::to_value(history).unwrap());
+    write_private_fixture(
+        dir.join("run-metadata.json"),
+        serde_json::to_string(&meta).unwrap(),
+    )
+    .unwrap();
+}
+fn record_verifier_fixtures(dir: &std::path::Path, findings: &FindingsFile) {
+    for f in &findings.findings {
+        if let Some(v) = &f.verification {
+            record_attempt_fixture(
+                dir,
+                &v.attempt,
+                "verifier",
+                f.verified_by.as_deref().unwrap_or("blue-1"),
+            );
+        }
+    }
+}
+
 fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
+    for f in &mut findings.findings {
+        f.verification = Some(omgs::model::Verification {
+            state: "final".into(),
+            attempt: "verify-1".into(),
+        });
+    }
+    record_verifier_fixtures(dir, &findings);
     for f in findings.findings.iter_mut() {
         if f.proof_tier == ProofTier::Traced {
             continue;
@@ -469,6 +529,8 @@ fn relocate_replay_fixture(value: &mut serde_json::Value, old: &str, new: &str) 
 }
 
 fn adjudicate_fixture(dir: &std::path::Path, findings: &FindingsFile) {
+    record_verifier_fixtures(dir, findings);
+    record_attempt_fixture(dir, "eval-fixture", "evaluator", "eval-fixture");
     let mut decisions = Vec::new();
     for f in &findings.findings {
         let mut evidence = Vec::new();
@@ -528,7 +590,7 @@ fn adjudicate_fixture(dir: &std::path::Path, findings: &FindingsFile) {
     }
     write_private_fixture(
         dir.join("evaluation.json"),
-        serde_json::json!({"evaluator":"eval-fixture",
+        serde_json::json!({"evaluator":"eval-fixture","attempt":"eval-fixture",
         "source_ref": if dir.join("run-metadata.json").is_file() { omgs::runmeta::read(dir).unwrap().get("source_ref").cloned().unwrap_or(serde_json::json!("synthetic")) } else { serde_json::json!("synthetic") },"decisions":decisions,"gaps":[]})
         .to_string(),
     )
@@ -2584,7 +2646,14 @@ fn persona_never_changes_validation_critic_or_verdicts() {
                 "{}",
                 String::from_utf8_lossy(&check.stderr)
             );
-            assert_eq!(critic(), Some(0));
+            assert_eq!(
+                critic(),
+                Some(if verdict == Verdict::NeedsValidation {
+                    1
+                } else {
+                    0
+                })
+            );
             let proof_path = run.join(proven.findings[0].proof_ref.as_ref().unwrap());
             let mut proof: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&proof_path).unwrap()).unwrap();
@@ -2725,8 +2794,8 @@ fn report_handoff_and_sarif_golden_contract() {
             .cloned()
             .collect(),
     };
-    assert!(render_markdown(&zero, &meta).contains("Nothing to fix"));
-    assert!(render_html(&zero, &meta).contains("Nothing to fix"));
+    assert!(render_markdown(&zero, &meta).contains("Incomplete review"));
+    assert!(render_html(&zero, &meta).contains("Incomplete review"));
     let short = ReportMeta {
         persona: "builder".into(),
         ..Default::default()
@@ -3043,7 +3112,7 @@ fn unicode_formatting_controls_are_visible_in_all_display_formats() {
         f.fix_brief = Some(format!("Fix brief with {controls} controls."));
     }
     let mut p = omgs::proof::load(&dir, "proofs/1.json").unwrap();
-    let command = format!("printf 'src/\u{202E}txt.exe {controls}'");
+    let command = format!("printf 'src/\u{202E}txt.exe \u{85} {controls}'");
     p.command = command.clone();
     p.command_sha256 = omgs::sha256::digest(command.as_bytes());
     write_private_fixture(dir.join("proofs/1/command.txt"), &command).unwrap();
@@ -3073,10 +3142,13 @@ fn unicode_formatting_controls_are_visible_in_all_display_formats() {
             }
         }
     }
-    assert!(handoff.contains("Warning: command contains Unicode formatting controls"));
+    assert!(handoff
+        .contains("Warning: command contains escaped control or Unicode formatting characters"));
     let (_, _, blocks) = markdown_structure(&handoff);
     let a = h.records[0].acceptance.as_ref().unwrap();
-    assert!(blocks.iter().any(|b| b.contains("src/<U+202E>txt.exe")));
+    assert!(blocks
+        .iter()
+        .any(|b| b.contains(&omgs::platform::escape_controls(&a.command))));
     assert!(blocks
         .iter()
         .any(|b| serde_json::from_str::<String>(b).ok().as_deref() == Some(&a.command)));
@@ -3290,12 +3362,24 @@ fn finding_content_cannot_forge_markdown_structure() {
                                 a.command.contains(payload),
                                 "the quoted command must be retained"
                             );
-                            assert!(
-                                handoff.contains(&format!("\n{}\n", a.command)),
-                                "the command bytes must remain exact"
-                            );
-                            assert!(blocks
-                                .contains(&format!("{}\n", omgs::handoff::normalized(&a.command))));
+                            if omgs::platform::escape_controls(&a.command) != a.command {
+                                assert!(
+                                    blocks.iter().any(|block| {
+                                        serde_json::from_str::<String>(block).ok().as_deref()
+                                            == Some(a.command.as_str())
+                                    }),
+                                    "the command JSON must preserve exact bytes"
+                                );
+                            } else {
+                                assert!(
+                                    handoff.contains(&format!("\n{}\n", a.command)),
+                                    "the command bytes must remain exact"
+                                );
+                                assert!(blocks.contains(&format!(
+                                    "{}\n",
+                                    omgs::handoff::normalized(&a.command)
+                                )));
+                            }
                             assert_eq!(
                                 a.command_args.last().unwrap(),
                                 &format!("--cmd=printf original{payload}")
@@ -3399,6 +3483,7 @@ fn report_metadata_defaults_explicit_overrides_and_handoff_cli() {
     let (dir, file) = report_fixture("metadata-defaults");
     let meta = serde_json::json!({"repo":"saved/repo", "source_ref":"saved-ref", "mode":"gate", "sandbox":"saved-sandbox", "persona":"builder", "hunters":7, "agent_calls_used":43, "verifier":"saved-reviewer"});
     write_private_fixture(dir.join("run-metadata.json"), meta.to_string()).unwrap();
+    record_verifier_fixtures(&dir, &file);
     let out_dir = dir.join("rendered");
     let findings_path = dir.join("findings.json");
     let render = |extra: &[&str]| {
@@ -3477,6 +3562,7 @@ fn report_metadata_defaults_explicit_overrides_and_handoff_cli() {
     meta["persona"] = serde_json::Value::Null;
     meta["report_depth"] = "concise".into();
     write_private_fixture(dir.join("run-metadata.json"), meta.to_string()).unwrap();
+    record_verifier_fixtures(&dir, &file);
     let md = render(&[]);
     assert!(
         md.contains("Hunted by:"),
@@ -3772,5 +3858,30 @@ fn replay_fixture_relocates_windows_and_unix_paths_exactly_once() {
         assert_eq!(config["process"]["cwd"], expected);
         assert_eq!(config["process"]["env"][0], format!("HOME={expected}"));
         assert!(!config.to_string().contains("1001001"));
+    }
+}
+
+#[test]
+fn handoff_exact_command_survives_each_control_class() {
+    for c in [
+        "\r", "\r\n", "\n", "\t", "\u{1}", "\u{85}", "\u{202e}", "\u{2028}", "\u{2029}",
+    ] {
+        let (dir, file) = report_fixture("exact-control-command");
+        let mut proof = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+        proof.command = format!("printf 'a{c}b'");
+        proof.command_sha256 = omgs::sha256::digest(proof.command.as_bytes());
+        write_private_fixture(dir.join("proofs/1/command.txt"), &proof.command).unwrap();
+        omgs::proof::write(&dir, &proof).unwrap();
+        let handoff = omgs::handoff::build(&dir, &file, None).unwrap();
+        let rendered = omgs::handoff::markdown(&handoff);
+        assert!(rendered.contains("escaped preview is not executable"));
+        assert!(!rendered.contains(&format!("printf 'a{c}b'")));
+        let (_, _, blocks) = markdown_structure(&rendered);
+        let exact = &handoff.records[0].acceptance.as_ref().unwrap().command;
+        assert!(rendered.contains(&omgs::platform::escape_controls(exact)));
+        assert!(blocks
+            .iter()
+            .any(|block| serde_json::from_str::<String>(block).ok().as_deref() == Some(exact)));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
