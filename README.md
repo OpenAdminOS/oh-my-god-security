@@ -72,9 +72,20 @@ network denied. Semgrep requires an existing local rules file or directory in
 Download rules separately before scanning if needed. OSV database preparation is
 opt-in and separate from proof execution. At this revision the binary only detects
 OSV availability and never downloads its database. Proofs never download target
-dependencies or access the external network. The CLI's git subprocess can also
-inherit user git configuration and credentials for cloning; use an appropriate review account.
-The update lookup ignores that configuration and disables credential helpers and prompts.
+dependencies or access the external network. Review clones resolve the repository
+host once, refuse it when any address is loopback, private, link-local or otherwise
+not publicly routable (and refuse local names such as `*.localhost`, `*.local` and
+`*.internal`), pin Git to those addresses, follow no redirects and stop after 10
+minutes; on macOS and Linux a single file is also capped at 1 GiB (Windows has no
+per-file cap). Git runs with no inherited configuration, environment injection,
+templates or attribute files, and reads attributes from the empty tree, so URL
+rewrites, URL-specific HTTP settings, filters such as git-lfs and server-chosen
+packfile or bundle URLs cannot move or extend the clone; LFS pointers stay pointers.
+Only your system and global `credential.*` settings and the generic `http.proxy` and
+CA settings are carried over, so private repositories work; use an appropriate review
+account. A configured proxy resolves the host itself, so the address check cannot
+cover proxied clones. This needs Git 2.42 or later.
+The update lookup carries none of your git configuration and disables credential helpers and prompts.
 
 ## Why a binary at all?
 
@@ -335,6 +346,7 @@ secrets are listed separately in [SECURITY.md](SECURITY.md#release-owner-configu
 | `GH_TOKEN`, `GITHUB_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR` | Read by external gh, not the binary. Existing gh authentication/configuration controls optional provenance checks. |
 | `OMGS_REQUIRE_RECIPES` | Test suite only: comma-separated runtimes whose absence must fail recipe tests. |
 | `OMGS_TEST_SCRATCH_PARENT`, `OMGS_TEST_LOW_FD_CLEANUP`, `OMGS_TEST_DOCTOR_RECOVERY` | Test-only scratch recovery, descriptor-limit and doctor subprocess hooks. |
+| `OMGS_TEST_RESOLVE`, `OMGS_TEST_CLONE_DEADLINE_MS` | Debug builds only: a fixed `host=address` resolution and a shorter clone deadline for tests. Release builds ignore them. |
 | `OMGS_TEST_PUBLICATION_DIR`, `OMGS_OWNER_TEST_DIR`, `OMGS_CAPTURE_CHILD`, `OMGS_SHUTDOWN_MARKER_CHILD`, `OMGS_TEST_PROBE_JSON` | Regression child-process hooks, with no installer authority or production signature bypass. |
 
 ## For agents: install and run
