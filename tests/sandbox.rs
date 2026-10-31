@@ -4249,3 +4249,67 @@ fn a_removed_screenshot_helper_is_named_and_never_stops_the_harness() {
     assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// Status markers are created with mkdir and never opened, so FIFOs planted at
+// their names by the harness cannot block the helper.
+#[cfg(unix)]
+#[test]
+fn planted_fifo_markers_never_block_the_capture_helper() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("screenshot-fifo");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(target.join("tests")).unwrap();
+    std::fs::write(
+        target.join("tests/shot.sh"),
+        "set -e\nout=\"$(dirname \"$OMGS_SCREENSHOT\")/screenshots\"\nmkfifo \"$out/page.failed-1\" \"$out/page.timeout\"\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/x.html\" || true\necho AFTER_CAPTURE\nexit 1\n",
+    )
+    .unwrap();
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "tests/shot.sh",
+            "--screenshots",
+            "--timeout-ms",
+            "60000",
+            "--cmd",
+            "sh tests/shot.sh",
+        ])
+        .env("OMGS_HOME", &d)
+        .env(omgs::screenshot::BROWSER_ENV, "/usr/bin/false")
+        .env(
+            "OMGS_MXC_EXEC",
+            omgs::sandbox::locate_executor().unwrap().path,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("AFTER_CAPTURE"), "{}", text(&out));
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert!(record.clean(), "{record:?}");
+    let shots = record.screenshots.clone().unwrap();
+    assert!(shots.files.is_empty());
+    assert!(shots
+        .skipped
+        .contains(&"page: the browser exited with status 1".to_string()));
+    assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+    let _ = std::fs::remove_dir_all(&d);
+}

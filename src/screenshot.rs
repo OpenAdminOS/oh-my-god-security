@@ -331,7 +331,7 @@ pub fn helper(os: &str, browser: &Path, scratch: &Path) -> Result<(String, Strin
         ("set -m\n", "")
     };
     let text = format!(
-        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 0;; esac\nmkdir -p {tmp} && cd {tmp} || exit 0\n{monitor}TMPDIR=. {launch}{} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\" &\nbrowser=$!\n(i=0; while kill -0 \"$browser\" 2>/dev/null; do if [ \"$i\" -ge {CAPTURE_SECONDS} ]; then kill -9 -\"$browser\" 2>/dev/null || kill -9 \"$browser\" 2>/dev/null; true > {out}/\"$1\".timeout 2>/dev/null; break; fi; sleep 1; i=$((i + 1)); done) &\nwatchdog=$!\nwait \"$browser\"\nstatus=$?\nwait \"$watchdog\"\nkill -9 -\"$browser\" 2>/dev/null\n[ -f {out}/\"$1\".timeout ] || [ \"$status\" -eq 0 ] || echo \"$status\" > {out}/\"$1\".failed 2>/dev/null\nexit 0\n",
+        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 0;; esac\nmkdir -p {tmp} && cd {tmp} || exit 0\n{monitor}TMPDIR=. {launch}{} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\" &\nbrowser=$!\n(i=0; while kill -0 \"$browser\" 2>/dev/null; do if [ \"$i\" -ge {CAPTURE_SECONDS} ]; then kill -9 -\"$browser\" 2>/dev/null || kill -9 \"$browser\" 2>/dev/null; mkdir {out}/\"$1\".timeout 2>/dev/null; break; fi; sleep 1; i=$((i + 1)); done) &\nwatchdog=$!\nwait \"$browser\"\nstatus=$?\nwait \"$watchdog\"\nkill -9 -\"$browser\" 2>/dev/null\n[ -e {out}/\"$1\".timeout ] || [ \"$status\" -eq 0 ] || mkdir {out}/\"$1\".failed-\"$status\" 2>/dev/null\nexit 0\n",
         quoted(browser)?,
         flags(os).join(" "),
         quoted(&profile)?,
@@ -391,12 +391,11 @@ pub fn collect(scratch: &Path, to: &Path) -> (Vec<Shot>, Vec<String>) {
             ));
             continue;
         }
-        if let Some(name) = file.strip_suffix(".failed").filter(|n| valid_name(n)) {
-            let status = crate::platform::read_bounded_in(scratch, &Path::new(DIR).join(&file), 64)
-                .ok()
-                .map(|b| String::from_utf8_lossy(&b).trim().to_string())
-                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
-                .unwrap_or_else(|| "unknown".into());
+        // Status markers are directories named for their outcome, so neither
+        // the helper nor this reader ever opens one.
+        if let Some((name, status)) = file.split_once(".failed-").filter(|(n, s)| {
+            valid_name(n) && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+        }) {
             skipped.push(format!("{name}: the browser exited with status {status}"));
             continue;
         }
@@ -663,8 +662,9 @@ mod tests {
         assert!(text.contains("--screenshot='/r/scratch/screenshots'/\"$1\".png \"$2\""));
         assert!(!text.contains("--single-process"));
         assert!(text.contains(
-            "[ \"$status\" -eq 0 ] || echo \"$status\" > '/r/scratch/screenshots'/\"$1\".failed"
+            "[ \"$status\" -eq 0 ] || mkdir '/r/scratch/screenshots'/\"$1\".failed-\"$status\" 2>/dev/null"
         ));
+        assert!(text.contains("mkdir '/r/scratch/screenshots'/\"$1\".timeout 2>/dev/null; break"));
         let (_, mac) = helper(
             "macos",
             Path::new("/a/chrome-headless-shell"),
@@ -696,8 +696,8 @@ mod tests {
         std::fs::write(from.join("b.png"), png(900, 600, 0)).unwrap();
         std::fs::write(from.join("bad name.png"), png(10, 10, 0)).unwrap();
         std::fs::write(from.join("c.txt"), "x").unwrap();
-        std::fs::write(from.join("broken.failed"), "133\n").unwrap();
-        std::fs::write(from.join("slow.timeout"), "").unwrap();
+        std::fs::create_dir(from.join("broken.failed-133")).unwrap();
+        std::fs::create_dir(from.join("slow.timeout")).unwrap();
         for n in ["d", "e", "f", "g"] {
             std::fs::write(from.join(format!("{n}.png")), png(10, 10, 0)).unwrap();
         }
