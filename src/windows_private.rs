@@ -63,11 +63,13 @@ extern "system" {
     fn GetCurrentProcess() -> Ptr;
     fn CloseHandle(handle: Ptr) -> i32;
     fn LocalFree(mem: Ptr) -> Ptr;
+    // Declared with an untyped security pointer so every crate declaration of
+    // this symbol shares one signature.
     fn CreateFileW(
         path: *const u16,
         access: u32,
         share: u32,
-        security: *const SecurityAttributes,
+        security: *const c_void,
         creation: u32,
         flags: u32,
         template: Ptr,
@@ -277,7 +279,7 @@ pub(super) fn open_write(path: &Path, create_new: bool) -> Result<std::fs::File>
             path.as_ptr(),
             0x4000_0000,
             0x1 | 0x2 | 0x4,
-            &security,
+            (&security as *const SecurityAttributes).cast(),
             if create_new { 1 } else { 4 },
             0x0020_0000,
             null_mut(),
