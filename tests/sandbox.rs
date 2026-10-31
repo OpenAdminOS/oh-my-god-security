@@ -4029,3 +4029,60 @@ fn installer_trust_fix_round_trip_turns_the_acceptance_command_green() {
     assert!(record.clean());
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// A browser that exits with an error leaves its status in the record.
+#[cfg(unix)]
+#[test]
+fn a_failing_screenshot_browser_is_named_in_the_record() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("screenshot-failure");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(target.join("tests")).unwrap();
+    std::fs::write(
+        target.join("tests/shot.sh"),
+        "sh \"$OMGS_SCREENSHOT\" page \"file://$PWD/missing.html\"\nexit 1\n",
+    )
+    .unwrap();
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"));
+    c.args([
+        "prove",
+        "--run",
+        run.to_str().unwrap(),
+        "--test",
+        "tests/shot.sh",
+        "--screenshots",
+        "--cmd",
+        "sh tests/shot.sh",
+    ])
+    .env("OMGS_HOME", &d)
+    .env(omgs::screenshot::BROWSER_ENV, "/usr/bin/false")
+    .env(
+        "OMGS_MXC_EXEC",
+        omgs::sandbox::locate_executor().unwrap().path,
+    );
+    let out = c.output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    let shots = record.screenshots.clone().unwrap();
+    assert_eq!(shots.browser.as_deref(), Some("/usr/bin/false"));
+    assert!(shots.files.is_empty());
+    assert_eq!(shots.skipped, ["page: the browser exited with status 1"]);
+    assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -1711,15 +1711,22 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     let mut screenshots = req
         .screenshots
         .then(crate::screenshot::Screenshots::default);
-    let mut browser = None;
+    // Everything that can fail for screenshot reasons is settled here, before
+    // any grant, so a failure becomes the record's blocker instead.
+    let mut helper = None;
     if let Some(shots) = screenshots.as_mut() {
+        let helper_scratch = PathBuf::from(mxc_path(&scratch));
         match crate::screenshot::browser(os, std::env::var_os(crate::screenshot::BROWSER_ENV))
-            .and_then(|b| admit_browser(&b, &run_dir, &readonly).map(|root| (b, root)))
-        {
-            Ok((b, root)) => {
+            .and_then(|b| {
+                let text =
+                    crate::screenshot::helper(os, &PathBuf::from(mxc_path(&b)), &helper_scratch)
+                        .map_err(|e| format!("cannot prepare the screenshot helper: {e}"))?;
+                admit_browser(os, &b, &run_dir, &readonly).map(|root| (b, text, root))
+            }) {
+            Ok((b, text, root)) => {
                 shots.browser = Some(mxc_path(&b));
                 readonly.extend(root);
-                browser = Some(b);
+                helper = Some(text);
             }
             Err(reason) => shots.blocker = Some(reason),
         }
@@ -1786,9 +1793,9 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         Ok(staged) => staged,
         Err(reason) => return blocked(reason),
     };
-    let screenshot = match browser
+    let screenshot = match helper
         .as_ref()
-        .map(|b| write_screenshot_helper(os, b, &scratch))
+        .map(|h| write_screenshot_helper(h, &scratch))
         .transpose()
     {
         Ok(helper) => helper,
@@ -1923,8 +1930,8 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             if digest != target_sha256 {
                 return blocked("target changed before MXC retry".into());
             }
-            if let Some(b) = &browser {
-                if let Err(reason) = write_screenshot_helper(os, b, &scratch) {
+            if let Some(h) = &helper {
+                if let Err(reason) = write_screenshot_helper(h, &scratch) {
                     return blocked(reason);
                 }
             }
@@ -1985,11 +1992,12 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             gaps.push(note.clone());
         }
     }
-    if let (Some(shots), Some(_)) = (screenshots.as_mut(), &browser) {
-        let (files, skipped) = crate::screenshot::collect(
-            &scratch.join(crate::screenshot::DIR),
-            &run_dir.join(crate::screenshot::DIR),
-        );
+    if let (Some(shots), Some(_)) = (screenshots.as_mut(), &helper) {
+        let (files, mut skipped) =
+            crate::screenshot::collect(&scratch, &run_dir.join(crate::screenshot::DIR));
+        if files.is_empty() && skipped.is_empty() {
+            skipped.push("no screenshot was produced: the command did not run the helper or the browser wrote nothing".into());
+        }
         shots.files = files;
         shots.skipped = skipped;
     }
@@ -2022,11 +2030,12 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
 /// The browser directory to add as a read-only grant, if no existing grant
 /// already covers it, or the reason the browser cannot be granted.
 fn admit_browser(
+    os: &str,
     browser: &Path,
     run_dir: &Path,
     readonly: &[PathBuf],
 ) -> Result<Option<PathBuf>, String> {
-    let root = PathBuf::from(mxc_path(&crate::screenshot::browser_root(browser)));
+    let root = PathBuf::from(crate::screenshot::browser_root(os, &mxc_path(browser)));
     if run_dir.starts_with(&root) || root.starts_with(run_dir) {
         return Err(format!(
             "the browser directory {} overlaps the proof directory",
@@ -2038,16 +2047,22 @@ fn admit_browser(
     Ok((!readonly.iter().any(|r| root.starts_with(r))).then_some(root))
 }
 
-/// Writes the capture helper and its output directory into scratch.
-fn write_screenshot_helper(os: &str, browser: &Path, scratch: &Path) -> Result<PathBuf, String> {
-    let scratch = PathBuf::from(mxc_path(scratch));
-    let (name, text) = crate::screenshot::helper(os, browser, &scratch)
-        .map_err(|e| format!("cannot write the screenshot helper: {e}"))?;
+/// Writes the prepared capture helper and its output directory into the
+/// freshly staged scratch, refusing anything already present there.
+fn write_screenshot_helper(helper: &(String, String), scratch: &Path) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let (name, text) = helper;
     let path = scratch.join(name);
-    std::fs::create_dir_all(scratch.join(crate::screenshot::DIR))
-        .and_then(|_| std::fs::write(&path, text))
+    std::fs::create_dir(scratch.join(crate::screenshot::DIR))
+        .and_then(|_| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+        })
+        .and_then(|mut file| file.write_all(text.as_bytes()))
         .map_err(|e| format!("cannot write the screenshot helper: {e}"))?;
-    Ok(path)
+    Ok(PathBuf::from(mxc_path(&path)))
 }
 
 #[cfg(test)]

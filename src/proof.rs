@@ -776,7 +776,7 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
         .screenshots
         .as_ref()
         .and_then(|s| s.browser.as_deref())
-        .map(|b| norm(&crate::screenshot::browser_root(Path::new(b)).to_string_lossy()));
+        .map(|b| norm(&crate::screenshot::browser_root(os, b)));
     if roots.iter().any(|p| {
         !absolute(p)
             || p.split('/').any(|c| c == "." || c == "..")

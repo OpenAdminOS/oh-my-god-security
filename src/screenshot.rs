@@ -56,22 +56,83 @@ pub fn relative(name: &str) -> PathBuf {
     Path::new(DIR).join(format!("{name}.png"))
 }
 
-/// Width and height from a PNG signature and its leading IHDR chunk.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                0xedb8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// Width and height of a structurally complete PNG: signature, a valid IHDR
+/// first, checksummed chunks, image data, and IEND as the last bytes. Pixel
+/// data is not decoded.
 pub fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
     const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-    if bytes.len() < 24 || bytes[..8] != SIGNATURE {
+    if bytes.len() < 8 || bytes[..8] != SIGNATURE {
         return Err("not a PNG file".into());
-    }
-    if bytes[8..12] != [0, 0, 0, 13] || &bytes[12..16] != b"IHDR" {
-        return Err("PNG does not start with an IHDR chunk".into());
     }
     let word =
         |at: usize| u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
-    let (width, height) = (word(16), word(20));
-    if width == 0 || height == 0 {
-        return Err("PNG has an empty dimension".into());
+    let mut at = 8;
+    let mut dimensions = None;
+    let mut image_data = false;
+    loop {
+        if at + 12 > bytes.len() {
+            return Err("truncated PNG".into());
+        }
+        let length = word(at) as usize;
+        let kind = &bytes[at + 4..at + 8];
+        let end = at
+            .checked_add(8)
+            .and_then(|v| v.checked_add(length))
+            .filter(|end| end + 4 <= bytes.len())
+            .ok_or("truncated PNG chunk")?;
+        if crc32(&bytes[at + 4..end]) != word(end) {
+            return Err("PNG chunk checksum mismatch".into());
+        }
+        match (dimensions.is_none(), kind) {
+            (true, b"IHDR") if length == 13 => {
+                let (width, height) = (word(at + 8), word(at + 12));
+                let (depth, color) = (bytes[at + 16], bytes[at + 17]);
+                let valid = match color {
+                    0 => [1, 2, 4, 8, 16].contains(&depth),
+                    3 => [1, 2, 4, 8].contains(&depth),
+                    2 | 4 | 6 => [8, 16].contains(&depth),
+                    _ => false,
+                };
+                if !valid || bytes[at + 18] != 0 || bytes[at + 19] != 0 || bytes[at + 20] > 1 {
+                    return Err("PNG header has unsupported values".into());
+                }
+                if width == 0 || height == 0 {
+                    return Err("PNG has an empty dimension".into());
+                }
+                dimensions = Some((width, height));
+            }
+            (true, _) | (false, b"IHDR") => {
+                return Err("PNG does not start with one IHDR chunk".into())
+            }
+            (false, b"IDAT") => image_data = true,
+            (false, b"IEND") => {
+                if length != 0 || end + 4 != bytes.len() {
+                    return Err("PNG has data after its end".into());
+                }
+                if !image_data {
+                    return Err("PNG has no image data".into());
+                }
+                return dimensions.ok_or_else(|| "PNG has no header".into());
+            }
+            _ => {}
+        }
+        at = end + 4;
     }
-    Ok((width, height))
 }
 
 /// Checks a candidate file's bytes against every limit and returns its
@@ -116,8 +177,11 @@ pub fn browser(os: &str, explicit: Option<OsString>) -> Result<PathBuf, String> 
         }
         let path = std::fs::canonicalize(&path)
             .map_err(|e| format!("{BROWSER_ENV} {}: {e}", path.display()))?;
-        if !path.is_file() {
-            return Err(format!("{BROWSER_ENV} {} is not a file", path.display()));
+        if !executable(&path) {
+            return Err(format!(
+                "{BROWSER_ENV} {} is not an executable file",
+                path.display()
+            ));
         }
         return Ok(path);
     }
@@ -127,7 +191,7 @@ pub fn browser(os: &str, explicit: Option<OsString>) -> Result<PathBuf, String> 
     default_browsers(os)
         .iter()
         .map(PathBuf::from)
-        .find(|p| p.is_file())
+        .find(|p| executable(p))
         .ok_or_else(|| {
             format!(
                 "no headless browser found at {}; install Chrome, Edge or Chromium there or set {BROWSER_ENV}",
@@ -136,12 +200,40 @@ pub fn browser(os: &str, explicit: Option<OsString>) -> Result<PathBuf, String> 
         })
 }
 
-/// The directory to grant read access to so the browser can load its files.
-pub fn browser_root(browser: &Path) -> PathBuf {
-    browser
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| browser.to_path_buf())
+fn executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
+/// The directory granted read access so the browser can load its files,
+/// computed from the recorded text with `os` path rules, never the host's.
+pub fn browser_root(os: &str, browser: &str) -> String {
+    let path = if os == "windows" {
+        crate::platform::mxc_path(Path::new(browser))
+    } else {
+        browser.to_string()
+    };
+    let separators: &[char] = if os == "windows" {
+        &['\\', '/']
+    } else {
+        &['/']
+    };
+    match path.rfind(separators) {
+        Some(0) => path[..1].to_string(),
+        Some(i) if os == "windows" && path[..i].ends_with(':') => path[..=i].to_string(),
+        Some(i) => path[..i].to_string(),
+        None => path,
+    }
 }
 
 fn flags(os: &str) -> Vec<String> {
@@ -184,12 +276,12 @@ pub fn helper(os: &str, browser: &Path, scratch: &Path) -> Result<(String, Strin
             }
             Ok(s.into_owned())
         };
+        let out = quoted(&out)?;
         let text = format!(
-            "@echo off\r\n\"{}\" {} \"--user-data-dir={}\" \"--screenshot={}\\%~1.png\" \"%~2\"\r\nexit /b %errorlevel%\r\n",
+            "@echo off\r\n\"{}\" {} \"--user-data-dir={}\" \"--screenshot={out}\\%~1.png\" \"%~2\"\r\nset omgs_status=%errorlevel%\r\nif not \"%omgs_status%\"==\"0\" (echo %omgs_status%)> \"{out}\\%~1.failed\"\r\nexit /b %omgs_status%\r\n",
             quoted(browser)?,
             flags(os).join(" "),
             quoted(&profile)?,
-            quoted(&out)?
         );
         return Ok((helper_name(os).into(), text));
     }
@@ -200,12 +292,12 @@ pub fn helper(os: &str, browser: &Path, scratch: &Path) -> Result<(String, Strin
         }
         Ok(format!("'{s}'"))
     };
+    let out = quoted(&out)?;
     let text = format!(
-        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 2;; esac\n{} {} --user-data-dir={} --screenshot={}/\"$1\".png \"$2\"\n",
+        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 2;; esac\n{} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\"\nstatus=$?\n[ \"$status\" -eq 0 ] || echo \"$status\" > {out}/\"$1\".failed\nexit \"$status\"\n",
         quoted(browser)?,
         flags(os).join(" "),
         quoted(&profile)?,
-        quoted(&out)?
     );
     Ok((helper_name(os).into(), text))
 }
@@ -219,26 +311,49 @@ pub fn helper_name(os: &str) -> &'static str {
     }
 }
 
-/// Keeps admissible PNG files from `from` (the sandbox's output directory) in
-/// `to`, in name order, and names every file it refused.
-pub fn collect(from: &Path, to: &Path) -> (Vec<Shot>, Vec<String>) {
+/// Keeps admissible PNG files from the sandbox's `scratch/screenshots` in
+/// `to`, in name order, and names every file it refused. Sandboxed code owned
+/// that directory, so nothing in it is followed: a linked directory is refused
+/// before listing and every file is opened beneath `scratch` without
+/// traversing links, as a single-link regular file.
+pub fn collect(scratch: &Path, to: &Path) -> (Vec<Shot>, Vec<String>) {
     let mut kept = Vec::new();
     let mut skipped = Vec::new();
-    let mut entries: Vec<_> = match std::fs::read_dir(from) {
-        Ok(dir) => dir.filter_map(Result::ok).map(|e| e.path()).collect(),
+    let dir = scratch.join(DIR);
+    match std::fs::symlink_metadata(&dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (kept, skipped),
+        Err(e) => {
+            skipped.push(format!("cannot inspect the screenshot directory: {e}"));
+            return (kept, skipped);
+        }
+        Ok(meta) if crate::platform::is_link(&meta) || !meta.is_dir() => {
+            skipped.push("the screenshot directory is not a plain directory".into());
+            return (kept, skipped);
+        }
+        Ok(_) => {}
+    }
+    let mut names: Vec<String> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect(),
         Err(e) => {
             skipped.push(format!("cannot read the screenshot directory: {e}"));
             return (kept, skipped);
         }
     };
-    entries.sort();
-    for path in entries {
-        let file = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+    names.sort();
+    for file in names {
         let shown = crate::platform::escape_controls(&file);
+        if let Some(name) = file.strip_suffix(".failed").filter(|n| valid_name(n)) {
+            let status = crate::platform::read_bounded_in(scratch, &Path::new(DIR).join(&file), 64)
+                .ok()
+                .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+                .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
+                .unwrap_or_else(|| "unknown".into());
+            skipped.push(format!("{name}: the browser exited with status {status}"));
+            continue;
+        }
         let name = match file.strip_suffix(".png").filter(|n| valid_name(n)) {
             Some(n) => n.to_string(),
             None => {
@@ -248,44 +363,34 @@ pub fn collect(from: &Path, to: &Path) -> (Vec<Shot>, Vec<String>) {
                 continue;
             }
         };
-        match read_regular(&path).and_then(|bytes| {
-            let (width, height) = admit(&bytes)?;
-            if kept.len() == MAX_FILES {
-                return Err(format!("more than {MAX_FILES} screenshots"));
-            }
-            let target = to.join(format!("{name}.png"));
-            crate::platform::private_dir(to)
-                .and_then(|_| crate::runmeta::write_atomic_bytes(&target, &bytes))
-                .map_err(|e| format!("cannot keep it: {e}"))?;
-            Ok(Shot {
-                name: name.clone(),
-                sha256: crate::sha256::digest(&bytes),
-                bytes: bytes.len() as u64,
-                width,
-                height,
+        match crate::platform::read_bounded_in(scratch, &Path::new(DIR).join(&file), MAX_BYTES)
+            .map_err(|e| match e.to_string().as_str() {
+                "file exceeds byte limit" => format!("larger than {MAX_BYTES} bytes"),
+                other => format!("not a single-link regular file: {other}"),
             })
-        }) {
+            .and_then(|bytes| {
+                let (width, height) = admit(&bytes)?;
+                if kept.len() == MAX_FILES {
+                    return Err(format!("more than {MAX_FILES} screenshots"));
+                }
+                crate::platform::private_dir(to)
+                    .and_then(|_| {
+                        crate::runmeta::write_atomic_bytes(&to.join(format!("{name}.png")), &bytes)
+                    })
+                    .map_err(|e| format!("cannot keep it: {e}"))?;
+                Ok(Shot {
+                    name: name.clone(),
+                    sha256: crate::sha256::digest(&bytes),
+                    bytes: bytes.len() as u64,
+                    width,
+                    height,
+                })
+            }) {
             Ok(shot) => kept.push(shot),
             Err(reason) => skipped.push(format!("{shown}: {reason}")),
         }
     }
     (kept, skipped)
-}
-
-/// Reads a regular, unlinked file, refusing anything above the byte cap.
-fn read_regular(path: &Path) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if !meta.file_type().is_file() || crate::platform::is_link(&meta) {
-        return Err("not a regular file".into());
-    }
-    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut bytes = Vec::new();
-    file.by_ref()
-        .take(MAX_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    Ok(bytes)
 }
 
 /// Standard base64 for data URIs.
@@ -311,14 +416,25 @@ pub fn base64(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let crc = crc32(&out[start..]);
+        out.extend_from_slice(&crc.to_be_bytes());
+    }
+
+    /// A structurally complete PNG with `extra` bytes of image data.
     pub(crate) fn png(width: u32, height: u32, extra: usize) -> Vec<u8> {
-        let mut b = vec![
-            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13,
-        ];
-        b.extend_from_slice(b"IHDR");
-        b.extend_from_slice(&width.to_be_bytes());
-        b.extend_from_slice(&height.to_be_bytes());
-        b.extend(std::iter::repeat_n(0u8, extra));
+        let mut b = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        let mut header = Vec::new();
+        header.extend_from_slice(&width.to_be_bytes());
+        header.extend_from_slice(&height.to_be_bytes());
+        header.extend_from_slice(&[8, 6, 0, 0, 0]);
+        chunk(&mut b, b"IHDR", &header);
+        chunk(&mut b, b"IDAT", &vec![0u8; extra.max(1)]);
+        chunk(&mut b, b"IEND", &[]);
         b
     }
 
@@ -342,10 +458,31 @@ mod tests {
         assert!(admit(b"GIF89a not a png file at all")
             .unwrap_err()
             .contains("not a PNG"));
-        assert!(admit(&png(10, 10, 0)[..20]).is_err());
+        // A bare signature and header prefix is not an image.
+        let whole = png(10, 10, 0);
+        for cut in [20, 24, 33, whole.len() - 1] {
+            assert!(
+                admit(&whole[..cut]).unwrap_err().contains("truncated"),
+                "{cut}"
+            );
+        }
         let mut wrong = png(10, 10, 0);
         wrong[12..16].copy_from_slice(b"tEXt");
-        assert!(admit(&wrong).unwrap_err().contains("IHDR"));
+        assert!(admit(&wrong).unwrap_err().contains("checksum"));
+        let mut corrupt = png(10, 10, 4);
+        corrupt[40] ^= 1;
+        assert!(admit(&corrupt).unwrap_err().contains("checksum"));
+        let mut trailing = png(10, 10, 0);
+        trailing.push(0);
+        assert!(admit(&trailing).unwrap_err().contains("after its end"));
+        let mut no_data = whole[..33].to_vec();
+        no_data.extend_from_slice(&whole[whole.len() - 12..]);
+        assert!(admit(&no_data).unwrap_err().contains("no image data"));
+        let mut depth = png(10, 10, 0);
+        depth[24] = 3;
+        let crc = crc32(&depth[12..29]);
+        depth[29..33].copy_from_slice(&crc.to_be_bytes());
+        assert!(admit(&depth).unwrap_err().contains("unsupported"));
         assert!(admit(&png(10, 10, MAX_BYTES as usize))
             .unwrap_err()
             .contains("larger"));
@@ -365,6 +502,41 @@ mod tests {
             assert_eq!(base64(input.as_bytes()), out);
         }
         assert_eq!(base64(&[0xff, 0xfe, 0xfd]), "//79");
+    }
+
+    #[test]
+    fn browser_roots_follow_the_recorded_os() {
+        assert_eq!(
+            browser_root(
+                "windows",
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+            ),
+            r"C:\Program Files\Google\Chrome\Application"
+        );
+        assert_eq!(
+            browser_root("windows", r"\\?\C:\Tools\chrome-headless-shell.exe"),
+            r"C:\Tools"
+        );
+        assert_eq!(browser_root("windows", r"C:\chrome.exe"), r"C:\");
+        assert_eq!(
+            browser_root("linux", "/opt/google/chrome/chrome"),
+            "/opt/google/chrome"
+        );
+        assert_eq!(browser_root("macos", "/chs"), "/");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_override_is_a_blocker() {
+        let base = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-shots-exec-{}", std::process::id()));
+        crate::platform::private_dir(&base).unwrap();
+        let file = base.join("chrome");
+        std::fs::write(&file, "not a browser").unwrap();
+        let err = browser("linux", Some(file.clone().into_os_string())).unwrap_err();
+        assert!(err.contains("not an executable file"), "{err}");
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -388,6 +560,9 @@ mod tests {
         assert!(text.contains("--window-size=800,600"));
         assert!(text.contains("--screenshot='/r/scratch/screenshots'/\"$1\".png \"$2\""));
         assert!(!text.contains("--single-process"));
+        assert!(text.contains(
+            "[ \"$status\" -eq 0 ] || echo \"$status\" > '/r/scratch/screenshots'/\"$1\".failed"
+        ));
         let (_, mac) = helper(
             "macos",
             Path::new("/a/chrome-headless-shell"),
@@ -404,6 +579,7 @@ mod tests {
         .unwrap();
         assert_eq!(win, "omgs-screenshot.cmd");
         assert!(text.contains(r#""--screenshot=C:\r\scratch\screenshots\%~1.png" "%~2""#));
+        assert!(text.contains(r#"(echo %omgs_status%)> "C:\r\scratch\screenshots\%~1.failed""#));
         assert!(helper("windows", Path::new(r"C:\a%b\c.exe"), Path::new(r"C:\r")).is_err());
     }
 
@@ -415,25 +591,33 @@ mod tests {
             .join("case");
         let _ = std::fs::remove_dir_all(&base);
         crate::platform::private_dir(&base).unwrap();
-        let from = base.join("from");
+        let scratch = base.join("scratch");
+        let from = scratch.join(DIR);
         let to = base.join("to");
         std::fs::create_dir_all(&from).unwrap();
         std::fs::write(from.join("a.png"), png(800, 600, 4)).unwrap();
         std::fs::write(from.join("b.png"), png(900, 600, 0)).unwrap();
         std::fs::write(from.join("bad name.png"), png(10, 10, 0)).unwrap();
         std::fs::write(from.join("c.txt"), "x").unwrap();
+        std::fs::write(from.join("broken.failed"), "133\n").unwrap();
         for n in ["d", "e", "f", "g"] {
             std::fs::write(from.join(format!("{n}.png")), png(10, 10, 0)).unwrap();
         }
         #[cfg(unix)]
         std::os::unix::fs::symlink(from.join("a.png"), from.join("link.png")).unwrap();
-        let (kept, skipped) = collect(&from, &to);
+        #[cfg(unix)]
+        {
+            std::fs::write(base.join("outside.png"), png(10, 10, 0)).unwrap();
+            std::fs::hard_link(base.join("outside.png"), from.join("hard.png")).unwrap();
+        }
+        let (kept, skipped) = collect(&scratch, &to);
         let names: Vec<_> = kept.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["a", "d", "e", "f"]);
         assert_eq!(kept[0].sha256, crate::sha256::digest(&png(800, 600, 4)));
         assert_eq!(std::fs::read(to.join("a.png")).unwrap(), png(800, 600, 4));
         let joined = skipped.join("\n");
         for needle in [
+            "broken: the browser exited with status 133",
             "b.png: 900x600",
             "bad name.png: name",
             "c.txt: name",
@@ -442,8 +626,23 @@ mod tests {
             assert!(joined.contains(needle), "{needle}: {joined}");
         }
         #[cfg(unix)]
-        assert!(joined.contains("link.png: not a regular file"), "{joined}");
+        for refused in ["link.png: not a single-link", "hard.png: not a single-link"] {
+            assert!(joined.contains(refused), "{refused}: {joined}");
+        }
         assert_eq!(collect(&base.join("missing"), &to), (vec![], vec![]));
+        // A screenshot directory replaced by a link to host storage is never listed.
+        #[cfg(unix)]
+        {
+            let linked = base.join("linked");
+            std::fs::create_dir_all(&linked).unwrap();
+            std::os::unix::fs::symlink(&from, linked.join(DIR)).unwrap();
+            let (kept, skipped) = collect(&linked, &base.join("to2"));
+            assert!(kept.is_empty());
+            assert_eq!(
+                skipped,
+                ["the screenshot directory is not a plain directory"]
+            );
+        }
         std::fs::remove_dir_all(base.parent().unwrap()).unwrap();
     }
 }
