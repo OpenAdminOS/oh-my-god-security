@@ -37,6 +37,9 @@ impl Drop for Fixture {
 fn cli() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_omgs"));
     command.env_remove("OMGS_SKILL_DIR");
+    // Debug builds only: resolve the fixture host to a public documentation-free
+    // address without DNS; the stub git never connects anywhere.
+    command.env("OMGS_TEST_RESOLVE", "example.invalid=93.184.215.14");
     command
 }
 
@@ -248,7 +251,7 @@ fn clone_progress_has_bounded_start_completion_reuse_and_failure_phases() {
     let bin = fixture.0.join("bin");
     std::fs::create_dir(&bin).unwrap();
     let stub = bin.join("git");
-    std::fs::write(&stub, "#!/bin/sh\nfor arg in \"$@\"; do last=\"$arg\"; done\ncase \" $* \" in\n*' clone '*) case \" $* \" in *' --quiet --depth 1 --no-recurse-submodules -- '*) ;; *) exit 9 ;; esac; if [ \"$FAIL_CLONE\" = yes ]; then exit 1; fi; mkdir -p \"$last\" ;;\n*' get-url '*) echo https://example.invalid/owner/repo ;;\n*) exit 1 ;;\nesac\n").unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.50.0'; exit 0; fi\nfor arg in \"$@\"; do last=\"$arg\"; done\ncase \" $* \" in\n*' clone '*) case \" $* \" in *' --attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904 '*) ;; *) exit 8 ;; esac; case \" $* \" in *' http.followRedirects=false '*) ;; *) exit 7 ;; esac; case \" $* \" in *' http.curloptResolve=example.invalid:443:93.184.215.14 '*) ;; *) exit 6 ;; esac; case \" $* \" in *' --quiet --depth 1 --no-recurse-submodules -- '*) ;; *) exit 9 ;; esac; if [ \"$FAIL_CLONE\" = yes ]; then exit 1; fi; mkdir -p \"$last\" ;;\n*' get-url '*) echo https://example.invalid/owner/repo ;;\n*) exit 1 ;;\nesac\n").unwrap();
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     let skill = fixture.skill();
     let invoke = |home: &Path, fail: bool| {
@@ -1015,4 +1018,39 @@ fn default_run_for_cache_named_repository_is_refused_before_writing() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("skill bundle cache"));
     assert!(!home.exists());
     assert_eq!(std::fs::read_dir(target).unwrap().count(), 0);
+}
+
+// A stalled clone fails at the deadline and leaves no partial checkout.
+#[cfg(unix)]
+#[test]
+fn a_stalled_clone_fails_at_its_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let bin = fixture.0.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let stub = bin.join("git");
+    std::fs::write(&stub, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.50.0'; exit 0; fi\nfor arg in \"$@\"; do last=\"$arg\"; done\nmkdir -p \"$last\"\nexec /bin/sleep 30\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = fixture.0.join("home");
+    let started = std::time::Instant::now();
+    let out = cli()
+        .env("OMGS_HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("OMGS_TEST_CLONE_DEADLINE_MS", "2000")
+        .args([
+            "review",
+            "--repo-url",
+            "https://example.invalid/owner/repo",
+            "--no-sensors",
+            "--skill-dir",
+        ])
+        .arg(fixture.skill())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(started.elapsed() < std::time::Duration::from_secs(25));
+    let text = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("exceeded the 2 s deadline"), "{text}");
+    assert!(text.contains("clone phase=failed destination="), "{text}");
+    assert!(!home.join("targets/example.invalid/owner/repo").exists());
 }

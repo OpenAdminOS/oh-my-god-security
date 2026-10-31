@@ -86,8 +86,59 @@ fn repo_urls_are_strictly_validated() {
         "https://169.254.169.254/a/b",
         "https://github.com:22/a/b",
         "https://intranet/a/b",
+        // Names that resolve locally rather than through public DNS.
+        "https://probe.localhost/a/b",
+        "https://localhost.localdomain/a/b",
+        "https://printer.local/a/b",
+        "https://metadata.google.internal/a/b",
+        "https://git.home.arpa/a/b",
+        "https://git.corp.lan/a/b",
     ] {
         assert!(parse_repo_url(bad).is_err(), "accepted {bad}");
+    }
+    for ok in ["https://gitlab.com/a/b", "https://codeberg.org/a/b"] {
+        assert!(parse_repo_url(ok).is_ok(), "refused {ok}");
+    }
+}
+
+#[test]
+fn only_publicly_routable_addresses_are_cloned() {
+    use omgs::batch::is_public;
+    for public in [
+        "140.82.112.3",
+        "1.1.1.1",
+        "2606:4700:4700::1111",
+        "::ffff:140.82.112.3",
+    ] {
+        assert!(is_public(&public.parse().unwrap()), "{public}");
+    }
+    for private in [
+        "0.0.0.0",
+        "127.0.0.1",
+        "10.1.2.3",
+        "100.64.0.1",
+        "169.254.169.254",
+        "172.16.0.1",
+        "192.0.2.1",
+        "192.168.1.1",
+        "198.18.0.1",
+        "203.0.113.5",
+        "224.0.0.1",
+        "255.255.255.255",
+        "::",
+        "::1",
+        "fc00::1",
+        "fd12:3456::1",
+        "fe80::1",
+        "ff02::1",
+        "2001:db8::1",
+        "::ffff:127.0.0.1",
+        "::ffff:10.0.0.1",
+        "2002:7f00:1::1",
+        "64:ff9b::a00:1",
+        "::127.0.0.1",
+    ] {
+        assert!(!is_public(&private.parse().unwrap()), "{private}");
     }
 }
 
@@ -1624,7 +1675,7 @@ fn concurrent_reviews_of_one_url_never_delete_each_others_clone() {
     // A stub git: clone sleeps, then succeeds for the first caller and fails
     // for any later one, as a real clone into an existing path would.
     let stub = format!(
-        "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\ncase \" $* \" in\n  *' clone '*) sleep 1; if mkdir \"{m}\" 2>/dev/null; then mkdir -p \"$last\"; exit 0; else exit 1; fi ;;\n  *' get-url '*) echo https://github.com/a/b ;;\n  *) exit 1 ;;\nesac\n",
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.50.0'; exit 0; fi\nfor a in \"$@\"; do last=\"$a\"; done\ncase \" $* \" in\n  *' clone '*) sleep 1; if mkdir \"{m}\" 2>/dev/null; then mkdir -p \"$last\"; exit 0; else exit 1; fi ;;\n  *' get-url '*) echo https://github.com/a/b ;;\n  *) exit 1 ;;\nesac\n",
         m = dir.join("cloned-once").display()
     );
     std::fs::write(bin.join("git"), stub).unwrap();
@@ -1635,6 +1686,7 @@ fn concurrent_reviews_of_one_url_never_delete_each_others_clone() {
             .env("HOME", &home)
             .env_remove("OMGS_HOME")
             .env("PATH", &path)
+            .env("OMGS_TEST_RESOLVE", "github.com=140.82.112.3")
             .args([
                 "review",
                 "--repo-url",

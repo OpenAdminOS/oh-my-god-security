@@ -3467,6 +3467,48 @@ fn cmd_critic(args: &[String]) -> Result<(), String> {
     })
 }
 
+/// Git's well-known empty tree, used as the attribute source for review clones.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/// A review clone is shallow; a stalled or oversized one fails instead of
+/// holding the run.
+const CLONE_DEADLINE_MS: u64 = 600_000;
+const CLONE_FILE_BYTES: u64 = 1 << 30;
+
+fn clone_deadline_ms() -> u64 {
+    // Debug builds only, so tests need not wait for the real deadline.
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("OMGS_TEST_CLONE_DEADLINE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        return ms;
+    }
+    CLONE_DEADLINE_MS
+}
+
+/// Review clones rely on `--attr-source`, added in Git 2.42.
+fn require_clone_git(git: &Path) -> Result<(), String> {
+    let out = std::process::Command::new(git)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("git --version: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version = text
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or_default()
+        .to_string();
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    if (major, minor) < (2, 42) {
+        return Err(format!(
+            "review clones need Git 2.42 or later to keep repository attributes from selecting filters; found {}",
+            omgs::platform::escape_controls(text.trim())
+        ));
+    }
+    Ok(())
+}
+
 /// Clone (or reuse) a repository for review. Only validated https URLs reach
 /// git, as a positional argument after `--`, with every other transport
 /// disabled and no prompts; a reused clone must have the same origin.
@@ -3479,14 +3521,26 @@ fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
         .unwrap_or_else(|| data_dir().join(&repo.name));
     admit_clone_storage(&targets, &dest, &out)?;
     let git_path = omgs::platform::which("git").ok_or("git not found on an absolute PATH entry")?;
-    let git = || {
+    let git = |pin: Option<&str>| {
         let mut c = std::process::Command::new(&git_path);
-        c.env("GIT_TERMINAL_PROMPT", "0").args([
-            "-c",
-            "protocol.allow=never",
-            "-c",
-            "protocol.https.allow=always",
-        ]);
+        // Credential helpers from the user's configuration stay available
+        // for private repositories. Attributes are read from the empty tree,
+        // so the repository cannot select filters (such as git-lfs) that run
+        // host programs or contact other URLs during checkout.
+        c.env("GIT_TERMINAL_PROMPT", "0")
+            .arg(format!("--attr-source={EMPTY_TREE}"))
+            .args([
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "protocol.https.allow=always",
+                "-c",
+                "http.followRedirects=false",
+            ]);
+        if let Some(pin) = pin {
+            c.arg("-c")
+                .arg(format!("http.curloptResolve={}:443:{pin}", repo.host));
+        }
         c
     };
     let parent = dest.parent().ok_or("invalid clone destination")?;
@@ -3503,7 +3557,7 @@ fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
     let lock = parent.join(format!(".{}.lock", repo.name));
     omgs::runmeta::with_lock_file(&lock, || {
         if dest.exists() {
-            let origin = git()
+            let origin = git(None)
                 .args(["-C", &dest.to_string_lossy(), "remote", "get-url", "origin"])
                 .output()
                 .ok()
@@ -3538,7 +3592,22 @@ fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
             dest.display()
         ));
         // Two bounded phase lines replace carriage-return Git progress for hosts.
-        let status = git()
+        // Git diagnostics can contain remote-controlled text, so they are
+        // captured and discarded; the escaped phase/error messages below are
+        // the terminal output boundary.
+        require_clone_git(&git_path)?;
+        // Resolve once, refuse non-public addresses and pin the clone to them,
+        // so neither a second lookup nor a redirect can move it elsewhere.
+        let pin = omgs::batch::public_addresses(&repo.host)?
+            .iter()
+            .map(|ip| match ip {
+                std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+                std::net::IpAddr::V4(v4) => v4.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut clone = git(Some(&pin));
+        clone
             .args([
                 "clone",
                 "--quiet",
@@ -3548,20 +3617,35 @@ fn clone_target(raw_url: &str, args: &[String]) -> Result<PathBuf, String> {
                 "--",
             ])
             .arg(&repo.url)
-            .arg(&dest)
-            // Git diagnostics can contain remote-controlled text. The escaped
-            // phase/error messages below are the terminal output boundary.
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| e.to_string())?;
-        if !status.success() {
+            .arg(&dest);
+        let result = omgs::supervise::run(
+            clone,
+            &omgs::supervise::Limits {
+                wall_ms: clone_deadline_ms(),
+                cpu_secs: None,
+                file_size_bytes: Some(CLONE_FILE_BYTES),
+                open_files: None,
+                memory_bytes: None,
+                tasks: None,
+                output_cap_bytes: 64 * 1024,
+            },
+            None,
+        );
+        if !(result.exit_code == Some(0) && !result.timed_out && !result.interrupted) {
             let _ = std::fs::remove_dir_all(&dest);
             omgs::out::err(&format!(
                 "clone phase=failed destination={}",
                 dest.display()
             ));
-            return Err(format!("git clone failed for {}", repo.url));
+            return Err(if result.timed_out {
+                format!(
+                    "git clone for {} exceeded the {} s deadline",
+                    repo.url,
+                    clone_deadline_ms() / 1000
+                )
+            } else {
+                format!("git clone failed for {}", repo.url)
+            });
         }
         omgs::out::err(&format!(
             "clone phase=complete destination={}",

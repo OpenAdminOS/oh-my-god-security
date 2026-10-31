@@ -63,6 +63,20 @@ pub fn parse_repo_url(raw: &str) -> Result<RepoUrl, String> {
     if !host_ok {
         return bad("host must be a domain name, not an IP address or bare hostname");
     }
+    // Names that resolve locally rather than through public DNS.
+    const LOCAL_NAMES: [&str; 8] = [
+        "localhost",
+        "local",
+        "localdomain",
+        "internal",
+        "intranet",
+        "lan",
+        "home",
+        "arpa",
+    ];
+    if labels.contains(&"localhost") || labels.last().is_some_and(|tld| LOCAL_NAMES.contains(tld)) {
+        return bad("special-use and local host names are not accepted");
+    }
     let name = name.strip_suffix(".git").unwrap_or(name).to_string();
     if !safe_segment(&owner) || !safe_segment(&name) {
         return bad("owner and name may use letters, digits, '.', '_', '-' only");
@@ -73,6 +87,90 @@ pub fn parse_repo_url(raw: &str) -> Result<RepoUrl, String> {
         owner,
         name,
     })
+}
+
+/// Every address `host` resolves to for HTTPS, refusing the host if any of
+/// them is not publicly routable. The clone is pinned to these addresses so a
+/// second lookup cannot move it elsewhere.
+pub fn public_addresses(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+    use std::net::ToSocketAddrs;
+    let mut addrs: Vec<std::net::IpAddr> = Vec::new();
+    #[cfg(debug_assertions)]
+    if let Some(fixed) = std::env::var("OMGS_TEST_RESOLVE")
+        .ok()
+        .and_then(|v| v.strip_prefix(&format!("{host}=")).map(str::to_string))
+    {
+        addrs.push(
+            fixed
+                .parse()
+                .map_err(|_| "invalid OMGS_TEST_RESOLVE address")?,
+        );
+    }
+    if addrs.is_empty() {
+        addrs = (host, 443)
+            .to_socket_addrs()
+            .map_err(|e| format!("cannot resolve {host}: {e}"))?
+            .map(|a| a.ip())
+            .collect();
+    }
+    addrs.sort();
+    addrs.dedup();
+    if addrs.is_empty() {
+        return Err(format!("cannot resolve {host}: no addresses"));
+    }
+    if let Some(bad) = addrs.iter().find(|ip| !is_public(ip)) {
+        return Err(format!(
+            "refusing {host}: it resolves to the non-public address {bad}"
+        ));
+    }
+    Ok(addrs)
+}
+
+/// Publicly routable unicast addresses only: loopback, private, link-local,
+/// shared, documentation, benchmarking, multicast and reserved ranges are
+/// refused, including IPv4 addresses embedded in IPv6.
+pub fn is_public(ip: &std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr};
+    fn v4(ip: &Ipv4Addr) -> bool {
+        let [a, b, c, _] = ip.octets();
+        !(a == 0
+            || a == 10
+            || a == 127
+            || (a == 100 && (64..128).contains(&b))
+            || (a == 169 && b == 254)
+            || (a == 172 && (16..32).contains(&b))
+            || (a == 192 && b == 0 && (c == 0 || c == 2))
+            || (a == 192 && b == 88 && c == 99)
+            || (a == 192 && b == 168)
+            || (a == 198 && (18..20).contains(&b))
+            || (a == 198 && b == 51 && c == 100)
+            || (a == 203 && b == 0 && c == 113)
+            || a >= 224)
+    }
+    match ip {
+        IpAddr::V4(ip) => v4(ip),
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return v4(&mapped);
+            }
+            let s = ip.segments();
+            let embedded = |hi: u16, lo: u16| Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
+            if s[0] == 0x2002 {
+                return v4(&embedded(s[1], s[2]));
+            }
+            if s[0] == 0x64 && s[1] == 0xff9b {
+                return v4(&embedded(s[6], s[7]));
+            }
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || s[0] & 0xfe00 == 0xfc00
+                || s[0] & 0xffc0 == 0xfe80
+                || s[0] & 0xffc0 == 0xfec0
+                || (s[0] == 0x2001 && s[1] == 0xdb8)
+                || s[..6] == [0, 0, 0, 0, 0, 0])
+        }
+    }
 }
 
 /// Repository URLs from a list file: one per line, `#` starts a comment.
