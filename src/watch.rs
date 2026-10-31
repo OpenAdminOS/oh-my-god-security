@@ -4,7 +4,10 @@
 //! `pipeline-status.json`, never the rest of the run directory (findings and
 //! reports describe vulnerabilities). It binds 127.0.0.1 on an ephemeral port,
 //! rejects foreign Host headers so a rebinding page cannot read it, never opens
-//! a browser, and exits once the run is marked complete.
+//! a browser, and exits once the run is marked complete. Status requires the
+//! per-run token printed only to the starting terminal, sent by the dashboard
+//! in an `X-OMGS-Token` header, so other local users and processes cannot
+//! read it. The status never carries finding or lead titles.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -44,11 +47,21 @@ fn text(status: u16) -> Response {
 
 /// Answer one raw request. Pure apart from reading the status file, so the
 /// routing and Host rules are testable without a socket.
-pub fn respond(raw: &str, port: u16, run_dir: &Path) -> Response {
-    respond_locked(raw, port, run_dir)
+pub fn respond(raw: &str, port: u16, token: &str, run_dir: &Path) -> Response {
+    respond_locked(raw, port, token, run_dir)
 }
 
-fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
+/// Constant-time comparison, so response timing reveals nothing about the token.
+fn same_token(given: &str, token: &str) -> bool {
+    given.len() == token.len()
+        && given
+            .bytes()
+            .zip(token.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
+fn respond_locked(raw: &str, port: u16, token: &str, run_dir: &Path) -> Response {
     let mut lines = raw.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
     let mut parts = request_line.split(' ');
@@ -59,11 +72,15 @@ fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
     if !version.starts_with("HTTP/1.") || parts.next().is_some() {
         return text(400);
     }
-    let mut hosts = lines
+    let headers: Vec<(String, String)> = lines
         .take_while(|l| !l.is_empty())
         .filter_map(|l| l.split_once(':'))
-        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("host"))
-        .map(|(_, v)| v.trim().to_ascii_lowercase());
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    let mut hosts = headers
+        .iter()
+        .filter(|(k, _)| k == "host")
+        .map(|(_, v)| v.to_ascii_lowercase());
     let host = hosts.next();
     let allowed = [format!("127.0.0.1:{port}"), format!("localhost:{port}")];
     if hosts.next().is_some() || !host.is_some_and(|h| allowed.contains(&h)) {
@@ -80,6 +97,14 @@ fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
             body: DASHBOARD.as_bytes().to_vec(),
         },
         "/pipeline-status.json" => {
+            let mut given = headers.iter().filter(|(k, _)| k == "x-omgs-token");
+            let authorized = match (given.next(), given.next()) {
+                (Some((_, value)), None) => !token.is_empty() && same_token(value, token),
+                _ => false,
+            };
+            if !authorized {
+                return text(403);
+            }
             let body = match crate::runmeta::with_lock(run_dir, || {
                 // Unsafe file types are refused. Parse errors in regular artifacts
                 // become review limits in the canonical progress document.
@@ -90,8 +115,9 @@ fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
                 )?;
                 crate::review::View::load_locked(run_dir)
             })
-            .and_then(|view| serde_json::to_vec(&view.progress).map_err(|e| e.to_string()))
-            {
+            .and_then(|view| {
+                serde_json::to_vec(&public_progress(view.progress)).map_err(|e| e.to_string())
+            }) {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     return Response {
@@ -109,6 +135,18 @@ fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
         }
         _ => text(404),
     }
+}
+
+/// The live view shows progress, never review content: the review state
+/// names gap counts instead of the gap messages, which can quote finding,
+/// candidate and architecture text.
+fn public_progress(mut progress: serde_json::Value) -> serde_json::Value {
+    if progress.get("review_complete") == Some(&serde_json::Value::Bool(false)) {
+        progress["review_state"] = serde_json::json!(
+            "The review is incomplete. Run omgs critic and omgs validate in the run directory for details."
+        );
+    }
+    progress
 }
 
 /// Write all of `bytes` before `deadline`, or give up. A reader that drains
@@ -147,10 +185,11 @@ fn write_response(stream: &mut TcpStream, r: &Response, deadline: Instant) {
 /// trickles bytes cannot hold the single server thread.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
 
-fn handle(stream: TcpStream, port: u16, run_dir: &Path) {
+fn handle(stream: TcpStream, port: u16, token: &str, run_dir: &Path) {
     handle_inner(
         stream,
         port,
+        token,
         run_dir,
         #[cfg(test)]
         || {},
@@ -160,6 +199,7 @@ fn handle(stream: TcpStream, port: u16, run_dir: &Path) {
 fn handle_inner(
     mut stream: TcpStream,
     port: u16,
+    token: &str,
     run_dir: &Path,
     #[cfg(test)] before_write: impl FnOnce(),
 ) {
@@ -187,20 +227,21 @@ fn handle_inner(
         }
     }
     let raw = String::from_utf8_lossy(&buf);
-    let response = respond(&raw, port, run_dir);
+    let response = respond(&raw, port, token, run_dir);
     #[cfg(test)]
     before_write();
     write_response(&mut stream, &response, deadline);
 }
 
-/// Bind loopback and return the listener with its port, so callers can print
-/// the URL before serving.
-pub fn bind() -> Result<(TcpListener, u16), String> {
+/// Bind loopback and return the listener with its port and a fresh per-run
+/// token, so callers can print the URL before serving.
+pub fn bind() -> Result<(TcpListener, u16, String), String> {
     let listener =
         TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("bind 127.0.0.1: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    Ok((listener, port))
+    let token = crate::platform::random_nonce().map_err(|e| format!("watch token: {e}"))?;
+    Ok((listener, port, token))
 }
 
 fn update_completion(completed_at: &mut Option<Instant>, complete: bool, now: Instant) {
@@ -212,7 +253,7 @@ fn update_completion(completed_at: &mut Option<Instant>, complete: bool, now: In
 }
 
 /// Serve until the run is complete (plus a short grace) or `max` elapses.
-pub fn serve(listener: TcpListener, port: u16, run_dir: &Path, max: Duration) {
+pub fn serve(listener: TcpListener, port: u16, token: &str, run_dir: &Path, max: Duration) {
     let start = Instant::now();
     let mut completed_at: Option<Instant> = None;
     let mut last_check = Instant::now() - Duration::from_secs(1);
@@ -220,7 +261,7 @@ pub fn serve(listener: TcpListener, port: u16, run_dir: &Path, max: Duration) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let _ = stream.set_nonblocking(false);
-                handle(stream, port, run_dir);
+                handle(stream, port, token, run_dir);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => {}
@@ -268,8 +309,12 @@ mod lock_tests {
         ));
         crate::platform::create_private_dir_new(&dir).unwrap();
         crate::runmeta::with_lock(&dir, || {
-            let response =
-                super::respond("GET / HTTP/1.1\r\nHost: localhost:4000\r\n\r\n", 4000, &dir);
+            let response = super::respond(
+                "GET / HTTP/1.1\r\nHost: localhost:4000\r\n\r\n",
+                4000,
+                "t0k",
+                &dir,
+            );
             assert_eq!(response.status, 200);
             Ok(())
         })
@@ -279,12 +324,12 @@ mod lock_tests {
         let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         client
             .write_all(
-                format!("GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
+                format!("GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:{port}\r\nX-OMGS-Token: t0k\r\n\r\n")
                     .as_bytes(),
             )
             .unwrap();
         let (server, _) = listener.accept().unwrap();
-        super::handle_inner(server, port, &dir, || {
+        super::handle_inner(server, port, "t0k", &dir, || {
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)

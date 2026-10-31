@@ -63,8 +63,11 @@ that explicit yes. Ask only once per run; an unanswered prompt must not stall th
 
 Watch binds `127.0.0.1` on an ephemeral port, serves just the dashboard and `pipeline-status.json`
 (never findings or reports), rejects foreign Host headers, and exits on its own shortly after
-`omgs report` marks the run complete. Never bind a non-loopback interface or serve the run directory
-with a generic file server. The page and its status schema live in [progress/](progress/).
+`omgs report` marks the run complete. The printed URL ends in `#token=...`, a fresh per-run token
+that the dashboard sends with every status request; open the URL exactly as printed, never share it,
+and never write the token to run files or logs. The status names no finding or lead titles. Never
+bind a non-loopback interface or serve the run directory with a generic file server. The page and
+its status schema live in [progress/](progress/).
 
 ## Attempt history and incomplete publication
 

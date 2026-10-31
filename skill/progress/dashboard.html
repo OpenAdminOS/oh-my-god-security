@@ -180,7 +180,11 @@ function render(d){
 async function tick(){
   // A stopped orchestrator leaves old JSON, which must still read as stale.
   // A fetch failure marks stale directly. Keep the last progress visible.
-  try{const r=await fetch("pipeline-status.json?_="+now());if(!r.ok)throw new Error("Status unavailable");const d=await r.json();render(d);}
+  // The per-run token lives in the URL fragment, which browsers never send.
+  const hash=(globalThis.location&&globalThis.location.hash)||"";
+  const match=/(?:^|&)token=([0-9a-f]{16,128})(?:&|$)/.exec(hash.slice(1)),token=match?match[1]:"";
+  if(!token){document.getElementById("upd").textContent=display("Open the full address printed by omgs watch, including #token");document.getElementById("dot").classList.add("stale");return;}
+  try{const r=await fetch("pipeline-status.json?_="+now(),{headers:{"X-OMGS-Token":token},cache:"no-store"});if(!r.ok)throw new Error("Status unavailable");const d=await r.json();render(d);}
   catch(e){document.getElementById("upd").textContent=display("Waiting for status");document.getElementById("dot").classList.add("stale");}
 }
 tick();setInterval(tick,2000);

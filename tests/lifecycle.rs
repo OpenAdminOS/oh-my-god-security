@@ -1466,8 +1466,9 @@ fn published_consumers_agree_on_review_matrix() {
                 (view.confirmed, view.needs_validation, view.rejected)
             );
             let response = omgs::watch::respond(
-                "GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:4000\r\n\r\n",
+                "GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:4000\r\nX-OMGS-Token: t0k\r\n\r\n",
                 4000,
+                "t0k",
                 &run.0,
             );
             assert_eq!(response.status, 200);
@@ -2334,8 +2335,9 @@ fn malformed_review_artifacts_allow_failed_status_and_safe_dashboard() {
             view.meta.review_limits
         );
         let response = omgs::watch::respond(
-            "GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:4000\r\n\r\n",
+            "GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:4000\r\nX-OMGS-Token: t0k\r\n\r\n",
             4000,
+            "t0k",
             &run.0,
         );
         assert_eq!(response.status, 200);
