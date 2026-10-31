@@ -29,10 +29,6 @@ impl View {
         crate::runmeta::with_lock(run, || Self::load_locked(run))
     }
 
-    pub fn load_archive(run: &Path) -> Result<Self, String> {
-        crate::runmeta::with_archive_lock(run, || Self::build_locked(run, None, true))
-    }
-
     pub fn with_findings(run: &Path, findings: &FindingsFile) -> Result<Self, String> {
         crate::runmeta::with_lock(run, || Self::build_locked(run, Some(findings), false))
     }

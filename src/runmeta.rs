@@ -183,8 +183,20 @@ impl Transaction {
             }
         }
         // All temporary and backup entries live in a private sibling directory.
-        // No existing entry is changed until all staging succeeds.
+        // No existing entry is changed until all staging succeeds. A regular
+        // destination is only ever replaced by one atomic rename, so readers
+        // never find it missing; rollback restores a private byte copy. Any
+        // other entry, such as a link that must be replaced and not followed,
+        // is moved aside first; no-follow readers refuse it anyway.
+        #[derive(Clone, Copy)]
+        enum Previous {
+            Absent,
+            Copied,
+            Moved,
+        }
         let mut backups = Vec::new();
+        let mut previous = Vec::new();
+        let mut keep = vec![false; self.files.len()];
         let result = (|| {
             for (path, bytes) in &self.files {
                 let tmp = prepare_atomic_content(path, bytes, None)
@@ -195,17 +207,24 @@ impl Transaction {
                     crate::platform::random_nonce().map_err(|e| e.to_string())?
                 ));
                 crate::platform::create_private_dir_new(&backup).map_err(|e| e.to_string())?;
-                backups.push(backup);
+                backups.push(backup.clone());
+                previous.push(match std::fs::symlink_metadata(path) {
+                    Ok(m) if m.file_type().is_file() => {
+                        std::fs::copy(path, backup.join("previous"))
+                            .map_err(|e| format!("back up {}: {e}", path.display()))?;
+                        Previous::Copied
+                    }
+                    Ok(_) => Previous::Moved,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Previous::Absent,
+                    Err(e) => return Err(format!("inspect {}: {e}", path.display())),
+                });
             }
             #[cfg(test)]
             before_commit();
             for (i, (path, _)) in self.files.iter().enumerate() {
-                let previous = backups[i].join("previous");
                 let replaced = (|| {
-                    match std::fs::symlink_metadata(path) {
-                        Ok(_) => std::fs::rename(path, &previous)?,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e),
+                    if let Previous::Moved = previous[i] {
+                        std::fs::rename(path, backups[i].join("previous"))?;
                     }
                     std::fs::rename(&staged[i], path)
                 })();
@@ -214,19 +233,26 @@ impl Transaction {
                     for j in (0..=i).rev() {
                         let dest = &self.files[j].0;
                         let old = backups[j].join("previous");
-                        if j < i {
-                            if let Err(e) = std::fs::remove_file(dest) {
-                                recovery.push(format!("remove {}: {e}", dest.display()));
+                        let restored = match previous[j] {
+                            Previous::Absent if j < i => std::fs::remove_file(dest),
+                            Previous::Copied if j < i => std::fs::rename(&old, dest),
+                            Previous::Moved if std::fs::symlink_metadata(&old).is_ok() => {
+                                if j < i {
+                                    std::fs::remove_file(dest)
+                                } else {
+                                    Ok(())
+                                }
+                                .and_then(|()| std::fs::rename(&old, dest))
                             }
-                        }
-                        if std::fs::symlink_metadata(&old).is_ok() {
-                            if let Err(e) = std::fs::rename(&old, dest) {
-                                recovery.push(format!(
-                                    "restore {} from {}: {e}",
-                                    dest.display(),
-                                    old.display()
-                                ));
-                            }
+                            _ => Ok(()),
+                        };
+                        if let Err(e) = restored {
+                            keep[j] = true;
+                            recovery.push(format!(
+                                "restore {} from {}: {e}",
+                                dest.display(),
+                                backups[j].display()
+                            ));
                         }
                     }
                     return Err(format!(
@@ -245,12 +271,10 @@ impl Transaction {
         for path in staged {
             let _ = std::fs::remove_file(path);
         }
-        for path in backups {
-            if result.is_ok() {
+        // Retain only an original that an OS error prevented restoring.
+        for (path, keep) in backups.into_iter().zip(keep) {
+            if !keep {
                 let _ = std::fs::remove_dir_all(path);
-            } else {
-                // Retain any original that an OS error prevented restoring.
-                let _ = std::fs::remove_dir(path);
             }
         }
         result
@@ -475,16 +499,6 @@ pub fn update<T>(
     })
 }
 
-/// Invalidate a published completion before reopening work, under the run lock.
-pub fn invalidate_completion_locked(dir: &Path) -> Result<(), String> {
-    if let Some(mut meta) = read_optional(dir)? {
-        meta.insert("run_status".into(), serde_json::json!("in_progress"));
-        let text = serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?;
-        write_atomic(&dir.join(FILE), &text)?;
-    }
-    Ok(())
-}
-
 /// Clock time of day in UTC for log lines, for example "14:03:09".
 pub fn clock(ms: u64) -> String {
     let secs = ms / 1000;
@@ -567,6 +581,39 @@ mod transaction_tests {
             "{}"
         );
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_readers_never_see_a_destination_missing_during_commit() {
+        let dir = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-transaction-test-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&dir).unwrap();
+        let path = dir.join(super::FILE);
+        super::write_atomic(&path, "{}").unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let (path, done) = (path.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut missing = 0;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if std::fs::symlink_metadata(&path).is_err() {
+                        missing += 1;
+                    }
+                }
+                missing
+            })
+        };
+        for _ in 0..300 {
+            let mut transaction = super::Transaction::default();
+            transaction.metadata(&dir, &serde_json::Map::new()).unwrap();
+            transaction.commit().unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(watcher.join().unwrap(), 0);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

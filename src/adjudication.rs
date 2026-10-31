@@ -337,11 +337,6 @@ pub fn report_lines(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, 
     report_lines_inner(run, findings, false, None)
 }
 
-/// Caller holds the family and run locks through artifact publication.
-pub fn report_lines_locked(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String> {
-    report_lines_inner(run, findings, true, None)
-}
-
 pub fn report_lines_view(run: &Path, view: &crate::review::View) -> Result<Vec<String>, String> {
     report_lines_inner(run, &view.findings, true, Some(view))
 }
