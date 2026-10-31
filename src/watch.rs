@@ -4,7 +4,11 @@
 //! `pipeline-status.json`, never the rest of the run directory (findings and
 //! reports describe vulnerabilities). It binds 127.0.0.1 on an ephemeral port,
 //! rejects foreign Host headers so a rebinding page cannot read it, never opens
-//! a browser, and exits once the run is marked complete.
+//! a browser, and exits once the run is marked complete. Status requires the
+//! per-run token printed only to the starting terminal, sent by the dashboard
+//! in an `X-OMGS-Token` header, so other local users and processes cannot
+//! read it. The status is a fixed projection that never carries finding,
+//! lead or other free text written by agents.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -44,11 +48,21 @@ fn text(status: u16) -> Response {
 
 /// Answer one raw request. Pure apart from reading the status file, so the
 /// routing and Host rules are testable without a socket.
-pub fn respond(raw: &str, port: u16, run_dir: &Path) -> Response {
-    respond_locked(raw, port, run_dir)
+pub fn respond(raw: &str, port: u16, token: &str, run_dir: &Path) -> Response {
+    respond_locked(raw, port, token, run_dir)
 }
 
-fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
+/// Constant-time comparison, so response timing reveals nothing about the token.
+fn same_token(given: &str, token: &str) -> bool {
+    given.len() == token.len()
+        && given
+            .bytes()
+            .zip(token.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
+fn respond_locked(raw: &str, port: u16, token: &str, run_dir: &Path) -> Response {
     let mut lines = raw.split("\r\n");
     let request_line = lines.next().unwrap_or_default();
     let mut parts = request_line.split(' ');
@@ -59,11 +73,15 @@ fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
     if !version.starts_with("HTTP/1.") || parts.next().is_some() {
         return text(400);
     }
-    let mut hosts = lines
+    let headers: Vec<(String, String)> = lines
         .take_while(|l| !l.is_empty())
         .filter_map(|l| l.split_once(':'))
-        .filter(|(k, _)| k.trim().eq_ignore_ascii_case("host"))
-        .map(|(_, v)| v.trim().to_ascii_lowercase());
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    let mut hosts = headers
+        .iter()
+        .filter(|(k, _)| k == "host")
+        .map(|(_, v)| v.to_ascii_lowercase());
     let host = hosts.next();
     let allowed = [format!("127.0.0.1:{port}"), format!("localhost:{port}")];
     if hosts.next().is_some() || !host.is_some_and(|h| allowed.contains(&h)) {
@@ -80,6 +98,14 @@ fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
             body: DASHBOARD.as_bytes().to_vec(),
         },
         "/pipeline-status.json" => {
+            let mut given = headers.iter().filter(|(k, _)| k == "x-omgs-token");
+            let authorized = match (given.next(), given.next()) {
+                (Some((_, value)), None) => !token.is_empty() && same_token(value, token),
+                _ => false,
+            };
+            if !authorized {
+                return text(403);
+            }
             let body = match crate::runmeta::with_lock(run_dir, || {
                 // Unsafe file types are refused. Parse errors in regular artifacts
                 // become review limits in the canonical progress document.
@@ -90,8 +116,15 @@ fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
                 )?;
                 crate::review::View::load_locked(run_dir)
             })
-            .and_then(|view| serde_json::to_vec(&view.progress).map_err(|e| e.to_string()))
-            {
+            .and_then(|view| {
+                serde_json::to_vec(&public_progress(
+                    view.progress,
+                    run_dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned()),
+                ))
+                .map_err(|e| e.to_string())
+            }) {
                 Ok(bytes) => bytes,
                 Err(_) => {
                     return Response {
@@ -109,6 +142,170 @@ fn respond_locked(raw: &str, port: u16, run_dir: &Path) -> Response {
         }
         _ => text(404),
     }
+}
+
+/// Stage ids the dashboard names with its own fixed labels.
+const STAGE_IDS: [&str; 9] = [
+    "initialize",
+    "map",
+    "hunt",
+    "verify",
+    "challenge",
+    "prove",
+    "adjudicate",
+    "evaluate",
+    "report",
+];
+const STATES: [&str; 4] = ["pending", "active", "done", "failed"];
+const COUNTERS: [&str; 4] = ["candidates", "confirmed", "needs_validation", "rejected"];
+
+fn state_of(v: &serde_json::Value) -> &'static str {
+    let s = v.as_str().unwrap_or_default();
+    STATES
+        .iter()
+        .find(|k| **k == s)
+        .copied()
+        .unwrap_or("pending")
+}
+
+/// A UTC timestamp exactly as `omgs status` writes it,
+/// `YYYY-MM-DDTHH:MM:SSZ` naming a real calendar date and time. Anything else is
+/// dropped, so a log entry cannot carry an address or identifier.
+fn is_timestamp(t: &str) -> bool {
+    let b = t.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return false;
+    }
+    let num = |from: usize, to: usize| -> Option<u32> {
+        let part = &t[from..to];
+        part.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        num(0, 4),
+        num(5, 7),
+        num(8, 10),
+        num(11, 13),
+        num(14, 16),
+        num(17, 19),
+    ) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day) && hour < 24 && minute < 60 && second < 60
+}
+
+/// One stage with only fixed vocabulary, numbers and generic labels.
+fn public_stage(stage: &serde_json::Value, label: String) -> serde_json::Value {
+    let id = stage.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    let known = STAGE_IDS.contains(&id);
+    let mut out = serde_json::json!({
+        "id": if known { id } else { "step" },
+        "label": label,
+        "status": state_of(&stage["status"]),
+    });
+    for key in ["started_ms", "ended_ms"] {
+        if let Some(n) = stage.get(key).and_then(|v| v.as_u64()) {
+            out[key] = n.into();
+        }
+    }
+    if let Some(children) = stage.get("children").and_then(|v| v.as_array()) {
+        out["children"] = children
+            .iter()
+            .enumerate()
+            .map(|(i, c)| public_stage(c, format!("Part {}", i + 1)))
+            .collect();
+    }
+    out
+}
+
+/// The live view shows progress, never review content. It is an explicit
+/// projection: stage ids from a fixed list, states, times, numeric
+/// counters, fixed sentences and the run directory name. Stage details, labels, log messages,
+/// history and gap messages are agent or target text that can quote
+/// findings, so none of it is served.
+fn public_progress(progress: serde_json::Value, run_name: Option<String>) -> serde_json::Value {
+    let stages: Vec<serde_json::Value> = progress
+        .get("stages")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .enumerate()
+                .map(|(i, st)| public_stage(st, format!("Review step {}", i + 1)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut counters = serde_json::Map::new();
+    for key in COUNTERS {
+        if let Some(n) = progress
+            .get("counters")
+            .and_then(|c| c.get(key))
+            .and_then(|v| v.as_u64())
+        {
+            counters.insert(key.into(), n.into());
+        }
+    }
+    let log: Vec<serde_json::Value> = progress
+        .get("log")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .map(|e| {
+                    let kind = state_of(&e["kind"]);
+                    serde_json::json!({
+                        "ts": e
+                            .get("ts")
+                            .and_then(|v| v.as_str())
+                            .filter(|t| is_timestamp(t))
+                            .unwrap_or_default(),
+                        "kind": kind,
+                        "m": match kind {
+                            "active" => "A review step started",
+                            "done" => "A review step finished",
+                            "failed" => "A review step stopped",
+                            _ => "A review step is waiting",
+                        },
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let complete = progress.get("review_complete").and_then(|v| v.as_bool());
+    let mut out = serde_json::json!({
+        "stages": stages,
+        "counters": counters,
+        "log": log,
+    });
+    if let Some(name) = run_name {
+        out["run"] = name.into();
+    }
+    if let Some(n) = progress.get("updated_ms").and_then(|v| v.as_u64()) {
+        out["updated_ms"] = n.into();
+    }
+    if let Some(done) = complete {
+        out["review_complete"] = done.into();
+        out["review_state"] = if done {
+            "complete".into()
+        } else {
+            "The review is incomplete. Run omgs critic and omgs validate in the run directory for details.".into()
+        };
+    }
+    out
 }
 
 /// Write all of `bytes` before `deadline`, or give up. A reader that drains
@@ -147,10 +344,11 @@ fn write_response(stream: &mut TcpStream, r: &Response, deadline: Instant) {
 /// trickles bytes cannot hold the single server thread.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
 
-fn handle(stream: TcpStream, port: u16, run_dir: &Path) {
+fn handle(stream: TcpStream, port: u16, token: &str, run_dir: &Path) {
     handle_inner(
         stream,
         port,
+        token,
         run_dir,
         #[cfg(test)]
         || {},
@@ -160,6 +358,7 @@ fn handle(stream: TcpStream, port: u16, run_dir: &Path) {
 fn handle_inner(
     mut stream: TcpStream,
     port: u16,
+    token: &str,
     run_dir: &Path,
     #[cfg(test)] before_write: impl FnOnce(),
 ) {
@@ -187,20 +386,21 @@ fn handle_inner(
         }
     }
     let raw = String::from_utf8_lossy(&buf);
-    let response = respond(&raw, port, run_dir);
+    let response = respond(&raw, port, token, run_dir);
     #[cfg(test)]
     before_write();
     write_response(&mut stream, &response, deadline);
 }
 
-/// Bind loopback and return the listener with its port, so callers can print
-/// the URL before serving.
-pub fn bind() -> Result<(TcpListener, u16), String> {
+/// Bind loopback and return the listener with its port and a fresh per-run
+/// token, so callers can print the URL before serving.
+pub fn bind() -> Result<(TcpListener, u16, String), String> {
     let listener =
         TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("bind 127.0.0.1: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    Ok((listener, port))
+    let token = crate::platform::random_nonce().map_err(|e| format!("watch token: {e}"))?;
+    Ok((listener, port, token))
 }
 
 fn update_completion(completed_at: &mut Option<Instant>, complete: bool, now: Instant) {
@@ -212,7 +412,7 @@ fn update_completion(completed_at: &mut Option<Instant>, complete: bool, now: In
 }
 
 /// Serve until the run is complete (plus a short grace) or `max` elapses.
-pub fn serve(listener: TcpListener, port: u16, run_dir: &Path, max: Duration) {
+pub fn serve(listener: TcpListener, port: u16, token: &str, run_dir: &Path, max: Duration) {
     let start = Instant::now();
     let mut completed_at: Option<Instant> = None;
     let mut last_check = Instant::now() - Duration::from_secs(1);
@@ -220,7 +420,7 @@ pub fn serve(listener: TcpListener, port: u16, run_dir: &Path, max: Duration) {
         match listener.accept() {
             Ok((stream, _)) => {
                 let _ = stream.set_nonblocking(false);
-                handle(stream, port, run_dir);
+                handle(stream, port, token, run_dir);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => {}
@@ -268,8 +468,12 @@ mod lock_tests {
         ));
         crate::platform::create_private_dir_new(&dir).unwrap();
         crate::runmeta::with_lock(&dir, || {
-            let response =
-                super::respond("GET / HTTP/1.1\r\nHost: localhost:4000\r\n\r\n", 4000, &dir);
+            let response = super::respond(
+                "GET / HTTP/1.1\r\nHost: localhost:4000\r\n\r\n",
+                4000,
+                "t0k",
+                &dir,
+            );
             assert_eq!(response.status, 200);
             Ok(())
         })
@@ -279,12 +483,12 @@ mod lock_tests {
         let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         client
             .write_all(
-                format!("GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
+                format!("GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:{port}\r\nX-OMGS-Token: t0k\r\n\r\n")
                     .as_bytes(),
             )
             .unwrap();
         let (server, _) = listener.accept().unwrap();
-        super::handle_inner(server, port, &dir, || {
+        super::handle_inner(server, port, "t0k", &dir, || {
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)

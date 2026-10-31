@@ -65,7 +65,8 @@ Network use is specific: `review` and `batch init` use `git clone` over HTTPS;
 `update-check` makes one Git protocol request to GitHub when invoked, using
 `git ls-remote --tags` (or to the `OMGS_UPDATE_REMOTE` mirror). It uses no stored
 credentials or telemetry and has a short deadline and output cap. `watch` serves
-only loopback HTTP. The installer downloads release assets over
+only loopback HTTP, and its status needs a per-run token in the printed URL; keep that URL to
+yourself. The installer downloads release assets over
 HTTPS after consent. Sensors use local tools and local data inside MXC with the
 network denied. Semgrep requires an existing local rules file or directory in
 `OMGS_SEMGREP_CONFIG`; registry shorthand and URL values do not enable fetching.
