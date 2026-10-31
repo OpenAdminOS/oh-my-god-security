@@ -271,7 +271,7 @@ fn watch_routes_and_host_rules() {
     let dir = scratch("watch");
     write_private_fixture(
         dir.join("pipeline-status.json"),
-        r#"{"target":"Synthetic target text","run":"Synthetic run text","stages":[{"id":"hunt","attempt_id":"hunt:2","label":"Synthetic label","status":"active","detail":"Synthetic detail","started_ms":3,"history":[{"id":"hunt","label":"Synthetic old label","status":"done","detail":"Synthetic old detail"}],"children":[{"id":"Synthetic child id","label":"Synthetic child label","status":"done","detail":"Synthetic child detail"}]},{"id":"Synthetic stage id","label":"Synthetic custom label","status":"Synthetic state"}],"counters":{"candidates":2,"Synthetic counter":1},"log":[{"ts":"2026-10-31T10:00:00Z","kind":"active","m":"Synthetic log text"},{"ts":"Synthetic ts","kind":"Synthetic kind","m":"x"}],"updated_ms":5}"#,
+        r#"{"target":"Synthetic target text","run":"Synthetic run text","stages":[{"id":"hunt","attempt_id":"hunt:2","label":"Synthetic label","status":"active","detail":"Synthetic detail","started_ms":3,"history":[{"id":"hunt","label":"Synthetic old label","status":"done","detail":"Synthetic old detail"}],"children":[{"id":"Synthetic child id","label":"Synthetic child label","status":"done","detail":"Synthetic child detail"}]},{"id":"Synthetic stage id","label":"Synthetic custom label","status":"Synthetic state"}],"counters":{"candidates":2,"Synthetic counter":1},"log":[{"ts":"2026-10-31T10:00:00Z","kind":"active","m":"Synthetic log text"},{"ts":"Synthetic ts","kind":"Synthetic kind","m":"x"},{"ts":"192.168.100.200:4433","kind":"done","m":"x"},{"ts":"9876543210987654321","kind":"done","m":"x"},{"ts":"2026-13-31T10:00:00Z","kind":"done","m":"x"}],"updated_ms":5}"#,
     )
     .unwrap();
     write_private_fixture(
@@ -320,6 +320,12 @@ fn watch_routes_and_host_rules() {
     assert_eq!(progress["log"][0]["ts"], "2026-10-31T10:00:00Z");
     assert_eq!(progress["log"][0]["m"], "A review step started");
     assert_eq!(progress["log"][1]["kind"], "pending");
+    // Only real timestamps pass; addresses and identifiers are dropped.
+    assert!(!body.contains("192.168"), "{body}");
+    assert!(!body.contains("98765"), "{body}");
+    for i in 1..5 {
+        assert_eq!(progress["log"][i]["ts"], "", "{i}");
+    }
     for path in [
         "/findings.json",
         "/../findings.json",

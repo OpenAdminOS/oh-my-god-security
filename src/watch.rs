@@ -168,6 +168,47 @@ fn state_of(v: &serde_json::Value) -> &'static str {
         .unwrap_or("pending")
 }
 
+/// A UTC timestamp exactly as `omgs status` writes it,
+/// `YYYY-MM-DDTHH:MM:SSZ` with every field in range. Anything else is
+/// dropped, so a log entry cannot carry an address or identifier.
+fn is_timestamp(t: &str) -> bool {
+    let b = t.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return false;
+    }
+    let num = |from: usize, to: usize| -> Option<u32> {
+        let part = &t[from..to];
+        part.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| part.parse().ok())?
+    };
+    matches!(
+        (
+            num(0, 4),
+            num(5, 7),
+            num(8, 10),
+            num(11, 13),
+            num(14, 16),
+            num(17, 19)
+        ),
+        (
+            Some(_),
+            Some(1..=12),
+            Some(1..=31),
+            Some(0..=23),
+            Some(0..=59),
+            Some(0..=59)
+        )
+    )
+}
+
 /// One stage with only fixed vocabulary, numbers and generic labels.
 fn public_stage(stage: &serde_json::Value, label: String) -> serde_json::Value {
     let id = stage.get("id").and_then(|v| v.as_str()).unwrap_or_default();
@@ -229,7 +270,7 @@ fn public_progress(progress: serde_json::Value, run_name: Option<String>) -> ser
                         "ts": e
                             .get("ts")
                             .and_then(|v| v.as_str())
-                            .filter(|t| t.len() <= 40 && t.bytes().all(|b| b.is_ascii_digit() || b"-:TZ.+".contains(&b)))
+                            .filter(|t| is_timestamp(t))
                             .unwrap_or_default(),
                         "kind": kind,
                         "m": match kind {
