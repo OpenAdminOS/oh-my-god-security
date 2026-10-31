@@ -673,6 +673,10 @@ fn export_head_bounded(
         paths.insert(path.to_string());
         manifest.push((path, fields[0], fields[2], size));
     }
+    // Exact directory spellings already created by this export. A new spelling
+    // must create its directory itself, so a folded alias of another spelling
+    // (Checks/ versus checks/) fails instead of merging two Git directories.
+    let mut created_dirs = std::collections::BTreeSet::new();
     for (path, _mode, blob, size) in manifest {
         crate::supervise::check_interrupted().map_err(|_| "gate export interrupted")?;
         let bytes = git(target, &["cat-file", "blob", blob])?;
@@ -681,7 +685,23 @@ fn export_head_bounded(
             return Err("gate blob size mismatch".into());
         }
         let file = out.join(path);
-        std::fs::create_dir_all(file.parent().unwrap()).map_err(|e| e.to_string())?;
+        let mut dir = std::path::PathBuf::new();
+        if let Some(parent) = Path::new(path).parent() {
+            for component in parent.components() {
+                dir.push(component);
+                if created_dirs.contains(&dir) {
+                    continue;
+                }
+                std::fs::create_dir(out.join(&dir)).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        format!("head paths alias the same directory on this filesystem: {}; gate export is blocked", dir.display())
+                    } else {
+                        e.to_string()
+                    }
+                })?;
+                created_dirs.insert(dir.clone());
+            }
+        }
         // Never overwrite: a path this filesystem treats as an existing one
         // (case or Unicode folding, normalization, short names) must not
         // replace a registered test with pull request content.
@@ -1193,7 +1213,7 @@ mod scratch_tests {
         let out = root.join("out");
         std::fs::create_dir(&out).unwrap();
         match export_head(&repo, &head, &out) {
-            Err(error) => assert!(error.contains("alias the same file"), "{error}"),
+            Err(error) => assert!(error.contains("alias the same"), "{error}"),
             // A filesystem that keeps both names apart exports both intact.
             Ok(paths) => {
                 assert_eq!(paths.len(), 2);
@@ -1201,6 +1221,48 @@ mod scratch_tests {
                     std::fs::read(out.join("checks/entry.sh")).unwrap(),
                     b"registered\n"
                 );
+            }
+        }
+        // Aliased parent directories with distinct children, in both orders,
+        // and a file aliasing a directory never merge.
+        let base = git_fixture(&repo, &["rev-parse", "HEAD:checks/entry.sh"]);
+        for (index, (first, second)) in [
+            ("Checks/helper.sh", "checks/entry.sh"),
+            ("checks/entry.sh", "Checks/helper.sh"),
+            ("Checks", "checks/entry.sh"),
+            ("checks/entry.sh", "CHECKS"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            git_fixture(&repo, &["read-tree", "--empty"]);
+            for path in [first, second] {
+                git_fixture(
+                    &repo,
+                    &[
+                        "update-index",
+                        "--add",
+                        "--cacheinfo",
+                        "100644",
+                        &base,
+                        path,
+                    ],
+                );
+            }
+            let tree = git_fixture(&repo, &["write-tree"]);
+            let head = git_fixture(&repo, &["commit-tree", &tree, "-m", "Directory alias"]);
+            let out = root.join(format!("dirs-{index}"));
+            std::fs::create_dir(&out).unwrap();
+            match export_head(&repo, &head, &out) {
+                Err(error) => assert!(error.contains("alias the same"), "{index}: {error}"),
+                Ok(paths) => {
+                    // Only a filesystem keeping both spellings apart may export.
+                    assert_eq!(paths.len(), 2, "{index}");
+                    for path in [first, second] {
+                        assert!(out.join(path).exists(), "{index}: {path}");
+                    }
+                    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2, "{index}");
+                }
             }
         }
         std::fs::remove_dir_all(root).unwrap();
