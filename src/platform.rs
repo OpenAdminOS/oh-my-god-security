@@ -625,6 +625,105 @@ fn link_count(_file: &std::fs::File) -> std::io::Result<u64> {
     ))
 }
 
+/// OS change metadata for staging only, never part of replay identity.
+/// Access times are excluded because staging itself reads the source.
+pub(crate) fn change_stamp(path: &Path) -> std::io::Result<[u64; 7]> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path)?;
+        Ok([
+            meta.dev(),
+            meta.ino(),
+            meta.size(),
+            meta.mtime() as u64,
+            meta.mtime_nsec() as u64,
+            meta.ctime() as u64,
+            meta.ctime_nsec() as u64,
+        ])
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle};
+        #[repr(C)]
+        struct FileBasicInfo {
+            creation_time: i64,
+            last_access_time: i64,
+            last_write_time: i64,
+            change_time: i64,
+            attributes: u32,
+        }
+        extern "system" {
+            fn CreateFileW(
+                path: *const u16,
+                access: u32,
+                share: u32,
+                security: *const core::ffi::c_void,
+                disposition: u32,
+                flags: u32,
+                template: *mut core::ffi::c_void,
+            ) -> *mut core::ffi::c_void;
+            fn GetFileInformationByHandleEx(
+                file: *mut core::ffi::c_void,
+                class: i32,
+                info: *mut core::ffi::c_void,
+                size: u32,
+            ) -> i32;
+        }
+        let wide = crate::windows_path::wide(path)?;
+        // SAFETY: wide is NUL terminated. Open the entry itself, including a
+        // directory or reparse point, with read-attributes access and all shares.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0x80,
+                7,
+                std::ptr::null(),
+                3,
+                0x0200_0000 | 0x0020_0000,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle as isize == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: CreateFileW returned a new handle owned here.
+        let file = unsafe { std::fs::File::from_raw_handle(handle) };
+        let (volume, index) = windows_file_identity(&file)?;
+        let size = file.metadata()?.len();
+        let mut basic = std::mem::MaybeUninit::<FileBasicInfo>::zeroed();
+        // SAFETY: class 0 is FileBasicInfo; the live handle and correctly sized
+        // writable FILE_BASIC_INFO buffer remain valid throughout the call.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                0,
+                basic.as_mut_ptr().cast(),
+                std::mem::size_of::<FileBasicInfo>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a successful call initialized the structure.
+        let basic = unsafe { basic.assume_init() };
+        Ok([
+            u64::from(volume),
+            index,
+            size,
+            basic.last_write_time as u64,
+            basic.change_time as u64,
+            u64::from(basic.attributes),
+            0,
+        ])
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(std::io::Error::other("source change stamps unavailable"))
+    }
+}
+
 /// A fresh nonce from the OS CSPRNG, never the clock or process id.
 pub fn random_nonce() -> std::io::Result<String> {
     let mut bytes = [0u8; 32];

@@ -447,77 +447,116 @@ pub(crate) fn verify_selection(root: &Path, selection: &Selection) -> Result<(),
     Ok(())
 }
 
-// Fixed-size sorted batches avoid collecting an arbitrarily wide directory.
-// The admitted path length also bounds recursion depth. Order is component-wise.
+// Each directory is read once. Only selected candidates consume sort memory.
+const MAX_DIRECTORY_NAMES: usize = 200_000;
+const MAX_DIRECTORY_NAME_BYTES: usize = 32 << 20;
+
+#[derive(Clone, Copy)]
+struct DirectoryLimits {
+    entries: usize,
+    names: usize,
+    bytes: usize,
+}
+const DIRECTORY_LIMITS: DirectoryLimits = DirectoryLimits {
+    entries: MAX_ENTRIES,
+    names: MAX_DIRECTORY_NAMES,
+    bytes: MAX_DIRECTORY_NAME_BYTES,
+};
+
 pub(crate) fn children(
     dir: &Path,
-    visit: impl FnMut(std::fs::DirEntry) -> Result<(), String>,
-) -> Result<(), String> {
-    children_with_limit(dir, MAX_ENTRIES, visit)
-}
-
-fn children_with_limit(
-    dir: &Path,
-    limit: usize,
     mut visit: impl FnMut(std::fs::DirEntry) -> Result<(), String>,
 ) -> Result<(), String> {
-    sorted_children(dir, limit, &mut 0, |entry, _| visit(entry))
+    sorted_children(dir, &mut 0, |_| true, |entry, _| visit(entry))
 }
 
-/// Charge all siblings on the first scan, before retaining any names. Rescans
-/// do not charge the same siblings twice; recursion shares the traversal budget.
-pub(crate) fn children_budgeted(
+/// Charge every enumerated sibling, including omitted scoped inputs, to the
+/// shared traversal budget before retaining or sorting selected candidates.
+pub(crate) fn children_selected(
+    root: &Path,
     dir: &Path,
+    selection: Option<&Selection>,
     count: &mut usize,
     visit: impl FnMut(std::fs::DirEntry, &mut usize) -> Result<(), String>,
 ) -> Result<(), String> {
-    sorted_children(dir, MAX_ENTRIES, count, visit)
+    let prefix = dir
+        .strip_prefix(root)
+        .map_err(|e| e.to_string())?
+        .to_str()
+        .ok_or("execution input paths must be UTF-8")?
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    sorted_children(
+        dir,
+        count,
+        |name| {
+            let relative = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            selection.is_none_or(|s| {
+                relative == ".git"
+                    || relative.starts_with(".git/")
+                    || s.paths.iter().any(|p| overlaps(p, &relative))
+            })
+        },
+        visit,
+    )
 }
 
 fn sorted_children(
     dir: &Path,
-    limit: usize,
     count: &mut usize,
+    include: impl FnMut(&str) -> bool,
     mut visit: impl FnMut(std::fs::DirEntry, &mut usize) -> Result<(), String>,
 ) -> Result<(), String> {
-    let mut first_scan = true;
-    let mut after = None;
-    loop {
-        let mut batch = std::collections::BTreeMap::new();
-        let mut scanned = 0;
-        for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .map(|entry| {
             let entry = entry.map_err(|e| e.to_string())?;
-            scanned += 1;
-            if scanned > limit {
-                return Err(format!("execution input directory exceeds {limit} entries"));
-            }
-            crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
-            if first_scan {
-                admit_entry(count)?;
-            }
             let name = entry
                 .file_name()
                 .into_string()
                 .map_err(|_| "execution input paths must be UTF-8")?;
-            if after.as_ref().is_some_and(|a| &name <= a) {
-                continue;
-            }
-            if batch.len() < 256 || batch.last_key_value().is_some_and(|(last, _)| &name < last) {
-                batch.insert(name, entry);
-                if batch.len() > 256 {
-                    batch.pop_last();
-                }
-            }
-        }
-        if batch.is_empty() {
-            return Ok(());
-        }
-        first_scan = false;
-        after = batch.last_key_value().map(|(name, _)| name.clone());
-        for (_, entry) in batch {
-            visit(entry, count)?;
-        }
+            Ok((name, entry))
+        });
+    for (_, entry) in sorted_names(dir, entries, count, DIRECTORY_LIMITS, include)? {
+        visit(entry, count)?;
     }
+    Ok(())
+}
+
+fn sorted_names<T>(
+    dir: &Path,
+    entries: impl IntoIterator<Item = Result<(String, T), String>>,
+    count: &mut usize,
+    limits: DirectoryLimits,
+    mut include: impl FnMut(&str) -> bool,
+) -> Result<Vec<(String, T)>, String> {
+    let mut names = Vec::new();
+    let mut bytes = 0;
+    for (scanned, entry) in entries.into_iter().enumerate() {
+        crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
+        if scanned >= limits.entries {
+            return Err(format!(
+                "execution input directory {} exceeds {} entries",
+                dir.display(),
+                limits.entries
+            ));
+        }
+        admit_entry(count)?;
+        let (name, entry) = entry?;
+        if !include(&name) {
+            continue;
+        }
+        if names.len() >= limits.names || name.len() > limits.bytes - bytes {
+            return Err(format!("execution input directory {} exceeds sort memory budget ({} names or {} name bytes)", dir.display(), limits.names, limits.bytes));
+        }
+        bytes += name.len();
+        names.push((name, entry));
+    }
+    names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    Ok(names)
 }
 
 fn count_paths(
@@ -526,7 +565,17 @@ fn count_paths(
     selection: Option<&Selection>,
     count: &mut usize,
 ) -> Result<(), String> {
-    children(dir, |entry| {
+    count_paths_budgeted(root, dir, selection, count, &mut 0)
+}
+
+fn count_paths_budgeted(
+    root: &Path,
+    dir: &Path,
+    selection: Option<&Selection>,
+    count: &mut usize,
+    scanned: &mut usize,
+) -> Result<(), String> {
+    children_selected(root, dir, selection, scanned, |entry, scanned| {
         let path = entry.path();
         let name = path
             .strip_prefix(root)
@@ -534,13 +583,6 @@ fn count_paths(
             .to_str()
             .ok_or("execution input paths must be UTF-8")?
             .replace(std::path::MAIN_SEPARATOR, "/");
-        if selection.is_some_and(|s| {
-            name != ".git"
-                && !name.starts_with(".git/")
-                && !s.paths.iter().any(|p| overlaps(p, &name))
-        }) {
-            return Ok(());
-        }
         safe_path(&name)?;
         let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
         if crate::platform::contentless(&meta) {
@@ -548,7 +590,7 @@ fn count_paths(
         }
         admit_entry(count)?;
         if meta.is_dir() && !crate::platform::is_link(&meta) {
-            count_paths(root, &path, selection, count)?;
+            count_paths_budgeted(root, &path, selection, count, scanned)?;
         }
         Ok(())
     })
@@ -561,7 +603,18 @@ fn walk(
     count: &mut usize,
     emit: &mut impl FnMut(Entry) -> Result<(), String>,
 ) -> Result<(), String> {
-    children(dir, |entry| {
+    walk_budgeted(root, dir, selection, count, &mut 0, emit)
+}
+
+fn walk_budgeted(
+    root: &Path,
+    dir: &Path,
+    selection: Option<&Selection>,
+    count: &mut usize,
+    scanned: &mut usize,
+    emit: &mut impl FnMut(Entry) -> Result<(), String>,
+) -> Result<(), String> {
+    children_selected(root, dir, selection, scanned, |entry, scanned| {
         crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
         let path = entry.path();
         let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
@@ -569,13 +622,6 @@ fn walk(
             .to_str()
             .ok_or("execution input paths must be UTF-8")?
             .replace(std::path::MAIN_SEPARATOR, "/");
-        if selection.is_some_and(|s| {
-            name != ".git"
-                && !name.starts_with(".git/")
-                && !s.paths.iter().any(|p| overlaps(p, &name))
-        }) {
-            return Ok(());
-        }
         safe_path(&name)?;
         let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
         if crate::platform::contentless(&meta) {
@@ -613,10 +659,51 @@ fn walk(
             sha256: digest,
         })?;
         if meta.is_dir() && !crate::platform::is_link(&meta) {
-            walk(root, &path, selection, count, emit)?;
+            walk_budgeted(root, &path, selection, count, scanned, emit)?;
         }
         Ok(())
     })
+}
+
+/// Bounded canonical stamp stream, including the root and each traversed
+/// directory itself so transient membership changes cannot disappear unnoticed.
+/// This guards staging only; replay continues to bind normalized content.
+pub(crate) fn source_stamps(
+    root: &Path,
+    selection: Option<&Selection>,
+) -> Result<[u8; 32], String> {
+    fn walk_stamps(
+        root: &Path,
+        path: &Path,
+        selection: Option<&Selection>,
+        count: &mut usize,
+        hash: &mut crate::sha256::Sha256,
+    ) -> Result<(), String> {
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|e| e.to_string())?
+            .to_str()
+            .ok_or("execution input paths must be UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        if !rel.is_empty() {
+            safe_path(&rel)?;
+        }
+        hash.update(&(rel.len() as u64).to_le_bytes());
+        hash.update(rel.as_bytes());
+        for value in crate::platform::change_stamp(path).map_err(|e| e.to_string())? {
+            hash.update(&value.to_le_bytes());
+        }
+        let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if meta.is_dir() && !crate::platform::is_link(&meta) {
+            children_selected(root, path, selection, count, |entry, count| {
+                walk_stamps(root, &entry.path(), selection, count, hash)
+            })?;
+        }
+        Ok(())
+    }
+    let mut hash = crate::sha256::Sha256::new();
+    walk_stamps(root, root, selection, &mut 0, &mut hash)?;
+    Ok(hash.finish())
 }
 
 /// Reset copy-preserved access/write times after all hashing and staging, in
@@ -1069,20 +1156,146 @@ mod tests {
         for i in 0..257 {
             std::fs::write(d.join(format!("p{i:04}")), b"").unwrap();
         }
-        let mut visited = 0;
-        let error = children_with_limit(&d, 256, |_| {
-            visited += 1;
-            Ok(())
-        })
+        let entries = || {
+            std::fs::read_dir(&d).unwrap().map(|entry| {
+                let entry = entry.unwrap();
+                Ok((entry.file_name().into_string().unwrap(), entry))
+            })
+        };
+        let error = sorted_names(
+            &d,
+            entries(),
+            &mut 0,
+            DirectoryLimits {
+                entries: 256,
+                ..DIRECTORY_LIMITS
+            },
+            |_| true,
+        )
         .unwrap_err();
         assert!(error.contains("exceeds 256 entries"));
-        assert_eq!(visited, 0, "reject the oversized first scan before copying");
-        children_with_limit(&d, 257, |_| {
-            visited += 1;
-            Ok(())
-        })
+        let mut count = 0;
+        let names = sorted_names(&d, entries(), &mut count, DIRECTORY_LIMITS, |_| true).unwrap();
+        assert_eq!(names.len(), 257);
+        assert_eq!(count, 257, "one enumeration charges each sibling once");
+        std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn wide_directory_sort_limits_and_scoped_filter_are_bounded() {
+        let dir = Path::new("synthetic-wide-directory");
+        let entries = |n| (0..n).rev().map(|i| Ok((format!("p{i:06}"), ())));
+        let mut count = 0;
+        let names = sorted_names(
+            dir,
+            entries(MAX_DIRECTORY_NAMES),
+            &mut count,
+            DIRECTORY_LIMITS,
+            |_| true,
+        )
         .unwrap();
-        assert_eq!(visited, 257, "rescan batches must visit each name once");
+        assert_eq!(count, MAX_DIRECTORY_NAMES);
+        assert_eq!(names.len(), MAX_DIRECTORY_NAMES);
+        assert_eq!(names.first().unwrap().0, "p000000");
+        assert_eq!(names.last().unwrap().0, "p199999");
+        let error = sorted_names(
+            dir,
+            entries(MAX_DIRECTORY_NAMES + 1),
+            &mut 0,
+            DIRECTORY_LIMITS,
+            |_| true,
+        )
+        .unwrap_err();
+        assert!(error.contains("synthetic-wide-directory") && error.contains("sort memory budget"));
+        let error = sorted_names(
+            dir,
+            entries(2),
+            &mut 0,
+            DirectoryLimits {
+                bytes: 13,
+                ..DIRECTORY_LIMITS
+            },
+            |_| true,
+        )
+        .unwrap_err();
+        assert!(error.contains("13 name bytes"));
+        let names = sorted_names(
+            dir,
+            entries(2),
+            &mut 0,
+            DirectoryLimits {
+                bytes: 14,
+                ..DIRECTORY_LIMITS
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(names.len(), 2);
+        let mut count = 0;
+        let names = sorted_names(
+            dir,
+            entries(MAX_DIRECTORY_NAMES + 1),
+            &mut count,
+            DirectoryLimits {
+                names: 1,
+                bytes: 7,
+                ..DIRECTORY_LIMITS
+            },
+            |name| name == "p000001",
+        )
+        .unwrap();
+        assert_eq!(
+            names.len(),
+            1,
+            "unselected siblings never consume sort memory"
+        );
+        assert_eq!(count, MAX_DIRECTORY_NAMES + 1);
+        let error = sorted_names(
+            dir,
+            entries(2),
+            &mut (MAX_ENTRIES - 1),
+            DIRECTORY_LIMITS,
+            |_| false,
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeds 2000000 entries"), "{error}");
+    }
+
+    #[test]
+    fn scoped_walk_and_copy_filter_a_wide_directory_before_sorting() {
+        let d = scratch("scoped-wide");
+        let target = d.join("target");
+        std::fs::create_dir_all(target.join("selected")).unwrap();
+        std::fs::write(target.join("selected/input"), b"synthetic").unwrap();
+        for i in 0..1024 {
+            std::fs::write(target.join(format!("omitted{i:04}")), b"").unwrap();
+        }
+        let selection = Selection {
+            version: 1,
+            paths: vec!["selected/input".into()],
+        };
+        let mut count = 0;
+        let mut visited = Vec::new();
+        children_selected(
+            &target,
+            &target,
+            Some(&selection),
+            &mut count,
+            |entry, _| {
+                visited.push(entry.file_name());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(count, 1025);
+        assert_eq!(visited, [std::ffi::OsString::from("selected")]);
+        let identity = manifest(&target, Some(selection.clone())).unwrap();
+        assert_eq!(identity.count, 2);
+        // Exercise the same copy filter through staging without executing code.
+        let copied = d.join("copy");
+        crate::sandbox::copy_selected(&target, &copied, &selection).unwrap();
+        assert_eq!(identity, manifest(&copied, Some(selection)).unwrap());
+        assert_eq!(std::fs::read_dir(&copied).unwrap().count(), 1);
         std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
     }
 
@@ -1115,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_directory_stream_is_component_sorted_across_batches() {
+    fn wide_directory_stream_is_component_sorted() {
         let d = scratch("wide");
         let target = d.join("target");
         crate::platform::private_dir(&target).unwrap();

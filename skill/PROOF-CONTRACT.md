@@ -115,10 +115,13 @@ renames it atomically before target execution. Publication computes the identity
 bytes written; a changed entry count aborts publication. A separately computed identity must
 still match when republished. No full entry list, JSON value, string or serialized manifest
 buffer is retained. Directory traversal retains
-at most 256 sorted children per active directory level and rescans wide directories in
-batches, including during workspace copying. Every enumerated sibling is charged against the
-2,000,000 entry traversal budget before selection filtering; each directory scan also refuses
-entry 2,000,001 before retaining its name. Gap diagnostics retain only the first 20 sorted paths
+a single sorted name collection per active directory level, including during workspace copying.
+Each directory is enumerated once per traversal. Every enumerated sibling is charged against the
+shared 2,000,000 entry traversal budget before selection filtering. Only selected candidates
+(including root Git metadata) are retained and sorted. Each directory permits at most 200,000
+retained names and 32 MiB of UTF-8 name bytes, whichever is reached first; exceeding either
+limit refuses staging with a message naming the directory. Unselected siblings consume only
+the traversal budget, never sort memory. Gap diagnostics retain only the first 20 sorted paths
 and aggregate counts. The 1024-byte canonical path limit bounds recursion depth. Git index
 normalization still uses its separate 16 MiB bound.
 
@@ -132,12 +135,22 @@ allocating another entry. Diagnostics stop at the first divergent entry, reporti
 two paths. Diagnostic failures cannot allow reproduction. Copy and hash phases report elapsed
 time and entry count.
 Each execution receives a fresh disposable copy; no mutable workspace cache is reused.
-Before copying, OMGS streams the source identity. After copying, it streams both the staged
-identity and a fresh source identity. All three must agree before any target execution, including
-for a fresh proof. A mismatch or failed source recheck refuses execution with
-`target changed during staging`; no proof record is emitted. This detects concurrent changes
-that would otherwise combine files into a state absent from the source. It is a comparison
-boundary, not an atomic filesystem snapshot or a lock against writers that restore prior bytes.
+The target must not be modified while a proof is staged. Before reading source content or
+copying, OMGS streams a canonical digest of OS change stamps for every admitted entry,
+including the target root and each traversed directory itself. Unix stamps bind st_dev, st_ino,
+st_size, st_mtime and st_ctime with nanoseconds. Windows stamps bind volume serial, file index,
+size, LastWriteTime and ChangeTime from FILE_BASIC_INFO through no-follow handles.
+After copying and all source content reads, a fresh stamp walk must have identical membership
+and stamps. Directory stamps detect membership changes even if entries are removed again.
+OS change times detect writes even if original bytes and modification times are restored.
+The stamp stream is hashed incrementally without retaining an entry map. These stamps guard
+staging only and are never part of replay identity.
+OMGS also streams the source identity before copying, then both the staged identity and a fresh
+source identity after copying. All three must agree before any target execution, including for
+a fresh proof. Any stamp, membership or content difference, or failed source recheck refuses
+execution with `target changed during staging`; no proof record is emitted. There is no retry.
+This detects modifications during staging without locking the source or claiming an atomic
+filesystem snapshot. Keep the source unchanged until staging completes.
 
 `--test-from` accepts a regular file or a directory outside the target. A directory's files are
 mapped beneath the parent of `--test`, and must include that test's basename. For example,

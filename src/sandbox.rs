@@ -897,7 +897,7 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
 
 // Explicit selections omit everything else from the sandbox. Always include root
 // Git metadata. Refuse links in scoped inputs, including ancestor components.
-fn copy_selected(
+pub(crate) fn copy_selected(
     root: &Path,
     dst: &Path,
     selection: &crate::proof_inputs::Selection,
@@ -1103,7 +1103,7 @@ fn copy_recursive(
     selection: Option<&crate::proof_inputs::Selection>,
     count: &mut usize,
 ) -> Result<(), String> {
-    crate::proof_inputs::children_budgeted(src, count, |entry, count| {
+    crate::proof_inputs::children_selected(&roots.0, src, selection, count, |entry, count| {
         supervise::check_interrupted().map_err(|e| e.to_string())?;
         let path = entry.path();
         let rel = path.strip_prefix(&roots.0).map_err(|e| e.to_string())?;
@@ -1111,15 +1111,6 @@ fn copy_recursive(
             .to_str()
             .ok_or("execution input paths must be UTF-8")?
             .replace(std::path::MAIN_SEPARATOR, "/");
-        if selection.is_some_and(|s| {
-            !s.paths.iter().any(|p| {
-                p == &name
-                    || p.starts_with(&format!("{name}/"))
-                    || name.starts_with(&format!("{p}/"))
-            })
-        }) {
-            return Ok(());
-        }
         crate::proof_inputs::safe_path(&name)?;
         let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
         let to = dst.join(entry.file_name());
@@ -1431,6 +1422,12 @@ struct StagedWorkspace {
     gaps: Vec<String>,
 }
 
+#[cfg(test)]
+thread_local! {
+    // One-shot deterministic mutation between the pre-copy and post-copy reads.
+    static STAGING_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn stage_workspace(
     req: &ProveRequest,
     workspace: &Path,
@@ -1440,6 +1437,7 @@ fn stage_workspace(
 ) -> Result<StagedWorkspace, String> {
     let mut gaps = Vec::new();
     let mut source_before = None;
+    let mut stamps_before = None;
     if let Some(target) = &req.target {
         let target = std::fs::canonicalize(target).map_err(|e| format!("target: {e}"))?;
         if !target.is_dir() {
@@ -1456,6 +1454,10 @@ fn stage_workspace(
                     .into(),
             );
         }
+        stamps_before = Some(crate::proof_inputs::source_stamps(
+            &target,
+            req.inputs.as_ref(),
+        )?);
         source_before = Some(crate::proof_inputs::manifest(&target, req.inputs.clone())?);
         eprintln!(
             "proof inputs: copy started ({})",
@@ -1470,6 +1472,12 @@ fn stage_workspace(
             Some(selection) => copy_selected(&target, workspace, selection)?,
             None => copy_tree_with_gaps(&target, workspace)?,
         };
+        #[cfg(test)]
+        STAGING_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         eprintln!(
             "proof inputs: copy complete ({} ms)",
             started.elapsed().as_millis()
@@ -1511,7 +1519,11 @@ fn stage_workspace(
     if let Some(target) = &req.target {
         let source_after = crate::proof_inputs::manifest(target, req.inputs.clone())
             .map_err(|e| format!("target changed during staging: {e}"))?;
-        if source_before.as_ref() != Some(&source_after) || manifest.as_ref() != Some(&source_after)
+        let stamps_after = crate::proof_inputs::source_stamps(target, req.inputs.as_ref())
+            .map_err(|e| format!("target changed during staging: {e}"))?;
+        if stamps_before != Some(stamps_after)
+            || source_before.as_ref() != Some(&source_after)
+            || manifest.as_ref() != Some(&source_after)
         {
             return Err(
                 "target changed during staging; refusing to execute inconsistent inputs".into(),
@@ -2008,6 +2020,83 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_source_writes_and_membership_changes_refuse_staging() {
+        for membership in [false, true] {
+            let base = crate::platform::scratch_root().unwrap().join(format!(
+                "staging-restored-{}-{}",
+                std::process::id(),
+                crate::platform::random_nonce().unwrap()
+            ));
+            crate::platform::create_private_dir_new(&base).unwrap();
+            let target = base.join("target");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("input"), b"0").unwrap();
+            let identity = crate::proof_inputs::manifest(&target, None).unwrap();
+            let modified = std::fs::metadata(target.join("input"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            let source = target.clone();
+            STAGING_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    for _ in 0..8 {
+                        if membership {
+                            std::fs::write(source.join("transient"), b"synthetic").unwrap();
+                            std::fs::remove_file(source.join("transient")).unwrap();
+                        } else {
+                            std::fs::write(source.join("input"), b"1").unwrap();
+                            std::fs::write(source.join("input"), b"0").unwrap();
+                        }
+                    }
+                    // Restoring mtime must not hide the OS change time.
+                    if !membership {
+                        std::fs::File::options()
+                            .write(true)
+                            .open(source.join("input"))
+                            .unwrap()
+                            .set_times(std::fs::FileTimes::new().set_modified(modified))
+                            .unwrap();
+                    }
+                }))
+            });
+            let run_dir = base.join("proof");
+            crate::platform::create_private_dir_new(&run_dir).unwrap();
+            let request = ProveRequest {
+                command: "never executed".into(),
+                expect_marker: None,
+                test: None,
+                timeout_ms: 1000,
+                target: Some(target.clone()),
+                run_dir: run_dir.clone(),
+                tier: Tier::Test,
+                stage: None,
+                expected_tree_sha256: None,
+                inputs: None,
+                expected_inputs: None,
+                harness: vec![],
+            };
+            let workspace = run_dir.join("workspace");
+            let result =
+                stage_workspace(&request, &workspace, &run_dir.join("scratch"), &[], "nonce");
+            assert!(matches!(result, Err(ref e) if e.contains("target changed during staging")));
+            assert_eq!(
+                identity,
+                crate::proof_inputs::manifest(&target, None).unwrap(),
+                "all content identities agree after restoring the source"
+            );
+            assert_eq!(
+                identity,
+                crate::proof_inputs::manifest(&workspace, None).unwrap()
+            );
+            assert!(
+                !run_dir.join("config.json").exists(),
+                "refuse before execution setup"
+            );
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
 
     #[cfg(unix)]
     #[test]
