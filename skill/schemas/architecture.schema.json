@@ -90,7 +90,7 @@
           "id": { "type": "string" },
           "name": { "type": "string" },
           "between": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 2, "description": "Two zone ids." },
-          "enforcement": { "type": "array", "items": { "type": "string" } },
+          "enforcement": {"description": "Array of strings naming source enforcement locations or explicit unresolved checks.", "type": "array", "items": { "type": "string" } },
           "notes": { "type": "string" }
         }
       }

@@ -179,7 +179,8 @@ fn call_charging_budget_handoff_and_status_are_consistent() {
 #[test]
 fn strict_role_handoffs_and_atomic_disposition_ingest() {
     let f = Fixture::new();
-    f.put("dispositions-test.json", json!({"hunter":"test-hunter", "units":[{"unit_id":"stack:powershell", "disposition":"candidate", "evidence":["synthetic-fingerprint"], "note":"handed to verification"}]}));
+    f.put("coverage-ledger.json", json!({"units":[{"id":"function:dummy","surface":"sample.ps1:Get-Dummy","attack_classes":["credential_handling"],"status":"planned"}]}));
+    f.put("dispositions-test.json", json!({"hunter":"test-hunter", "units":[{"unit_id":"function:dummy", "disposition":"candidate", "evidence":["synthetic-fingerprint"], "note":"handed to verification"}]}));
     let input = f.run.join("dispositions-test.json");
     assert!(f
         .cli(&["validate", "--dispositions", input.to_str().unwrap()])
@@ -546,6 +547,9 @@ fn unresolved_evaluator_leads_keep_delivery_partial() {
         u["status"] = "covered".into();
         u["evidence"] = json!(["sample.ps1"]);
     }
+    let parent_classes = ledger["units"][0]["attack_classes"].clone();
+    ledger["units"][0]["child_units"] = json!(["function:dummy"]);
+    ledger["units"].as_array_mut().unwrap().push(json!({"id":"function:dummy","surface":"sample.ps1:Get-Dummy","attack_classes":parent_classes,"status":"covered","evidence":["sample.ps1"],"scope_paths":[{"path":"sample.ps1","operation":"Get-Dummy"}]}));
     ledger["units"].as_array_mut().unwrap().push(json!({"id":"late-lead","surface":"sample.ps1","attack_classes":[],"status":"blocked","note":"provider block"}));
     f.put("coverage-ledger.json", ledger.clone());
     f.put("candidates-empty.json", json!({"candidates":[]}));

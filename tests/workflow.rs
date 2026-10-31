@@ -14,15 +14,16 @@ fn write_private_fixture(
 
 /// A valid confirmed record for `key`, hunted by red-1 and verified by blue-1.
 fn record(key: &str) -> Finding {
-    let attack_class = format!("class_{key}");
+    let attack_class = "missing_authz".to_string();
+    let entry_point = format!("GET /api/{key}");
     Finding {
-        fingerprint: omgs::fingerprint(&attack_class, "GET /api/x", "db.x", "tenant"),
+        fingerprint: omgs::fingerprint(&attack_class, &entry_point, "db.x", "tenant"),
         title: format!("Title {key}"),
         verdict: Verdict::Confirmed,
         severity: Some(Severity::High),
         proof_tier: ProofTier::TestProven,
         attack_class,
-        entry_point: "GET /api/x".into(),
+        entry_point,
         sink: "db.x".into(),
         boundary: "tenant".into(),
         location: Location {
@@ -128,7 +129,7 @@ fn hunter_and_verifier_are_required_and_distinct() {
 fn merged_candidates_are_checked_across_records() {
     let a = record("a");
     let b = record("b");
-    let stray = omgs::fingerprint("class_c", "GET /api/x", "db.x", "tenant");
+    let stray = omgs::fingerprint("missing_authz", "GET /api/c", "db.x", "tenant");
 
     let mut bad = a.clone();
     bad.candidates = vec!["nope".into()];
@@ -410,7 +411,12 @@ fn bind_execution_inputs(
 fn complete_run() -> (Ledger, Vec<SourcedCandidate>, FindingsFile) {
     let f = record("a");
     let mut ledger = Ledger::default();
-    let mut unit = Unit::new("route:x", "app/api/x/route.ts", &["class_a"], "covered");
+    let mut unit = Unit::new(
+        "route:x",
+        "app/api/x/route.ts",
+        &["missing_authz"],
+        "covered",
+    );
     unit.evidence = vec![f.fingerprint.clone()];
     ledger.units.push(unit);
     let c = Candidate {
@@ -687,8 +693,29 @@ fn scratch(name: &str) -> std::path::PathBuf {
     dir
 }
 
+fn cli_home() -> std::path::PathBuf {
+    struct Home(std::path::PathBuf);
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    thread_local! {
+        static HOME: Home = {
+            let base = omgs::platform::temp_root().unwrap()
+                .join(format!("omgs-private-fixtures-{}", std::process::id()));
+            omgs::platform::create_private_tree(&base).unwrap();
+            let home = base.join(format!("home-{}", omgs::platform::random_nonce().unwrap()));
+            omgs::platform::private_dir(&home).unwrap();
+            Home(home)
+        };
+    }
+    HOME.with(|home| home.0.clone())
+}
+
 fn omgs(args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", cli_home())
         .args(args)
         .output()
         .unwrap()
@@ -1022,11 +1049,11 @@ fn candidates_require_every_schema_field() {
 fn critic_flags_blank_identity_inputs_on_merged_candidates() {
     let (ledger, mut cands, mut findings) = complete_run();
     let blank = Candidate {
-        fingerprint: omgs::fingerprint("class_m", "GET /api/x", "", "tenant"),
+        fingerprint: omgs::fingerprint("missing_authz", "GET /api/x", "", "tenant"),
         hunter: "red-1".into(),
         unit_ids: vec!["route:x".into()],
         title: "Copy".into(),
-        attack_class: "class_m".into(),
+        attack_class: "missing_authz".into(),
         entry_point: "GET /api/x".into(),
         sink: "".into(),
         boundary: "tenant".into(),
@@ -1344,7 +1371,15 @@ fn sensors_documents_must_be_objects() {
         omgs::shape::sensors(r#"{"tools_run":[],"tools_unavailable":[],"hits":[],"hits":[]}"#)
             .is_err()
     );
-    assert!(omgs::shape::sensors(r#"{"tools_run":["gitleaks"],"tools_unavailable":[],"hits":[{"tool":"gitleaks","rule":"r","file":"f","line":1,"vendored":false,"class":"code","fingerprint":"f"}]}"#).is_ok());
+    let mut report = serde_json::json!({"tools_run":["gitleaks"],"tools_unavailable":[],"hits":[{
+        "tool":"gitleaks","rule":"r","file":"f","line":1,"vendored":false,
+        "class":"code","fingerprint":"f"
+    }]});
+    assert!(omgs::shape::sensors(&report.to_string())
+        .unwrap_err()
+        .contains("regenerate"));
+    report["hits"][0]["occurrence"] = serde_json::json!("a".repeat(64));
+    assert!(omgs::shape::sensors(&report.to_string()).is_ok());
     let dir = scratch("sensors-array");
     write_private_fixture(dir.join("findings.json"), r#"{"findings": []}"#).unwrap();
     write_private_fixture(dir.join("sensors.json"), "[[],[],[]]").unwrap();
@@ -1795,6 +1830,7 @@ fn contract_deletions_nulls_and_downgrades_fail_validation_and_replay() {
                 vec!["prove", "--run", dir.to_str().unwrap(), "--replay", "1"],
             ] {
                 let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                    .env("OMGS_HOME", cli_home())
                     .args(args)
                     .output()
                     .unwrap();
@@ -1833,6 +1869,7 @@ fn contract_deletions_nulls_and_downgrades_fail_validation_and_replay() {
             vec!["prove", "--run", dir.to_str().unwrap(), "--replay", "1"],
         ] {
             let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .env("OMGS_HOME", cli_home())
                 .args(args)
                 .output()
                 .unwrap();
@@ -2139,6 +2176,7 @@ fn check_saved_config_roots(name: &str, cargo_bin: Option<std::path::PathBuf>) {
     };
     save(&config, &mut record);
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", cli_home())
         .args(["validate", "--findings", findings_path.to_str().unwrap()])
         .env("HOME", dir.join("different-home"))
         .env("USERPROFILE", dir.join("different-home"))
@@ -2260,6 +2298,7 @@ fn validation_and_replay_reject_special_tests_within_a_second() {
             ] {
                 let start = std::time::Instant::now();
                 let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                    .env("OMGS_HOME", cli_home())
                     .args(&args)
                     .current_dir(&dir)
                     .stdout(std::process::Stdio::null())

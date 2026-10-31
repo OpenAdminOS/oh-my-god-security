@@ -78,6 +78,36 @@ fn ready(runtime: &str) -> bool {
     }
     true
 }
+fn node_typescript_version(version: &str) -> bool {
+    let parts: Vec<_> = version.trim().trim_start_matches('v').split('.').collect();
+    let (Some(major), Some(minor)) = (
+        parts.first().and_then(|s| s.parse::<u32>().ok()),
+        parts.get(1).and_then(|s| s.parse::<u32>().ok()),
+    ) else {
+        return false;
+    };
+    major > 23 || (major == 23 && minor >= 6) || (major == 22 && minor >= 18)
+}
+fn typescript_ready() -> bool {
+    let Some(node) = omgs::platform::which("node") else {
+        return false;
+    };
+    let available = Command::new(node).args(["--eval", "if (typeof require('node:module').registerHooks !== 'function') process.exit(1); console.log(process.version)"])
+        .output().is_ok_and(|out| out.status.success() && node_typescript_version(&String::from_utf8_lossy(&out.stdout)));
+    if !available {
+        skip("node", "TypeScript recipe requires Node 22.18+ (22.x), 23.6+ (23.x), or 24+, with registerHooks and unflagged type stripping");
+    }
+    available
+}
+#[test]
+fn typescript_runtime_version_boundaries() {
+    for version in ["v20.19.0", "v22.17.0", "v23.5.0", "invalid"] {
+        assert!(!node_typescript_version(version), "{version}");
+    }
+    for version in ["v22.18.0", "v23.6.0", "v24.0.0", "v26.7.0\n"] {
+        assert!(node_typescript_version(version), "{version}");
+    }
+}
 fn record(out: &Output, expected: i32, test: bool) {
     let output = text(out);
 
@@ -125,7 +155,7 @@ struct Recipe {
     dependency_failure: &'static str,
 }
 fn check(recipe: Recipe) -> bool {
-    if !ready(recipe.runtime) {
+    if !ready(recipe.runtime) || (recipe.source == "target.ts" && !typescript_ready()) {
         return false;
     }
     let d = omgs::platform::temp_root().unwrap().join(format!(
@@ -168,7 +198,7 @@ fn check(recipe: Recipe) -> bool {
         ],
     );
     assert!(init.status.success(), "{}", text(&init));
-    let fp = omgs::fingerprint("authorization", "can_read", "resource", "owner");
+    let fp = omgs::fingerprint("missing_authz", "can_read", "resource", "owner");
     let findings_path = run.join("findings.json");
     let mut n = 0;
     for (variant, source, exit) in [
@@ -246,7 +276,7 @@ fn check(recipe: Recipe) -> bool {
         std::fs::write(target.join(recipe.test), harness).unwrap();
         let findings = serde_json::json!({"findings": [{
             "fingerprint": fp, "title": "Unauthorized resource access", "verdict": "confirmed",
-            "severity": "high", "proof_tier": "test_proven", "attack_class": "authorization",
+            "severity": "high", "proof_tier": "test_proven", "attack_class": "missing_authz",
             "entry_point": "can_read", "sink": "resource", "boundary": "owner",
             "location": {"path": recipe.source, "line": 1},
             "evidence": "Real target invocation with synthetic owner and intruder.",
@@ -453,6 +483,42 @@ fn node_recipe() -> Recipe {
         harness: "function check() {\n  let forbidden;\n  try {\n    const {canRead} = require('./target.cjs');\n    if (canRead('owner', 'owner') !== true) throw new Error('AUTHORIZED_CONTROL_FAILED');\n    console.log('OMGS_CONTROL_' + process.env.OMGS_PROOF_NONCE);\n    forbidden = canRead('intruder', 'owner');\n  } catch (error) { console.error(error); return 2; }\n  if (typeof forbidden !== 'boolean') return 2;\n  if (forbidden) { console.log('OMGS_BOUNDARY_' + process.env.OMGS_PROOF_NONCE + '_' + process.env.OMGS_PROOF_CONTRACT); return 1; }\n  console.log('BOUNDARY_ASSERTION_OK');\n  return 0;\n}\n// process.exit() can drop queued pipe writes; exitCode lets them drain.\nprocess.exitCode = check();\n",
     }
 }
+fn typescript_recipe() -> Recipe {
+    Recipe {
+        runtime: "node", source: "target.ts", test: "test.cjs", command: "node test.cjs",
+        vulnerable: "export function canRead(actor: string, owner: string): boolean { return true; }\n",
+        fixed: "export function canRead(actor: string, owner: string): boolean { return actor === owner; }\n",
+        broken: "import './missing-enforcement.ts';\n",
+        control_failure: "export function canRead(actor: string, owner: string): boolean { return false; }\n",
+        dependency_failure: "export function canRead(actor: string, owner: string): boolean { if (actor !== owner) throw new Error('missing enforcement dependency'); return true; }\n",
+        harness: r#"async function check() {
+  let forbidden;
+  try {
+    const {registerHooks} = require('node:module');
+    const {pathToFileURL} = require('node:url');
+    const root = pathToFileURL(__dirname + '/');
+    registerHooks({resolve(specifier, context, nextResolve) {
+      if (!specifier.startsWith('@/')) return nextResolve(specifier, context);
+      const suffix = specifier.slice(2);
+      if (!suffix.endsWith('.ts') || suffix.split('/').some(p => !p || p === '..' || p === '.')) throw new Error('UNSUPPORTED_ALIAS');
+      const resolved = new URL(suffix, root);
+      if (!resolved.href.startsWith(root.href)) throw new Error('ALIAS_ESCAPE');
+      return nextResolve(resolved.href, context);
+    }});
+    const {canRead} = await import('@/target.ts');
+    if (canRead('owner', 'owner') !== true) throw new Error('AUTHORIZED_CONTROL_FAILED');
+    console.log('OMGS_CONTROL_' + process.env.OMGS_PROOF_NONCE);
+    forbidden = canRead('intruder', 'owner');
+  } catch (error) { console.error(error); return 2; }
+  if (typeof forbidden !== 'boolean') return 2;
+  if (forbidden) { console.log('OMGS_BOUNDARY_' + process.env.OMGS_PROOF_NONCE + '_' + process.env.OMGS_PROOF_CONTRACT); return 1; }
+  console.log('BOUNDARY_ASSERTION_OK');
+  return 0;
+}
+check().then(code => { process.exitCode = code; }, error => { console.error(error); process.exitCode = 2; });
+"#,
+    }
+}
 fn powershell_recipe() -> Recipe {
     Recipe {
         runtime: "pwsh", source: "target.ps1", test: "test.ps1", command: "pwsh -NoProfile -NonInteractive -File test.ps1",
@@ -468,10 +534,10 @@ fn swift_recipe() -> Recipe {
     Recipe {
         runtime: "swiftc", source: "target.swift", test: "main.swift", command: "swiftc target.swift main.swift -o fixture || exit 2; ./fixture",
         broken: "import MissingTargetModule\n", control_failure: "func canRead(_ actor: String, _ owner: String) throws -> Bool { false }\n",
-        vulnerable: "func canRead(_ actor: String, _ owner: String) throws -> Bool { true }\n",
-        fixed: "func canRead(_ actor: String, _ owner: String) throws -> Bool { actor == owner }\n",
+        vulnerable: "func canRead(_ actor: String, _ owner: String) throws -> Bool { DiagnosticLog.record(); return true }\n",
+        fixed: "func canRead(_ actor: String, _ owner: String) throws -> Bool { DiagnosticLog.record(); return actor == owner }\n",
         dependency_failure: "enum DependencyError: Error { case missing }\nfunc canRead(_ actor: String, _ owner: String) throws -> Bool { if actor != owner { throw DependencyError.missing }; return true }\n",
-        harness: "import Foundation\nlet nonce = ProcessInfo.processInfo.environment[\"OMGS_PROOF_NONCE\"]!\nlet marker = ProcessInfo.processInfo.environment[\"OMGS_PROOF_CONTRACT\"]!\n#if canImport(Darwin)\nimport Darwin\n#else\nimport Glibc\n#endif\ndo {\n  guard try canRead(\"owner\", \"owner\") else { exit(2) }\n  print(\"OMGS_CONTROL_\\(nonce)\")\n  if try canRead(\"intruder\", \"owner\") { print(\"OMGS_BOUNDARY_\\(nonce)_\\(marker)\"); exit(1) }\n  print(\"BOUNDARY_ASSERTION_OK\")\n} catch { exit(2) }\n",
+        harness: "// Unrelated logging stub only; real authorization stays in target.swift.\nenum DiagnosticLog { static func record() {} }\nimport Foundation\nlet nonce = ProcessInfo.processInfo.environment[\"OMGS_PROOF_NONCE\"]!\nlet marker = ProcessInfo.processInfo.environment[\"OMGS_PROOF_CONTRACT\"]!\n#if canImport(Darwin)\nimport Darwin\n#else\nimport Glibc\n#endif\ndo {\n  guard try canRead(\"owner\", \"owner\") else { exit(2) }\n  print(\"OMGS_CONTROL_\\(nonce)\")\n  if try canRead(\"intruder\", \"owner\") { print(\"OMGS_BOUNDARY_\\(nonce)_\\(marker)\"); exit(1) }\n  print(\"BOUNDARY_ASSERTION_OK\")\n} catch { exit(2) }\n",
     }
 }
 #[cfg(windows)]
@@ -535,11 +601,12 @@ fn recipes() {
         shell_recipe(),
         python_recipe(),
         node_recipe(),
+        typescript_recipe(),
         powershell_recipe(),
         swift_recipe(),
     ];
     #[cfg(windows)]
-    let all = vec![node_recipe(), powershell_recipe()];
+    let all = vec![node_recipe(), typescript_recipe(), powershell_recipe()];
     let total = all.len();
     let executed = all.into_iter().map(check).filter(|ran| *ran).count();
     eprintln!(
@@ -653,4 +720,20 @@ do {
     record(&out, 0, true);
     assert!(text(&out).contains("REDIRECTED_TEMP_OK"), "{}", text(&out));
     std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn t50_t69_typescript_and_swift_dependency_boundaries_are_documented() {
+    let recipe = include_str!("../skill/PROOF-RECIPES.md");
+    for text in [
+        "registerHooks",
+        "await import('./src/decision.ts')",
+        "UNSUPPORTED_ALIAS",
+        "minimal real source set",
+        "Evaluators reject replaced enforcement",
+        "No installation",
+        "Missing Next.js",
+    ] {
+        assert!(recipe.contains(text), "{text}");
+    }
 }

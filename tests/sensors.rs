@@ -281,6 +281,16 @@ fn offline_tools_feed_redacted_artifacts_reports_and_critic() {
             .count(),
         2
     );
+    // Preserve all broad parent classes when closing the inventory fixture.
+    let mapped_classes: std::collections::BTreeSet<_> = units
+        .iter()
+        .filter(|u| {
+            u["id"].as_str().unwrap().starts_with("stack:")
+                || u["id"].as_str().unwrap().starts_with("project:")
+        })
+        .flat_map(|u| u["attack_classes"].as_array().unwrap().iter())
+        .map(|class| class.as_str().unwrap().to_string())
+        .collect();
     // Close unrelated inventory units to isolate the sensor requirement.
     for u in units
         .iter_mut()
@@ -288,7 +298,13 @@ fn offline_tools_feed_redacted_artifacts_reports_and_critic() {
     {
         u["status"] = json!("covered");
         u["evidence"] = json!(["reviewed source"]);
+        if u["id"].as_str().unwrap().starts_with("stack:")
+            || u["id"].as_str().unwrap().starts_with("project:")
+        {
+            u["child_units"] = json!(["mapped:source"]);
+        }
     }
+    units.push(json!({"id":"mapped:source","surface":"src/main.rs","attack_classes":mapped_classes,"status":"covered","evidence":["src/main.rs"],"scope_paths":[{"path":"src/main.rs"}]}));
     write_private_fixture(run.join("coverage-ledger.json"), ledger.to_string()).unwrap();
     write_private_fixture(run.join("candidates-empty.json"), r#"{"candidates":[]}"#).unwrap();
     let critic = omgs::critic::critique_run(&run).unwrap();
@@ -609,9 +625,19 @@ fn oversized_and_linked_inputs_remain_explicit_gaps() {
     let run = f.init("bounded-input");
     let r = read(&run.join("sensors.json"));
     assert!(
-        r["gaps"].to_string().contains("input entries skipped"),
+        r["gaps"]
+            .to_string()
+            .contains("input entries/subtrees skipped"),
         "{r}"
     );
+    assert!(r["gaps"].to_string().contains("oversized.bin"));
+    assert!(r["gaps"].to_string().contains("file byte limit"));
+    let ledger = read(&run.join("coverage-ledger.json"));
+    assert!(ledger["units"].as_array().unwrap().iter().any(|u| u["id"]
+        .as_str()
+        .unwrap()
+        .starts_with("inventory:sensor-input:")
+        && u["status"] == "blocked"));
     assert_eq!(r["hits"].as_array().unwrap().len(), 1, "{r}");
 }
 
@@ -1208,4 +1234,160 @@ fn sensor_output_near_its_cap_survives_launchd_result_transport() {
             );
         }
     }
+}
+
+#[test]
+fn additional_b_repeated_gitleaks_hits_have_one_identity_and_bounded_provenance() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    let hit = json!({"RuleID":"fixture-rule","File":"src/main.rs","StartLine":1,
+        "Secret":"duplicate-match-sentinel-never-store"});
+    f.tool(
+        "gitleaks",
+        &json!([hit.clone(), hit.clone(), hit]).to_string(),
+        1,
+    );
+    let run = f.init("deduplicated-hits");
+    let report = read(&run.join("sensors.json"));
+    let hits = read(&run.join("sensor-hits.json"));
+    assert_eq!(report["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(hits.as_array().unwrap().len(), 1);
+    assert_eq!(hits[0]["duplicate_sources"]["first_source_index"], 0);
+    assert_eq!(hits[0]["duplicate_sources"]["count"], 2);
+    assert_eq!(
+        hits[0]["duplicate_sources"]["source_indexes"],
+        json!([1, 2])
+    );
+    assert_eq!(hits[0]["duplicate_sources"]["omitted"], 0);
+    assert!(!report
+        .to_string()
+        .contains("duplicate-match-sentinel-never-store"));
+    let one: omgs::sensors::SensorHit = serde_json::from_value(hits[0].clone()).unwrap();
+    let mut clean = one.clone();
+    clean.duplicate_sources = None;
+    let mut repeated = vec![clean.clone(); 401];
+    omgs::sensors::deduplicate_hits(&mut repeated);
+    assert_eq!(repeated.len(), 1);
+    let sources = repeated[0].duplicate_sources.as_ref().unwrap();
+    assert_eq!(sources.count, 400);
+    assert_eq!(sources.source_indexes.len(), 128);
+    assert_eq!(sources.omitted, 272);
+    let before = repeated.clone();
+    omgs::sensors::deduplicate_hits(&mut repeated);
+    assert_eq!(before, repeated);
+    let mut groups = vec![clean.clone(); 201];
+    let mut other = clean.clone();
+    other.line = Some(3);
+    groups.extend(vec![other; 201]);
+    omgs::sensors::deduplicate_hits(&mut groups);
+    assert_eq!(groups.len(), 2);
+    assert_eq!(
+        groups
+            .iter()
+            .map(|h| h.duplicate_sources.as_ref().unwrap().source_indexes.len())
+            .sum::<usize>(),
+        128
+    );
+    assert_eq!(
+        groups
+            .iter()
+            .map(|h| h.duplicate_sources.as_ref().unwrap().omitted)
+            .sum::<u64>(),
+        272
+    );
+    let mut distinct = clean.clone();
+    distinct.line = Some(2);
+    let mut input = vec![clean.clone(), clean, distinct];
+    omgs::sensors::deduplicate_hits(&mut input);
+    assert_eq!(input.len(), 2);
+    let mut legacy = report.clone();
+    legacy["hits"] = json!([one.clone(), one]);
+    let parsed = omgs::shape::sensors(&legacy.to_string()).unwrap();
+    assert_eq!(parsed.hits.len(), 1);
+    let l: omgs::ledger::Ledger =
+        serde_json::from_value(read(&run.join("coverage-ledger.json"))).unwrap();
+    assert_eq!(
+        l.units
+            .iter()
+            .filter(|u| u.id.starts_with("sensor:gitleaks:"))
+            .count(),
+        1
+    );
+    assert!(!omgs::critic::critique(&l, 1, &[], &Default::default()).passed());
+}
+
+#[test]
+fn short_secret_guesses_cannot_be_confirmed_from_persisted_artifacts() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    // No column forces the ephemeral keyed fallback.
+    let mut hit = json!({"RuleID":"fixture-rule", "File":"src/main.rs", "StartLine":1,
+        "Secret":"0427"});
+    f.tool(
+        "gitleaks",
+        &json!([hit.clone(), hit.clone()]).to_string(),
+        1,
+    );
+    let run = f.init("short-secret");
+    let first = read(&run.join("sensor-hits.json"));
+    assert_eq!(first.as_array().unwrap().len(), 1);
+    assert_eq!(first[0]["duplicate_sources"]["count"], 1);
+    let out = f.cli(&[
+        "report",
+        "--findings",
+        run.join("findings.json").to_str().unwrap(),
+        "--out",
+        run.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fn collect(path: &Path, bytes: &mut Vec<u8>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(&path, bytes);
+            } else {
+                bytes.extend(std::fs::read(path).unwrap());
+                bytes.push(b'\n');
+            }
+        }
+    }
+    let mut bytes = Vec::new();
+    collect(&run, &mut bytes);
+    bytes.extend(out.stdout);
+    bytes.extend(out.stderr);
+    let saved = String::from_utf8_lossy(&bytes);
+    assert!(!saved.contains("\"Secret\":\"0427\""));
+    for guess in 0..10_000 {
+        hit["Secret"] = json!(format!("{guess:04}"));
+        let digest = omgs::sha256::digest(&serde_json::to_vec(&hit).unwrap());
+        assert!(
+            !saved.contains(&digest),
+            "guess {guess} has a persisted oracle"
+        );
+        let old_fingerprint = omgs::sha256::digest(
+            &serde_json::to_vec(&(
+                "occurrence-v1",
+                "gitleaks",
+                "fixture-rule",
+                "src/main.rs",
+                Some(1u64),
+                &digest,
+            ))
+            .unwrap(),
+        );
+        assert!(!saved.contains(&old_fingerprint));
+    }
+    let second = f.init("short-secret-again");
+    assert_ne!(
+        first[0]["occurrence"],
+        read(&second.join("sensor-hits.json"))[0]["occurrence"]
+    );
 }

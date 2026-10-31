@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OMGS coverage ledger",
+  "type": "object",
+  "required": ["units"],
+  "properties": {
+    "scope_root": {"type": "string", "description": "Absolute target root used to resolve filesystem spelling of scope paths. Unavailable paths fail mapping validation; legacy ledgers without scope_root must run omgs ledger migrate --run <run-dir> before closing partitions. Migration sets only the target from run-metadata.json after validation. CLI transitions and the critic require scope_root to identify that same filesystem directory before resolution."},
+    "units": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "surface", "attack_classes", "status"],
+        "properties": {
+          "id": { "type": "string" },
+          "surface": { "type": "string" },
+          "attack_classes": { "type": "array", "items": { "type": "string" } },
+          "status": { "enum": ["planned", "candidate", "covered", "deferred", "blocked", "out_of_scope"] },
+          "evidence": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "What shows the unit was examined: finding fingerprints, candidate files, or repo paths."
+          },
+          "note": { "type": "string", "description": "Why the unit was deferred, blocked, or put out of scope. Exclusion units require reviewed, not security relevant: followed by a nonempty reason when out_of_scope." },
+          "child_units": {"type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": {"type": "string", "minLength": 1}, "description": "Bounded partition references. Covered checklists require existing, reconciled children with non-overlapping scope_paths per attack class."},
+          "residual_units": {"type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true, "items": {"type": "string", "minLength": 1}, "description": "Required when partial is true and covered. Residuals remain independent accountable units; dangling, duplicate, self and cyclic references fail validation."},
+          "scope_paths": {
+            "type": "array", "minItems": 1, "maxItems": 256, "uniqueItems": true,
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object", "required": ["path"], "additionalProperties": false,
+                  "properties": {
+                    "path": {"type": "string", "minLength": 1, "description": "Relative target path. Literal # characters are part of the path."},
+                    "operation": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.:-]{0,127}(?![\\s\\S])", "description": "Optional case-sensitive operation identifier, 1 to 128 ASCII characters."}
+                  }
+                },
+                {"type": "string", "pattern": "^[^#]+(?![\\s\\S])", "description": "Legacy plain path with no operation. Strings containing # are ambiguous between a literal path and a path plus operation; use an object with explicit path and optional operation."}
+              ]
+            },
+            "description": "Bounded source scopes with separate path and optional operation. Omitting operation owns the entire path and descendants. Different operations or attack classes may share a file. Paths must resolve inside scope_root without links."
+          },
+          "partial": {"type": "boolean", "description": "Declare partial examination before closure; preserve unexamined scope in residual_units."},
+          "checklist": {"enum": ["partition", "operations"]},
+          "syntax_review": {"enum": ["complete", "uncertain"], "description": "Source-only enumeration reviewed completely. Reexports, computed handlers and uncertain syntax require manual mapping or remain blocked."},
+          "operations": {"type": "object", "minProperties": 1, "maxProperties": 256, "additionalProperties": {"type": "string", "minLength": 1}, "description": "Every HTTP method or native operation mapped to an existing child_units id."},
+          "excluded_count": {"type": "integer", "minimum": 0, "description": "Total excluded inventory files in this group."},
+          "excluded_paths": {"type": "array", "maxItems": 20, "items": {"type": "string"}, "description": "First 20 excluded inventory paths in sorted order."},
+          "excluded_source_count": {"type": "integer", "minimum": 0, "description": "Total excluded files with source or executable extensions in this group."},
+          "excluded_source_paths": {"type": "array", "maxItems": 20, "items": {"type": "string"}, "description": "First 20 excluded source paths in sorted order."}
+        },
+        "allOf": [
+          {"if": {"required": ["checklist"], "properties": {"status": {"enum": ["covered", "out_of_scope"]}}}, "then": {"required": ["child_units"]}},
+          {"if": {"required": ["partial"], "properties": {"partial": {"const": true}, "status": {"enum": ["covered", "out_of_scope"]}}}, "then": {"required": ["residual_units"]}},
+          {"if": {"required": ["checklist"], "properties": {"checklist": {"const": "operations"}, "status": {"enum": ["covered", "out_of_scope"]}}}, "then": {"required": ["operations", "syntax_review"], "properties": {"syntax_review": {"const": "complete"}}}},
+          {"if": {"required": ["id"], "properties": {"id": {"pattern": "^(stack:|project:)"}, "status": {"enum": ["covered", "out_of_scope"]}}}, "then": {"required": ["child_units"]}},
+
+          {
+            "if": {
+              "properties": {"status": {"const": "out_of_scope"}},
+              "anyOf": [
+                {"required": ["excluded_count"]},
+                {"properties": {"id": {"enum": ["tests:excluded", "docs:excluded", "data:excluded", "assets:excluded", "vendored:excluded"]}}}
+              ]
+            },
+            "then": {
+              "required": ["note"],
+              "properties": {"note": {"pattern": "^\\s*reviewed, not security relevant:\\s*\\S"}}
+            }
+          },
+          {
+            "if": { "properties": { "status": { "const": "covered" } } },
+            "then": { "required": ["evidence"], "properties": { "evidence": { "minItems": 1 } } }
+          },
+          {
+            "if": { "properties": { "status": { "enum": ["deferred", "blocked", "out_of_scope"] } } },
+            "then": { "required": ["note"], "properties": { "note": { "minLength": 1 } } }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,6 +1,6 @@
 # Route and action authorization
 
-Use for `missing_authorization` and `idor` units. Hunt a concrete private read or privileged write by the wrong principal, not the mere absence of an inline guard.
+Use for `missing_authz` and `idor_tenant_isolation` units. Hunt a concrete private read or privileged write by the wrong principal, not the mere absence of an inline guard.
 
 ## What to hunt
 
@@ -39,3 +39,8 @@ When a record turns on intent, set its `intent_id` to one of these library quest
 - `web.public-resource`: Is this resource meant to be readable without signing in?
 - `web.admin-only-action`: Which roles are allowed to perform this action?
 - `web.cross-tenant-read`: May a member of one workspace or tenant ever read another workspace's records through this route?
+
+Deprecated classes `idor` and `missing_authorization` remain accepted for existing records.
+Use `idor_tenant_isolation` and `missing_authz` for new records. Keep existing class names
+and fingerprints unchanged. The registry also retains `client_only_authorization` and
+`webhook_verification` as deprecated aliases for `client_only_auth` and `webhook_signature`.

@@ -151,6 +151,9 @@ pub fn validate(file: &FindingsFile) -> Vec<String> {
     let mut absorbed: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (i, f) in file.findings.iter().enumerate() {
         let at = format!("findings[{i}] '{}'", f.title);
+        if let Err(error) = crate::classes::validate(&f.attack_class) {
+            errors.push(format!("{at}: {error}"));
+        }
         let expected = crate::fingerprint(&f.attack_class, &f.entry_point, &f.sink, &f.boundary);
         if f.fingerprint.is_empty() {
             errors.push(format!("{at}: fingerprint is empty, expected {expected}"));

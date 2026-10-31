@@ -62,7 +62,8 @@ synthetic test. They add nothing to the evidence, and the proof runs only inside
 ## Excluded file accountability
 
 Classification sets hunting priority only. Every assigned `tests:excluded`, `docs:excluded`,
-`data:excluded` or `vendored:excluded` unit starts unresolved and includes the total count and first
+`data:excluded`, `assets:excluded` or `vendored:excluded` unit starts unresolved and includes the
+total count and first
 20 sorted paths across all files, regardless of extension. Skim or sample the group and trace any
 interpreted policy, executable content or build logic you encounter. Hunt relevant logic and record
 `covered` with evidence, or record `out_of_scope` with the exact note `reviewed, not security

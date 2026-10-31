@@ -5,6 +5,7 @@ pub mod architecture;
 pub mod batch;
 pub mod bench;
 pub mod budget;
+pub mod classes;
 #[cfg(target_os = "macos")]
 pub mod coalition;
 pub mod critic;
@@ -13,6 +14,7 @@ pub mod help;
 pub mod install;
 pub mod intent;
 pub mod ledger;
+pub mod mapping;
 pub mod model;
 pub mod paths;
 pub mod persona;
@@ -37,6 +39,8 @@ pub mod supervise;
 pub mod tcc;
 pub mod update;
 pub mod watch;
+#[cfg(windows)]
+mod windows_path;
 
 /// Stable, non cryptographic fingerprint for finding identity across runs.
 /// Inputs are the semantic identity of a finding, never prose or line numbers.
@@ -139,6 +143,8 @@ pub fn stack_attack_classes(stack: &str) -> Vec<&'static str> {
             "privileged_local_ops",
         ],
         "swift" => vec![
+            "ipc_authorization",
+            "secret_disclosure",
             "shell_injection",
             "deletion_path_safety",
             "privileged_local_ops",
