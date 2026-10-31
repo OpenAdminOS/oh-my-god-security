@@ -31,6 +31,123 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
+// Explicit sparse admission avoids allocating the 8 GiB regression on Windows.
+fn sparse_fixture(path: &Path, size: u64) {
+    let file = std::fs::File::create(path).unwrap();
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        extern "system" {
+            fn DeviceIoControl(
+                handle: *mut core::ffi::c_void,
+                code: u32,
+                input: *const u8,
+                input_len: u32,
+                output: *mut u8,
+                output_len: u32,
+                returned: *mut u32,
+                overlapped: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+        let mut returned = 0;
+        // SAFETY: the owned handle is live, no buffers are supplied, and
+        // returned points to writable storage. The control marks it sparse.
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                0x0009_00c4,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+    }
+    file.set_len(size).unwrap();
+}
+
+#[test]
+fn cli_refuses_oversized_sparse_tests_before_hashing_or_retention() {
+    for (name, draft, size, reason) in [
+        (
+            "target",
+            false,
+            (8u64 << 30) + 1,
+            "aggregate source byte budget",
+        ),
+        (
+            "draft",
+            true,
+            (16u64 << 20) + 1,
+            "draft exceeds retained artifact byte limit",
+        ),
+    ] {
+        let d = scratch(&format!("cli-test-size-{name}"));
+        let target = d.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let path = if draft {
+            d.join("draft")
+        } else {
+            target.join("test")
+        };
+        sparse_fixture(&path, size);
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"));
+        command
+            .env("OMGS_HOME", d.join("home"))
+            .args(["prove", "--target"])
+            .arg(&target)
+            .args([
+                "--test",
+                "test",
+                "--cmd",
+                "echo test OVERSIZED_TEST_EXECUTED",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if draft {
+            command.arg("--test-from").arg(&path);
+        }
+        let mut child = command.spawn().unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(15) {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "oversized {name} was not rejected before reading: {}",
+                    text(&output)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+        assert!(text(&output).contains(reason), "{}", text(&output));
+        assert!(!text(&output).contains("OVERSIZED_TEST_EXECUTED"));
+        assert!(!d.join("home/prove").exists());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn prove_help_describes_blocked_original_and_replay_exits() {
+    let d = scratch("prove-help-blocked");
+    let output = omgs(&d, &["prove", "--help"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let help = text(&output);
+    assert!(help.contains("2 harness, usage or execution error; 3 blocked before execution."));
+    assert!(help.contains(
+        "Replay exits: 0 reproduced; 1 mismatch; 2 setup error; 3 blocked before execution."
+    ));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 /// Runs the CLI with a throwaway data directory, handing it the executor
 /// this test process found so both agree on what is installed.
 fn omgs(home: &Path, args: &[&str]) -> Output {

@@ -22,9 +22,10 @@ thread_local! {
     #[cfg(test)]
     static ENUMERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-pub(crate) struct StagingGuard(bool);
+/// Shared byte and wall-clock accounting for one proof preparation.
+pub struct StagingGuard(bool);
 impl StagingGuard {
-    pub(crate) fn begin() -> Self {
+    pub fn begin() -> Self {
         Self(STAGING.with(|state| {
             let mut state = state.borrow_mut();
             if state.is_some() {
@@ -132,7 +133,23 @@ pub(crate) fn read_index(path: &Path) -> Result<Vec<u8>, String> {
     file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     Ok(bytes)
 }
-fn hash_file(path: &Path) -> Result<String, String> {
+/// Read one external draft before retaining or hashing it. Keep the admitted
+/// snapshot and permissions together so later pathname changes cannot enlarge it.
+pub fn read_draft(path: &Path) -> Result<(Vec<u8>, std::fs::Permissions), String> {
+    use std::io::Read;
+    let mut file = admitted_file(path)?;
+    if file.size > crate::run_artifact::DRAFT_BYTES {
+        return Err("proof draft exceeds retained artifact byte limit (16 MiB)".into());
+    }
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    let permissions = permissions(mode(&meta), meta.permissions());
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    Ok((bytes, permissions))
+}
+
+/// Hash a source through size admission and preparation deadline checks.
+pub fn hash_file(path: &Path) -> Result<String, String> {
     use std::io::Read;
     let mut file = admitted_file(path)?;
     let mut hash = crate::sha256::Sha256::new();
@@ -1249,6 +1266,12 @@ mod tests {
             .read(&mut [0u8; 1])
             .unwrap_err()
             .to_string()
+            .contains("staging deadline exceeded"));
+        assert!(hash_file(&d.join("input"))
+            .unwrap_err()
+            .contains("staging deadline exceeded"));
+        assert!(read_draft(&d.join("input"))
+            .unwrap_err()
             .contains("staging deadline exceeded"));
         assert!(check_paths(&d, &["input"], false)
             .unwrap_err()

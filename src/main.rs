@@ -542,6 +542,7 @@ fn release_proof_charge(run: &Path) -> Result<(), String> {
 }
 
 fn cmd_prove(args: &[String]) -> Result<(), String> {
+    let _preparation = omgs::proof_inputs::StagingGuard::begin();
     #[cfg(unix)]
     let _signals = omgs::supervise::interruption::Guard::install().map_err(|e| e.to_string())?;
     let run = flag(args, "--run").map(PathBuf::from);
@@ -784,7 +785,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     }
     // Replay evidence is read once through the run boundary and that exact
     // snapshot is staged below, even if the retained pathname is replaced.
-    let replay_draft = match (&replay, &run) {
+    let prepared_draft = match (&replay, &run) {
         (Some(record), Some(run)) if record.test_from.is_some() => Some(
             omgs::run_artifact::read_with_permissions(
                 run,
@@ -795,6 +796,10 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             )
             .map_err(|e| e.to_string())?,
         ),
+        (None, _) => draft
+            .as_ref()
+            .map(|path| omgs::proof_inputs::read_draft(path))
+            .transpose()?,
         _ => None,
     };
     let test_sha256 = if let Some(h) = &harness {
@@ -804,12 +809,10 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     } else {
         match (&test, &draft) {
             (Some(_), Some(d)) => {
-                let digest = match &replay_draft {
-                    Some((bytes, _)) => omgs::sha256::digest(bytes),
-                    // A caller-supplied draft is source input, not retained evidence.
-                    None => omgs::sha256::digest_file(d)
-                        .map_err(|e| format!("--test-from {}: {e}", d.display()))?,
-                };
+                let digest = prepared_draft
+                    .as_ref()
+                    .map(|(bytes, _)| omgs::sha256::digest(bytes))
+                    .ok_or("missing prepared proof draft")?;
                 let d = std::fs::canonicalize(d)
                     .map_err(|e| format!("--test-from {}: {e}", d.display()))?;
                 if let Some(base) = &target {
@@ -837,7 +840,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
                     eprintln!("proof test: {}", omgs::platform::describe_path(&path));
                 }
                 Some(
-                    omgs::sha256::digest_file(&path).map_err(|e| {
+                    omgs::proof_inputs::hash_file(&path).map_err(|e| {
                         format!("read {}: {e}", omgs::platform::describe_path(&path))
                     })?,
                 )
@@ -922,7 +925,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         Some(d) => {
             let copy = run_dir.join("test-draft");
             let kept = omgs::platform::private_dir(&run_dir)
-                .and_then(|_| match &replay_draft {
+                .and_then(|_| match &prepared_draft {
                     Some((bytes, permissions)) => {
                         omgs::runmeta::write_atomic_bytes_with_permissions(
                             &copy,
@@ -930,7 +933,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
                             permissions.clone(),
                         )
                     }
-                    None => omgs::sandbox::stage_file(&run_dir, "test-draft", d),
+                    None => Err(std::io::Error::other("missing prepared proof draft")),
                 })
                 .map_err(|e| e.to_string())
                 .and_then(|_| {
