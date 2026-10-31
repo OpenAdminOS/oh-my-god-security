@@ -442,12 +442,13 @@ pub fn collect(scratch: &Path, to: &Path) -> (Vec<Shot>, Vec<String>) {
             Err(reason) => skipped.push(format!("{shown}: {reason}")),
         }
     }
+    let mut skipped = bounded(skipped);
     if unexamined {
         skipped.push(format!(
             "more than {MAX_ENTRIES} entries; the rest were not examined"
         ));
     }
-    (kept, bounded(skipped))
+    (kept, skipped)
 }
 
 /// Keeps the record small whatever the sandbox left behind: at most
@@ -630,6 +631,24 @@ mod tests {
         let out = bounded(many);
         assert_eq!(out.len(), MAX_NOTES + 1);
         assert_eq!(out[MAX_NOTES], "and 24 more refused entries");
+        // A flooded directory keeps its limit warning after the bounded notes.
+        let base = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-shots-flood-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        crate::platform::private_dir(&base.join(DIR)).unwrap();
+        for i in 0..=MAX_ENTRIES {
+            std::fs::write(base.join(DIR).join(format!("j{i}.txt")), "").unwrap();
+        }
+        let (kept, notes) = collect(&base, &base.join("to"));
+        assert!(kept.is_empty());
+        assert_eq!(notes.len(), MAX_NOTES + 2);
+        assert_eq!(notes[MAX_NOTES], "and 4080 more refused entries");
+        assert_eq!(
+            notes[MAX_NOTES + 1],
+            "more than 4096 entries; the rest were not examined"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
         let long = bounded(vec!["é".repeat(300)]);
         assert!(long[0].len() <= NOTE_BYTES + 3 && long[0].ends_with("..."));
     }
