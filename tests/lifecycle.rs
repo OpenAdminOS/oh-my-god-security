@@ -1466,15 +1466,16 @@ fn published_consumers_agree_on_review_matrix() {
                 (view.confirmed, view.needs_validation, view.rejected)
             );
             let response = omgs::watch::respond(
-                "GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:4000\r\n\r\n",
+                "GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:4000\r\nX-OMGS-Token: t0k\r\n\r\n",
                 4000,
+                "t0k",
                 &run.0,
             );
             assert_eq!(response.status, 200);
             let dashboard: Value = serde_json::from_slice(&response.body).unwrap();
             assert_eq!(dashboard["review_complete"], complete);
             assert_eq!(dashboard["counters"]["confirmed"], expected_confirmed);
-            assert_dashboard_render(&dashboard);
+            assert_dashboard_render(&dashboard, true);
             assert_eq!(
                 dashboard["counters"]["needs_validation"],
                 view.needs_validation
@@ -1608,7 +1609,7 @@ fn status_publishes_view_counts_and_dashboard_requires_its_completion_verdict() 
             .unwrap();
     assert_eq!(status["counters"]["confirmed"], 0);
     assert_eq!(status["review_complete"], false);
-    assert_dashboard_render(&status);
+    assert_dashboard_render(&status, false);
 }
 
 fn confirmed_fixture(run: &Run) -> FindingsFile {
@@ -1707,7 +1708,8 @@ console.log(JSON.stringify(elements));
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn assert_dashboard_render(data: &Value) {
+/// `served` data comes from `omgs watch`, which never carries stage details.
+fn assert_dashboard_render(data: &Value, served: bool) {
     let rendered = render_dashboard(data);
     assert_eq!(
         rendered["c-conf"]["textContent"],
@@ -1733,7 +1735,11 @@ fn assert_dashboard_render(data: &Value) {
     if data["review_complete"] == false {
         if active {
             assert_ne!(headline, data["review_state"].as_str().unwrap());
-            assert!(headline.contains("round detail") || headline.contains("in progress"));
+            if served {
+                assert!(!headline.contains("round detail"), "{headline}");
+            } else {
+                assert!(headline.contains("round detail") || headline.contains("in progress"));
+            }
         } else {
             assert_eq!(headline, data["review_state"].as_str().unwrap());
         }
@@ -2334,8 +2340,9 @@ fn malformed_review_artifacts_allow_failed_status_and_safe_dashboard() {
             view.meta.review_limits
         );
         let response = omgs::watch::respond(
-            "GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:4000\r\n\r\n",
+            "GET /pipeline-status.json HTTP/1.1\r\nHost: localhost:4000\r\nX-OMGS-Token: t0k\r\n\r\n",
             4000,
+            "t0k",
             &run.0,
         );
         assert_eq!(response.status, 200);
@@ -2601,4 +2608,72 @@ fn dashboard_controls_are_visible_at_every_dynamic_sink_and_json_is_lossless() {
     data["stages"] = json!([]);
     let rendered = render_dashboard(&data);
     assert_eq!(rendered["happening"]["textContent"], visible);
+}
+
+// The dashboard keeps the per-run token in memory, removes it from the
+// address bar, and sends it only as the status request header.
+#[test]
+fn dashboard_moves_the_token_out_of_the_address_bar_and_into_a_header() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let script = include_str!("../skill/progress/dashboard.html")
+        .split_once("<script>")
+        .unwrap()
+        .1
+        .split_once("</script>")
+        .unwrap()
+        .0;
+    let harness = r#"
+const fs=require('fs'), vm=require('vm');
+const input=JSON.parse(fs.readFileSync(0,'utf8'));
+const element=()=>({textContent:'',innerHTML:'',classList:{toggle(){},add(){}},querySelector(){return element()}});
+const elements={};
+const seen={replaced:null,headers:null,fetches:0};
+const context={document:{getElementById(id){return elements[id]||(elements[id]=element())}},Date,setInterval(){},
+  location:{hash:input.hash,pathname:'/',search:''},
+  history:{replaceState(_s,_t,url){seen.replaced=url;}},
+  fetch(_url,options){seen.fetches++;seen.headers=options&&options.headers;return new Promise(()=>{});}};
+context.globalThis=context;
+vm.createContext(context);vm.runInContext(input.script,context);
+seen.upd=elements.upd?elements.upd.textContent:'';
+console.log(JSON.stringify(seen));
+"#;
+    let run = |hash: &str| -> serde_json::Value {
+        let mut child = Command::new("node")
+            .args(["-e", harness])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Node is required to exercise dashboard rendering");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                serde_json::json!({ "script": script, "hash": hash })
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let seen = run(&format!("#token={}", "ab".repeat(32)));
+    assert_eq!(seen["replaced"], "/");
+    assert_eq!(seen["fetches"], 1);
+    assert_eq!(seen["headers"]["X-OMGS-Token"], "ab".repeat(32));
+    // Without a token the page explains what to open and fetches nothing.
+    for hash in ["", "#token=", "#token=NOT-HEX"] {
+        let seen = run(hash);
+        assert_eq!(seen["fetches"], 0, "{hash}");
+        assert!(seen["replaced"].is_null(), "{hash}");
+        assert!(
+            seen["upd"]
+                .as_str()
+                .unwrap()
+                .contains("full address printed by omgs watch"),
+            "{hash}: {seen}"
+        );
+    }
 }

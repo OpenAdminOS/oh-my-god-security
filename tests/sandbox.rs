@@ -4125,7 +4125,7 @@ fn a_stalled_screenshot_browser_is_stopped_and_named() {
         (
             "kept",
             "",
-            "page: capture timed out after 20 s and the browser was stopped",
+            "page: capture timed out after 30 s and the browser was stopped",
         ),
         (
             "removed-output",

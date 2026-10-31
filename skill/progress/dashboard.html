@@ -177,10 +177,16 @@ function render(d){
   if(typeof d.updated_ms==="number"&&isFinite(d.updated_ms)&&d.updated_ms>0){const age=now()-d.updated_ms;upd.textContent=display((age>120000?"No recent updates; last updated ":"Updated ")+fmtDur(age)+" ago");dot.classList.toggle("stale",age>120000);}
   else{upd.textContent=display("No updates yet");dot.classList.add("stale");}
 }
+// Read the per-run token once, then drop it from the address bar and the
+// current history entry; polls use the copy kept in memory.
+const token=(()=>{const loc=globalThis.location,hash=(loc&&loc.hash)||"",match=/(?:^|&)token=([0-9a-f]{16,128})(?:&|$)/.exec(hash.slice(1));
+  if(match&&globalThis.history&&globalThis.history.replaceState)globalThis.history.replaceState(null,"",loc.pathname+loc.search);
+  return match?match[1]:"";})();
 async function tick(){
   // A stopped orchestrator leaves old JSON, which must still read as stale.
   // A fetch failure marks stale directly. Keep the last progress visible.
-  try{const r=await fetch("pipeline-status.json?_="+now());if(!r.ok)throw new Error("Status unavailable");const d=await r.json();render(d);}
+  if(!token){document.getElementById("upd").textContent=display("Open the full address printed by omgs watch, including #token");document.getElementById("dot").classList.add("stale");return;}
+  try{const r=await fetch("pipeline-status.json?_="+now(),{headers:{"X-OMGS-Token":token},cache:"no-store"});if(!r.ok)throw new Error("Status unavailable");const d=await r.json();render(d);}
   catch(e){document.getElementById("upd").textContent=display("Waiting for status");document.getElementById("dot").classList.add("stale");}
 }
 tick();setInterval(tick,2000);

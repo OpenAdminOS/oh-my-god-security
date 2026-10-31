@@ -65,7 +65,8 @@ Network use is specific: `review` and `batch init` use `git clone` over HTTPS;
 `update-check` makes one Git protocol request to GitHub when invoked, using
 `git ls-remote --tags` (or to the `OMGS_UPDATE_REMOTE` mirror). It uses no stored
 credentials or telemetry and has a short deadline and output cap. `watch` serves
-only loopback HTTP. The installer downloads release assets over
+only loopback HTTP, and its status needs a per-run token in the printed URL; keep that URL to
+yourself. The installer downloads release assets over
 HTTPS after consent. Sensors use local tools and local data inside MXC with the
 network denied. Semgrep requires an existing local rules file or directory in
 `OMGS_SEMGREP_CONFIG`; registry shorthand and URL values do not enable fetching.
@@ -268,9 +269,9 @@ browser already on the machine renders the page inside the same MXC sandbox at a
 into the proof record, and REPORT.html embeds verified copies inline. `validate` and
 replay fail when a kept file changes. The helper always exits 0, so a failed capture
 never changes the proof's outcome; the record names the browser's exit status instead.
-Chrome stops waiting for the page after 15 seconds, and the helper stops the browser's
-whole process group if it is still running after 20 seconds and records the timeout.
-Allow for 20 seconds per capture in `--timeout-ms`. A child that detaches from that
+Chrome stops waiting for the page after 25 seconds, and the helper stops the browser's
+whole process group if it is still running after 30 seconds and records the timeout.
+Allow for 30 seconds per capture in `--timeout-ms`. A child that detaches from that
 group and outlives the proof is a survivor like any other and makes the proof unclean.
 Screenshots must show dummy data only and never replace the failing test.
 
