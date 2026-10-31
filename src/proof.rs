@@ -111,6 +111,9 @@ pub struct ProofRecord {
     pub gaps: Vec<String>,
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Present when the run requested proof screenshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshots: Option<crate::screenshot::Screenshots>,
     pub output_sha256: String,
     pub output_bytes_total: u64,
     /// Capped and redacted; the digest covers exactly this saved text.
@@ -615,8 +618,52 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
         )),
         Err(e) => errors.push(format!("has no runner config at {}: {e}", config.display())),
     }
+    if let Some(shots) = &record.screenshots {
+        errors.extend(screenshot_evidence(run, record.n, shots));
+    }
     if record.enforced.is_empty() {
         errors.push("lists no enforced controls".into());
+    }
+    errors
+}
+
+/// Kept screenshots must be exactly the admissible files the record names.
+fn screenshot_evidence(run: &Path, n: u32, shots: &crate::screenshot::Screenshots) -> Vec<String> {
+    let mut errors = Vec::new();
+    if shots.browser.is_some() == shots.blocker.is_some() {
+        errors.push("screenshots must name either a browser or a blocker".into());
+    }
+    if shots.blocker.is_some() && !shots.files.is_empty() {
+        errors.push("screenshots with a blocker cannot list files".into());
+    }
+    if shots.files.len() > crate::screenshot::MAX_FILES {
+        errors.push(format!(
+            "lists more than {} screenshots",
+            crate::screenshot::MAX_FILES
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    for shot in &shots.files {
+        if !crate::screenshot::valid_name(&shot.name) || !names.insert(shot.name.as_str()) {
+            errors.push("screenshot names must be unique plain names".into());
+            continue;
+        }
+        let path = Path::new(DIR)
+            .join(n.to_string())
+            .join(crate::screenshot::relative(&shot.name));
+        let ok = crate::run_artifact::read(run, &path, crate::screenshot::MAX_BYTES).is_ok_and(
+            |bytes| {
+                bytes.len() as u64 == shot.bytes
+                    && crate::sha256::digest(&bytes) == shot.sha256
+                    && crate::screenshot::admit(&bytes) == Ok((shot.width, shot.height))
+            },
+        );
+        if !ok {
+            errors.push(format!(
+                "screenshot {} does not match its recorded size, digest and dimensions",
+                shot.name
+            ));
+        }
     }
     errors
 }
@@ -725,10 +772,16 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
             p.starts_with('/')
         }
     };
+    let browser_root = record
+        .screenshots
+        .as_ref()
+        .and_then(|s| s.browser.as_deref())
+        .map(|b| norm(&crate::screenshot::browser_root(Path::new(b)).to_string_lossy()));
     if roots.iter().any(|p| {
         !absolute(p)
             || p.split('/').any(|c| c == "." || c == "..")
             || !(static_roots.contains(p)
+                || browser_root.as_ref() == Some(p)
                 || ["/.cargo/bin", "/.cargo/registry", "/.cargo/git", "/.rustup"]
                     .iter()
                     .any(|suffix| p.strip_suffix(suffix).is_some_and(|base| !base.is_empty())))
@@ -791,6 +844,11 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
             denied: vec![],
             rust,
             list_parents: config.pointer("/processContainer/filesystem").is_some(),
+            screenshot: record
+                .screenshots
+                .as_ref()
+                .filter(|s| s.browser.is_some())
+                .map(|_| path_at(&format!("scratch/{}", crate::screenshot::helper_name(os)))),
         },
         record.system_root.as_deref().unwrap_or(r"C:\Windows"),
     );

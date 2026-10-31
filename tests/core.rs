@@ -120,6 +120,7 @@ fn html_report_escapes_target_content() {
             persona: String::new(),
             report_depth: String::new(),
             intent_answers: Default::default(),
+            screenshots: Default::default(),
         },
     );
     assert!(!html.contains("<script>alert"));
@@ -147,6 +148,7 @@ fn mxc_config_matches_verified_contract() {
         denied: vec![PathBuf::from("/home/u/.cargo/credentials.toml")],
         rust: None,
         list_parents: true,
+        screenshot: None,
     };
     let v = mxc_config(&input("windows"));
     assert_eq!(v["version"], "1.0.0");
@@ -265,6 +267,7 @@ fn markdown_report_shows_rejected_and_pending_evidence() {
             persona: String::new(),
             report_depth: String::new(),
             intent_answers: Default::default(),
+            screenshots: Default::default(),
         },
     );
     assert!(md.contains("Rejected after verification"));
@@ -293,6 +296,7 @@ fn meta() -> ReportMeta {
         persona: String::new(),
         report_depth: String::new(),
         intent_answers: Default::default(),
+        screenshots: Default::default(),
     }
 }
 
@@ -423,6 +427,7 @@ fn html_escapes_hostile_strings_end_to_end() {
         persona: String::new(),
         report_depth: String::new(),
         intent_answers: Default::default(),
+        screenshots: Default::default(),
     };
     let html = render_html(&file, &hostile_meta);
     let lower = html.to_lowercase();
@@ -599,6 +604,7 @@ fn report_shows_run_metadata_or_not_recorded() {
         persona: String::new(),
         report_depth: String::new(),
         intent_answers: Default::default(),
+        screenshots: Default::default(),
     };
     let md2 = render_markdown(&file, &bare);
     assert!(
@@ -1040,4 +1046,64 @@ fn architecture_renders_cyclic_flows_without_panic() {
     let first = render_architecture_html(&a);
     assert_eq!(first, render_architecture_html(&a));
     assert!(first.contains("<svg"));
+}
+
+#[test]
+fn verified_screenshots_embed_inline_and_everything_else_is_named() {
+    let mut f = keyed("c", Verdict::Confirmed);
+    f.proof_ref = Some("proofs/1.json".into());
+    let file = FindingsFile { findings: vec![f] };
+    let mut m = meta();
+    m.screenshots.insert(
+        "proofs/1.json".into(),
+        omgs::report::ProofShots {
+            blocker: None,
+            skipped: vec!["huge.png: 900x600 exceeds the fixed 800x600 viewport".into()],
+            shots: vec![
+                omgs::report::ShownShot {
+                    name: "login".into(),
+                    sha256: "a".repeat(64),
+                    width: 800,
+                    height: 600,
+                    path: "proofs/1/screenshots/login.png".into(),
+                    data: Some("iVBORw0KGgo=".into()),
+                    problem: None,
+                },
+                omgs::report::ShownShot {
+                    name: "after<b>".into(),
+                    sha256: "b".repeat(64),
+                    width: 10,
+                    height: 10,
+                    path: "proofs/1/screenshots/after.png".into(),
+                    data: None,
+                    problem: Some("missing or changed since the proof ran".into()),
+                },
+            ],
+        },
+    );
+    let html = render_html(&file, &m);
+    assert!(html.contains("img-src data:;"));
+    assert!(html.contains(
+        "<img src=\"data:image/png;base64,iVBORw0KGgo=\" width=\"800\" height=\"600\" alt=\"Proof screenshot login\">"
+    ));
+    assert!(html
+        .contains("Screenshot after&lt;b&gt; not shown: missing or changed since the proof ran."));
+    assert!(html.contains("Screenshot refused: huge.png: 900x600 exceeds"));
+    // Inline data is the only image source; nothing external is requested.
+    assert_eq!(html.matches("src=").count(), 1);
+    assert!(!html.contains("http://") && !html.contains("https://"));
+    let md = omgs::report::render_markdown(&file, &m);
+    assert!(md.contains("Screenshot login: "), "{md}");
+    assert!(md.contains("proofs/1/screenshots/login.png"));
+    assert!(md.contains("not verified: missing or changed since the proof ran"));
+    m.screenshots.insert(
+        "proofs/1.json".into(),
+        omgs::report::ProofShots {
+            blocker: Some("no headless browser found".into()),
+            ..Default::default()
+        },
+    );
+    let html = render_html(&file, &m);
+    assert!(html.contains("No screenshot: no headless browser found"));
+    assert!(!html.contains("src="));
 }

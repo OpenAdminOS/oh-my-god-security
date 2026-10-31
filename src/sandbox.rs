@@ -253,6 +253,8 @@ pub struct ProveRequest {
     pub inputs: Option<crate::proof_inputs::Selection>,
     pub expected_inputs: Option<crate::proof_inputs::Manifest>,
     pub harness: Vec<crate::proof::HarnessFile>,
+    /// Offer the screenshot helper to the command and keep its PNG files.
+    pub screenshots: bool,
 }
 
 pub struct ProveResult {
@@ -269,6 +271,7 @@ pub struct ProveResult {
     pub enforced: Vec<String>,
     pub gaps: Vec<String>,
     pub notes: Vec<String>,
+    pub screenshots: Option<crate::screenshot::Screenshots>,
     pub run: supervise::Supervised,
 }
 
@@ -484,6 +487,8 @@ pub struct ConfigInput<'a> {
     /// Windows only: let the container list the parent directories of the
     /// granted paths when the MXC probe reports support for it.
     pub list_parents: bool,
+    /// Screenshot helper inside scratch, exported as `OMGS_SCREENSHOT`.
+    pub screenshot: Option<PathBuf>,
 }
 
 pub fn environment_keys(os: &str) -> Vec<&'static str> {
@@ -605,6 +610,9 @@ pub fn mxc_config_at(input: &ConfigInput, system_root: &str) -> serde_json::Valu
     ));
     if let Some((_, nonce)) = input.contract {
         env.push(format!("OMGS_PROOF_NONCE={nonce}"));
+    }
+    if let Some(helper) = &input.screenshot {
+        env.push(format!("{}={}", crate::screenshot::ENV, mxc_path(helper)));
     }
     let readonly: Vec<String> = input.readonly.iter().map(|p| mxc_path(p)).collect();
     let mut config = serde_json::json!({
@@ -1695,10 +1703,27 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         ));
     }
     let home = platform::home();
-    let readonly: Vec<PathBuf> = toolchain_roots(os, home.as_deref())
+    let mut readonly: Vec<PathBuf> = toolchain_roots(os, home.as_deref())
         .into_iter()
         .filter(|p| p.exists())
         .collect();
+    // A missing or unusable browser never blocks the proof; the record names why.
+    let mut screenshots = req
+        .screenshots
+        .then(crate::screenshot::Screenshots::default);
+    let mut browser = None;
+    if let Some(shots) = screenshots.as_mut() {
+        match crate::screenshot::browser(os, std::env::var_os(crate::screenshot::BROWSER_ENV))
+            .and_then(|b| admit_browser(&b, &run_dir, &readonly).map(|root| (b, root)))
+        {
+            Ok((b, root)) => {
+                shots.browser = Some(mxc_path(&b));
+                readonly.extend(root);
+                browser = Some(b);
+            }
+            Err(reason) => shots.blocker = Some(reason),
+        }
+    }
     // A run directory under a readable root would make the workspace, the
     // config readable to every sandbox.
     if let Some(root) = overlapping_root(&run_dir, &readonly) {
@@ -1761,6 +1786,14 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         Ok(staged) => staged,
         Err(reason) => return blocked(reason),
     };
+    let screenshot = match browser
+        .as_ref()
+        .map(|b| write_screenshot_helper(os, b, &scratch))
+        .transpose()
+    {
+        Ok(helper) => helper,
+        Err(reason) => return blocked(reason),
+    };
     #[cfg(target_os = "macos")]
     {
         let safe = supervise::capture_root().and_then(|root| {
@@ -1788,6 +1821,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         denied,
         rust,
         list_parents,
+        screenshot,
     };
     if let Err(e) = supervise::check_interrupted() {
         return blocked(e.to_string());
@@ -1889,6 +1923,11 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             if digest != target_sha256 {
                 return blocked("target changed before MXC retry".into());
             }
+            if let Some(b) = &browser {
+                if let Err(reason) = write_screenshot_helper(os, b, &scratch) {
+                    return blocked(reason);
+                }
+            }
             for gap in retry_gaps {
                 if !extra_gaps.contains(&gap) {
                     extra_gaps.push(gap);
@@ -1946,6 +1985,14 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             gaps.push(note.clone());
         }
     }
+    if let (Some(shots), Some(_)) = (screenshots.as_mut(), &browser) {
+        let (files, skipped) = crate::screenshot::collect(
+            &scratch.join(crate::screenshot::DIR),
+            &run_dir.join(crate::screenshot::DIR),
+        );
+        shots.files = files;
+        shots.skipped = skipped;
+    }
     // The workspace and scratch can be large and hold build output; the
     // config stays as part of the proof evidence.
     let _ = std::fs::remove_dir_all(&workspace);
@@ -1967,8 +2014,40 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         enforced,
         gaps,
         notes,
+        screenshots,
         run,
     }))
+}
+
+/// The browser directory to add as a read-only grant, if no existing grant
+/// already covers it, or the reason the browser cannot be granted.
+fn admit_browser(
+    browser: &Path,
+    run_dir: &Path,
+    readonly: &[PathBuf],
+) -> Result<Option<PathBuf>, String> {
+    let root = PathBuf::from(mxc_path(&crate::screenshot::browser_root(browser)));
+    if run_dir.starts_with(&root) || root.starts_with(run_dir) {
+        return Err(format!(
+            "the browser directory {} overlaps the proof directory",
+            root.display()
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    crate::tcc::admit_path(&root).map_err(|e| format!("browser directory refused: {e}"))?;
+    Ok((!readonly.iter().any(|r| root.starts_with(r))).then_some(root))
+}
+
+/// Writes the capture helper and its output directory into scratch.
+fn write_screenshot_helper(os: &str, browser: &Path, scratch: &Path) -> Result<PathBuf, String> {
+    let scratch = PathBuf::from(mxc_path(scratch));
+    let (name, text) = crate::screenshot::helper(os, browser, &scratch)
+        .map_err(|e| format!("cannot write the screenshot helper: {e}"))?;
+    let path = scratch.join(name);
+    std::fs::create_dir_all(scratch.join(crate::screenshot::DIR))
+        .and_then(|_| std::fs::write(&path, text))
+        .map_err(|e| format!("cannot write the screenshot helper: {e}"))?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -1988,6 +2067,7 @@ mod tests {
         let run_dir = base.join("proof");
         crate::platform::create_private_dir_new(&run_dir).unwrap();
         let request = ProveRequest {
+            screenshots: false,
             command: "never executed".into(),
             expect_marker: None,
             test: None,
@@ -2095,6 +2175,7 @@ mod tests {
             let run_dir = base.join("proof");
             crate::platform::create_private_dir_new(&run_dir).unwrap();
             let request = ProveRequest {
+                screenshots: false,
                 command: "never executed".into(),
                 expect_marker: None,
                 test: None,
@@ -2226,6 +2307,7 @@ mod tests {
                 let proof_dir = run.join("proofs/1");
                 platform::create_private_tree(&proof_dir).unwrap();
                 let req = ProveRequest {
+                    screenshots: false,
                     expect_marker: None,
                     command: "cargo run --offline".into(),
                     test: None,
@@ -2302,6 +2384,7 @@ mod tests {
                         denied: vec![],
                         rust: staged.rust,
                         list_parents: false,
+                        screenshot: None,
                     },
                     "",
                 );
@@ -2401,6 +2484,7 @@ mod tests {
             denied: vec![],
             rust: None,
             list_parents: false,
+            screenshot: None,
         };
         let config = mxc_config(&input);
         let text = serde_json::to_string(&config).unwrap();
@@ -2436,6 +2520,7 @@ mod tests {
             crate::runmeta::write_atomic_bytes(&retained, b"harness bytes").unwrap();
             let bound_mode = if cfg!(unix) { 0o640 } else { 1 };
             let req = ProveRequest {
+                screenshots: false,
                 expect_marker: None,
                 command: "echo fixture".into(),
                 test: Some("checks/deep/test".into()),
@@ -2521,6 +2606,7 @@ mod tests {
             .unwrap()
             .join(format!("omgs-blocked-{}", std::process::id()));
         let req = |command: &str| ProveRequest {
+            screenshots: false,
             expect_marker: None,
             command: command.into(),
             test: None,
@@ -2582,6 +2668,7 @@ mod tests {
                         rustup_home: Some("/tools/rustup".into()),
                     }),
                     list_parents: false,
+                    screenshot: None,
                 });
                 let mut keys: Vec<_> = config["process"]["env"]
                     .as_array()
@@ -3165,6 +3252,7 @@ mod tests {
             .join(format!("omgs-refusal-no-config-{}", std::process::id()));
         let before = preflight::config_invocations();
         let request = ProveRequest {
+            screenshots: false,
             expect_marker: None,
             command: "echo must-not-run".into(),
             test: None,
@@ -3307,6 +3395,7 @@ mod tests {
             assert!(preflight_harness(&ws, &["dangling/entry.sh"]).is_err());
         }
         let request = ProveRequest {
+            screenshots: false,
             command: "never executed".into(),
             expect_marker: None,
             test: Some("entry.sh".into()),

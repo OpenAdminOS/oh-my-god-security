@@ -63,6 +63,12 @@ when tier 1 cannot decide, add --tier 2 to the prove command. Tier 2 is Linux on
 prior human approval at a terminal; never run omgs approve yourself. Exit 3 means nothing ran. Keep
 drafts outside TARGET, record the exact blocker and retain only the tier already earned.
 
+When the effect is visible in a rendered page, add --screenshots to the prove command and have the
+harness run sh "$OMGS_SCREENSHOT" NAME URL (call "%OMGS_SCREENSHOT%" NAME URL on Windows) at the
+proof moment, against dummy data only. The browser runs inside the same sandbox. A screenshot
+supports the record; it never replaces the failing test. If the record names a screenshot blocker,
+keep the proof and report the blocker.
+
 ## Never do
 
 Never run target code outside omgs prove, including discovery, imports, builds or fixture setup.

@@ -242,6 +242,25 @@ These checks catch mistakes and hand-edited records. They do not defend against 
 See [proof record mechanics](docs/internals.md#what-a-proof-record-does-and-does-not-prove)
 for contracts, markers, validation, replay requirements, redaction and schema compatibility.
 
+### Proof screenshots
+
+`omgs prove --screenshots` offers the proof command a capture helper for web and
+rendered-output proofs. The harness calls `sh "$OMGS_SCREENSHOT" <name> <url>`
+(`call "%OMGS_SCREENSHOT%" <name> <url>` on Windows) at the proof moment, and a headless
+browser already on the machine renders the page inside the same MXC sandbox at a fixed
+800x600 viewport, with network still denied. Nothing is downloaded. OMGS keeps at most
+4 PNG files of up to 512 KiB each, refuses anything else by name, hashes the kept files
+into the proof record, and REPORT.html embeds verified copies inline. `validate` and
+replay fail when a kept file changes. Screenshots must show dummy data only and never
+replace the failing test.
+
+On Linux and Windows OMGS looks for Chrome, Edge or Chromium in their standard install
+locations; `OMGS_BROWSER` overrides the choice. On macOS the full Chrome, Edge and
+Chromium apps abort inside the sandbox because they must register with the window
+server, which OMGS keeps closed. Set `OMGS_BROWSER` to a `chrome-headless-shell` executable
+outside protected folders (not under `~/Library`, Desktop, Documents or Downloads).
+Without a usable browser the proof still runs and the record names the exact blocker.
+
 Proof execution inputs share the gate hard maximum of 2,000,000 files and directories
 (links also count for proof identities). Gate export defaults to 200,000 entries and
 4 GiB; base-policy `gate_limits` can raise these to 2,000,000 entries and 64 GiB.
@@ -280,6 +299,8 @@ secrets are listed separately in [SECURITY.md](SECURITY.md#release-owner-configu
 | `OMGS_UPDATE_REMOTE` | Update-check tag source; defaults to `https://github.com/OpenAdminOS/oh-my-god-security.git`. Supports HTTPS mirrors and local Git repositories, passed as one argument without a shell. Other Git transports are disabled. Empty or failed lookups are silent. |
 | `OMGS_OSV_DB` | Existing offline OSV cache root, containing `osv-scanner/<ecosystem>/all.zip`; defaults to `<OMGS data dir>/osv-db`. |
 | `OMGS_MXC_EXEC` | Explicit executor path, authoritative and SHA-256 pinned; otherwise data directory then PATH. |
+| `OMGS_BROWSER` | Absolute path of the headless browser `prove --screenshots` uses; its directory becomes a read-only grant. Defaults to Chrome, Edge or Chromium install locations on Linux and Windows; required on macOS. |
+| `OMGS_SCREENSHOT` | Set inside `prove --screenshots` workloads to the capture helper in scratch. |
 | `OMGS_SEMGREP_CONFIG` | Existing local Semgrep rules file or directory. Registry shorthand and URL values do not enable fetching; download rules separately before scanning if needed. |
 | `HOME`, `USERPROFILE` | Host home discovery; HOME wins, then USERPROFILE on Windows. Sandboxed values point to scratch. |
 | `PATH`, `PATHEXT` | Host tool lookup, absolute entries only. Sandboxed PATH is rebuilt; Windows PATHEXT is explicit. |

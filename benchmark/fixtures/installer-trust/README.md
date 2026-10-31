@@ -42,6 +42,14 @@ Benign lines may appear in the output, such as `xcodebuild` reporting that it co
 MXC denying writes to the real per-user cache and temp directories, outside the run's scratch. The
 compile and the proof still complete; it is the containment working, not a failure.
 
+## Fix round trip
+
+The test `installer_trust_fix_round_trip_turns_the_acceptance_command_green` in
+`tests/sandbox.rs` walks the path a green fixer takes. It proves the vulnerable decision in a run,
+builds the handoff, replaces only `Verifier.swift` with the fixed snapshot, initializes a fix run
+with `--fix-of`, and reruns the handoff's exact acceptance command there. The same proof test that
+failed with exit 1 now passes with exit 0 and its authorized control still succeeds.
+
 ## Scope of this proof
 
 This fixture proves the defect class and its fix: it models the install-decision logic rather than

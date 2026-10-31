@@ -308,6 +308,7 @@ fn assert_augmented_tier_refusal(tier: &str, caller: u32) {
     };
     let lib_dir = d.join("library-proof");
     let request = ProveRequest {
+        screenshots: false,
         expect_marker: None,
         command: "echo REFUSAL_WORKLOAD_RAN".into(),
         test: None,
@@ -1754,6 +1755,7 @@ fn unreachable_tests_never_run_the_command() {
     std::fs::create_dir_all(target.join("directory")).unwrap();
     for (n, test) in ["missing test's file", "directory"].iter().enumerate() {
         let request = ProveRequest {
+            screenshots: false,
             expect_marker: None,
             command: "echo UNREACHABLE_COMMAND_RAN".into(),
             test: Some((*test).into()),
@@ -3816,4 +3818,214 @@ fn retained_scoped_selection_handoff_omits_behavior_changing_directory() {
     write_private_fixture(&selection, r#"{"version":1,"paths":["asset"]}"#).unwrap();
     assert!(omgs::handoff::build(&run, &file, None).is_err());
     std::fs::remove_dir_all(d).unwrap();
+}
+
+// Screenshots are opt-in evidence: a usable browser yields kept, hashed PNG
+// files that replay and validation check; without one the proof still runs
+// and the record names the blocker.
+#[test]
+fn screenshots_are_kept_hashed_and_replayed_or_blocked_with_a_reason() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("screenshots");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(target.join("tests")).unwrap();
+    std::fs::write(
+        target.join("page.html"),
+        "<!doctype html><title>dummy</title><h1>Dummy account settings</h1>",
+    )
+    .unwrap();
+    let (test, command, body) = if cfg!(windows) {
+        (
+            "tests/shot.cmd",
+            "cmd.exe /d /c tests\\shot.cmd",
+            "@call \"%OMGS_SCREENSHOT%\" page \"file:///%CD:\\=/%/page.html\"\r\n@exit /b 1\r\n",
+        )
+    } else {
+        (
+            "tests/shot.sh",
+            "sh tests/shot.sh",
+            "sh \"$OMGS_SCREENSHOT\" page \"file://$PWD/page.html\"\nexit 1\n",
+        )
+    };
+    std::fs::write(target.join(test), body).unwrap();
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            test,
+            "--screenshots",
+            "--cmd",
+            command,
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    let shots = record.screenshots.clone().expect("screenshots requested");
+    let expected = omgs::screenshot::browser(
+        std::env::consts::OS,
+        std::env::var_os(omgs::screenshot::BROWSER_ENV),
+    );
+    match expected {
+        Ok(_) => {
+            assert!(shots.blocker.is_none(), "{shots:?}");
+            assert_eq!(shots.files.len(), 1, "{shots:?}\n{}", text(&out));
+            let shot = &shots.files[0];
+            assert_eq!(shot.name, "page");
+            assert!(shot.width <= 800 && shot.height <= 600);
+            let kept = run.join("proofs/1/screenshots/page.png");
+            assert_eq!(
+                omgs::sha256::digest(&std::fs::read(&kept).unwrap()),
+                shot.sha256
+            );
+            assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+            let replay = omgs(
+                &d,
+                &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+            );
+            assert_eq!(replay.status.code(), Some(0), "{}", text(&replay));
+            let again = omgs::proof::load(&run, "proofs/2.json").unwrap();
+            assert_eq!(again.screenshots.unwrap().files.len(), 1);
+            // A changed screenshot invalidates the proof record.
+            let mut bytes = std::fs::read(&kept).unwrap();
+            bytes.push(0);
+            std::fs::write(&kept, bytes).unwrap();
+            assert!(omgs::proof::runner_evidence(&run, &record)
+                .iter()
+                .any(|e| e.contains("screenshot page does not match")));
+        }
+        Err(reason) => {
+            assert_eq!(shots.blocker.as_deref(), Some(reason.as_str()));
+            assert!(shots.files.is_empty() && shots.browser.is_none());
+            assert!(record.readable_roots.iter().all(|r| !r.contains("chrome")));
+            assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// The fix round trip a green fixer performs: the handoff's exact acceptance
+// command fails against the vulnerable code and passes once the fix lands.
+#[cfg(target_os = "macos")]
+#[test]
+fn installer_trust_fix_round_trip_turns_the_acceptance_command_green() {
+    if !mxc_ready() {
+        return;
+    }
+    if omgs::platform::which("swiftc").is_none() {
+        eprintln!("skipping: swiftc not found");
+        return;
+    }
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/installer-trust");
+    let d = scratch("fix-round-trip");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::copy(fixture.join("main.swift"), target.join("main.swift")).unwrap();
+    std::fs::copy(
+        fixture.join("vulnerable/Verifier.swift"),
+        target.join("Verifier.swift"),
+    )
+    .unwrap();
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    completed_verifier_fixture(&run, "blue-1");
+    let fp = omgs::fingerprint(
+        "installer_signer_trust_bypass",
+        "install(request)",
+        "decide(_:)",
+        "signing team",
+    );
+    let command =
+        "swiftc main.swift Verifier.swift -o \"$TMPDIR/probe\" || exit 2; \"$TMPDIR/probe\"";
+    let vulnerable = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--finding",
+            &fp,
+            "--test",
+            "main.swift",
+            "--expect-marker",
+            "BOUNDARY_ASSERTION_FAILED",
+            "--cmd",
+            command,
+        ],
+    );
+    assert_eq!(vulnerable.status.code(), Some(1), "{}", text(&vulnerable));
+    assert!(text(&vulnerable).contains("proof support for test_proven: yes"));
+    let file = omgs::shape::findings(&serde_json::json!({"findings":[{
+        "fingerprint":fp,"title":"Nil expected team accepts a mismatched signer","verdict":"confirmed","severity":"high","proof_tier":"test_proven",
+        "attack_class":"installer_signer_trust_bypass","entry_point":"install(request)","sink":"decide(_:)","boundary":"signing team",
+        "location":{"path":"Verifier.swift","line":1},"evidence":"The invariant harness fails on the vulnerable decision.","hunted_by":"red-1","verified_by":"blue-1",
+        "verification":{"state":"final","attempt":"fixture-verifier"},"proof_ref":"proofs/1.json",
+        "fix_brief":"Refuse unnotarized or mismatched signers when no team is expected; refuse downgrades and mismatched payload versions."
+    }]}).to_string()).unwrap();
+    let handoff = omgs::handoff::build(&run, &file, None).unwrap();
+    let acceptance = handoff.records[0].acceptance.as_ref().expect("acceptance");
+    // The green fixer edits only the listed code; the proof test stays.
+    std::fs::copy(
+        fixture.join("fixed/Verifier.swift"),
+        target.join("Verifier.swift"),
+    )
+    .unwrap();
+    let fix = d.join("fix-run");
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            fix.to_str().unwrap(),
+            "--no-sensors",
+            "--fix-of",
+            run.to_str().unwrap(),
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let mut args = acceptance.command_args.clone();
+    let index = args.iter().position(|a| a == "--run").unwrap();
+    args[index + 1] = fix.to_str().unwrap().into();
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
+    let fixed = omgs(&d, &args);
+    assert_eq!(fixed.status.code(), Some(0), "{}", text(&fixed));
+    assert!(text(&fixed).contains("BOUNDARY_ASSERTION_OK"));
+    assert!(text(&fixed).contains("OMGS_CONTROL_"));
+    let record = omgs::proof::load(&fix, "proofs/1.json").unwrap();
+    assert_eq!(record.test.as_deref(), Some("main.swift"));
+    assert!(record.clean());
+    let _ = std::fs::remove_dir_all(&d);
 }
