@@ -164,20 +164,20 @@ fn publish_verified(
             .file_name()
             .is_some_and(|n| n == "omgs" || n == "omgs.exe")
         {
-            println!(
+            crate::out::line(&format!(
                 "Installed omgs {}: {}",
                 env!("CARGO_PKG_VERSION"),
                 destination.display()
-            );
+            ));
         } else if destination
             .file_name()
             .is_some_and(|n| n != "MXC-LICENSE.txt")
         {
-            println!(
+            crate::out::line(&format!(
                 "Installed MXC {}: {}",
                 crate::sandbox::MXC_VERSION,
                 destination.display()
-            );
+            ));
         }
     }
     Ok(())

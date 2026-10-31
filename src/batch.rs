@@ -332,7 +332,20 @@ pub fn render_index_html(runs: &[RunSummary]) -> String {
         let repo = match &r.report_href {
             Some(href) => format!(
                 "<a href=\"{}\">{}</a>",
-                html_escape(href),
+                // A relative filesystem name can contain a colon or URL syntax.
+                // Encode it as a path and force relative-link interpretation.
+                html_escape(&format!(
+                    "./{}",
+                    href.bytes()
+                        .map(|b| {
+                            if b.is_ascii_alphanumeric() || b"/._-~".contains(&b) {
+                                (b as char).to_string()
+                            } else {
+                                format!("%{b:02X}")
+                            }
+                        })
+                        .collect::<String>()
+                )),
                 html_escape(&r.url)
             ),
             None => html_escape(&r.url),

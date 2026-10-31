@@ -827,7 +827,8 @@ fn zone_label(z: &Zone) -> &str {
 /// literal there, so only neutralise a backtick (which would close the span)
 /// and newlines. No CommonMark escaping, which would otherwise show as text.
 fn md_code(s: &str) -> String {
-    s.chars()
+    crate::handoff::display_text(s)
+        .chars()
         .map(|c| match c {
             '`' => '\'',
             '\n' | '\r' => ' ',
@@ -838,13 +839,14 @@ fn md_code(s: &str) -> String {
 
 pub(crate) fn md_inline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
+    for ch in crate::handoff::display_text(s).chars() {
         match ch {
             '\n' | '\r' => out.push(' '),
             '|' => out.push_str("\\|"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '&' => out.push_str("&amp;"),
+            '@' => out.push_str("`@`"),
             // Backslash-escape CommonMark punctuation so target-derived text
             // cannot inject a link, image, emphasis, heading, list, or table.
             '\\' | '`' | '[' | ']' | '(' | ')' | '!' | '*' | '_' | '#' | '+' | '-' | '.' | '{'

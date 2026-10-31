@@ -699,3 +699,134 @@ fn batch_accepts_a_fresh_relative_clone_root_before_attempting_git() {
         .contains("git not found"));
     assert!(!f.root.join("fresh-clones").exists());
 }
+
+#[test]
+fn hostile_saved_text_is_inert_at_terminal_and_report_boundaries() {
+    let f = Fixture::new();
+    let hostile = "hostile\u{1b}[2J\n::error::forged <img src=x onerror=alert(1)> [x](javascript:alert(1)) @mention";
+    let check_terminal = |out: &Output| {
+        for bytes in [&out.stdout, &out.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(!text.contains('\u{1b}'), "{text:?}");
+            assert!(
+                !text.lines().any(|l| l.starts_with("::error::")),
+                "{text:?}"
+            );
+        }
+    };
+    let models = f.root.join("models.json");
+    omgs::runmeta::write_atomic(&models, &json!({"roles":{hostile:["test"]}}).to_string()).unwrap();
+    let out = f.cli(&[
+        "route",
+        "--run",
+        f.run_str(),
+        "--role",
+        "verifier",
+        "--models",
+        models.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("hostile"));
+    check_terminal(&out);
+
+    let ledger = f.run.join("coverage-ledger.json");
+    for args in [
+        vec![
+            "ledger",
+            "add",
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--unit",
+            hostile,
+            "--surface",
+            "sample.ps1",
+            "--note",
+            hostile,
+        ],
+        vec![
+            "ledger",
+            "set",
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--unit",
+            hostile,
+            "--status",
+            "planned",
+            "--note",
+            hostile,
+        ],
+        vec!["ledger", "list", "--ledger", ledger.to_str().unwrap()],
+    ] {
+        let out = f.cli(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("hostile"));
+        check_terminal(&out);
+    }
+
+    let summary = omgs::batch::RunSummary {
+        url: hostile.into(),
+        report_href: Some(format!("javascript:{hostile}/REPORT.html")),
+        state: hostile.into(),
+        budget: Some(hostile.into()),
+        blockers: vec![hostile.into()],
+        ..Default::default()
+    };
+    for text in [
+        omgs::batch::render_index_markdown(std::slice::from_ref(&summary)),
+        omgs::batch::render_index_html(&[summary]),
+    ] {
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.lines().any(|l| l.starts_with("::error::")));
+        assert!(!text.contains("<img src=x"));
+        assert!(!text.contains("href=\"javascript:"));
+    }
+
+    let mut findings: Value =
+        serde_json::from_str(include_str!("fixtures/report-run/findings.json")).unwrap();
+    findings["findings"].as_array_mut().unwrap().truncate(1);
+    findings["findings"][0]["title"] = hostile.into();
+    findings["findings"][0]["fingerprint"] =
+        omgs::fingerprint("export_scope", "GET /orders/:id", "orders.load", "tenant").into();
+    let input = f.root.join("findings.json");
+    omgs::runmeta::write_atomic(&input, &findings.to_string()).unwrap();
+    let report = f.root.join("report");
+    let out = f.cli(&[
+        "report",
+        "--findings",
+        input.to_str().unwrap(),
+        "--out",
+        report.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    check_terminal(&out);
+    for name in [
+        "REPORT.md",
+        "REPORT.html",
+        "HANDOFF.md",
+        "handoff.json",
+        "findings.sarif.json",
+    ] {
+        let text = std::fs::read_to_string(report.join(name)).unwrap();
+        assert!(!text.contains('\u{1b}'), "{name}");
+        assert!(!text.lines().any(|l| l.starts_with("::error::")), "{name}");
+        if name.ends_with(".json") {
+            // JSON retains data faithfully, never creates HTML or Markdown nodes.
+            serde_json::from_str::<Value>(&text).unwrap();
+        } else {
+            assert!(!text.contains("<img src=x"), "{name}");
+            assert!(!text.contains("href=\"javascript:"), "{name}");
+            if name.ends_with(".md") {
+                assert!(!text.contains("[x](javascript:"), "{name}");
+                assert!(!text.contains(" @mention"), "{name}");
+            }
+        }
+    }
+}

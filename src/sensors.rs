@@ -866,7 +866,8 @@ mod offline_tests {
     fn occurrence_process_fixture() {
         if let Ok(record) = std::env::var(OCCURRENCE_FIXTURE_ENV) {
             // Serial libtest output can leave its test label on the current line.
-            println!("\nOCCURRENCE_RECORD:{record}");
+            println!();
+            crate::out::line(&format!("OCCURRENCE_RECORD:{record}"));
         }
     }
 

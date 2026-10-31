@@ -878,6 +878,10 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
             .args(&flags)
             .arg(&from)
             .arg(dst)
+            // Copy diagnostics contain target-controlled filenames. Fall back
+            // to the Rust copier and its escaped error path on failure.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn();
         let ok = match child {
             Ok(mut child) => loop {

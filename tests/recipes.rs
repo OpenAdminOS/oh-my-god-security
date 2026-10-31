@@ -368,11 +368,13 @@ fn check(recipe: Recipe) -> bool {
         );
         if exit != 2 && !variant.ends_with("cap") && variant != "queued output flood" && !collision
         {
+            // Contract evidence comes from the retained record. Terminal output
+            // deliberately escapes embedded newlines and cannot be parsed as raw markers.
             let control = omgs::proof::control_marker(&proof.marker_nonce);
             let boundary =
                 omgs::proof::boundary_marker("BOUNDARY_ASSERTION_FAILED", &proof.marker_nonce);
             assert!(
-                output.lines().any(|s| s
+                proof.output.lines().any(|s| s
                     == if variant == "missing control marker" {
                         control.replace("OMGS_CONTROL_", "CONTROL_MARKER_OMITTED_")
                     } else {
@@ -381,7 +383,7 @@ fn check(recipe: Recipe) -> bool {
                 "{output}"
             );
             assert!(
-                output.lines().any(|s| s
+                proof.output.lines().any(|s| s
                     == if variant == "missing marker" {
                         boundary.replace("OMGS_BOUNDARY_", "BOUNDARY_MARKER_OMITTED_")
                     } else if exit == 1 {

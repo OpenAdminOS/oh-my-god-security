@@ -271,7 +271,9 @@ fn formatting_control(c: char) -> bool {
 pub(crate) fn display_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if formatting_control(c) {
+        if c.is_control() && !matches!(c, '\n' | '\r' | '\t') {
+            out.extend(c.escape_default());
+        } else if formatting_control(c) {
             out.push_str(&format!("<U+{:04X}>", c as u32));
         } else {
             out.push(c);
@@ -284,7 +286,7 @@ pub(crate) fn display_text(s: &str) -> String {
 fn command_json(s: &str) -> String {
     let mut out = String::new();
     for c in serde_json::to_string(s).unwrap().chars() {
-        if formatting_control(c) {
+        if c.is_control() || formatting_control(c) {
             for unit in c.encode_utf16(&mut [0; 2]) {
                 out.push_str(&format!("\\u{unit:04x}"));
             }

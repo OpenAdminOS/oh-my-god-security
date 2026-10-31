@@ -558,7 +558,9 @@ pub fn committed_snapshot(
     }
     let meta = crate::runmeta::read(&run)?;
     if meta.get("policy") != Some(&serde_json::to_value(&base).map_err(|e| e.to_string())?) {
-        eprintln!("warning: run policy snapshot differs from trusted record; ignoring snapshot");
+        crate::out::err(
+            "warning: run policy snapshot differs from trusted record; ignoring snapshot",
+        );
     }
     Ok(AuthenticatedPolicy(base))
 }
@@ -709,7 +711,7 @@ pub fn gate(target: &Path, base: &str, head: &str, run: Option<&Path>) -> Result
     match outcome {
         Ok(blocked) => Ok(u8::from(blocked && s.policy.mode == Mode::Gate)),
         Err(e) if s.policy.mode == Mode::Advisory => {
-            println!("advisory: would block (infrastructure): {e}");
+            crate::out::line(&format!("advisory: would block (infrastructure): {e}"));
             Ok(0)
         }
         Err(e) => Err(e),
@@ -736,7 +738,10 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
         })
         .collect();
     if tests.is_empty() {
-        println!("{}: no active registered gate tests", p.mode.label());
+        crate::out::line(&format!(
+            "{}: no active registered gate tests",
+            p.mode.label()
+        ));
         return Ok(false);
     }
     // Inspect all active registrations before export or sandbox setup can fail.
@@ -761,10 +766,10 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
     let after = blobs(head)?;
     for t in &tests {
         if before.get(t.test.as_bytes()) != after.get(t.test.as_bytes()) {
-            println!(
+            crate::out::line(&format!(
                 "WARNING: registered gate test modified in head: {} {}",
                 t.id, t.test
-            );
+            ));
         }
     }
     let _signals = crate::supervise::interruption::Guard::install().map_err(|e| e.to_string())?;
@@ -813,10 +818,10 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
             return Err(format!("{}: blocked or unclean gate execution (started={}, finished={}, timeout={}, killed={}, executor_error={}, capture={}, cleanup={}, survivors={}): {}", t.id, r.command_started, r.command_finished, r.timed_out, r.killed, r.executor_error, r.capture_complete, r.cleanup_complete, r.survivors.len(), r.notes.join("; ")));
         }
         match r.exit_code {
-            Some(0) => println!("passes {}", t.id),
+            Some(0) => crate::out::line(&format!("passes {}", t.id)),
             Some(1) if r.boundary_marker_seen && r.authorized_control_seen => {
                 blocked = true;
-                println!(
+                crate::out::line(&format!(
                     "{} {}",
                     if p.mode == Mode::Advisory {
                         "would block"
@@ -824,7 +829,7 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
                         "blocks"
                     },
                     t.id
-                );
+                ));
             }
             _ => return Err(format!("{}: test failed outside its recipe contract", t.id)),
         }
@@ -870,21 +875,21 @@ fn advisory_findings(run: &Path, p: &Policy) {
         match advisory_lines_locked(run, p) {
             Ok(lines) => {
                 for line in lines {
-                    println!("{}", crate::platform::escape_controls(&line));
+                    crate::out::line(&crate::platform::escape_controls(&line));
                 }
             }
-            Err(e) => println!(
+            Err(e) => crate::out::line(&format!(
                 "advisory run unavailable: {}",
                 crate::platform::escape_controls(&e)
-            ),
+            )),
         }
         Ok(())
     });
     if let Err(e) = result {
-        println!(
+        crate::out::line(&format!(
             "advisory run unavailable: {}",
             crate::platform::escape_controls(&e)
-        );
+        ));
     }
 }
 
@@ -904,7 +909,7 @@ pub fn propose(
     };
     let staged = crate::handoff::stage_validated(run, &file)?;
     for reason in &staged.excluded {
-        eprintln!("{reason}");
+        crate::out::err(reason);
     }
     propose_staged(run, answers, &staged, policy)
 }
@@ -972,7 +977,7 @@ fn propose_tests(
             .iter()
             .find(|t| t.test == test || t.id == f.fingerprint)
         {
-            println!("already registered: {}", old.id);
+            crate::out::line(&format!("already registered: {}", old.id));
             continue;
         }
         p.gate_tests.push(GateTest {

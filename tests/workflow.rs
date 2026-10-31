@@ -3028,7 +3028,7 @@ fn unicode_formatting_controls_are_visible_in_all_display_formats() {
         f.fix_brief = Some(format!("Fix brief with {controls} controls."));
     }
     let mut p = omgs::proof::load(&dir, "proofs/1.json").unwrap();
-    let command = format!("printf 'src/\u{202E}txt.exe {controls}'");
+    let command = format!("printf 'src/\u{202E}txt.exe \u{85} {controls}'");
     p.command = command.clone();
     p.command_sha256 = omgs::sha256::digest(command.as_bytes());
     write_private_fixture(dir.join("proofs/1/command.txt"), &command).unwrap();

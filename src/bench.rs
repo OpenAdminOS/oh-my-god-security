@@ -1075,18 +1075,12 @@ pub fn markdown(result: &Value) -> String {
     let mut s=String::from("| Cohort | Run | Recall | FP | FDR | Negative-unit rate | Verifier rejection | Verifier pending | Pending adjudications | Invalid evidence |\n| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
     let display = |v: &Value| format!("{}/{} ({})", v["numerator"], v["denominator"], v["value"]);
     for c in result["cohorts"].as_array().unwrap() {
-        let name = c["cohort"]
-            .as_str()
-            .unwrap()
-            .replace(['|', '\n', '\r'], " ");
+        let name = crate::handoff::markdown_inline(c["cohort"].as_str().unwrap());
         for r in c["runs"].as_array().unwrap() {
             s.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 name,
-                r["run_id"]
-                    .as_str()
-                    .unwrap()
-                    .replace(['|', '\n', '\r'], " "),
+                crate::handoff::markdown_inline(r["run_id"].as_str().unwrap()),
                 display(&r["recall"]),
                 r["false_positives"]["numerator"],
                 display(&r["false_discovery_fraction"]),
@@ -1107,10 +1101,7 @@ pub fn markdown(result: &Value) -> String {
     for c in result["cohorts"].as_array().unwrap() {
         s.push_str(&format!(
             "| {} | {} | {}/{} |\n",
-            c["cohort"]
-                .as_str()
-                .unwrap()
-                .replace(['|', '\n', '\r'], " "),
+            crate::handoff::markdown_inline(c["cohort"].as_str().unwrap()),
             c["mean_recall"]["value"],
             c["mean_recall"]["numerator"],
             c["mean_recall"]["denominator"]

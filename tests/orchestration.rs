@@ -146,7 +146,7 @@ fn batch_index_is_deterministic_offline_and_escaped() {
     }
     assert_eq!(html.matches("<a href=").count(), 1);
     assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
-    assert!(html.contains("<a href=\"github.com__a__b/REPORT.html\">"));
+    assert!(html.contains("<a href=\"./github.com__a__b/REPORT.html\">"));
     assert!(html.contains("2 repositories: 2 confirmed, 4 needs validation, 6 rejected"));
     assert!(html.contains("40 recorded, some runs not recorded"));
     let md = render_index_markdown(&runs);

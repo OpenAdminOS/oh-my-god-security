@@ -147,7 +147,7 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         if let Err(e) = self.cleanup() {
-            eprintln!("{}", platform::escape_controls(&e));
+            crate::out::err(&platform::escape_controls(&e));
         }
     }
 }
@@ -248,7 +248,7 @@ pub fn recover() -> Result<(), String> {
 fn report(warnings: Vec<String>) -> Result<(), String> {
     for warning in warnings {
         crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
-        eprintln!("{}", platform::escape_controls(&warning));
+        crate::out::err(&platform::escape_controls(&warning));
     }
     crate::supervise::check_interrupted().map_err(|e| e.to_string())
 }

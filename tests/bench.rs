@@ -213,7 +213,7 @@ fn cli_emits_json_and_markdown_offline() {
         score()
     );
     assert!(String::from_utf8_lossy(&out.stderr)
-        .contains("| not_applicable:development:1 | r1 | 1/4 (0.25) |"));
+        .contains("| not&#95;applicable:development:1 | r1 | 1/4 (0.25) |"));
 }
 
 struct SavedRuns(PathBuf);
@@ -933,4 +933,48 @@ fn benchmark_retains_all_source_locks_until_output_is_written() {
     )
     .unwrap();
     mutation.unwrap().join().unwrap();
+}
+
+#[test]
+fn hostile_fixture_labels_are_inert_in_summary_and_json() {
+    let dir = root();
+    let hostile = "hostile\u{85}\u{1b}[2J\n::error::forged <img src=x onerror=alert(1)> [x](javascript:alert(1)) @mention";
+    let path = dir.join("run-1/benchmark-run.json");
+    let mut run: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    run["run_id"] = hostile.into();
+    omgs::runmeta::write_atomic(&path, &run.to_string()).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["bench", "score", "--cases"])
+        .arg(dir.join("cases.json"))
+        .arg("--runs")
+        .arg(dir.join("run-1"))
+        .arg("--runs")
+        .arg(dir.join("run-2"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for bytes in [&out.stdout, &out.stderr] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.lines().any(|l| l.starts_with("::error::")));
+    }
+    let mut result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["cohorts"][0]["runs"][0]["run_id"], hostile);
+    // Cohort names are computed today. Exercise the renderer boundary as well.
+    result["cohorts"][0]["cohort"] = hostile.into();
+    for text in [
+        String::from_utf8(out.stderr).unwrap(),
+        omgs::bench::markdown(&result),
+    ] {
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.lines().any(|l| l.starts_with("::error::")));
+        assert!(!text.contains("<img src=x"));
+        assert!(!text.contains("[x](javascript:"));
+        assert!(!text.contains(" @mention"));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -17,6 +17,7 @@ pub mod intent;
 pub mod ledger;
 pub mod mapping;
 pub mod model;
+pub mod out;
 pub mod paths;
 pub mod persona;
 pub mod platform;
@@ -166,7 +167,7 @@ pub fn stack_attack_classes(stack: &str) -> Vec<&'static str> {
 
 pub fn html_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
+    for ch in platform::escape_controls(&crate::handoff::display_text(input)).chars() {
         match ch {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),

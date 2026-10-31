@@ -199,7 +199,10 @@ fn prove_refuses_an_executor_that_does_not_match_the_pin() {
     assert_eq!(out.status.code(), Some(3), "{t}");
     assert!(t.contains("refusing to run"), "{t}");
     assert!(t.contains("target code was not executed"), "{t}");
-    assert!(!t.lines().any(|l| l.trim() == "ran"), "{t}");
+    assert!(
+        out.stdout.is_empty(),
+        "refused executor must emit no workload output: {t}"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -291,7 +294,11 @@ fn denials_hold_and_the_target_is_untouched() {
     let t = text(&out);
     assert!(curl_works, "host loopback positive control must answer");
     assert!(
-        t.lines().any(|line| line == "CURL_EXISTS"),
+        record_from(&t)["output"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .any(|line| line == "CURL_EXISTS"),
         "sandbox curl must exist: {t}"
     );
     for leak in [
