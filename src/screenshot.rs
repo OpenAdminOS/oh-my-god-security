@@ -331,7 +331,7 @@ pub fn helper(os: &str, browser: &Path, scratch: &Path) -> Result<(String, Strin
         ("set -m\n", "")
     };
     let text = format!(
-        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 0;; esac\nmkdir -p {tmp} && cd {tmp} || exit 0\n{monitor}TMPDIR=. {launch}{} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\" &\nbrowser=$!\n(i=0; while kill -0 \"$browser\" 2>/dev/null; do if [ \"$i\" -ge {CAPTURE_SECONDS} ]; then : > {out}/\"$1\".timeout; kill -9 -\"$browser\" 2>/dev/null || kill -9 \"$browser\" 2>/dev/null; break; fi; sleep 1; i=$((i + 1)); done) &\nwatchdog=$!\nwait \"$browser\"\nstatus=$?\nwait \"$watchdog\"\nkill -9 -\"$browser\" 2>/dev/null\n[ -f {out}/\"$1\".timeout ] || [ \"$status\" -eq 0 ] || echo \"$status\" > {out}/\"$1\".failed\nexit 0\n",
+        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 0;; esac\nmkdir -p {tmp} && cd {tmp} || exit 0\n{monitor}TMPDIR=. {launch}{} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\" &\nbrowser=$!\n(i=0; while kill -0 \"$browser\" 2>/dev/null; do if [ \"$i\" -ge {CAPTURE_SECONDS} ]; then kill -9 -\"$browser\" 2>/dev/null || kill -9 \"$browser\" 2>/dev/null; true > {out}/\"$1\".timeout 2>/dev/null; break; fi; sleep 1; i=$((i + 1)); done) &\nwatchdog=$!\nwait \"$browser\"\nstatus=$?\nwait \"$watchdog\"\nkill -9 -\"$browser\" 2>/dev/null\n[ -f {out}/\"$1\".timeout ] || [ \"$status\" -eq 0 ] || echo \"$status\" > {out}/\"$1\".failed 2>/dev/null\nexit 0\n",
         quoted(browser)?,
         flags(os).join(" "),
         quoted(&profile)?,
@@ -358,7 +358,10 @@ pub fn collect(scratch: &Path, to: &Path) -> (Vec<Shot>, Vec<String>) {
     let mut skipped = Vec::new();
     let dir = scratch.join(DIR);
     match std::fs::symlink_metadata(&dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (kept, skipped),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            skipped.push("the screenshot output directory was missing after the run".into());
+            return (kept, skipped);
+        }
         Err(e) => {
             skipped.push(format!("cannot inspect the screenshot directory: {e}"));
             return (kept, skipped);
@@ -725,7 +728,13 @@ mod tests {
         for refused in ["link.png: not a single-link", "hard.png: not a single-link"] {
             assert!(joined.contains(refused), "{refused}: {joined}");
         }
-        assert_eq!(collect(&base.join("missing"), &to), (vec![], vec![]));
+        assert_eq!(
+            collect(&base.join("missing"), &to),
+            (
+                vec![],
+                vec!["the screenshot output directory was missing after the run".to_string()]
+            )
+        );
         // A screenshot directory replaced by a link to host storage is never listed.
         #[cfg(unix)]
         {

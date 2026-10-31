@@ -4105,10 +4105,7 @@ fn a_stalled_screenshot_browser_is_stopped_and_named() {
         return;
     }
     let d = scratch("screenshot-stall");
-    let target = d.join("target");
-    let run = d.join("run");
     let browser = d.join("browser");
-    std::fs::create_dir_all(target.join("tests")).unwrap();
     std::fs::create_dir_all(&browser).unwrap();
     // The stub starts a child of its own before stalling; the watchdog must
     // stop the whole capture process group so the proof stays clean.
@@ -4122,54 +4119,73 @@ fn a_stalled_screenshot_browser_is_stopped_and_named() {
         std::fs::Permissions::from_mode(0o755),
     )
     .unwrap();
-    std::fs::write(
-        target.join("tests/shot.sh"),
-        "set -e\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/x.html\" || true\necho AFTER_CAPTURE\nexit 1\n",
-    )
-    .unwrap();
-    let init = omgs(
-        &d,
-        &[
-            "audit",
-            "init",
-            "--target",
-            target.to_str().unwrap(),
-            "--out",
-            run.to_str().unwrap(),
-            "--no-sensors",
-        ],
-    );
-    assert!(init.status.success(), "{}", text(&init));
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
-        .args([
-            "prove",
-            "--run",
-            run.to_str().unwrap(),
-            "--test",
-            "tests/shot.sh",
-            "--screenshots",
-            "--cmd",
-            "sh tests/shot.sh",
-        ])
-        .env("OMGS_HOME", &d)
-        .env(omgs::screenshot::BROWSER_ENV, browser.join("stall"))
-        .env(
-            "OMGS_MXC_EXEC",
-            omgs::sandbox::locate_executor().unwrap().path,
+    // The second harness removes the output directory first: the watchdog
+    // must still stop the browser group when it cannot write its marker.
+    for (case, prefix, expected) in [
+        (
+            "kept",
+            "",
+            "page: capture timed out after 20 s and the browser was stopped",
+        ),
+        (
+            "removed-output",
+            "rm -rf \"$(dirname \"$OMGS_SCREENSHOT\")/screenshots\"\n",
+            "the screenshot output directory was missing after the run",
+        ),
+    ] {
+        let target = d.join(format!("target-{case}"));
+        let run = d.join(format!("run-{case}"));
+        std::fs::create_dir_all(target.join("tests")).unwrap();
+        std::fs::write(
+            target.join("tests/shot.sh"),
+            format!("set -e\n{prefix}sh \"${{OMGS_SCREENSHOT:-/dev/null}}\" page \"file://$PWD/x.html\" || true\necho AFTER_CAPTURE\nexit 1\n"),
         )
-        .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
-    assert!(text(&out).contains("AFTER_CAPTURE"), "{}", text(&out));
-    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
-    assert!(record.clean(), "{record:?}");
-    let shots = record.screenshots.clone().unwrap();
-    assert!(shots.files.is_empty());
-    assert_eq!(
-        shots.skipped,
-        ["page: capture timed out after 20 s and the browser was stopped"]
-    );
-    assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+        let init = omgs(
+            &d,
+            &[
+                "audit",
+                "init",
+                "--target",
+                target.to_str().unwrap(),
+                "--out",
+                run.to_str().unwrap(),
+                "--no-sensors",
+            ],
+        );
+        assert!(init.status.success(), "{}", text(&init));
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .args([
+                "prove",
+                "--run",
+                run.to_str().unwrap(),
+                "--test",
+                "tests/shot.sh",
+                "--screenshots",
+                "--cmd",
+                "sh tests/shot.sh",
+            ])
+            .env("OMGS_HOME", &d)
+            .env(omgs::screenshot::BROWSER_ENV, browser.join("stall"))
+            .env(
+                "OMGS_MXC_EXEC",
+                omgs::sandbox::locate_executor().unwrap().path,
+            )
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{case}: {}", text(&out));
+        assert!(
+            text(&out).contains("AFTER_CAPTURE"),
+            "{case}: {}",
+            text(&out)
+        );
+        let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+        assert!(record.clean(), "{case}: {record:?}");
+        let shots = record.screenshots.clone().unwrap();
+        assert!(shots.files.is_empty());
+        assert_eq!(shots.skipped, [expected], "{case}");
+        assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 
