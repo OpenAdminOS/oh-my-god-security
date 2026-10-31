@@ -24,8 +24,30 @@ fn scratch(name: &str) -> PathBuf {
     omgs::platform::private_dir(&path).unwrap();
     path
 }
+
+fn cli_home() -> std::path::PathBuf {
+    struct Home(std::path::PathBuf);
+    impl Drop for Home {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    thread_local! {
+        static HOME: Home = {
+            let base = omgs::platform::temp_root().unwrap()
+                .join(format!("omgs-private-fixtures-{}", std::process::id()));
+            omgs::platform::create_private_tree(&base).unwrap();
+            let home = base.join(format!("home-{}", omgs::platform::random_nonce().unwrap()));
+            omgs::platform::private_dir(&home).unwrap();
+            Home(home)
+        };
+    }
+    HOME.with(|home| home.0.clone())
+}
+
 fn cli(args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", cli_home())
         .args(args)
         .output()
         .unwrap()
@@ -90,7 +112,7 @@ fn classifier_table_covers_every_class_and_stack_conventions() {
         ("data/export.json", Class::Code),
         ("export.csv", Class::Code),
         ("package.json", Class::Code),
-        ("assets/icon.png", Class::Code),
+        ("assets/icon.png", Class::Asset),
         ("contest/main.rs", Class::Code),
     ] {
         assert_eq!(classify(path), class, "{path}");
@@ -1076,6 +1098,49 @@ fn build_names_and_txt_configuration_are_code_before_docs_or_data() {
     let out = cli(&["critic", "--run", run.to_str().unwrap()]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("project:.:generic"));
+    let parent_classes = ledger["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == "project:.:generic")
+        .unwrap()["attack_classes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .chain(std::iter::once("command_injection"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert!(cli(&[
+        "ledger",
+        "add",
+        "--ledger",
+        run.join("coverage-ledger.json").to_str().unwrap(),
+        "--unit",
+        "build:command",
+        "--surface",
+        "CMakeLists.txt:execute_process",
+        "--classes",
+        &parent_classes,
+        "--mapping",
+        r##"{"scope_paths":[{"path":"CMakeLists.txt","operation":"execute_process"}]}"##
+    ])
+    .status
+    .success());
+    assert!(cli(&[
+        "ledger",
+        "set",
+        "--ledger",
+        run.join("coverage-ledger.json").to_str().unwrap(),
+        "--unit",
+        "build:command",
+        "--status",
+        "covered",
+        "--evidence",
+        "CMakeLists.txt"
+    ])
+    .status
+    .success());
     assert!(cli(&[
         "ledger",
         "set",
@@ -1086,7 +1151,9 @@ fn build_names_and_txt_configuration_are_code_before_docs_or_data() {
         "--status",
         "covered",
         "--evidence",
-        "CMakeLists.txt"
+        "CMakeLists.txt",
+        "--mapping",
+        r#"{"child_units":["build:command"]}"#
     ])
     .status
     .success());
@@ -1122,6 +1189,14 @@ fn every_excluded_class_requires_review_and_reports_the_reason() {
             (0..26)
                 .rev()
                 .map(|i| format!("vendor/item{i:02}.unknown"))
+                .collect(),
+        ),
+        (
+            "asset",
+            "assets:excluded",
+            (0..26)
+                .rev()
+                .map(|i| format!("public/icon{i:02}.png"))
                 .collect(),
         ),
         (
@@ -1600,4 +1675,51 @@ fn completed_review_fixture(run: &std::path::Path) {
             omgs::attempts::append(run, serde_json::from_value(event).unwrap()).unwrap();
         }
     }
+}
+
+#[test]
+fn cli_helper_overrides_inherited_home_with_private_fixture_state() {
+    if std::env::var_os("OMGS_TEST_HOME_ISOLATION").is_some() {
+        let inherited = PathBuf::from(std::env::var_os("OMGS_HOME").unwrap());
+        assert!(inherited.is_file());
+        let home = cli_home();
+        assert_ne!(home, inherited);
+        omgs::platform::check_private_dir(&home).unwrap();
+        let dir = scratch("home-isolation-child");
+        let target = dir.join("target");
+        omgs::platform::private_dir(&target).unwrap();
+        init(&target, &dir.join("run"), &[]);
+        assert!(std::fs::read_dir(home).unwrap().next().is_some());
+        assert_eq!(
+            std::fs::read(&inherited).unwrap(),
+            b"inherited state must remain untouched"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        return;
+    }
+    let dir = scratch("home-isolation-parent");
+    let inherited = dir.join("inherited-home");
+    std::fs::write(&inherited, b"inherited state must remain untouched").unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cli_helper_overrides_inherited_home_with_private_fixture_state",
+            "--nocapture",
+        ])
+        .env("OMGS_TEST_HOME_ISOLATION", "1")
+        .env("OMGS_HOME", &inherited)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(inherited).unwrap(),
+        b"inherited state must remain untouched"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }

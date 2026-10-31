@@ -31,8 +31,9 @@ policy takes precedence and conflicting overrides fail. The persona is recorded 
 never changes the evidence bar, sandbox rules or verdict semantics. Without --persona, the existing
 unbounded budget remains unless --budget is supplied.
 
-Every inventory class stays accountable. Test, docs, data and vendored groups each get a `planned`
-exclusion unit with their total count and first 20 sorted paths across all files. Assign these units
+Every inventory class stays accountable. Test, docs, data, assets and vendored groups each get a
+`planned` exclusion unit with their total count and first 20 sorted paths across all files.
+This includes `assets:excluded`, which blocks the critic until resolved. Assign these units
 to hunters to skim or sample, then hunt with `covered` plus evidence or record `out_of_scope` with
 `--note "reviewed, not security relevant: <reason>"`. For out_of_scope, cite at least one displayed
 sampled path with --evidence. Describe the review and why the group is irrelevant; classification
@@ -46,7 +47,9 @@ to host execution. Target copies, scanner runtime roots, rules and the OSV datab
 Private scratch is outside run artifacts and removed after supervised cleanup on every exit path;
 cleanup failures remain gaps. Linux requests a 2 GiB cgroup memory limit and 128 tasks where the
 user scope is available. Elsewhere no total memory cap is claimed. Source input is bounded to 16
-MiB/file, 64 MiB total, 10,000 entries and 64 directory levels; omissions are gaps. Every sensor has
+MiB/file, 64 MiB total, 100,000 enumerated entries, 10,000 staged files and 64 directory levels.
+Omissions retain bounded per path skip records and omitted record counts as gaps. A skipped
+directory describes an unenumerated subtree, not a count of its files. Every sensor has
 a 120 second deadline and 4 MiB output cap. See README for the teardown margin.
 
 TruffleHog uses `--no-verification --no-update --no-ignore-tag`. OSV-Scanner uses

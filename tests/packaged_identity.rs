@@ -397,6 +397,47 @@ fn source_archive_revision_supports_metadata_and_unknown_without_git() {
 }
 
 #[test]
+fn first_init_materializes_a_bundle_in_a_missing_long_data_directory() {
+    let fixture = Fixture::new();
+    let target = fixture.0.join("target");
+    std::fs::create_dir(&target).unwrap();
+    let mut home = fixture.0.clone();
+    for i in 0..6 {
+        home.push(format!("data-{i}-{}", "x".repeat(40)));
+    }
+    assert!(home.as_os_str().len() > 260);
+    assert!(!home.exists());
+    // Use ordinary paths, as an OMGS_HOME supplied by a user would. Both the
+    // private directory and file creation calls must support long paths.
+    for name in ["first", "cached"] {
+        let run = fixture.0.join(name);
+        let out = cli()
+            .env("OMGS_HOME", &home)
+            .args(["audit", "init", "--no-sensors", "--target"])
+            .arg(&target)
+            .arg("--out")
+            .arg(&run)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let meta = omgs::runmeta::read(&run).unwrap();
+        let selected = Path::new(meta["skill_dir"].as_str().unwrap());
+        assert_eq!(
+            omgs::setup::check_identity(selected).unwrap(),
+            omgs::setup::bundled_digest()
+        );
+        assert_eq!(
+            std::fs::canonicalize(selected).unwrap(),
+            std::fs::canonicalize(
+                home.join("skill-bundles")
+                    .join(omgs::setup::bundled_digest())
+            )
+            .unwrap()
+        );
+    }
+}
+
+#[test]
 fn default_review_binds_embedded_bundle_despite_stale_installed_skill() {
     let fixture = Fixture::new();
     let stale = fixture.0.join(".agents/skills/omgs-security-review");

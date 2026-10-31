@@ -42,7 +42,8 @@ Write the structured map to `architecture.json` in the output directory, followi
 [schemas/architecture.schema.json](schemas/architecture.schema.json). Use these exact keys: `stack`
 (detected); `zones` (ordered least to most trusted, each `id` + `name`); `components` (each `id`,
 `name`, `zone`, optional `kind`/`tech`/`path`, and `entry_point: true` when externally reachable);
-`principals`; `boundaries` (each `id`, `name`, `between` of exactly two zone ids, `enforcement`);
+`principals`; `boundaries` (each `id`, `name`, `between` of exactly two zone ids,
+`enforcement` as an array of strings);
 `flows` (each `from` and `to` component id, optional `data`/`protocol`/`authn`/`authz` and `crosses`
 set to a boundary id when the flow crosses one); `input_surfaces` (each `id`, `component`,
 `attacker`); and `unexamined` stated plainly. Unrecognised keys are silently ignored, so match these
@@ -60,6 +61,8 @@ A unit is one concrete surface, one violated boundary under investigation, and o
 not use whole folders as units or multiply by irrelevant classes. Split HTTP methods and materially
 different principal/resource operations. Multiple units may share a root cause and later deduplicate
 to one fingerprint.
+
+Use [schemas/coverage-ledger.schema.json](schemas/coverage-ledger.schema.json) for the ledger.
 
 Each unit records:
 
@@ -79,7 +82,8 @@ units discovered during the run with `omgs ledger add --ledger <run-dir>/coverag
 <id> --surface <s> --classes <a,b>`.
 
 Example unit: `GET /api/projects/[id]` by a member of tenant A, tenant A to tenant B project rows,
-`tenant_isolation`, sink `loadProject`, invariant that only current-tenant rows can be returned.
+`idor_tenant_isolation`, sink `loadProject`, invariant that only current-tenant rows can be
+returned.
 Check both the application predicate and the effective database role before proposing a violation.
 
 Seed per-boundary units when a target runs privileged components; one whole-repo unit is too coarse
@@ -115,7 +119,104 @@ execute them to complete the map. For libraries, exported functions and callers 
 trace caller capabilities and validation before each sensitive return or side effect.
 
 Seeded stack units are mapping checklists, not hunter assignments. Before dispatch, create bounded
-surface/boundary/class units with `ledger add`, then close the checklist with evidence naming those
-units and a note describing the partition. Give each candidate one primary owner; additional units
-cite the same fingerprint rather than re-filing it. Never assign a whole-stack residual sweep over
-units another hunter already owns. The critic checks dispositions, not semantic non-overlap.
+surface/boundary/class units. A covered checklist requires `child_units` with 1 to 256 existing
+unit ids, all covered or explicitly out of scope. Each child declares `scope_paths`, such as
+`[{"path":"app/api/items/route.ts","operation":"GET"}]`, with one attack class per bounded
+decision. The critic rejects shared or overlapping path scopes for the same class across different
+children. Split a large partition into nested checklists. Parent checklists describe the partition
+and own no candidates.
+
+Each scope is an object with a required relative `path` and an optional `operation`. Literal
+`#` characters in directory and file names stay in `path`, for example
+`{"path":"src#ipc/Decision#read.swift","operation":"read"}`. Omit `operation` to own the whole
+path and its descendants. Operation identifiers are case-sensitive ASCII strings matching
+`[A-Za-z_][A-Za-z0-9_.:-]{0,127}` (1 to 128 characters). Use a stable identifier for source
+symbols whose spelling does not fit this grammar. Unknown fields and null operations are refused.
+Legacy string scopes without `#` remain accepted as plain paths with no operation. Any string
+containing `#` is refused because it could name a literal path or a path plus operation. Migrate
+`"dir/a#b"` to `{"path":"dir/a#b"}` for the literal filename or
+`{"path":"dir/a","operation":"b"}` for operation `b` on `dir/a`. No separator is inferred.
+All paths resolve against `scope_root` with existence, containment, link and filesystem alias
+checks before a partition closes. A legacy ledger without `scope_root` requires target context
+before closure.
+
+Route file checklists require `operations`, an object mapping every method/operation name to its
+child unit id, and `syntax_review: "complete"`. Enumerate methods by reading source only. Include
+reexports, aliases, default handlers, wrappers and delegated operations. Never import target code
+or execute a parser supplied by the target. Uncertain syntax means `syntax_review: "uncertain"`
+and a blocked checklist until a complete manual enumeration is possible. Do not infer a missing
+method from a text search or a failed parse. Keep native operation lists to the same standard.
+
+Use `ledger add` or `ledger set` with `--mapping '<json-object>'` to merge mapping fields under
+the ledger lock. For example, add a child with
+`--mapping '{"scope_paths":[{"path":"src/route.ts","operation":"GET"}]}'`, then close its parent
+with
+
+```sh
+--mapping '{"child_units":["route-get"],"operations":{"GET":"route-get"},"syntax_review":"complete"}'
+```
+
+Create and reconcile children before closing their checklist. A rejected update writes nothing.
+
+For a legacy ledger without `scope_root`, run `omgs ledger migrate --run <run-dir>` before
+closing partitions. Migration reads only that run's `run-metadata.json` target, requires an
+available absolute directory without a root link or reparse point, validates the resulting ledger,
+and writes under the run lock. It preserves other fields and never accepts a caller-supplied root.
+An existing root must identify the same filesystem object as the recorded target. Missing metadata,
+unavailable targets and invalid mapping must be repaired before migration; rejection writes nothing.
+CLI transitions and the critic verify this binding before resolving scope paths.
+
+Partial examination is recorded with `partial: true` and `residual_units` naming 1 to 256 separate
+units for every unexamined remainder before marking the examined unit covered. A candidate does
+not close its residuals. Missing, self, duplicate or cyclic references fail validation. Planned
+residuals still fail the critic; blocked/deferred residuals remain disclosed gaps. Never replace a
+partial note with a claim that the whole source was examined.
+
+Binary assets have an `assets:excluded` review unit with a count and at most 20 sorted paths.
+Scripts under public directories remain code. Exclusion requires examination or the same explicit
+reviewed exclusion reason as documentation and dependencies. Classification never removes a path
+from accountability. Sensor staging prioritizes discovered first-party source, then other inputs.
+`sensors.json` retains up to 128 skipped path/reason records per scanner, with paths bounded to
+1024 characters. The summary states omitted record counts; a directory bound describes an
+unenumerated subtree, never a count of all its files. Resolve the sensor inventory ledger gap by
+reviewing the retained manifest and accounting for unlisted scope. A truncated manifest cannot
+establish complete scanning, and zero matches cannot close that gap.
+
+## Native IPC and credential boundaries
+
+Read native sources and launchd property lists as text. Record these checks explicitly:
+
+- Listener creation, Mach service name, launchd `MachServices`, `UserName`, executable path and
+  ownership assumptions. Root service effects and installation remain manual validation limits.
+- `listener(_:shouldAcceptNewConnection:)`, audit-token identity, signer/team/entitlement checks,
+  and whether caller identity stays bound to each connection and operation.
+- Exported object and `NSXPCInterface`, protocol methods, argument/reply class allowlists,
+  `setClasses` and secure decoding. Enumerate reply payloads as well as inbound objects.
+- Per-operation resource authorization, credential getters, disclosure recipients, and downstream
+  privileged operations. Admission alone does not authorize all operations or secret readback.
+
+Small map fragment (use existing zone ids in the full map):
+
+```json
+{
+  "boundaries": [{
+    "id": "ipc-callers", "name": "Local caller to privileged service",
+    "between": ["local-client", "service"],
+    "enforcement": ["Sources/Listener.swift: caller audit-token check",
+                    "Sources/Service.swift: per-operation resource check"]
+  }],
+  "unexamined": ["Live launchd registration and privileged effects"]
+}
+```
+
+Partition listener/caller authorization as `ipc_authorization`, credential-return policy as
+`secret_disclosure`, and privileged effects as `privileged_local_ops`. Source hints seed native
+operation checklists but never prove their enumeration complete. Ask `native.accepted-callers`,
+`native.secret-disclosure` and `native.privileged-operations` when policy is unresolved.
+
+Sensor hit counts use distinct fingerprints. Repeated observations retain `duplicate_sources` on
+the surviving hit: the original `first_source_index`, duplicate `count`, sampled `source_indexes`
+and `omitted` count. Indices address the ordered normalized scanner metadata stream before
+compaction. Up to 128 duplicate indices are retained across the whole report. The surviving hit
+supplies the shared tool, rule, path, line and package identity. Matched values and raw scanner
+content remain discarded. Removing duplicate observations never closes their ledger unit.

@@ -1,6 +1,6 @@
 # Webhooks and integrations
 
-Use for `webhook_verification`, `webhook_replay`, and `integration_url` units. The result must be a privileged local effect by an unauthorized event or destination, not simply an unusual handler shape.
+Use for `webhook_signature`, `webhook_replay`, and `integration_url` units. The result must be a privileged local effect by an unauthorized event or destination, not simply an unusual handler shape.
 
 ## What to hunt
 

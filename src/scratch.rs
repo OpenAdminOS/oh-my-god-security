@@ -572,7 +572,6 @@ mod usage {
     // NTFS alternate streams consume scratch too. Pin the non-reparse file
     // without delete sharing before enumerating streams by its stable path.
     fn named_streams(path: &Path, used: &mut (u64, usize), cap: (u64, usize)) -> io::Result<()> {
-        use std::os::windows::ffi::OsStrExt;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(3)
@@ -596,7 +595,7 @@ mod usage {
             fn FindNextStreamW(handle: *mut core::ffi::c_void, data: *mut StreamData) -> i32;
             fn FindClose(handle: *mut core::ffi::c_void) -> i32;
         }
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let wide = crate::windows_path::wide(path)?;
         let mut data = std::mem::MaybeUninit::<StreamData>::zeroed();
         // SAFETY: path and correctly sized stream storage remain live.
         let handle = unsafe { FindFirstStreamW(wide.as_ptr(), 0, data.as_mut_ptr(), 0) };
@@ -1124,6 +1123,53 @@ mod process_tests {
 
 #[cfg(all(test, windows))]
 mod windows_tests {
+    #[test]
+    fn ordinary_long_paths_support_scratch_usage_and_stream_limits() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let base = crate::platform::home().unwrap().join(format!(
+            "omgs-long-scratch-test-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&base).unwrap();
+        // Reproduce scratch_root's ordinary spelling without changing OMGS_HOME
+        // process-wide while other tests are running.
+        let mut parent = std::path::PathBuf::from(crate::platform::mxc_path(&base));
+        while parent.as_os_str().encode_wide().count() <= 280 {
+            parent.push("long-scratch-home-component");
+            crate::platform::create_private_dir_new(&parent).unwrap();
+        }
+        assert!(!parent.as_os_str().to_string_lossy().starts_with(r"\\?\"));
+        let mut scratch = super::Scratch::create_in(&parent, "sensor", |_| Ok(())).unwrap();
+        let payload = scratch.path();
+        let nested = payload.join("nested");
+        crate::platform::create_private_dir_new(&nested).unwrap();
+        let file = nested.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        super::check_usage(&payload, 32768, 10).unwrap();
+        super::UsageMonitor::start(payload.clone())
+            .finish()
+            .unwrap();
+
+        // Exercise enumeration on the root, nested directory and regular file.
+        for path in [&payload, &nested, &file] {
+            let mut stream = path.as_os_str().to_os_string();
+            stream.push(":extra");
+            std::fs::write(&stream, vec![0; 8192]).unwrap();
+            super::check_usage(&payload, 32768, 10).unwrap();
+            assert!(super::check_usage(&payload, 4096, 10)
+                .unwrap_err()
+                .contains("byte limit exceeded"));
+            assert!(super::check_usage(&payload, 32768, 2)
+                .unwrap_err()
+                .contains("entry limit exceeded"));
+            std::fs::remove_file(&stream).unwrap();
+        }
+        scratch.cleanup().unwrap();
+        drop(scratch);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn writable_usage_counts_directory_streams_including_root() {
         let parent = crate::platform::home().unwrap().join(format!(

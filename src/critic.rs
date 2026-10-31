@@ -111,6 +111,9 @@ pub fn validate_candidate(c: &Candidate) -> Vec<String> {
             errors.push(format!("{name} is empty"));
         }
     }
+    if let Err(error) = crate::classes::validate(&c.attack_class) {
+        errors.push(error);
+    }
     if c.location.line == Some(0) {
         errors.push("location.line must be one-based".into());
     }
@@ -151,7 +154,11 @@ pub fn critique(
         gaps.push(format!("ledger {e}"));
     }
     for u in &ledger.units {
-        if u.status == "planned"
+        if ((u.id.starts_with("stack:")
+            || u.id.starts_with("project:")
+            || u.extra.contains_key("checklist"))
+            && !["covered", "out_of_scope"].contains(&u.status.as_str()))
+            || u.status == "planned"
             || u.status == "candidate"
             || ((crate::ledger::is_exclusion(u) || crate::ledger::is_inventory_gap(u))
                 && !["covered", "out_of_scope"].contains(&u.status.as_str()))
@@ -186,6 +193,14 @@ pub fn critique(
             }
         }
         for id in &c.unit_ids {
+            if ledger.units.iter().any(|u| {
+                u.id == *id
+                    && (u.id.starts_with("stack:")
+                        || u.id.starts_with("project:")
+                        || u.extra.contains_key("checklist"))
+            }) {
+                gaps.push(format!("{at}: mapping checklist '{id}' cannot own a candidate; use its bounded child unit"));
+            }
             if !unit_ids.contains(id.as_str()) {
                 gaps.push(format!("{at}: unit '{id}' is not in the ledger"));
             }
@@ -340,6 +355,7 @@ fn critique_dir_inner(
         crate::run_artifact::LEDGER_BYTES,
     )?)
     .map_err(|e| format!("parse coverage-ledger.json: {e}"))?;
+    crate::mapping::validate_run_root(&ledger, dir)?;
     // Every candidates*.json must be a readable regular file: a symlink, a
     // directory, or an unreadable entry is an error, never silently skipped,
     // so no hunter handoff can disappear from reconciliation.

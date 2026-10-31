@@ -43,3 +43,14 @@ When a record turns on intent, set its `intent_id` to one of these library quest
 - `local.installer-signer`: Must every installed payload be signed by one expected team and match the requested version?
 - `local.downgrade`: May an older version ever replace a newer installed version?
 - `script.dry-run-executes`: Must a dry run be free of side effects, including executing commands built from input?
+
+## Native IPC classes
+
+Use `ipc_authorization` for listener admission and per-operation caller/resource authorization.
+Use `secret_disclosure` for credential-return boundaries, and `privileged_local_ops` for privileged
+effects. These identifiers are registered in `intent/classes.json`. Read exported protocols,
+argument and reply class allowlists, audit-token checks and launchd configuration as source.
+Connection admission does not establish permission to disclose credentials or perform every
+operation. Ask `native.accepted-callers`, `native.secret-disclosure` and
+`native.privileged-operations` when the intended policy is missing. Follow the native mapping
+checklist in `RECONNAISSANCE.md`; privileged runtime effects remain validation limits.

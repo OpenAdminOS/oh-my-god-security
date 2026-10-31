@@ -1,4 +1,5 @@
 //! Owner-only Windows run storage. Unknown ACE types fail closed.
+use crate::windows_path::wide;
 use std::ffi::c_void;
 use std::io::{Error, Result};
 use std::os::windows::ffi::OsStrExt;
@@ -109,14 +110,6 @@ fn user() -> Result<Vec<usize>> {
         }
         Ok(data)
     }
-}
-fn wide(path: &Path) -> Result<Vec<u16>> {
-    let mut text: Vec<u16> = path.as_os_str().encode_wide().collect();
-    if text.contains(&0) {
-        return Err(Error::other("NUL in storage path"));
-    }
-    text.push(0);
-    Ok(text)
 }
 
 /// Open exactly one leaf relative to the retained staging directory handle.
@@ -549,6 +542,26 @@ mod tests {
                 0
             );
         }
+    }
+
+    #[test]
+    fn long_ordinary_paths_retain_acl_enforcement() {
+        let base = scratch("long-path");
+        let mut dir = std::path::PathBuf::from(crate::platform::mxc_path(&base));
+        while dir.as_os_str().encode_wide().count() <= 280 {
+            dir.push("long-private-storage-component");
+            crate::platform::create_private_dir_new(&dir).unwrap();
+        }
+        let file = dir.join("record");
+        crate::platform::write_private_new(&file, b"private").unwrap();
+        check(&dir).unwrap();
+        check(&file).unwrap();
+        set_acl(&file, "(A;;FW;;;BU)");
+        let error = check(&file).unwrap_err().to_string();
+        assert!(error.contains("writable by another principal"), "{error}");
+        assert!(error.contains(&file.display().to_string()), "{error}");
+        assert!(!error.contains(r"\\?\"), "{error}");
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

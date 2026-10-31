@@ -184,6 +184,9 @@ fn validate_inner(file: &FindingsFile, finalized: bool) -> Vec<String> {
         {
             errors.push(format!("{at}: verification requires final state and a completed attempt; drafts are not decisions"));
         }
+        if let Err(error) = crate::classes::validate(&f.attack_class) {
+            errors.push(format!("{at}: {error}"));
+        }
         let expected = crate::fingerprint(&f.attack_class, &f.entry_point, &f.sink, &f.boundary);
         if f.fingerprint.is_empty() {
             errors.push(format!("{at}: fingerprint is empty, expected {expected}"));

@@ -39,7 +39,8 @@ SKILL_DIR/schemas/candidates.schema.json. Never directly invent a finding.
 
 ## Excluded file accountability
 
-Check every `tests:excluded`, `docs:excluded`, `data:excluded` and `vendored:excluded` unit.
+Check every `tests:excluded`, `docs:excluded`, `data:excluded`, `assets:excluded` and
+`vendored:excluded` unit.
 Classification is a heuristic for priority, stack detection and size statistics, never proof that
 files are inert. Confirm that hunters skimmed or sampled the group and recorded either hunting
 evidence (`covered`) or `out_of_scope` with `reviewed, not security relevant: <reason>`. Challenge

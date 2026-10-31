@@ -117,13 +117,14 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "handoff" => ("--run --finding", false),
         "stage" => ("--run", false),
         "architecture" => ("--in --out", false),
+        "ledger" if args.first().is_some_and(|a| a == "migrate") => ("--run", true),
         "ledger" if args.first().is_some_and(|a| a == "ingest") => ("--ledger --dispositions", true),
         "ledger" if args.first().is_some_and(|a| a == "list") => ("--ledger", true),
         "ledger" if args.first().is_some_and(|a| a == "add") => {
-            ("--ledger --unit --surface --classes --status --note", true)
+            ("--ledger --unit --surface --classes --status --note --mapping", true)
         }
         "ledger" if args.first().is_some_and(|a| a == "set") => {
-            ("--ledger --unit --status --evidence --note --attempt-ref --blocker-ref", true)
+            ("--ledger --unit --status --evidence --note --mapping --attempt-ref --blocker-ref", true)
         }
         "gate" => ("--target --base --head --run", false),
         "critic" => ("--run", false),
@@ -205,7 +206,14 @@ fn cli_error(error: &str) {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Ok(args) = std::env::args_os()
+        .skip(1)
+        .map(|a| a.into_string())
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        cli_error("command arguments must be UTF-8");
+        return ExitCode::from(2);
+    };
     let Some(cmd) = args.first().map(|s| s.as_str()) else {
         cli_error("a command is required");
         return ExitCode::from(2);
@@ -546,10 +554,12 @@ fn cmd_bench(args: &[String]) -> Result<(), String> {
 
 fn cmd_fingerprint(args: &[String]) -> Result<(), String> {
     let get = |n: &str| flag(args, n).ok_or_else(|| format!("fingerprint requires {n}"));
+    let class = get("--attack-class")?;
+    omgs::classes::validate(&class)?;
     println!(
         "{}",
         omgs::fingerprint(
-            &get("--attack-class")?,
+            &class,
             &get("--entry-point")?,
             &get("--sink")?,
             &get("--boundary")?
@@ -2443,6 +2453,9 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
     let target_raw = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
     let target =
         std::fs::canonicalize(&target_raw).map_err(|e| format!("target {target_raw}: {e}"))?;
+    target
+        .to_str()
+        .ok_or("audit init requires a UTF-8 target path")?;
     let repo = target
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -2662,14 +2675,18 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             || rel.starts_with("pages/api/")
             || rel.contains("/pages/api/");
         if is_route {
-            units.push(Unit::new(
+            let mut unit = Unit::new(
                 &format!("route:{rel}"),
                 rel,
                 &["missing_authz", "idor_tenant_isolation", "client_only_auth"],
                 "planned",
-            ));
+            );
+            unit.extra
+                .insert("checklist".into(), serde_json::json!("operations"));
+            units.push(unit);
         }
     }
+    units.extend(omgs::mapping::native_units(&target, &native_paths));
     for project in &projects {
         for stack in &project.stacks {
             let id = if project.root == "." {
@@ -2683,6 +2700,8 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
                 &omgs::stack_attack_classes(stack),
                 "planned",
             );
+            unit.extra
+                .insert("checklist".into(), serde_json::json!("partition"));
             unit.note = Some("Mapping placeholder: split into bounded surface/boundary/class units before hunter dispatch; cite those unit ids when closing this checklist. Never use it to duplicate candidate ownership.".into());
             units.push(unit);
         }
@@ -2695,24 +2714,10 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             "planned",
         ));
     }
-    for (class, id, label) in [
-        (
-            omgs::paths::Class::Vendored,
-            "vendored:excluded",
-            "vendored or generated",
-        ),
-        (omgs::paths::Class::Docs, "docs:excluded", "documentation"),
-        (
-            omgs::paths::Class::Data,
-            "data:excluded",
-            "large structured data",
-        ),
-        (
-            omgs::paths::Class::Test,
-            "tests:excluded",
-            "test or fixture",
-        ),
-    ] {
+    for class in counts.keys().copied() {
+        let Some((id, label)) = omgs::paths::exclusion_group(class) else {
+            continue;
+        };
         let count = counts.get(&class).copied().unwrap_or(0);
         if count > 0 {
             let mut unit = Unit::new(id, &format!("{count} {label} file(s)"), &[], "planned");
@@ -2815,6 +2820,9 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
         units,
         ..Ledger::default()
     };
+    ledger
+        .extra
+        .insert("scope_root".into(), serde_json::json!(target));
     let started_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -3096,10 +3104,20 @@ fn flags(args: &[String], name: &str) -> Vec<String> {
 }
 
 fn cmd_ledger(args: &[String]) -> Result<(), String> {
-    let usage = "usage: omgs ledger list|add|set --ledger <file> ...";
+    let usage =
+        "usage: omgs ledger list|add|set --ledger <file> ...; omgs ledger migrate --run <dir>";
     let sub = args.first().map(|s| s.as_str()).ok_or(usage)?;
     let rest = &args[1..];
-    let path = flag(rest, "--ledger").ok_or("ledger requires --ledger <file>")?;
+    let path = if sub == "migrate" {
+        let run = flag(rest, "--run").ok_or("ledger migrate requires --run <dir>")?;
+        Path::new(&run)
+            .join("coverage-ledger.json")
+            .to_str()
+            .ok_or("run path must be UTF-8")?
+            .to_string()
+    } else {
+        flag(rest, "--ledger").ok_or("ledger requires --ledger <file>")?
+    };
     let dir = Path::new(&path)
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -3112,10 +3130,22 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
 }
 
 fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
-    let usage = "usage: omgs ledger list|add|set --ledger <file> ...";
+    let usage =
+        "usage: omgs ledger list|add|set --ledger <file> ...; omgs ledger migrate --run <dir>";
     let path = path.to_string();
     let mut ledger = read_ledger(&path)?;
+    let run = Path::new(&path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    omgs::mapping::validate_run_root(&ledger, run)?;
     match sub {
+        "migrate" => {
+            omgs::mapping::migrate(&mut ledger, run)?;
+            write_ledger(&path, &ledger)?;
+            println!("migrated scope_root from run-metadata.json");
+            Ok(())
+        }
         "ingest" => {
             let input =
                 flag(rest, "--dispositions").ok_or("ledger ingest requires --dispositions")?;
@@ -3170,9 +3200,15 @@ fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
                 .map(str::trim)
                 .filter(|c| !c.is_empty())
                 .collect();
+            for class in &classes {
+                omgs::classes::validate(class)?;
+            }
             let status = flag(rest, "--status").unwrap_or_else(|| "planned".into());
             let mut new = Unit::new(&unit, &surface, &classes, &status);
             new.note = flag(rest, "--note").filter(|n| !n.trim().is_empty());
+            if let Some(mapping) = flag(rest, "--mapping") {
+                omgs::mapping::apply_metadata(&mut new, &mapping)?;
+            }
             add_unit(&mut ledger, new)?;
             write_ledger(&path, &ledger)?;
             println!("{status}: {unit}");
@@ -3186,6 +3222,14 @@ fn ledger_locked(sub: &str, rest: &[String], path: &str) -> Result<(), String> {
             }
             let evidence = flags(rest, "--evidence");
             let note = flag(rest, "--note");
+            if let Some(mapping) = flag(rest, "--mapping") {
+                let target = ledger
+                    .units
+                    .iter_mut()
+                    .find(|u| u.id == unit)
+                    .ok_or("ledger unit not found")?;
+                omgs::mapping::apply_metadata(target, &mapping)?;
+            }
             set_status(&mut ledger, &unit, &status, &evidence, note.as_deref())?;
             let unit = ledger.units.iter_mut().find(|u| u.id == unit).unwrap();
             for (flag_name, key) in [
@@ -3912,10 +3956,12 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
             let class = flag(rest, "--attack-class").map(|c| c.replace('-', "_"));
             let class = class.map(|c| if c == "fail_closed" { "fail_closed_semantics".into() } else { c });
             if let Some(c) = &class {
-                let valid: std::collections::BTreeSet<_> = omgs::intent::list(None, None).iter().flat_map(|q| q.attack_classes.iter().cloned()).collect();
-                if !valid.contains(c) { return Err(format!("unknown attack class {c}; expected {}", valid.into_iter().collect::<Vec<_>>().join(", "))); }
+                if !omgs::classes::known(c) { return Err(format!("unknown attack class {c}; expected {}", omgs::classes::all().join(", "))); }
             }
-            for q in omgs::intent::list(stack.as_deref(), class.as_deref()) {
+            let class = class.map(|c| omgs::classes::replacement(&c).unwrap_or(c));
+            let questions = omgs::intent::list(stack.as_deref(), class.as_deref());
+            if questions.is_empty() { println!("no intent questions for this class/stack; record unresolved owner intent explicitly"); }
+            for q in questions {
                 println!("{}: {}", q.id, q.question);
                 if !q.answers.is_empty() {
                     println!("  answers: {}", q.answers.join(" | "));
@@ -4379,6 +4425,7 @@ mod cli_tests {
         ("handoff", ""),
         ("stage", ""),
         ("architecture", ""),
+        ("ledger", "migrate"),
         ("ledger", "ingest"),
         ("ledger", "list"),
         ("ledger", "add"),
@@ -4432,6 +4479,19 @@ mod cli_tests {
                 }
                 ("route", _) => sections.push(("models_path", function(source, "models_path"))),
                 ("ledger", _) => {
+                    // The migration path reads --run; other ledger commands
+                    // select an explicit --ledger. Audit each actual branch.
+                    let paths = sections[0]
+                        .1
+                        .split_once("if sub == \"migrate\" {")
+                        .unwrap()
+                        .1;
+                    let (migration, existing) = paths.split_once("} else {").unwrap();
+                    sections[0].1 = if sub == "migrate" {
+                        migration
+                    } else {
+                        existing.split("};").next().unwrap()
+                    };
                     let body = function(source, "ledger_locked");
                     let branch = body.split_once(&format!("\"{sub}\" => {{")).unwrap().1;
                     sections.push((

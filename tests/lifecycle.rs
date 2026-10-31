@@ -2499,3 +2499,36 @@ fn report_renders_the_proposed_budget_without_persisting_during_rendering() {
     }
     assert!(omgs::accounting::aggregate(&serde_json::Map::new()).unwrap()["tokens"].is_null());
 }
+
+#[test]
+fn ledger_migration_validates_before_committing_and_reopens_saved_completion() {
+    let run = finished_review();
+    assert!(publish_report(&run, &[], &run.0).status.success());
+    let before = publication_bytes(&run);
+    let ledger = std::fs::read(run.0.join("coverage-ledger.json")).unwrap();
+    let rejected = cli(&run, &["ledger", "migrate"]);
+    assert_eq!(rejected.status.code(), Some(2));
+    assert_eq!(publication_bytes(&run), before);
+    assert_eq!(
+        std::fs::read(run.0.join("coverage-ledger.json")).unwrap(),
+        ledger
+    );
+    let target = run.1.join("target");
+    omgs::platform::create_private_dir(&target).unwrap();
+    omgs::runmeta::update(&run.0, |meta| {
+        meta.insert("target".into(), json!(target));
+        Ok(())
+    })
+    .unwrap();
+    let migrated = cli(&run, &["ledger", "migrate"]);
+    assert!(
+        migrated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    let ledger: Value =
+        serde_json::from_slice(&std::fs::read(run.0.join("coverage-ledger.json")).unwrap())
+            .unwrap();
+    assert_eq!(ledger["scope_root"], json!(target));
+    assert_eq!(run.meta()["run_status"], "in_progress");
+}
