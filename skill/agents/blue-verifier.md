@@ -66,7 +66,7 @@ drafts outside TARGET, record the exact blocker and retain only the tier already
 When the effect is visible in a rendered page, add --screenshots to the prove command and have the
 harness run sh "${OMGS_SCREENSHOT:-/dev/null}" NAME URL || true, with an absolute URL, at the proof
 moment, against dummy data only. The browser runs inside the same sandbox and the helper always
-exits 0, so a capture never changes the proof's outcome. Allow 20 seconds per capture in
+exits 0, so a capture never changes the proof's outcome. Allow 30 seconds per capture in
 --timeout-ms. A screenshot supports the record; it never replaces the failing test. If the record
 names a screenshot blocker, keep the proof and report the blocker.
 
