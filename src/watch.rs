@@ -7,7 +7,8 @@
 //! a browser, and exits once the run is marked complete. Status requires the
 //! per-run token printed only to the starting terminal, sent by the dashboard
 //! in an `X-OMGS-Token` header, so other local users and processes cannot
-//! read it. The status never carries finding or lead titles.
+//! read it. The status is a fixed projection that never carries finding,
+//! lead or other free text written by agents.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -116,7 +117,13 @@ fn respond_locked(raw: &str, port: u16, token: &str, run_dir: &Path) -> Response
                 crate::review::View::load_locked(run_dir)
             })
             .and_then(|view| {
-                serde_json::to_vec(&public_progress(view.progress)).map_err(|e| e.to_string())
+                serde_json::to_vec(&public_progress(
+                    view.progress,
+                    run_dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned()),
+                ))
+                .map_err(|e| e.to_string())
             }) {
                 Ok(bytes) => bytes,
                 Err(_) => {
@@ -137,16 +144,126 @@ fn respond_locked(raw: &str, port: u16, token: &str, run_dir: &Path) -> Response
     }
 }
 
-/// The live view shows progress, never review content: the review state
-/// names gap counts instead of the gap messages, which can quote finding,
-/// candidate and architecture text.
-fn public_progress(mut progress: serde_json::Value) -> serde_json::Value {
-    if progress.get("review_complete") == Some(&serde_json::Value::Bool(false)) {
-        progress["review_state"] = serde_json::json!(
-            "The review is incomplete. Run omgs critic and omgs validate in the run directory for details."
-        );
+/// Stage ids the dashboard names with its own fixed labels.
+const STAGE_IDS: [&str; 9] = [
+    "initialize",
+    "map",
+    "hunt",
+    "verify",
+    "challenge",
+    "prove",
+    "adjudicate",
+    "evaluate",
+    "report",
+];
+const STATES: [&str; 4] = ["pending", "active", "done", "failed"];
+const COUNTERS: [&str; 4] = ["candidates", "confirmed", "needs_validation", "rejected"];
+
+fn state_of(v: &serde_json::Value) -> &'static str {
+    let s = v.as_str().unwrap_or_default();
+    STATES
+        .iter()
+        .find(|k| **k == s)
+        .copied()
+        .unwrap_or("pending")
+}
+
+/// One stage with only fixed vocabulary, numbers and generic labels.
+fn public_stage(stage: &serde_json::Value, label: String) -> serde_json::Value {
+    let id = stage.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+    let known = STAGE_IDS.contains(&id);
+    let mut out = serde_json::json!({
+        "id": if known { id } else { "step" },
+        "label": label,
+        "status": state_of(&stage["status"]),
+    });
+    for key in ["started_ms", "ended_ms"] {
+        if let Some(n) = stage.get(key).and_then(|v| v.as_u64()) {
+            out[key] = n.into();
+        }
     }
-    progress
+    if let Some(children) = stage.get("children").and_then(|v| v.as_array()) {
+        out["children"] = children
+            .iter()
+            .enumerate()
+            .map(|(i, c)| public_stage(c, format!("Part {}", i + 1)))
+            .collect();
+    }
+    out
+}
+
+/// The live view shows progress, never review content. It is an explicit
+/// projection: stage ids from a fixed list, states, times, numeric
+/// counters, fixed sentences and the run directory name. Stage details, labels, log messages,
+/// history and gap messages are agent or target text that can quote
+/// findings, so none of it is served.
+fn public_progress(progress: serde_json::Value, run_name: Option<String>) -> serde_json::Value {
+    let stages: Vec<serde_json::Value> = progress
+        .get("stages")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .enumerate()
+                .map(|(i, st)| public_stage(st, format!("Review step {}", i + 1)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut counters = serde_json::Map::new();
+    for key in COUNTERS {
+        if let Some(n) = progress
+            .get("counters")
+            .and_then(|c| c.get(key))
+            .and_then(|v| v.as_u64())
+        {
+            counters.insert(key.into(), n.into());
+        }
+    }
+    let log: Vec<serde_json::Value> = progress
+        .get("log")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .map(|e| {
+                    let kind = state_of(&e["kind"]);
+                    serde_json::json!({
+                        "ts": e
+                            .get("ts")
+                            .and_then(|v| v.as_str())
+                            .filter(|t| t.len() <= 40 && t.bytes().all(|b| b.is_ascii_digit() || b"-:TZ.+".contains(&b)))
+                            .unwrap_or_default(),
+                        "kind": kind,
+                        "m": match kind {
+                            "active" => "A review step started",
+                            "done" => "A review step finished",
+                            "failed" => "A review step stopped",
+                            _ => "A review step is waiting",
+                        },
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let complete = progress.get("review_complete").and_then(|v| v.as_bool());
+    let mut out = serde_json::json!({
+        "stages": stages,
+        "counters": counters,
+        "log": log,
+    });
+    if let Some(name) = run_name {
+        out["run"] = name.into();
+    }
+    if let Some(n) = progress.get("updated_ms").and_then(|v| v.as_u64()) {
+        out["updated_ms"] = n.into();
+    }
+    if let Some(done) = complete {
+        out["review_complete"] = done.into();
+        out["review_state"] = if done {
+            "complete".into()
+        } else {
+            "The review is incomplete. Run omgs critic and omgs validate in the run directory for details.".into()
+        };
+    }
+    out
 }
 
 /// Write all of `bytes` before `deadline`, or give up. A reader that drains

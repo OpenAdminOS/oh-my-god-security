@@ -1475,7 +1475,7 @@ fn published_consumers_agree_on_review_matrix() {
             let dashboard: Value = serde_json::from_slice(&response.body).unwrap();
             assert_eq!(dashboard["review_complete"], complete);
             assert_eq!(dashboard["counters"]["confirmed"], expected_confirmed);
-            assert_dashboard_render(&dashboard);
+            assert_dashboard_render(&dashboard, true);
             assert_eq!(
                 dashboard["counters"]["needs_validation"],
                 view.needs_validation
@@ -1609,7 +1609,7 @@ fn status_publishes_view_counts_and_dashboard_requires_its_completion_verdict() 
             .unwrap();
     assert_eq!(status["counters"]["confirmed"], 0);
     assert_eq!(status["review_complete"], false);
-    assert_dashboard_render(&status);
+    assert_dashboard_render(&status, false);
 }
 
 fn confirmed_fixture(run: &Run) -> FindingsFile {
@@ -1708,7 +1708,8 @@ console.log(JSON.stringify(elements));
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn assert_dashboard_render(data: &Value) {
+/// `served` data comes from `omgs watch`, which never carries stage details.
+fn assert_dashboard_render(data: &Value, served: bool) {
     let rendered = render_dashboard(data);
     assert_eq!(
         rendered["c-conf"]["textContent"],
@@ -1734,7 +1735,11 @@ fn assert_dashboard_render(data: &Value) {
     if data["review_complete"] == false {
         if active {
             assert_ne!(headline, data["review_state"].as_str().unwrap());
-            assert!(headline.contains("round detail") || headline.contains("in progress"));
+            if served {
+                assert!(!headline.contains("round detail"), "{headline}");
+            } else {
+                assert!(headline.contains("round detail") || headline.contains("in progress"));
+            }
         } else {
             assert_eq!(headline, data["review_state"].as_str().unwrap());
         }
