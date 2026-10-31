@@ -1027,7 +1027,9 @@ fn default_run_for_cache_named_repository_is_refused_before_writing() {
     assert_eq!(std::fs::read_dir(target).unwrap().count(), 0);
 }
 
-// A stalled clone fails at the deadline and leaves no partial checkout.
+// One deadline covers the configuration reads and the clone: reads that
+// use most of the budget leave the stalled clone only the remainder, and
+// no partial checkout is left behind.
 #[cfg(unix)]
 #[test]
 fn a_stalled_clone_fails_at_its_deadline() {
@@ -1036,14 +1038,14 @@ fn a_stalled_clone_fails_at_its_deadline() {
     let bin = fixture.0.join("bin");
     std::fs::create_dir(&bin).unwrap();
     let stub = bin.join("git");
-    std::fs::write(&stub, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.50.0'; exit 0; fi\nif [ \"$1\" = config ]; then exit 1; fi\nfor arg in \"$@\"; do last=\"$arg\"; done\nmkdir -p \"$last\"\nexec /bin/sleep 30\n").unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.50.0'; exit 0; fi\nif [ \"$1\" = config ]; then /bin/sleep 1.5; exit 1; fi\nfor arg in \"$@\"; do last=\"$arg\"; done\nmkdir -p \"$last\"\nexec /bin/sleep 30\n").unwrap();
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     let home = fixture.0.join("home");
     let started = std::time::Instant::now();
     let out = cli()
         .env("OMGS_HOME", &home)
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-        .env("OMGS_TEST_CLONE_DEADLINE_MS", "2000")
+        .env("OMGS_TEST_CLONE_DEADLINE_MS", "4000")
         .args([
             "review",
             "--repo-url",
@@ -1054,10 +1056,59 @@ fn a_stalled_clone_fails_at_its_deadline() {
         .arg(fixture.skill())
         .output()
         .unwrap();
+    let elapsed = started.elapsed();
     assert!(!out.status.success());
-    assert!(started.elapsed() < std::time::Duration::from_secs(25));
     let text = String::from_utf8_lossy(&out.stderr);
-    assert!(text.contains("exceeded the 2 s deadline"), "{text}");
+    assert!(text.contains("exceeded the 4 s deadline"), "{text}");
     assert!(text.contains("clone phase=failed destination="), "{text}");
+    // The reads take 3 s; a clone timer restarted after them would run to
+    // at least 7 s. The bound allows process start and cleanup.
+    assert!(elapsed >= std::time::Duration::from_secs(3), "{elapsed:?}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(6500),
+        "{elapsed:?}"
+    );
     assert!(!home.join("targets/example.invalid/owner/repo").exists());
+}
+
+// Caller Git variables reach none of the Git commands, including the
+// configuration reads that choose carried credential settings.
+#[cfg(unix)]
+#[test]
+fn caller_git_variables_never_reach_clone_git_commands() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let bin = fixture.0.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let stub = bin.join("git");
+    std::fs::write(&stub, "#!/bin/sh\nfor v in GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_TRACE GIT_DIR; do eval \"val=\\${$v+set}\"; if [ -n \"$val\" ] && ! { [ \"$1\" != config ] && [ \"$v\" = GIT_CONFIG_GLOBAL ] && [ \"$GIT_CONFIG_GLOBAL\" = /dev/null ]; }; then echo \"$v $1\" >> \"${0%/*}/leak\"; fi; done\nif [ \"$1\" = --version ]; then echo 'git version 2.50.0'; exit 0; fi\nif [ \"$1\" = config ]; then exit 1; fi\nfor arg in \"$@\"; do last=\"$arg\"; done\nmkdir -p \"$last\"\n").unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = fixture.0.join("home");
+    let hostile = fixture.0.join("hostile.gitconfig");
+    std::fs::write(&hostile, "[credential]\n\thelper = !touch /dev/null\n").unwrap();
+    let out = cli()
+        .env("OMGS_HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("GIT_CONFIG_GLOBAL", &hostile)
+        .env("GIT_CONFIG_SYSTEM", &hostile)
+        .env(
+            "GIT_CONFIG_PARAMETERS",
+            "'credential.helper'='!touch /dev/null'",
+        )
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_TRACE", fixture.0.join("trace"))
+        .env("GIT_DIR", fixture.0.join("elsewhere"))
+        .args([
+            "review",
+            "--repo-url",
+            "https://example.invalid/owner/repo",
+            "--no-sensors",
+            "--skill-dir",
+        ])
+        .arg(fixture.skill())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let leak = std::fs::read_to_string(bin.join("leak")).unwrap_or_default();
+    assert!(leak.is_empty(), "{leak}");
 }

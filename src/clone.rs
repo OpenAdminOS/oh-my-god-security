@@ -136,7 +136,9 @@ fn bounded(mut cmd: Command, deadline: &Deadline, cap: u64) -> Result<Vec<u8>, S
     if result.timed_out {
         return Err("clone deadline exceeded".into());
     }
-    if !result.capture_complete {
+    // A drained stream can still have been cut at the cap; parsing a
+    // truncated configuration could drop a later reset of a setting.
+    if !result.capture_complete || result.stdout_bytes.len() as u64 != result.stream_bytes[0] {
         return Err("git output exceeded its limit".into());
     }
     match result.exit_code {
@@ -153,7 +155,9 @@ pub fn carried_config(
 ) -> Result<Vec<(String, Option<String>)>, String> {
     let mut out = Vec::new();
     for scope in ["--system", "--global"] {
-        let mut cmd = Command::new(git);
+        // Git finds the normal system and global files from HOME and
+        // XDG_CONFIG_HOME; caller overrides of either source are dropped.
+        let mut cmd = host_git(git);
         cmd.args([
             "config",
             scope,
@@ -163,6 +167,9 @@ pub fn carried_config(
             r"^(credential\..*|http\.[a-z]+)$",
         ]);
         let bytes = bounded(cmd, deadline, STEP_MS)?;
+        if bytes.last().is_some_and(|b| *b != 0) {
+            return Err("git configuration output ended inside a record".into());
+        }
         out.extend(
             parse_config_null(&bytes)
                 .into_iter()
@@ -186,11 +193,8 @@ pub fn version_ok(text: &str) -> bool {
 }
 
 pub fn require_git(git: &Path, deadline: &Deadline) -> Result<(), String> {
-    let mut cmd = Command::new(git);
-    cmd.env_clear().arg("--version");
-    if let Some(path) = std::env::var_os("PATH") {
-        cmd.env("PATH", path);
-    }
+    let mut cmd = host_git(git);
+    cmd.arg("--version");
     let out = bounded(cmd, deadline, STEP_MS)?;
     let text = String::from_utf8_lossy(&out);
     if !version_ok(&text) {
@@ -230,8 +234,9 @@ pub fn pin(host: &str, addrs: &[IpAddr]) -> String {
     format!("{host}:443:{list}")
 }
 
-/// An isolated Git command for a review clone.
-pub fn git(git: &Path, carried: &[(String, Option<String>)], pin: Option<&str>) -> Command {
+/// A Git command with only the kept host environment, so GIT_CONFIG_*,
+/// GIT_TRACE* and every other Git variable from the caller are dropped.
+fn host_git(git: &Path) -> Command {
     let mut c = Command::new(git);
     c.env_clear();
     for (key, value) in std::env::vars_os() {
@@ -240,6 +245,12 @@ pub fn git(git: &Path, carried: &[(String, Option<String>)], pin: Option<&str>) 
             c.env(&key, value);
         }
     }
+    c
+}
+
+/// An isolated Git command for a review clone.
+pub fn git(git: &Path, carried: &[(String, Option<String>)], pin: Option<&str>) -> Command {
+    let mut c = host_git(git);
     c.env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", null_device())
         .env("GIT_ATTR_NOSYSTEM", "1")
@@ -456,6 +467,15 @@ mod tests {
             assert!(listed.contains(present), "{present}: {listed}");
         }
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configuration_output_cut_at_the_cap_is_refused() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "head -c 1100000 /dev/zero"]);
+        let err = bounded(cmd, &Deadline::after(10_000), STEP_MS).unwrap_err();
+        assert!(err.contains("exceeded its limit"), "{err}");
     }
 
     #[test]
