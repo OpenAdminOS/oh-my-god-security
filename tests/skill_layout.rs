@@ -499,6 +499,32 @@ fn dashboard_announces_summary_only_when_it_changes() {
 }
 
 #[test]
+fn proof_locations_and_recipe_exit_codes_are_explicit_in_role_guidance() {
+    for (name, text) in [
+        ("recipes", include_str!("../skill/PROOF-RECIPES.md")),
+        ("hunter", include_str!("../skill/agents/red-hunter.md")),
+        ("verifier", include_str!("../skill/agents/blue-verifier.md")),
+    ] {
+        let text = normalized(text);
+        for required in [
+            "workspace root",
+            "full workspace-relative `--test` path in `--cmd`",
+            "checks/entry.ps1",
+        ] {
+            assert!(text.contains(required), "{name}: missing {required}");
+        }
+    }
+    for text in [
+        include_str!("../skill/PROOF-RECIPES.md"),
+        include_str!("../skill/PROOF-CONTRACT.md"),
+    ] {
+        let text = normalized(text);
+        assert!(text.contains("inner 64") || text.contains("inner usage code such as 64"));
+        assert!(text.contains("outer 2") || text.contains("outer exit 2"));
+    }
+}
+
+#[test]
 fn role_reading_uses_one_contract_and_preserves_full_safety_context() {
     let entry = normalized(include_str!("../skill/SKILL.md"));
     let pipeline = normalized(include_str!("../skill/PIPELINE.md"));

@@ -23,6 +23,7 @@ pub mod persona;
 pub mod platform;
 pub mod policy;
 pub mod proof;
+pub mod proof_inputs;
 pub mod report;
 pub mod review;
 pub mod route;

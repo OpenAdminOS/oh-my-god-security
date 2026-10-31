@@ -54,9 +54,10 @@ synthetic reproducer for the pack, evidence about the class and not about this t
 Do not rely on the sandbox to contain daemon-mediated effects. Under MXC on macOS, `defaults write`,
 `open`, `launchctl` and the clipboard are denied and Apple Events are not delivered (observed
 2026-10-27), but a proof that needs such an API is testing the daemon, not the target.
-`NSTemporaryDirectory()` resolves to the real per-user temp dir, which MXC denies, so a harness that
-uses it fails rather than escaping. Cleaning up afterward never counts as containment: if an effect
-could leave the sandbox, the escape has already happened. Redirect temp to a scratch-relative path.
+The runner redirects `TMPDIR`, `TMP` and `TEMP` to per-proof scratch. Under the current macOS
+runner, `NSTemporaryDirectory()` resolves to that scratch path. Check its resolved synthetic path
+inside the sandbox before using it; do not assume every runtime or API honors the redirection.
+Cleaning up afterward never counts as containment. Use scratch-relative synthetic paths.
 For preferences, launchd, or similar daemon IPC, avoid the API in the proof or record a blocker and
 leave the record `needs_validation`; never rely on post-run cleanup as the containment, and never
 reach for an unsandboxed machine instead. A proof harness that crashes before reaching the code
@@ -96,11 +97,18 @@ Read [PROOF-RECIPES.md](PROOF-RECIPES.md) for the matching local sandbox harness
 
 Validation requires bubblewrap containment for every `local_app` proof record. Replay requires the
 recorded `timeout_ms`, rejects overrides, consumes proof budget and checks the target commit,
-copied-tree digest including all `.git` content, inner exit code and cleanliness. Exact command and
+versioned execution input identity, inner exit code and cleanliness. The authoritative
+[proof contract](PROOF-CONTRACT.md#execution-input-identity-and-replay) describes normalized index
+stat/cache data, retained config and hook protection, optional bounded selections and exact
+multi-file harness replay. Inspect `input-manifest.json` and challenge omitted dependencies.
+Keep `proof_ref` on the original even when the replay reproduces. Read `output_audit` marker
+observations and redaction/truncation ranges when saved text hides evidence; never recover or
+publish redacted key material. Exact command and
 config artifacts can contain credentials, so protect the entire run directory. On Unix proof
 directories are 0700 and command and config files are 0600. Content hashing accepts hardlinks and
 symlinks resolving to regular files; small trust files retain bounded, single-link, no-follow reads.
-Snapshot hashing has no size cap. Target FIFOs and sockets are skipped in the workspace copy and
+Execution input manifests have explicit entry and serialized-byte bounds; file hashing streams
+content. Target FIFOs and sockets are skipped in the workspace copy and
 snapshot digest, with up to 20 paths recorded as proof gaps and one aggregate count for the
 remainder. Devices are refused before copying.
 

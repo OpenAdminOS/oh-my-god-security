@@ -44,7 +44,19 @@ fn write_atomic_content(
     bytes: &[u8],
     permissions: Option<std::fs::Permissions>,
 ) -> std::io::Result<()> {
-    let temporary = prepare_atomic_content(path, bytes, permissions)?;
+    write_atomic_stream(path, permissions, |file| {
+        use std::io::Write;
+        file.write_all(bytes)
+    })
+}
+
+/// Stream an artifact through the same private admission and atomic publication.
+pub fn write_atomic_stream(
+    path: &Path,
+    permissions: Option<std::fs::Permissions>,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let temporary = prepare_atomic_stream(path, permissions, write)?;
     std::fs::rename(&temporary, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&temporary);
     })
@@ -55,7 +67,17 @@ fn prepare_atomic_content(
     bytes: &[u8],
     permissions: Option<std::fs::Permissions>,
 ) -> std::io::Result<std::path::PathBuf> {
-    use std::io::Write;
+    prepare_atomic_stream(path, permissions, |file| {
+        use std::io::Write;
+        file.write_all(bytes)
+    })
+}
+
+fn prepare_atomic_stream(
+    path: &Path,
+    permissions: Option<std::fs::Permissions>,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<std::path::PathBuf> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
         return Err(std::io::Error::other("destination is a directory"));
     }
@@ -103,7 +125,7 @@ fn prepare_atomic_content(
         }
     };
     if let Err(e) = crate::platform::check_private_file(&file)
-        .and_then(|_| file.write_all(bytes))
+        .and_then(|_| write(&mut file))
         .and_then(|_| match permissions {
             Some(p) => file.set_permissions(p),
             None => Ok(()),

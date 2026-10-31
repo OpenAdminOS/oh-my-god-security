@@ -265,6 +265,21 @@ pub fn proof(text: &str) -> Result<crate::proof::ProofRecord, String> {
             top.get("survivors").ok_or("survivors is required")?,
             "survivors",
         )?;
+        for key in ["execution_inputs", "output_audit"] {
+            if let Some(value) = top.get(key).filter(|v| !v.is_null()) {
+                object(value, key)?;
+            }
+        }
+        if let Some(value) = top.get("harness") {
+            objects(value, "harness")?;
+        }
+        if let Some(audit) = top.get("output_audit").and_then(Value::as_object) {
+            for key in ["marker_observations", "redactions"] {
+                if let Some(value) = audit.get(key) {
+                    objects(value, key)?;
+                }
+            }
+        }
         Ok(())
     })
 }

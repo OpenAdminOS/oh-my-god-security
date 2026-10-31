@@ -250,6 +250,9 @@ pub struct ProveRequest {
     /// the given target-relative path before the command runs.
     pub stage: Option<(PathBuf, String)>,
     pub expected_tree_sha256: Option<String>,
+    pub inputs: Option<crate::proof_inputs::Selection>,
+    pub expected_inputs: Option<crate::proof_inputs::Manifest>,
+    pub harness: Vec<crate::proof::HarnessFile>,
 }
 
 pub struct ProveResult {
@@ -262,6 +265,7 @@ pub struct ProveResult {
     pub system_root: Option<String>,
     pub marker_nonce: String,
     pub target_sha256: Option<String>,
+    pub input_manifest: Option<crate::proof_inputs::Manifest>,
     pub enforced: Vec<String>,
     pub gaps: Vec<String>,
     pub notes: Vec<String>,
@@ -377,7 +381,7 @@ fn rust_root<'a>(os: &str, readonly: &'a [PathBuf], suffix: &str) -> Option<&'a 
 fn link_dir(to: &Path, link: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(to, link)
+        create_staging_link(to, link)
     }
     #[cfg(windows)]
     {
@@ -425,7 +429,7 @@ fn link_dir(to: &Path, link: &Path) -> std::io::Result<()> {
         for c in sub.into_iter().chain([0]).chain(print).chain([0]) {
             data.extend_from_slice(&c.to_le_bytes());
         }
-        std::fs::create_dir(link)?;
+        create_staging_dir(link)?;
         let result = (|| {
             let file = std::fs::OpenOptions::new()
                 .write(true)
@@ -783,7 +787,13 @@ fn write_wrapper(
             format!("if not exist \"{t}\" goto omgs_unreachable\r\nif exist \"{t}\\\" goto omgs_unreachable\r\nset \"omgs_readable=\"\r\n(set \"omgs_readable=1\") <\"{t}\"\r\nif not defined omgs_readable goto omgs_unreachable\r\necho OMGS_TEST_{nonce}:1\r\n")
         }).unwrap_or_default();
         let wrapper = format!("@echo off\r\necho OMGS_START_{nonce}\r\n{check}\"{root}\\System32\\cmd.exe\" /d /v:off /s /c \"{command}\"\r\nset \"omgs_exit=%errorlevel%\"\r\necho(\r\necho OMGS_END_{nonce}:%omgs_exit%\r\nexit /b %omgs_exit%\r\n:omgs_unreachable\r\necho OMGS_TEST_{nonce}:0\r\necho OMGS_END_{nonce}:126\r\nexit /b 126\r\n");
-        std::fs::write(workspace.join(format!("{name}.cmd")), wrapper)?;
+        let permissions = std::fs::metadata(workspace)?.permissions();
+        stage_content(
+            workspace,
+            &format!("{name}.cmd"),
+            std::io::Cursor::new(wrapper),
+            crate::proof_inputs::permissions(fixed_file_mode(), permissions),
+        )?;
     }
     Ok(())
 }
@@ -818,18 +828,33 @@ pub fn declared_limits(os: &str) -> Vec<String> {
     v
 }
 
-/// Copy `src` into the empty directory `dst`: an APFS clone on macOS, a
-/// reflink where the filesystem supports it on Linux, a plain copy otherwise.
+/// Materialize fresh entries in sorted order, preserving only admitted bytes,
+/// link text and allow-listed permissions, never source filesystem metadata.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
     copy_tree_with_gaps(src, dst).map(|_| ())
 }
 
 const MAX_SPECIAL_PATHS: usize = 20;
 
+#[derive(Default)]
+struct PathSummary {
+    count: usize,
+    paths: Vec<PathBuf>,
+}
+
+impl PathSummary {
+    fn push(&mut self, path: PathBuf) {
+        self.count += 1;
+        self.paths.push(path);
+        self.paths.sort();
+        self.paths.truncate(MAX_SPECIAL_PATHS);
+    }
+}
+
 fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
     let mut gaps = Vec::new();
-    let mut special_paths = Vec::new();
-    let mut links = Vec::new();
+    let mut special_paths = PathSummary::default();
+    let mut links = 0;
     let mut outside_links = 0;
     let root = std::fs::canonicalize(src).map_err(|e| e.to_string())?;
     inspect_target(
@@ -838,11 +863,12 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
         &mut special_paths,
         &mut links,
         &mut outside_links,
+        &mut 0,
     )?;
-    special_paths.sort();
-    let specials = special_paths.len();
+    let specials = special_paths.count;
     gaps.extend(
         special_paths
+            .paths
             .iter()
             .take(MAX_SPECIAL_PATHS)
             .map(|path| format!("skipped target socket or FIFO: {}", path.display())),
@@ -854,94 +880,165 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
         ));
     }
     if outside_links > 0 {
-        let action = if cfg!(unix) {
-            "copied as links, sandbox access rules apply"
-        } else {
-            "dropped from the workspace"
-        };
+        let action = "copied as links, sandbox access rules apply";
         gaps.push(format!(
             "{outside_links} target link(s) resolve outside the target or do not resolve: {action}"
         ));
     }
-    supervise::check_interrupted().map_err(|e| e.to_string())?;
+    crate::proof_inputs::check_staging()?;
     std::fs::create_dir_all(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
-    let from = format!("{}/.", src.display());
-    let attempts: Vec<Vec<&str>> = if cfg!(target_os = "macos") {
-        vec![vec!["-c", "-R", "-p"], vec!["-R", "-p"]]
-    } else if cfg!(target_os = "linux") {
-        vec![vec!["-a", "--no-preserve=links", "--reflink=auto"]]
-    } else {
-        vec![]
-    };
-    for flags in attempts.into_iter().filter(|_| specials == 0) {
-        let child = Command::new("/bin/cp")
-            .args(&flags)
-            .arg(&from)
-            .arg(dst)
-            // Copy diagnostics contain target-controlled filenames. Fall back
-            // to the Rust copier and its escaped error path on failure.
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        let ok = match child {
-            Ok(mut child) => loop {
-                if let Err(e) = supervise::check_interrupted() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(e.to_string());
-                }
-                match child.try_wait() {
-                    Ok(Some(status)) => break status.success(),
-                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                    Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(e.to_string());
-                    }
-                }
-            },
-            Err(_) => false,
-        };
-        if ok {
-            record_live_links(&root, dst, &links, &mut gaps);
-            return Ok(gaps);
-        }
-        // A partial clone must not be mixed with the next attempt.
-        let _ = std::fs::remove_dir_all(dst);
-        std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-    }
+    set_input_permissions(dst, root_mode())?;
     let roots = (root, dst.to_path_buf());
-    copy_recursive(src, dst, &roots)?;
-    record_live_links(&roots.0, dst, &links, &mut gaps);
+    copy_recursive(&roots.0, dst, &roots, None, &mut 0)?;
+    set_input_permissions(dst, root_mode())?;
+    record_live_links(&roots.0, dst, dst, &mut PathSummary::default(), &mut gaps)?;
     Ok(gaps)
+}
+
+// Explicit selections omit everything else from the sandbox. Always include root
+// Git metadata. Refuse links in scoped inputs, including ancestor components.
+pub(crate) fn copy_selected(
+    root: &Path,
+    dst: &Path,
+    selection: &crate::proof_inputs::Selection,
+) -> Result<Vec<String>, String> {
+    selection.validate()?;
+    crate::proof_inputs::verify_selection(root, selection)?;
+    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    set_input_permissions(dst, root_mode())?;
+    let mut paths = selection.paths.clone();
+    if root.join(".git").try_exists().map_err(|e| e.to_string())?
+        && !paths.iter().any(|p| p == ".git")
+    {
+        paths.retain(|p| !p.starts_with(".git/"));
+        paths.push(".git".into());
+    }
+    paths.sort();
+    let mut specials = PathSummary::default();
+    let mut inspected = 0;
+    for rel in &paths {
+        let mut from = root.to_path_buf();
+        for part in Path::new(rel) {
+            from.push(part);
+            let meta = std::fs::symlink_metadata(&from).map_err(|e| e.to_string())?;
+            if platform::is_link(&meta) {
+                return Err("scoped inputs cannot contain links".into());
+            }
+        }
+        let meta = std::fs::symlink_metadata(&from).map_err(|e| e.to_string())?;
+        if !meta.is_dir() && !meta.is_file() {
+            return Err("selected input must be a file or directory".into());
+        }
+        if meta.is_dir() {
+            let mut links = 0;
+            let mut outside = 0;
+            inspect_target(
+                root,
+                &from,
+                &mut specials,
+                &mut links,
+                &mut outside,
+                &mut inspected,
+            )?;
+            if links != 0 {
+                return Err("scoped inputs cannot contain links".into());
+            }
+        }
+        if rel == ".git" && meta.is_file() {
+            return Err(
+                "external Git directories are not execution inputs; use a standalone checkout"
+                    .into(),
+            );
+        }
+    }
+    // One sorted traversal also creates shared ancestors in a fixed order.
+    let selection = crate::proof_inputs::Selection { version: 1, paths };
+    copy_recursive(
+        root,
+        dst,
+        &(root.to_path_buf(), dst.to_path_buf()),
+        Some(&selection),
+        &mut 0,
+    )?;
+    crate::proof_inputs::verify_selection(dst, &selection)?;
+    set_input_permissions(dst, root_mode())?;
+    let mut gaps: Vec<_> = specials
+        .paths
+        .iter()
+        .take(MAX_SPECIAL_PATHS)
+        .map(|p| format!("skipped target socket or FIFO: {}", p.display()))
+        .collect();
+    if specials.count > MAX_SPECIAL_PATHS {
+        gaps.push(format!(
+            "skipped {} additional target sockets or FIFOs",
+            specials.count - MAX_SPECIAL_PATHS
+        ));
+    }
+    Ok(gaps)
+}
+
+fn root_mode() -> u32 {
+    if cfg!(unix) {
+        0o755
+    } else {
+        0
+    }
+}
+
+// Runner-created directories and single-file harnesses are always searchable
+// and executable on Unix, writable on Windows. Never inherit the host umask.
+fn create_staging_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir(path)?;
+    let current = std::fs::symlink_metadata(path)?.permissions();
+    std::fs::set_permissions(path, crate::proof_inputs::permissions(root_mode(), current))
+}
+
+fn fixed_file_mode() -> u32 {
+    if cfg!(unix) {
+        0o644
+    } else {
+        0
+    }
+}
+
+fn set_input_permissions(path: &Path, mode: u32) -> Result<(), String> {
+    let current = std::fs::symlink_metadata(path)
+        .map_err(|e| e.to_string())?
+        .permissions();
+    std::fs::set_permissions(path, crate::proof_inputs::permissions(mode, current))
+        .map_err(|e| e.to_string())
 }
 
 fn inspect_target(
     root: &Path,
     dir: &Path,
-    specials: &mut Vec<PathBuf>,
-    links: &mut Vec<PathBuf>,
+    specials: &mut PathSummary,
+    links: &mut usize,
     outside_links: &mut usize,
+    count: &mut usize,
 ) -> Result<(), String> {
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-        supervise::check_interrupted().map_err(|e| e.to_string())?;
+        crate::proof_inputs::check_staging()?;
         let entry = entry.map_err(|e| e.to_string())?;
+        crate::proof_inputs::admit_entry(count)?;
+        let path = entry.path();
+        let relative = path.strip_prefix(root).map_err(|e| e.to_string())?;
+        let name = relative
+            .to_str()
+            .ok_or("execution input paths must be UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        crate::proof_inputs::safe_path(&name)?;
         let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
         if platform::is_link(&meta) {
-            links.push(
-                entry
-                    .path()
-                    .strip_prefix(root)
-                    .map_err(|e| e.to_string())?
-                    .to_path_buf(),
-            );
+            crate::proof_inputs::admit_link(&entry.path())?;
+            *links += 1;
             if !std::fs::canonicalize(entry.path()).is_ok_and(|p| p.starts_with(root)) {
                 *outside_links += 1;
             }
             continue;
         }
         if meta.is_dir() {
-            inspect_target(root, &entry.path(), specials, links, outside_links)?;
+            inspect_target(root, &entry.path(), specials, links, outside_links, count)?;
         } else if platform::contentless(&meta) {
             specials.push(
                 entry
@@ -960,88 +1057,138 @@ fn inspect_target(
     Ok(())
 }
 
-fn record_live_links(root: &Path, dst: &Path, links: &[PathBuf], gaps: &mut Vec<String>) {
+fn record_live_links(
+    root: &Path,
+    dst: &Path,
+    dir: &Path,
+    live: &mut PathSummary,
+    gaps: &mut Vec<String>,
+) -> Result<(), String> {
     if cfg!(unix) {
-        let mut live: Vec<_> = links
-            .iter()
-            .filter(|rel| std::fs::canonicalize(dst.join(rel)).is_ok_and(|p| p.starts_with(root)))
-            .collect();
-        live.sort();
-        for rel in live.iter().take(MAX_SPECIAL_PATHS) {
-            gaps.push(format!(
-                "target link reaches live target from workspace: {}",
-                rel.display()
-            ));
-        }
-        if live.len() > MAX_SPECIAL_PATHS {
-            gaps.push(format!(
-                "{} additional target links reach live target from workspace",
-                live.len() - MAX_SPECIAL_PATHS
-            ));
-        }
-    }
-}
-
-/// `roots` is (canonical source root, destination root) of the whole copy.
-fn copy_recursive(src: &Path, dst: &Path, roots: &(PathBuf, PathBuf)) -> Result<(), String> {
-    for entry in std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
-        supervise::check_interrupted().map_err(|e| e.to_string())?;
-        let entry = entry.map_err(|e| e.to_string())?;
-        let ty = entry.file_type().map_err(|e| e.to_string())?;
-        let to = dst.join(entry.file_name());
-        if platform::is_link(&entry.metadata().map_err(|e| e.to_string())?) {
-            copy_link(&entry.path(), &to, roots)?;
-        } else if ty.is_dir() {
-            std::fs::create_dir_all(&to).map_err(|e| e.to_string())?;
-            copy_recursive(&entry.path(), &to, roots)?;
-            std::fs::set_permissions(
-                &to,
-                entry.metadata().map_err(|e| e.to_string())?.permissions(),
-            )
-            .map_err(|e| e.to_string())?;
-        } else if ty.is_file() {
-            std::fs::copy(entry.path(), &to)
-                .map_err(|e| format!("copy {}: {e}", entry.path().display()))?;
-        } else if ty.is_symlink() {
-            copy_link(&entry.path(), &to, roots)?;
-        } else if !platform::contentless(&entry.metadata().map_err(|e| e.to_string())?) {
-            return Err(format!(
-                "unsupported target file type at {}; devices are refused",
-                entry.path().display()
-            ));
+        crate::proof_inputs::children(dir, |entry| {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+            if platform::is_link(&meta) {
+                if std::fs::canonicalize(&path).is_ok_and(|p| p.starts_with(root)) {
+                    live.push(path.strip_prefix(dst).map_err(|e| e.to_string())?.into());
+                }
+            } else if meta.is_dir() {
+                record_live_links(root, dst, &path, live, gaps)?;
+            }
+            Ok(())
+        })?;
+        if dir == dst {
+            for rel in &live.paths {
+                gaps.push(format!(
+                    "target link reaches live target from workspace: {}",
+                    rel.display()
+                ));
+            }
+            if live.count > MAX_SPECIAL_PATHS {
+                gaps.push(format!(
+                    "{} additional target links reach live target from workspace",
+                    live.count - MAX_SPECIAL_PATHS
+                ));
+            }
         }
     }
     Ok(())
 }
 
-/// Preserve the same link text as cp, including dangling and outside links.
-#[cfg(unix)]
-fn copy_link(link: &Path, to: &Path, _roots: &(PathBuf, PathBuf)) -> Result<(), String> {
-    let target = std::fs::read_link(link).map_err(|e| e.to_string())?;
-    std::os::unix::fs::symlink(target, to).map_err(|e| format!("link {}: {e}", to.display()))
+/// `roots` is (canonical source root, destination root) of the whole copy.
+fn copy_recursive(
+    src: &Path,
+    dst: &Path,
+    roots: &(PathBuf, PathBuf),
+    selection: Option<&crate::proof_inputs::Selection>,
+    count: &mut usize,
+) -> Result<(), String> {
+    crate::proof_inputs::children_selected(&roots.0, src, selection, count, |entry, count| {
+        crate::proof_inputs::check_staging()?;
+        let path = entry.path();
+        let rel = path.strip_prefix(&roots.0).map_err(|e| e.to_string())?;
+        let name = rel
+            .to_str()
+            .ok_or("execution input paths must be UTF-8")?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        crate::proof_inputs::safe_path(&name)?;
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        let to = dst.join(entry.file_name());
+        if platform::is_link(&meta) {
+            if selection.is_some() {
+                return Err("scoped inputs cannot contain links".into());
+            }
+            crate::proof_inputs::admit_link(&path)?;
+            copy_link(&path, &to)?;
+        } else if meta.is_dir() {
+            create_staging_dir(&to).map_err(|e| e.to_string())?;
+            copy_recursive(&path, &to, roots, selection, count)?;
+            set_input_permissions(&to, crate::proof_inputs::mode(&meta))?;
+        } else if meta.is_file() {
+            // stage_file uses create_new and dense writes, with no clone/copy
+            // operation that could retain xattrs, ACLs, flags or sparse holes.
+            if crate::proof_inputs::canonical_git_index(rel) {
+                let bytes = crate::proof_inputs::read_index(&path)?;
+                let bytes = crate::proof_inputs::normalize_index(&bytes)?;
+                stage_content(
+                    dst,
+                    entry
+                        .file_name()
+                        .to_str()
+                        .ok_or("execution input paths must be UTF-8")?,
+                    std::io::Cursor::new(bytes),
+                    meta.permissions(),
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                stage_file(
+                    dst,
+                    entry
+                        .file_name()
+                        .to_str()
+                        .ok_or("execution input paths must be UTF-8")?,
+                    &path,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        } else if !platform::contentless(&meta) {
+            return Err(format!(
+                "unsupported target file type at {}; devices are refused",
+                path.display()
+            ));
+        }
+        Ok(())
+    })
 }
 
-/// Windows uses junctions and file copies without following outside links.
-#[cfg(windows)]
-fn copy_link(link: &Path, to: &Path, roots: &(PathBuf, PathBuf)) -> Result<(), String> {
-    let Ok(resolved) = std::fs::canonicalize(link) else {
-        return Ok(());
-    };
-    let Ok(rel) = resolved.strip_prefix(&roots.0) else {
-        return Ok(());
-    };
-    let mapped = roots.1.join(rel);
-    if resolved.is_dir() {
-        // The directory may not be copied yet; create it so the link resolves.
-        std::fs::create_dir_all(&mapped).map_err(|e| e.to_string())?;
-        link_dir(&mapped, to).map_err(|e| format!("link {}: {e}", to.display()))
-    } else if resolved.is_file() {
-        std::fs::copy(&resolved, to)
-            .map(|_| ())
-            .map_err(|e| format!("copy {}: {e}", link.display()))
-    } else {
-        Ok(())
+// Linux creates symlinks as 0777 regardless of umask. macOS filters their
+// initial permissions through umask, so reset the link itself without following it.
+#[cfg(unix)]
+fn create_staging_link(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(link.as_os_str().as_bytes())?;
+        // SAFETY: path is NUL terminated. lchmod changes only the new link,
+        // including dangling and outside links, never its referent.
+        if unsafe { libc::lchmod(path.as_ptr(), 0o777) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
     }
+    Ok(())
+}
+
+/// Preserve exact link text, including dangling and outside links.
+#[cfg(unix)]
+fn copy_link(link: &Path, to: &Path) -> Result<(), String> {
+    let target = std::fs::read_link(link).map_err(|e| e.to_string())?;
+    create_staging_link(&target, to).map_err(|e| format!("link {}: {e}", to.display()))
+}
+
+#[cfg(windows)]
+fn copy_link(link: &Path, _to: &Path) -> Result<(), String> {
+    crate::proof_inputs::admit_link(link)
 }
 
 /// Why tier 2 cannot run on this OS, if it cannot.
@@ -1058,8 +1205,10 @@ pub fn tier2_unavailable(os: &str) -> Option<String> {
 /// on the way would otherwise make this unsandboxed write land on the host.
 pub fn stage_file(workspace: &Path, rel: &str, draft: &Path) -> std::io::Result<()> {
     // Caller-supplied source drafts follow the checkout content policy.
-    let source = platform::open_regular(draft)?;
-    let permissions = source.metadata()?.permissions();
+    let source = crate::proof_inputs::admitted_file(draft).map_err(std::io::Error::other)?;
+    let meta = source.metadata()?;
+    let permissions =
+        crate::proof_inputs::permissions(crate::proof_inputs::mode(&meta), meta.permissions());
     stage_content(workspace, rel, source, permissions)
 }
 
@@ -1094,16 +1243,15 @@ fn stage_content(
                     dir.display()
                 )))
             }
-            Err(e) if e.kind() == ErrorKind::NotFound => std::fs::create_dir(&dir)?,
+            Err(e) if e.kind() == ErrorKind::NotFound => create_staging_dir(&dir)?,
             Err(e) => return Err(e),
         }
     }
     let dest = dir.join(file);
     match std::fs::symlink_metadata(&dest) {
-        Ok(m) if m.file_type().is_file() && !platform::is_link(&m) => std::fs::remove_file(&dest)?,
         Ok(_) => {
             return Err(Error::other(format!(
-                "{} is a link or directory in the target",
+                "{} already exists in the target",
                 dest.display()
             )))
         }
@@ -1117,14 +1265,69 @@ fn stage_content(
         .open(&dest)?;
     let mut bytes = vec![0u8; 1 << 16];
     loop {
-        supervise::check_interrupted()?;
+        crate::proof_inputs::check_staging().map_err(Error::other)?;
         let n = source.read(&mut bytes)?;
         if n == 0 {
             break;
         }
         out.write_all(&bytes[..n])?;
     }
-    out.set_permissions(permissions)
+    let mode = crate::proof_inputs::permission_mode(&permissions);
+    // Windows Permissions also carries file attributes. Never transfer directory
+    // attributes from a harness root onto a newly created regular file.
+    out.set_permissions(crate::proof_inputs::permissions(
+        mode,
+        out.metadata()?.permissions(),
+    ))
+}
+
+/// Admit the entire harness before writing any file. A harness owns fresh
+/// file names only, never an existing target entry or metadata tree.
+/// Restrict names to unambiguous portable ASCII rather than trying to emulate
+/// every filesystem's Unicode folding and generated DOS short-name rules.
+pub(crate) fn preflight_harness(workspace: &Path, paths: &[&str]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut nodes = std::collections::BTreeMap::new();
+    for path in paths {
+        crate::proof_inputs::safe_path(path)?;
+        let parts: Vec<_> = path.split('/').collect();
+        let mut prefix = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            let upper = part.to_ascii_uppercase();
+            let stem = upper.split('.').next().unwrap_or("");
+            if !part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                || part.starts_with('.')
+                || part.ends_with('.')
+                || matches!(stem, "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+                || ["COM", "LPT"].iter().any(|p| {
+                    stem.strip_prefix(p)
+                        .is_some_and(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit())
+                })
+            {
+                return Err(format!(
+                    "harness path has a reserved or ambiguous component: {path}"
+                ));
+            }
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            let leaf = i + 1 == parts.len();
+            let key = prefix.to_ascii_lowercase();
+            if let Some((previous, was_leaf)) = nodes.get(&key) {
+                if previous != &prefix || *was_leaf || leaf {
+                    return Err(format!("harness paths alias or overlap: {path}"));
+                }
+            } else {
+                nodes.insert(key, (prefix.clone(), leaf));
+            }
+        }
+    }
+    crate::proof_inputs::check_paths(workspace, paths, true)
 }
 
 /// A readable root that contains, or is contained in, the run directory.
@@ -1166,8 +1369,15 @@ impl Drop for BlockedCleanup {
 
 struct StagedWorkspace {
     digest: Option<String>,
+    manifest: Option<crate::proof_inputs::Manifest>,
     rust: Option<RustHomes>,
     gaps: Vec<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    // One-shot deterministic mutation between the pre-copy and post-copy reads.
+    static STAGING_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn stage_workspace(
@@ -1177,7 +1387,10 @@ fn stage_workspace(
     readonly: &[PathBuf],
     nonce: &str,
 ) -> Result<StagedWorkspace, String> {
+    let _staging = crate::proof_inputs::StagingGuard::begin();
     let mut gaps = Vec::new();
+    let mut source_before = None;
+    let mut stamps_before = None;
     if let Some(target) = &req.target {
         let target = std::fs::canonicalize(target).map_err(|e| format!("target: {e}"))?;
         if !target.is_dir() {
@@ -1186,24 +1399,121 @@ fn stage_workspace(
         if workspace.starts_with(&target) {
             return Err("the proof directory must be outside the target tree".into());
         }
-        gaps = copy_tree_with_gaps(&target, workspace)?;
+        if target.join(".git").is_file()
+            || std::fs::symlink_metadata(target.join(".git")).is_ok_and(|m| platform::is_link(&m))
+        {
+            return Err(
+                "external Git directories are not execution inputs; use a standalone checkout"
+                    .into(),
+            );
+        }
+        stamps_before = Some(crate::proof_inputs::source_stamps(
+            &target,
+            req.inputs.as_ref(),
+        )?);
+        source_before = Some(crate::proof_inputs::manifest(&target, req.inputs.clone())?);
+        crate::out::err(&format!(
+            "proof inputs: copy started ({})",
+            if req.inputs.is_some() {
+                "selected paths"
+            } else {
+                "full target"
+            }
+        ));
+        let started = std::time::Instant::now();
+        gaps = match &req.inputs {
+            Some(selection) => copy_selected(&target, workspace, selection)?,
+            None => copy_tree_with_gaps(&target, workspace)?,
+        };
+        #[cfg(test)]
+        STAGING_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        crate::out::err(&format!(
+            "proof inputs: copy complete ({} ms)",
+            started.elapsed().as_millis()
+        ));
     } else {
-        std::fs::create_dir_all(workspace).map_err(|e| e.to_string())?;
+        create_staging_dir(workspace).map_err(|e| e.to_string())?;
     }
-    let digest = if req.target.is_some() {
-        Some(
-            crate::proof::tree_digest(workspace)
-                .map_err(|e| format!("cannot digest target snapshot: {e}"))?,
-        )
-    } else {
-        None
-    };
+    let mut harness_paths: Vec<_> = req.harness.iter().map(|f| f.path.as_str()).collect();
+    if let Some((_, path)) = &req.stage {
+        harness_paths.push(path);
+    }
+    preflight_harness(workspace, &harness_paths)?;
+    if let Some(target) = &req.target {
+        // Selections must not let a harness impersonate omitted target files.
+        preflight_harness(target, &harness_paths)?;
+    }
+    crate::out::err("proof inputs: hash started");
+    let started = std::time::Instant::now();
+    let manifest = req
+        .target
+        .as_ref()
+        .map(|_| {
+            crate::proof_inputs::manifest_to(
+                workspace,
+                req.inputs.clone(),
+                &req.run_dir.join("input-manifest.json"),
+            )
+        })
+        .transpose()?;
+    let digest = manifest
+        .as_ref()
+        .map(crate::proof_inputs::Manifest::digest)
+        .transpose()?;
+    crate::out::err(&format!(
+        "proof inputs: hash complete ({} entries, {} ms)",
+        manifest.as_ref().map(|m| m.count).unwrap_or(0),
+        started.elapsed().as_millis()
+    ));
+    if let Some(target) = &req.target {
+        let source_after = crate::proof_inputs::manifest(target, req.inputs.clone())
+            .map_err(|e| format!("target changed during staging: {e}"))?;
+        let stamps_after = crate::proof_inputs::source_stamps(target, req.inputs.as_ref())
+            .map_err(|e| format!("target changed during staging: {e}"))?;
+        if stamps_before != Some(stamps_after)
+            || source_before.as_ref() != Some(&source_after)
+            || manifest.as_ref() != Some(&source_after)
+        {
+            return Err(
+                "target changed during staging; refusing to execute inconsistent inputs".into(),
+            );
+        }
+    }
     if req
         .expected_tree_sha256
         .as_ref()
         .is_some_and(|want| Some(want) != digest.as_ref())
     {
-        return Err("target snapshot differs from the recorded tree; refusing to replay".into());
+        let details = match (&req.expected_inputs, &manifest) {
+            (Some(old), Some(new)) => old.differences(new),
+            _ => "input identity mismatch".into(),
+        };
+        return Err(format!(
+            "target snapshot differs from the recorded tree; refusing to replay; {details}"
+        ));
+    }
+    for file in &req.harness {
+        let rel = Path::new("harness").join(&file.path);
+        let (bytes, permissions) = crate::run_artifact::read_with_permissions(
+            &req.run_dir,
+            &rel,
+            crate::run_artifact::DRAFT_BYTES,
+        )
+        .map_err(|e| e.to_string())?;
+        if sha256::digest(&bytes) != file.sha256 {
+            return Err("retained harness digest mismatch".into());
+        }
+        stage_content(
+            workspace,
+            &file.path,
+            std::io::Cursor::new(bytes),
+            crate::proof_inputs::permissions(file.mode, permissions),
+        )
+        .map_err(|e| e.to_string())?;
     }
     if let Some((draft, rel)) = &req.stage {
         // CLI drafts were retained beneath run_dir. Pin the original run
@@ -1222,23 +1532,41 @@ fn stage_workspace(
             crate::run_artifact::DRAFT_BYTES,
         )
         .map_err(|e| e.to_string())?;
-        stage_content(workspace, rel, std::io::Cursor::new(bytes), permissions)
-            .map_err(|e| format!("cannot stage the draft test at {rel}: {e}"))?;
+        // Single-file drafts bind bytes only. Their staged mode is a fixed
+        // policy constant, never retained evidence or source permissions.
+        stage_content(
+            workspace,
+            rel,
+            std::io::Cursor::new(bytes),
+            crate::proof_inputs::permissions(root_mode(), permissions),
+        )
+        .map_err(|e| format!("cannot stage the draft test at {rel}: {e}"))?;
     }
     for dir in [
         scratch.to_path_buf(),
         scratch.join("cache"),
         scratch.join("clang-cache"),
     ] {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        create_staging_dir(&dir).map_err(|e| e.to_string())?;
     }
     if cfg!(target_os = "macos") {
-        std::fs::write(scratch.join("openssl.cnf"), b"").map_err(|e| e.to_string())?;
+        stage_content(
+            scratch,
+            "openssl.cnf",
+            std::io::empty(),
+            crate::proof_inputs::permissions(
+                fixed_file_mode(),
+                std::fs::metadata(scratch)
+                    .map_err(|e| e.to_string())?
+                    .permissions(),
+            ),
+        )
+        .map_err(|e| e.to_string())?;
     }
     let os = std::env::consts::OS;
     let rust = select_rust_homes(os, readonly, &scratch.join("cargo-home"));
     if let Some(rust) = &rust {
-        std::fs::create_dir_all(&rust.cargo_home).map_err(|e| e.to_string())?;
+        create_staging_dir(&rust.cargo_home).map_err(|e| e.to_string())?;
         for sub in RUST_CACHES {
             if let Some(real) = rust_root(os, readonly, &format!("/.cargo/{sub}")) {
                 link_dir(real, &rust.cargo_home.join(sub))
@@ -1254,7 +1582,14 @@ fn stage_workspace(
         req.test.as_deref(),
     )
     .map_err(|e| format!("cannot write command wrapper: {e}"))?;
-    Ok(StagedWorkspace { digest, rust, gaps })
+    crate::proof_inputs::normalize_timestamps(workspace)?;
+    crate::proof_inputs::check_staging()?;
+    Ok(StagedWorkspace {
+        digest,
+        manifest,
+        rust,
+        gaps,
+    })
 }
 
 pub fn prove(req: &ProveRequest) -> ProveOutcome {
@@ -1419,6 +1754,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     let denied = Vec::new();
     let StagedWorkspace {
         digest: target_sha256,
+        manifest: input_manifest,
         rust,
         gaps: mut extra_gaps,
     } = match stage_workspace(req, &workspace, &scratch, &readonly, &nonce) {
@@ -1543,6 +1879,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             }
             let StagedWorkspace {
                 digest,
+                manifest: _,
                 rust,
                 gaps: retry_gaps,
             } = match stage_workspace(req, &workspace, &scratch, &input.readonly, &nonce) {
@@ -1626,6 +1963,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             .then(|| std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".into())),
         marker_nonce: nonce,
         target_sha256,
+        input_manifest,
         enforced,
         gaps,
         notes,
@@ -1636,6 +1974,160 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_refuses_oversized_sparse_source_before_copy_and_expired_postwalk() {
+        let base = crate::platform::scratch_root().unwrap().join(format!(
+            "staging-limits-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&base).unwrap();
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let input = target.join("input");
+        let run_dir = base.join("proof");
+        crate::platform::create_private_dir_new(&run_dir).unwrap();
+        let request = ProveRequest {
+            command: "never executed".into(),
+            expect_marker: None,
+            test: None,
+            timeout_ms: 1000,
+            target: Some(target.clone()),
+            run_dir: run_dir.clone(),
+            tier: Tier::Test,
+            stage: None,
+            expected_tree_sha256: None,
+            inputs: None,
+            expected_inputs: None,
+            harness: vec![],
+        };
+        let sparse = std::fs::File::create(&input).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            extern "system" {
+                fn DeviceIoControl(
+                    handle: *mut core::ffi::c_void,
+                    code: u32,
+                    input: *const u8,
+                    input_len: u32,
+                    output: *mut u8,
+                    output_len: u32,
+                    returned: *mut u32,
+                    overlapped: *mut core::ffi::c_void,
+                ) -> i32;
+            }
+            let mut returned = 0;
+            // SAFETY: the owned file handle is live, no buffers are passed,
+            // and returned points to writable storage. FSCTL_SET_SPARSE makes
+            // the oversized fixture cheap on Windows as well as Unix.
+            let ok = unsafe {
+                DeviceIoControl(
+                    sparse.as_raw_handle(),
+                    0x0009_00c4,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        }
+        sparse
+            .set_len(crate::proof_inputs::MAX_SOURCE_BYTES + 1)
+            .unwrap();
+        drop(sparse);
+        let workspace = run_dir.join("workspace");
+        let result = stage_workspace(&request, &workspace, &run_dir.join("scratch"), &[], "nonce");
+        assert!(matches!(result, Err(ref e) if e.contains("aggregate source byte budget")));
+        assert!(!workspace.exists());
+        std::fs::write(&input, b"ab").unwrap();
+        STAGING_HOOK
+            .with(|hook| *hook.borrow_mut() = Some(Box::new(crate::proof_inputs::expire_staging)));
+        let result = stage_workspace(&request, &workspace, &run_dir.join("scratch"), &[], "nonce");
+        assert!(matches!(result, Err(ref e) if e.contains("staging deadline exceeded")));
+        assert!(!run_dir.join("config.json").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn restored_source_writes_and_membership_changes_refuse_staging() {
+        for membership in [false, true] {
+            let base = crate::platform::scratch_root().unwrap().join(format!(
+                "staging-restored-{}-{}",
+                std::process::id(),
+                crate::platform::random_nonce().unwrap()
+            ));
+            crate::platform::create_private_dir_new(&base).unwrap();
+            let target = base.join("target");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("input"), b"0").unwrap();
+            let identity = crate::proof_inputs::manifest(&target, None).unwrap();
+            let modified = std::fs::metadata(target.join("input"))
+                .unwrap()
+                .modified()
+                .unwrap();
+            let source = target.clone();
+            STAGING_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    for _ in 0..8 {
+                        if membership {
+                            std::fs::write(source.join("transient"), b"synthetic").unwrap();
+                            std::fs::remove_file(source.join("transient")).unwrap();
+                        } else {
+                            std::fs::write(source.join("input"), b"1").unwrap();
+                            std::fs::write(source.join("input"), b"0").unwrap();
+                        }
+                    }
+                    // Restoring mtime must not hide the OS change time.
+                    if !membership {
+                        std::fs::File::options()
+                            .write(true)
+                            .open(source.join("input"))
+                            .unwrap()
+                            .set_times(std::fs::FileTimes::new().set_modified(modified))
+                            .unwrap();
+                    }
+                }))
+            });
+            let run_dir = base.join("proof");
+            crate::platform::create_private_dir_new(&run_dir).unwrap();
+            let request = ProveRequest {
+                command: "never executed".into(),
+                expect_marker: None,
+                test: None,
+                timeout_ms: 1000,
+                target: Some(target.clone()),
+                run_dir: run_dir.clone(),
+                tier: Tier::Test,
+                stage: None,
+                expected_tree_sha256: None,
+                inputs: None,
+                expected_inputs: None,
+                harness: vec![],
+            };
+            let workspace = run_dir.join("workspace");
+            let result =
+                stage_workspace(&request, &workspace, &run_dir.join("scratch"), &[], "nonce");
+            assert!(matches!(result, Err(ref e) if e.contains("target changed during staging")));
+            assert_eq!(
+                identity,
+                crate::proof_inputs::manifest(&target, None).unwrap(),
+                "all content identities agree after restoring the source"
+            );
+            assert_eq!(
+                identity,
+                crate::proof_inputs::manifest(&workspace, None).unwrap()
+            );
+            assert!(
+                !run_dir.join("config.json").exists(),
+                "refuse before execution setup"
+            );
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1743,6 +2235,9 @@ mod tests {
                     tier: Tier::Test,
                     stage: None,
                     expected_tree_sha256: None,
+                    inputs: None,
+                    expected_inputs: None,
+                    harness: vec![],
                 };
                 let readonly: Vec<_> = toolchain_roots("macos", discovered.as_deref())
                     .into_iter()
@@ -1849,7 +2344,8 @@ mod tests {
                     "executor": executor.file, "executor_sha256": executor.sha256,
                     "config_sha256": sha256::digest(config_text.as_bytes()),
                     "enforced": enforced, "gaps": gaps, "output_sha256": sha256::digest(b""),
-                    "output_bytes_total": 0, "output": "", "omgs_version": env!("CARGO_PKG_VERSION")
+                    "output_bytes_total": 0, "output": "", "omgs_version": env!("CARGO_PKG_VERSION"),
+                    "output_audit": {"version":1,"marker_observations":[],"stream_bytes":[0,0],"retained_stream_bytes":[0,0],"redactions":[],"captured_text_bytes":0,"decoded_capture_bytes":0}
                 })).unwrap();
                 crate::proof::write(&run, &record).unwrap();
                 let saved = crate::proof::load(&run, "proofs/1.json").unwrap();
@@ -1922,6 +2418,104 @@ mod tests {
     }
 
     #[test]
+    fn harness_modes_are_fixed_or_identity_bound_on_every_platform() {
+        let base = crate::platform::temp_root()
+            .unwrap()
+            .join(format!("omgs-harness-modes-{}", std::process::id()));
+        platform::create_private_tree(&base).unwrap();
+        for directory in [false, true] {
+            let run = base.join(if directory { "directory" } else { "single" });
+            let proof_dir = run.join("proofs/1");
+            platform::create_private_tree(&proof_dir).unwrap();
+            let retained = if directory {
+                proof_dir.join("harness/checks/deep/test")
+            } else {
+                proof_dir.join("test-draft")
+            };
+            platform::create_private_tree(retained.parent().unwrap()).unwrap();
+            crate::runmeta::write_atomic_bytes(&retained, b"harness bytes").unwrap();
+            let bound_mode = if cfg!(unix) { 0o640 } else { 1 };
+            let req = ProveRequest {
+                expect_marker: None,
+                command: "echo fixture".into(),
+                test: Some("checks/deep/test".into()),
+                timeout_ms: 1000,
+                target: None,
+                run_dir: proof_dir.clone(),
+                tier: Tier::Test,
+                stage: (!directory).then(|| (retained.clone(), "checks/deep/test".into())),
+                expected_tree_sha256: None,
+                inputs: None,
+                expected_inputs: None,
+                harness: if directory {
+                    vec![crate::proof::HarnessFile {
+                        path: "checks/deep/test".into(),
+                        sha256: sha256::digest(b"harness bytes"),
+                        mode: bound_mode,
+                    }]
+                } else {
+                    vec![]
+                },
+            };
+            for (i, retained_mode) in [
+                if cfg!(unix) { 0o600 } else { 0 },
+                if cfg!(unix) { 0o700 } else { 1 },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                set_input_permissions(&retained, retained_mode).unwrap();
+                let workspace = proof_dir.join(format!("workspace{i}"));
+                let scratch = proof_dir.join(format!("scratch{i}"));
+                stage_workspace(&req, &workspace, &scratch, &[], "fixture-nonce").unwrap();
+                for path in [
+                    workspace.clone(),
+                    workspace.join("checks"),
+                    workspace.join("checks/deep"),
+                    scratch.clone(),
+                    scratch.join("cache"),
+                    scratch.join("clang-cache"),
+                ] {
+                    assert_eq!(
+                        crate::proof_inputs::mode(&std::fs::metadata(path).unwrap()),
+                        root_mode()
+                    );
+                }
+                let file = workspace.join("checks/deep/test");
+                assert_eq!(std::fs::read(&file).unwrap(), b"harness bytes");
+                assert_eq!(
+                    crate::proof_inputs::mode(&std::fs::metadata(&file).unwrap()),
+                    if directory { bound_mode } else { root_mode() }
+                );
+                // Exercise the Windows wrapper materialization even on Unix.
+                write_wrapper(
+                    "windows",
+                    &workspace,
+                    "echo fixture",
+                    "wrapper-fixture-nonce",
+                    req.test.as_deref(),
+                )
+                .unwrap();
+                let wrapper = workspace.join(format!(
+                    "{}.cmd",
+                    wrapper_name("echo fixture", "wrapper-fixture-nonce", req.test.as_deref())
+                ));
+                assert_eq!(
+                    crate::proof_inputs::mode(&std::fs::metadata(&wrapper).unwrap()),
+                    fixed_file_mode()
+                );
+                assert!(std::fs::read_to_string(wrapper)
+                    .unwrap()
+                    .contains("OMGS_START_wrapper-fixture-nonce"));
+                // Read-only Windows fixtures must be restored before cleanup.
+                set_input_permissions(&file, fixed_file_mode()).unwrap();
+            }
+            set_input_permissions(&retained, fixed_file_mode()).unwrap();
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn blocked_proofs_remove_their_staging_directory() {
         let d = crate::platform::temp_root()
             .unwrap()
@@ -1936,6 +2530,9 @@ mod tests {
             tier: Tier::Test,
             stage: None,
             expected_tree_sha256: None,
+            inputs: None,
+            expected_inputs: None,
+            harness: vec![],
         };
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("test-draft"), b"draft").unwrap();
@@ -2003,6 +2600,317 @@ mod tests {
         }
     }
 
+    #[test]
+    fn selected_copy_is_batched_exact_and_charges_omitted_siblings_before_copying() {
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-selected-width-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let src = d.join("source");
+        std::fs::create_dir_all(src.join("selected/nested")).unwrap();
+        for n in (0..300).rev() {
+            std::fs::write(src.join(format!("selected/nested/p{n:04}")), b"synthetic").unwrap();
+            std::fs::write(src.join(format!("omitted{n:04}")), b"omitted").unwrap();
+        }
+        let selection = crate::proof_inputs::Selection {
+            version: 1,
+            paths: vec!["selected".into()],
+        };
+        let dst = d.join("copy");
+        copy_selected(&src, &dst, &selection).unwrap();
+        assert_eq!(
+            crate::proof_inputs::manifest(&src, Some(selection.clone())).unwrap(),
+            crate::proof_inputs::manifest(&dst, Some(selection.clone())).unwrap()
+        );
+        assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(dst.join("selected/nested"))
+                .unwrap()
+                .count(),
+            300
+        );
+        let capped = d.join("capped");
+        std::fs::create_dir(&capped).unwrap();
+        let mut count = crate::proof_inputs::MAX_ENTRIES - 1;
+        let error = copy_recursive(
+            &src,
+            &capped,
+            &(src.clone(), capped.clone()),
+            Some(&selection),
+            &mut count,
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeds"));
+        assert_eq!(count, crate::proof_inputs::MAX_ENTRIES);
+        assert_eq!(std::fs::read_dir(&capped).unwrap().count(), 0);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_staging_normalizes_hardlinks_sparse_files_and_special_modes() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-fresh-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let src = d.join("source");
+        std::fs::create_dir_all(src.join("dir")).unwrap();
+        std::fs::write(src.join("a"), b"same").unwrap();
+        std::fs::hard_link(src.join("a"), src.join("b")).unwrap();
+        let sparse = std::fs::File::create(src.join("zeros")).unwrap();
+        sparse.set_len(2 << 20).unwrap();
+        drop(sparse);
+        std::fs::set_permissions(src.join("a"), std::fs::Permissions::from_mode(0o6755)).unwrap();
+        std::fs::set_permissions(src.join("dir"), std::fs::Permissions::from_mode(0o3775)).unwrap();
+        let before = crate::proof_inputs::manifest(&src, None).unwrap();
+        let first = d.join("first");
+        copy_tree(&src, &first).unwrap();
+        assert_eq!(crate::proof_inputs::manifest(&first, None).unwrap(), before);
+        for name in ["a", "b"] {
+            let meta = std::fs::metadata(first.join(name)).unwrap();
+            assert_eq!(meta.nlink(), 1);
+            assert_eq!(meta.mode() & 0o7777, 0o755);
+        }
+        assert_ne!(
+            std::fs::metadata(first.join("a")).unwrap().ino(),
+            std::fs::metadata(first.join("b")).unwrap().ino()
+        );
+        assert_eq!(
+            std::fs::metadata(first.join("dir")).unwrap().mode() & 0o7777,
+            0o775
+        );
+        assert_eq!(std::fs::metadata(&first).unwrap().mode() & 0o7777, 0o755);
+        assert!(std::fs::metadata(first.join("zeros")).unwrap().blocks() >= (2 << 20) / 512);
+        // Independent files, dense bytes and no special bits admit identically.
+        std::fs::remove_file(src.join("b")).unwrap();
+        std::fs::write(src.join("b"), b"same").unwrap();
+        std::fs::set_permissions(src.join("a"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(src.join("b"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(src.join("dir"), std::fs::Permissions::from_mode(0o775)).unwrap();
+        std::fs::write(src.join("zeros"), vec![0; 2 << 20]).unwrap();
+        assert_eq!(crate::proof_inputs::manifest(&src, None).unwrap(), before);
+        let second = d.join("second");
+        copy_tree(&src, &second).unwrap();
+        assert_eq!(
+            crate::proof_inputs::manifest(&second, None).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::metadata(first.join("zeros")).unwrap().blocks(),
+            std::fs::metadata(second.join("zeros")).unwrap().blocks()
+        );
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn fresh_staging_never_transfers_source_extended_attributes() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-xattr-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let src = d.join("source");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("file"), b"bytes").unwrap();
+        for path in [&src, &src.join("file")] {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            let name = c"user.omgs_fixture";
+            #[cfg(target_os = "macos")]
+            let result = unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    b"BEFORE".as_ptr().cast(),
+                    6,
+                    0,
+                    0,
+                )
+            };
+            #[cfg(target_os = "linux")]
+            let result = unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    name.as_ptr(),
+                    b"BEFORE".as_ptr().cast(),
+                    6,
+                    0,
+                )
+            };
+            assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        }
+        let before = crate::proof_inputs::manifest(&src, None).unwrap();
+        for (n, value) in [b"BEFORE".as_slice(), b"AFTER".as_slice()]
+            .iter()
+            .enumerate()
+        {
+            let path = std::ffi::CString::new(src.join("file").as_os_str().as_bytes()).unwrap();
+            #[cfg(target_os = "macos")]
+            let result = unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    c"user.omgs_fixture".as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            };
+            #[cfg(target_os = "linux")]
+            let result = unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    c"user.omgs_fixture".as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            };
+            assert_eq!(result, 0);
+            assert_eq!(crate::proof_inputs::manifest(&src, None).unwrap(), before);
+            let dst = d.join(format!("copy-{n}"));
+            copy_tree(&src, &dst).unwrap();
+            for path in [&dst, &dst.join("file")] {
+                let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+                #[cfg(target_os = "macos")]
+                let result = unsafe {
+                    libc::getxattr(
+                        path.as_ptr(),
+                        c"user.omgs_fixture".as_ptr(),
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        0,
+                    )
+                };
+                #[cfg(target_os = "linux")]
+                let result = unsafe {
+                    libc::getxattr(
+                        path.as_ptr(),
+                        c"user.omgs_fixture".as_ptr(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert_eq!(result, -1, "source xattr must be absent");
+            }
+            assert_eq!(crate::proof_inputs::manifest(&dst, None).unwrap(), before);
+        }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fresh_staging_never_transfers_source_acls_or_flags() {
+        use std::os::macos::fs::MetadataExt;
+        use std::os::unix::ffi::OsStrExt;
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-acl-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let src = d.join("source");
+        std::fs::create_dir_all(src.join("dir")).unwrap();
+        std::fs::write(src.join("file"), b"bytes").unwrap();
+        let before = crate::proof_inputs::manifest(&src, None).unwrap();
+        let acl_listing = |path: &Path| {
+            let out = Command::new("/bin/ls")
+                .arg("-lde")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .lines()
+                .skip(1)
+                .any(|line| line.trim_start().starts_with("0:"))
+        };
+        for path in [&src, &src.join("dir"), &src.join("file")] {
+            let status = Command::new("/bin/chmod")
+                .args(["+a", "everyone allow read"])
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert!(acl_listing(path));
+            let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chflags(cpath.as_ptr(), libc::UF_HIDDEN) }, 0);
+        }
+        assert_eq!(crate::proof_inputs::manifest(&src, None).unwrap(), before);
+        let dst = d.join("copy");
+        copy_tree(&src, &dst).unwrap();
+        for path in [&dst, &dst.join("dir"), &dst.join("file")] {
+            assert!(!acl_listing(path));
+            assert_eq!(std::fs::metadata(path).unwrap().st_flags(), 0);
+        }
+        assert_eq!(crate::proof_inputs::manifest(&dst, None).unwrap(), before);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_directory_and_dangling_links_have_one_admission_policy() {
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-link-admission-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let src = d.join("source");
+        std::fs::create_dir_all(src.join("dir")).unwrap();
+        std::fs::write(src.join("file"), b"bytes").unwrap();
+        let src = std::fs::canonicalize(src).unwrap();
+        for kind in ["file", "directory", "dangling", "junction"] {
+            let link = src.join("link");
+            let result = match kind {
+                "junction" => link_dir(&src.join("dir"), &link),
+                "directory" => std::os::windows::fs::symlink_dir("dir", &link),
+                "file" => std::os::windows::fs::symlink_file("file", &link),
+                _ => std::os::windows::fs::symlink_file("missing", &link),
+            };
+            if let Err(e) = result {
+                // Windows symlinks need Developer Mode or SeCreateSymbolicLinkPrivilege.
+                // Junctions always exercise directory reparse admission.
+                if kind != "junction" && e.raw_os_error() == Some(1314) {
+                    crate::out::err(&format!("{kind} symlink fixture unavailable: {e}"));
+                    continue;
+                }
+                panic!("{kind}: {e}");
+            }
+            let validation = crate::proof_inputs::manifest(&src, None).unwrap_err();
+            let staging = copy_tree(&src, &d.join(format!("copy-{kind}"))).unwrap_err();
+            assert_eq!(staging, validation);
+            assert!(staging.contains("unsupported execution input link on Windows"));
+            if matches!(kind, "directory" | "junction") {
+                std::fs::remove_dir(link).unwrap();
+            } else {
+                std::fs::remove_file(link).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noncanonical_target_names_are_refused_before_copying() {
+        let base = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-names-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let src = base.join("target");
+        std::fs::create_dir_all(&src).unwrap();
+        for name in [r"a\b", "a:b"] {
+            let path = src.join(name);
+            std::fs::write(&path, b"fixture").unwrap();
+            let expected = crate::proof_inputs::manifest(&src, None).unwrap_err();
+            assert!(expected.contains("canonical relative paths"));
+            let dst = base.join("copy");
+            assert_eq!(copy_tree(&src, &dst).unwrap_err(), expected);
+            assert!(!dst.exists());
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn copies_content_and_skips_sockets_and_fifos() {
@@ -2031,9 +2939,9 @@ mod tests {
             std::os::unix::fs::symlink(target, src.join(name)).unwrap();
         }
         std::fs::write(d.join("outside"), "outside").unwrap();
-        let digest = crate::proof::tree_digest(&src).unwrap();
+        let digest = crate::proof_inputs::manifest(&src, None).unwrap();
         copy_tree(&src, &dst).unwrap();
-        let copied_digest = crate::proof::tree_digest(&dst).unwrap();
+        let copied_digest = crate::proof_inputs::manifest(&dst, None).unwrap();
         assert_eq!(std::fs::read(dst.join("large")).unwrap(), data);
         assert_ne!(
             std::fs::metadata(dst.join("a")).unwrap().ino(),
@@ -2067,9 +2975,9 @@ mod tests {
             assert!(gaps.iter().any(|gap| gap.ends_with(name)), "{gaps:?}");
             assert!(!special_copy.join(name).exists());
         }
-        assert_eq!(crate::proof::tree_digest(&src).unwrap(), digest);
+        assert_eq!(crate::proof_inputs::manifest(&src, None).unwrap(), digest);
         assert_eq!(
-            crate::proof::tree_digest(&special_copy).unwrap(),
+            crate::proof_inputs::manifest(&special_copy, None).unwrap(),
             copied_digest
         );
         assert!(crate::sha256::digest_file(&fifo).is_err());
@@ -2172,7 +3080,7 @@ mod tests {
             std::os::unix::fs::symlink(root.join("file"), copy.join(link)).unwrap();
         }
         let mut gaps = Vec::new();
-        record_live_links(&root, &copy, &links, &mut gaps);
+        record_live_links(&root, &copy, &copy, &mut PathSummary::default(), &mut gaps).unwrap();
         assert_eq!(gaps.len(), 21);
         assert!(gaps[0].ends_with("link-00"));
         assert!(gaps[19].ends_with("link-19"));
@@ -2206,6 +3114,10 @@ mod tests {
             test_reachable: None,
             boundary_marker_seen: false,
             authorized_control_seen: false,
+            marker_observations: vec![],
+            stream_bytes: [0; 2],
+            retained_stream_bytes: [0; 2],
+            decoded_capture_bytes: 0,
             enumerate_rejected: true,
             executor_error: true,
             killed: false,
@@ -2262,6 +3174,9 @@ mod tests {
             tier: Tier::Test,
             stage: None,
             expected_tree_sha256: None,
+            inputs: None,
+            expected_inputs: None,
+            harness: vec![],
         };
         let ProveOutcome::Blocked { reason } = prove(&request) else {
             panic!("augmented tier ran");
@@ -2331,10 +3246,98 @@ mod tests {
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
         assert!(stage_file(&ws, "a/b/c.sh", &draft).is_ok());
         std::fs::write(ws.join("existing.sh"), b"old").unwrap();
-        assert!(stage_file(&ws, "existing.sh", &draft).is_ok());
-        assert_eq!(std::fs::read(ws.join("existing.sh")).unwrap(), b"test");
+        assert!(stage_file(&ws, "existing.sh", &draft).is_err());
+        assert_eq!(std::fs::read(ws.join("existing.sh")).unwrap(), b"old");
         assert!(stage_file(&ws, "../x", &draft).is_err());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn harness_preflight_rejects_all_collisions_and_portable_aliases_before_writes() {
+        let base = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-harness-preflight-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_tree(&base).unwrap();
+        let ws = base.join("workspace");
+        crate::platform::private_dir(&ws).unwrap();
+        std::fs::write(ws.join("security.sh"), "ORIGINAL").unwrap();
+        std::fs::create_dir(ws.join("checks")).unwrap();
+        for path in [
+            "security.sh",
+            "SECURITY.SH",
+            "security.sh/child",
+            "checks",
+            ".git/config",
+            ".omgs-wrapper",
+            "securi~1.sh",
+            "x\\security.sh",
+            "x:stream",
+            "security.sh.",
+            "security.sh ",
+            "CON",
+            "NUL.txt",
+            "COM1.sh",
+            "caf\u{e9}/entry.sh",
+            "cafe\u{301}/entry.sh",
+        ] {
+            assert!(
+                preflight_harness(&ws, &["entry.sh", path]).is_err(),
+                "{path}"
+            );
+            assert!(!ws.join("entry.sh").exists());
+            assert_eq!(std::fs::read(ws.join("security.sh")).unwrap(), b"ORIGINAL");
+        }
+        for paths in [
+            vec!["new/a.sh", "NEW/b.sh"],
+            vec!["new/a.sh", "new/A.sh"],
+            vec!["new", "new/a.sh"],
+            vec!["new/a.sh", "new"],
+        ] {
+            assert!(preflight_harness(&ws, &paths).is_err(), "{paths:?}");
+        }
+        assert!(preflight_harness(
+            &ws,
+            &["new/entry.sh", "new/nested/helper.sh", "checks/new.sh"]
+        )
+        .is_ok());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("missing", ws.join("dangling")).unwrap();
+            assert!(preflight_harness(&ws, &["dangling/entry.sh"]).is_err());
+        }
+        let request = ProveRequest {
+            command: "never executed".into(),
+            expect_marker: None,
+            test: Some("entry.sh".into()),
+            timeout_ms: 1000,
+            target: Some(ws.clone()),
+            run_dir: base.join("proof"),
+            tier: Tier::Test,
+            stage: None,
+            expected_tree_sha256: None,
+            inputs: None,
+            expected_inputs: None,
+            harness: ["entry.sh", "security.sh"]
+                .into_iter()
+                .map(|path| crate::proof::HarnessFile {
+                    path: path.into(),
+                    sha256: crate::sha256::digest(b"replacement"),
+                    mode: 0,
+                })
+                .collect(),
+        };
+        let copied = base.join("copy");
+        let result = stage_workspace(&request, &copied, &base.join("scratch"), &[], "nonce");
+        assert!(matches!(result, Err(e) if e.contains("harness destination collides")));
+        assert!(!copied.join("entry.sh").exists());
+        assert_eq!(
+            std::fs::read(copied.join("security.sh")).unwrap(),
+            b"ORIGINAL"
+        );
+        std::fs::write(ws.join("caf\u{e9}"), "unicode").unwrap();
+        assert!(preflight_harness(&ws, &["fresh/entry.sh"]).is_err());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

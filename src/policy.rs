@@ -796,6 +796,9 @@ fn gate_tests(target: &Path, base: &str, head: &str, p: &Policy) -> Result<bool,
             tier: crate::sandbox::Tier::Test,
             stage: None,
             expected_tree_sha256: None,
+            inputs: None,
+            expected_inputs: None,
+            harness: vec![],
         });
         let r = match result {
             crate::sandbox::ProveOutcome::Blocked { reason } => {

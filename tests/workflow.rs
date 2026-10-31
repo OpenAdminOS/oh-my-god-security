@@ -396,6 +396,17 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             target: None,
             target_head: None,
             target_sha256: None,
+            execution_inputs: None,
+            harness: vec![],
+            output_audit: Some(omgs::proof::OutputAudit {
+                version: 1,
+                marker_observations: vec![],
+                stream_bytes: [0; 2],
+                retained_stream_bytes: [0; 2],
+                redactions: vec![],
+                captured_text_bytes: 0,
+                decoded_capture_bytes: 0,
+            }),
             proof_dir: proof_dir.to_string_lossy().into(),
             marker_nonce: nonce,
             command_started: true,
@@ -434,6 +445,27 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
         f.proof_ref = Some(omgs::proof::reference(n));
     }
     findings
+}
+
+fn bind_execution_inputs(
+    run: &std::path::Path,
+    target: &std::path::Path,
+    record: &mut omgs::proof::ProofRecord,
+) {
+    let manifest = omgs::proof_inputs::manifest(target, None).unwrap();
+    let digest = manifest.digest().unwrap();
+    record.target_sha256 = Some(digest.clone());
+    record.execution_inputs = Some(omgs::proof::ExecutionInputs {
+        version: omgs::proof_inputs::VERSION,
+        sha256: digest,
+        selection: None,
+    });
+    let path = run
+        .join("proofs")
+        .join(record.n.to_string())
+        .join("input-manifest.json");
+    omgs::platform::create_private_tree(path.parent().unwrap()).unwrap();
+    manifest.write_to(&path).unwrap();
 }
 
 fn complete_run() -> (Ledger, Vec<SourcedCandidate>, FindingsFile) {
@@ -534,6 +566,17 @@ fn adjudicate_fixture(dir: &std::path::Path, findings: &FindingsFile) {
                 .unwrap(),
             )
             .unwrap();
+            if replay.execution_inputs.is_some() {
+                let original = dir
+                    .join("proofs")
+                    .join(replay.replays.unwrap().to_string())
+                    .join("input-manifest.json");
+                write_private_fixture(
+                    artifacts.join("input-manifest.json"),
+                    std::fs::read(original).unwrap(),
+                )
+                .unwrap();
+            }
             assert!(
                 omgs::proof::runner_evidence(dir, &replay).is_empty(),
                 "{:?}",
@@ -1707,6 +1750,47 @@ fn bind_contract(dir: &std::path::Path, record: &mut omgs::proof::ProofRecord) {
     let text = config.to_string();
     std::fs::write(path, &text).unwrap();
     record.config_sha256 = omgs::sha256::digest(text.as_bytes());
+    let mut observations = Vec::new();
+    let mut offset = 0;
+    if let omgs::proof::Contract::Recipe {
+        expect_marker,
+        boundary_marker_seen,
+        authorized_control_seen,
+    } = &record.contract
+    {
+        for (kind, seen, text) in [
+            (
+                "control",
+                *authorized_control_seen,
+                omgs::proof::control_marker(&record.marker_nonce),
+            ),
+            (
+                "boundary",
+                *boundary_marker_seen,
+                omgs::proof::boundary_marker(expect_marker, &record.marker_nonce),
+            ),
+        ] {
+            if seen {
+                observations.push(omgs::proof::MarkerObservation {
+                    kind: kind.into(),
+                    stream: 0,
+                    start: offset,
+                    end: offset + text.len() as u64,
+                });
+                offset += text.len() as u64 + 1;
+            }
+        }
+    }
+    record.output_bytes_total = offset;
+    record.output_audit = Some(omgs::proof::OutputAudit {
+        version: 1,
+        marker_observations: observations,
+        stream_bytes: [offset, 0],
+        retained_stream_bytes: [0; 2],
+        redactions: vec![],
+        captured_text_bytes: 0,
+        decoded_capture_bytes: 0,
+    });
 }
 
 #[test]
@@ -1938,7 +2022,7 @@ fn proof_validation_checks_target_test_and_declared_gaps() {
     let test = target.join(record.test.as_ref().unwrap());
     std::fs::write(&test, b"original test").unwrap();
     record.target = Some(target.to_string_lossy().into());
-    record.target_sha256 = Some(omgs::proof::tree_digest(&target).unwrap());
+    bind_execution_inputs(&dir, &target, &mut record);
     record.test_sha256 = Some(omgs::sha256::digest(b"original test"));
     omgs::proof::write(&dir, &record).unwrap();
     assert!(omgs::proof::validate_proofs(&findings, &dir).is_empty());
@@ -2517,7 +2601,7 @@ fn persona_never_changes_validation_critic_or_verdicts() {
             let mut record: omgs::proof::ProofRecord =
                 serde_json::from_str(&std::fs::read_to_string(&saved_proof).unwrap()).unwrap();
             record.target = Some(target.canonicalize().unwrap().to_string_lossy().into());
-            record.target_sha256 = Some(omgs::proof::tree_digest(&target).unwrap());
+            bind_execution_inputs(&run, &target, &mut record);
             record.test_sha256 = Some(omgs::sha256::digest(b"fixture"));
             omgs::proof::write(&run, &record).unwrap();
             write_private_fixture(
@@ -2799,10 +2883,10 @@ fn stage_patch_applies_without_touching_target_and_rejects_bad_inputs() {
     let target = dir.with_extension("target");
     omgs::platform::create_private_tree(&target).unwrap();
     std::fs::write(target.join("source.txt"), "unchanged\n").unwrap();
-    let before = omgs::proof::tree_digest(&target).unwrap();
+    let before = omgs::proof_inputs::manifest(&target, None).unwrap();
     let mut p = omgs::proof::load(&dir, "proofs/1.json").unwrap();
     p.target = Some(target.to_string_lossy().into());
-    p.target_sha256 = Some(before.clone());
+    bind_execution_inputs(&dir, &target, &mut p);
     p.test_from = Some("original-draft".into());
     // Preserve CRLF and missing final newline byte-for-byte in the patch.
     let test = "first\r\nlast";
@@ -2830,7 +2914,7 @@ fn stage_patch_applies_without_touching_target_and_rejects_bad_inputs() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(omgs::proof::tree_digest(&target).unwrap(), before);
+    assert_eq!(omgs::proof_inputs::manifest(&target, None).unwrap(), before);
     let copy = dir.with_extension("copy");
     std::fs::create_dir(&copy).unwrap();
     std::fs::copy(target.join("source.txt"), copy.join("source.txt")).unwrap();
@@ -3587,7 +3671,7 @@ fn stage_includes_only_validated_confirmed_proofs_and_reports_exclusions() {
     let dir = scratch("stage-admission");
     let target = dir.with_extension("target");
     omgs::platform::create_private_tree(&target).unwrap();
-    let snapshot = omgs::proof::tree_digest(&target).unwrap();
+    let snapshot = omgs::proof_inputs::manifest(&target, None).unwrap();
     write_private_fixture(
         dir.join("run-metadata.json"),
         serde_json::json!({"target":target}).to_string(),
@@ -3605,7 +3689,7 @@ fn stage_includes_only_validated_confirmed_proofs_and_reports_exclusions() {
         let reference = f.proof_ref.as_deref().unwrap();
         let mut p = omgs::proof::load(&dir, reference).unwrap();
         p.target = Some(target.to_string_lossy().into());
-        p.target_sha256 = Some(snapshot.clone());
+        bind_execution_inputs(&dir, &target, &mut p);
         let test = format!("tests/{}.ts", ["accepted", "pending", "invalid"][i]);
         p.test = Some(test.clone());
         p.command = format!("node {test}");
@@ -3674,7 +3758,10 @@ fn stage_includes_only_validated_confirmed_proofs_and_reports_exclusions() {
         diagnostic.contains(&file.findings[2].fingerprint)
             && diagnostic.contains("did not finish cleanly")
     );
-    assert_eq!(omgs::proof::tree_digest(&target).unwrap(), snapshot);
+    assert_eq!(
+        omgs::proof_inputs::manifest(&target, None).unwrap(),
+        snapshot
+    );
     std::fs::remove_dir_all(dir).unwrap();
     std::fs::remove_dir_all(target).unwrap();
 }

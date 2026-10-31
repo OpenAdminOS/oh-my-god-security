@@ -92,7 +92,7 @@ proof replays, builds or target execution. Every exported finding is bound to it
 source run's `findings.json`, including the identity, verdict, tier and
 `proof_ref`. Source findings must pass the evidence rules used by `omgs validate`.
 Each matching finding then passes the same offline proof validator, including
-runner config, command and draft digests, clean execution and `omgs-proof/2`
+runner config, command and draft digests, clean execution and `omgs-proof/3`
 recipe contract rules. Its proof record must have a `target_head` exactly equal
 to the observation's frozen manifest snapshot `source_ref`. Missing or mismatched
 revisions cannot support TP, recovery or FP counts. Missing, mismatched or

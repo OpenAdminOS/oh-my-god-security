@@ -940,6 +940,7 @@ mod offline_tests {
                         ])
                         .env("OMGS_HOME", &home)
                         .env("RUSTUP_AUTO_INSTALL", "0")
+                        .env("RUST_TEST_THREADS", "1")
                         .env(OCCURRENCE_FIXTURE_ENV, item.to_string())
                         .output()
                         .unwrap();

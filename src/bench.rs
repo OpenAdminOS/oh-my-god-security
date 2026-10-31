@@ -704,7 +704,7 @@ fn evidence_errors(dir: &Path, r: &Value, manifest: &Value) -> Result<Evidence> 
                             }
                         } else {
                             // The same offline proof validator used by `omgs validate`, including
-                            // runner artifacts and omgs-proof/2 contract rules. No replay.
+                            // runner artifacts and versioned proof contract rules. No replay.
                             let mut proof_errors =
                                 view.decision_errors[&finding.fingerprint].clone();
                             if let Some(proof_ref) = finding.proof_ref.as_deref() {

@@ -2,20 +2,32 @@
 
 ## Proof by default: per-stack recipes
 
-For every candidate, attempt the cheapest decisive sandbox proof when its runtime is reachable
-locally, within the declared proof budget. A budget stop is also an exact blocker, never a silent
-omission. Hand the relevant recipe below to the hunter with its scope. The verifier checks the
-harness against the real source. Run `omgs doctor --live` first. Its `toolchains reachable inside
-the sandbox` list means a version command actually launched, not merely that a filename was found.
-Doctor prints `<runtime> not on host PATH` for an absent executable, or `<runtime> on host PATH but
-failed to launch inside MXC` followed by a reason for an installed tool whose bounded launch probe
-fails. It probes `sh` too. Record the exact line, its reason and the startup output from `omgs
-prove`, or its printed `needs_validation` reason on exit 3. Do not suggest an installation during
-proof. No runtime, missing local modules, a refused OS tier, failed DLL initialization, syntax or
-build errors, and exhausted budgets remain blockers with `needs_validation`, never rejection.
+For every candidate, attempt the cheapest decisive local sandbox proof within its budget. Give the
+hunter the recipe and scope; the verifier checks its harness against real source. Run
+`omgs doctor --live` first. `toolchains reachable inside the sandbox` means a version command
+launched, not merely that an executable exists. Doctor probes `sh` too. Record its exact
+`<runtime> not on host PATH` or `<runtime> on host PATH but failed to launch inside MXC` line and
+reason, plus `omgs prove` startup output or its exit-3 `needs_validation` reason. Missing runtimes
+or local modules, refused OS tiers, DLL initialization failures, syntax/build errors, and exhausted
+budgets remain explicit `needs_validation` blockers, never rejection or silent omissions. Do not
+suggest installation during proof.
 
-All commands below run from the reviewer's shell. Replace `RUN`, `FP` and `DRAFT` with the resolved
-external run directory, fingerprint and draft file. Staged test paths are relative to the target.
+Commands run from the reviewer's shell. Replace `RUN`, `FP` and `DRAFT` with the resolved external
+run directory, fingerprint and draft. Staged paths are relative to the target; the sandbox working
+directory is the workspace root, never the test's parent. Use the full workspace-relative `--test`
+path in `--cmd`. For example, `--test checks/entry.ps1 --test-from OUTPUT_DIR/draft.ps1` requires
+`--cmd "pwsh -NoProfile -NonInteractive -File checks/entry.ps1"`. The draft's own path does not set
+its staged location. Before execution the runner prints
+`proof harness: PATH (relative to workspace root WORKSPACE)`. Directory draft mappings are in
+[the proof contract](PROOF-CONTRACT.md).
+
+Original outer exits: 0 clean success, 1 supported assertion, 2 harness/usage/execution error,
+3 blocked before command execution. Replay outer exits: 0 reproduced, 1 mismatch, 2 invalid input
+or setup error, 3 blocked. Read `record.exit_code` for the inner code. A recipe requires inner 1,
+both marker flags and clean execution; inner 64 without markers is outer 2, never supported
+assertion exit 1. Inspect the record and
+[the exit contract](PROOF-CONTRACT.md#cli-exits-and-record-cleanliness).
+
 Every recipe invocation must include `--expect-marker BOUNDARY_ASSERTION_FAILED`. OMGS supplies a
 fresh per-run `OMGS_PROOF_NONCE` and the declared label as `OMGS_PROOF_CONTRACT` through the
 allowlisted MXC environment. Print `OMGS_CONTROL_<nonce>` only after the authorized control
@@ -23,7 +35,7 @@ succeeds. Print `OMGS_BOUNDARY_<nonce>_<label>` immediately before exit 1 when t
 on vulnerable source. Fixed source prints `BOUNDARY_ASSERTION_OK` and exits 0. Import, compile, load
 and authorized control failures exit 2 and earn no proof support.
 
-Proof schema `omgs-proof/2` requires a `contract` object with `kind: "recipe"`, `expect_marker`,
+Proof schema `omgs-proof/3` requires a `contract` object with `kind: "recipe"`, `expect_marker`,
 `boundary_marker_seen` and `authorized_control_seen`. All four fields are required and non-null.
 Runs without a declaration store the explicit `{"kind":"none"}` variant. The saved config
 environment binds the declaration and nonce to its digest, and validation reconstructs it with the
@@ -137,6 +149,15 @@ timed out run never supports a proof, even with both markers printed. Close targ
 in the harness through the target's own cleanup API (for example `server.close()` or
 `clearInterval`) before `check()` returns, and record the timeout as the blocker if the target
 offers no way to release them.
+
+#### Child process environment
+
+Child processes must inherit the sandbox environment. In Node use
+`spawnSync(process.execPath, args, {env: process.env})`, or omit `env`. Reduced environments must
+forward needed runner keys: `PATH`, `HOME`, `TMPDIR`, `TMP`, `TEMP`, `OPENSSL_CONF` and proof
+contract variables. On macOS `OPENSSL_CONF` selects scratch configuration; dropping it can make
+Node read denied host OpenSSL configuration and fail before target code. This is a harness failure,
+never target protection. Keep that denial; do not add grants or install replacement dependencies.
 
 ### TypeScript and Next.js decision imports
 

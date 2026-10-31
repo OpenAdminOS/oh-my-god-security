@@ -805,6 +805,11 @@ impl JobDirectory {
         Self::unlink(&self.file, &Self::name("ready")?, 0)?;
         Self::unlink(&self.file, &Self::name("owner")?, 0)?;
         if let Err(error) = self.remove_empty() {
+            // Once owner is unlinked, concurrent recovery may reclaim the empty
+            // directory first. Its removal completes this cleanup.
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok(());
+            }
             // A concurrent insertion or pathname replacement can still prevent
             // rmdir. Restore a marker in the pinned directory for a later retry.
             // Existing markers are never truncated or replaced.
@@ -1035,9 +1040,18 @@ fn lock(dir: &JobDirectory, create: bool) -> io::Result<File> {
             },
         0o600,
     )?;
+    acquire(file)
+}
+fn acquire(file: File) -> io::Result<File> {
+    use std::os::unix::fs::MetadataExt;
     // SAFETY: file owns this descriptor. LOCK_NB never waits on another proof.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(io::Error::last_os_error());
+    }
+    // Teardown may unlink owner between open and flock. A retired owner keeps
+    // no link and never regains one, so its lock proves nothing.
+    if file.metadata()?.nlink() == 0 {
+        return Err(io::Error::from(io::ErrorKind::NotFound));
     }
     Ok(file)
 }
@@ -2384,6 +2398,33 @@ mod tests {
         });
         drop(owner);
         directory.remove().unwrap();
+    }
+    #[test]
+    fn a_lock_on_an_owner_retired_before_flock_is_not_ownership() {
+        let dir = supervise::capture_root().unwrap().join(format!(
+            "retired-owner-{}",
+            platform::random_nonce().unwrap()
+        ));
+        platform::create_private_dir_new(&dir).unwrap();
+        let directory = JobDirectory::open(&dir).unwrap();
+        drop(lock(&directory, true).unwrap());
+        // Model recovery opening owner, then teardown unlinking it before flock.
+        let opened = directory.open_leaf("owner", libc::O_RDWR, 0).unwrap();
+        std::fs::remove_file(dir.join("owner")).unwrap();
+        assert_eq!(acquire(opened).unwrap_err().kind(), io::ErrorKind::NotFound);
+        directory.remove().unwrap();
+    }
+    #[test]
+    fn removal_completes_when_recovery_reclaimed_the_empty_directory() {
+        let dir = supervise::capture_root()
+            .unwrap()
+            .join(format!("reclaimed-{}", platform::random_nonce().unwrap()));
+        platform::create_private_dir_new(&dir).unwrap();
+        let directory = JobDirectory::open(&dir).unwrap();
+        // Model recovery removing the ownerless directory before our rmdir.
+        std::fs::remove_dir(&dir).unwrap();
+        directory.remove().unwrap();
+        assert!(!dir.exists());
     }
     #[test]
     fn sealed_anchor_exits_on_owner_death_or_recovery() {

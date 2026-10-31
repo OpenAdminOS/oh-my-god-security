@@ -52,6 +52,23 @@ pub fn read_with_permissions(
     })
 }
 
+/// Stream from the admitted descriptor without materializing the artifact.
+pub fn with_reader<T>(
+    run: &Path,
+    relative: &Path,
+    read: impl FnOnce(std::fs::File) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    if cfg!(windows) && has_windows_stream_syntax(relative) {
+        return Err(std::io::Error::other(
+            "artifact filename contains Windows stream syntax",
+        ));
+    }
+    crate::platform::with_file_in(run, relative, |file| {
+        crate::platform::check_private_file(&file)?;
+        read(file)
+    })
+}
+
 fn has_windows_stream_syntax(relative: &Path) -> bool {
     relative
         .components()

@@ -37,6 +37,10 @@ pub struct Supervised {
     pub test_reachable: Option<bool>,
     pub boundary_marker_seen: bool,
     pub authorized_control_seen: bool,
+    pub marker_observations: Vec<crate::proof::MarkerObservation>,
+    pub stream_bytes: [u64; 2],
+    pub retained_stream_bytes: [u64; 2],
+    pub decoded_capture_bytes: u64,
     pub enumerate_rejected: bool,
     pub success: bool,
     pub timed_out: bool,
@@ -381,13 +385,18 @@ struct MarkerScan {
     test_reachable: Option<bool>,
     invalid: bool,
     enumerate_rejected: bool,
+    observations: Vec<crate::proof::MarkerObservation>,
+    offsets: [u64; 2],
+    line_starts: [u64; 2],
 }
 
 impl MarkerScan {
     fn receive(&mut self, stream: usize, bytes: &[u8]) {
         for &byte in bytes {
+            self.offsets[stream] += 1;
             if byte == b'\n' {
                 self.line(stream);
+                self.line_starts[stream] = self.offsets[stream];
             } else if self.lines[stream].len() < 4096 {
                 self.lines[stream].push(byte);
             } else {
@@ -405,8 +414,20 @@ impl MarkerScan {
         let line = String::from_utf8_lossy(&bytes);
         let line = line.trim_end_matches('\r');
         if let (Some(marker), Some(nonce)) = (&self.expect_marker, &self.nonce) {
-            self.boundary_marker_seen |= line == crate::proof::boundary_marker(marker, nonce);
-            self.authorized_control_seen |= line == crate::proof::control_marker(nonce);
+            let boundary = line == crate::proof::boundary_marker(marker, nonce);
+            let control = line == crate::proof::control_marker(nonce);
+            if (boundary && !self.boundary_marker_seen)
+                || (control && !self.authorized_control_seen)
+            {
+                self.observations.push(crate::proof::MarkerObservation {
+                    kind: if boundary { "boundary" } else { "control" }.into(),
+                    stream,
+                    start: self.line_starts[stream],
+                    end: self.line_starts[stream] + line.len() as u64,
+                });
+            }
+            self.boundary_marker_seen |= boundary;
+            self.authorized_control_seen |= control;
         }
         let lower = line.to_ascii_lowercase();
         if stream == 1
@@ -490,16 +511,17 @@ impl Capture {
         }
     }
 
-    fn text(mut self) -> String {
+    fn text(mut self) -> (String, u64) {
         let mut bytes = std::mem::take(&mut self.streams[0]);
         bytes.extend_from_slice(&self.streams[1]);
         let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        let decoded_bytes = text.len() as u64;
         let mut end = self.cap.min(text.len());
         while !text.is_char_boundary(end) {
             end -= 1;
         }
         text.truncate(end);
-        text
+        (text, decoded_bytes)
     }
 }
 
@@ -1377,6 +1399,10 @@ pub(crate) fn run_controlled(
         test_reachable: None,
         boundary_marker_seen: false,
         authorized_control_seen: false,
+        marker_observations: vec![],
+        stream_bytes: [0; 2],
+        retained_stream_bytes: [0; 2],
+        decoded_capture_bytes: 0,
         enumerate_rejected: false,
         success: false,
         timed_out: false,
@@ -1614,6 +1640,12 @@ pub(crate) fn run_controlled(
     }
     result.boundary_marker_seen = capture.evidence.boundary_marker_seen;
     result.authorized_control_seen = capture.evidence.authorized_control_seen;
+    result.marker_observations = capture.evidence.observations.clone();
+    result.stream_bytes = capture.evidence.offsets;
+    result.retained_stream_bytes = [
+        capture.streams[0].len() as u64,
+        capture.streams[1].len() as u64,
+    ];
     result.enumerate_rejected = capture.evidence.enumerate_rejected;
     if nonce.is_some() {
         result.command_started = capture.evidence.started;
@@ -1632,7 +1664,7 @@ pub(crate) fn run_controlled(
     result.output_bytes_total = capture.total;
     result.stdout = String::from_utf8_lossy(&capture.streams[0]).into_owned();
     result.stdout_bytes = capture.streams[0].clone();
-    result.output = capture.text();
+    (result.output, result.decoded_capture_bytes) = capture.text();
     #[cfg(target_os = "linux")]
     if !pending_cgroups.is_empty() {
         if result.output.contains("Failed to start transient scope") {
@@ -2019,7 +2051,7 @@ mod tests {
         assert_eq!(capture.evidence.exit_code, Some(17));
         assert_eq!(capture.evidence.test_reachable, Some(true));
         assert!(capture.evidence.boundary_marker_seen && capture.evidence.authorized_control_seen);
-        assert_eq!(capture.text().len(), 10);
+        assert_eq!(capture.text().0.len(), 10);
     }
 
     #[test]
@@ -2118,7 +2150,7 @@ mod tests {
         capture.receive(Message::Data(1, b"error".to_vec()), &mut notes);
         capture.receive(Message::Data(0, b"out".to_vec()), &mut notes);
         assert_eq!(capture.total, 8);
-        assert_eq!(capture.text(), "outerr");
+        assert_eq!(capture.text().0, "outerr");
     }
 
     #[test]
@@ -2133,6 +2165,6 @@ mod tests {
         };
         capture.receive(Message::Data(0, vec![255, 255, 255]), &mut Vec::new());
         assert_eq!(capture.total, 3);
-        assert!(capture.text().len() <= 2);
+        assert!(capture.text().0.len() <= 2);
     }
 }

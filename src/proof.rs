@@ -6,7 +6,7 @@ use crate::model::{FindingsFile, ProofTier};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA: &str = "omgs-proof/2";
+pub const SCHEMA: &str = "omgs-proof/3";
 pub const DIR: &str = "proofs";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -14,6 +14,23 @@ pub const DIR: &str = "proofs";
 pub struct Survivor {
     pub pid: i32,
     pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionInputs {
+    pub version: u32,
+    pub sha256: String,
+    #[serde(default)]
+    pub selection: Option<crate::proof_inputs::Selection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessFile {
+    pub path: String,
+    pub sha256: String,
+    pub mode: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +68,12 @@ pub struct ProofRecord {
     pub target_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_inputs: Option<ExecutionInputs>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub harness: Vec<HarnessFile>,
+    #[serde(default)]
+    pub output_audit: Option<OutputAudit>,
     /// Original canonical proof directory, retained when a run is archived.
     pub proof_dir: String,
     pub marker_nonce: String,
@@ -411,6 +434,9 @@ pub fn command_names(command: &str, test: &str) -> bool {
 /// were recorded. This catches hand-written or edited records; it is not a
 /// defence against a process that runs as the user and forges every file.
 pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
+    // Standalone validation owns the preparation limits; prove and replay
+    // already hold them, so this guard then shares their budget.
+    let _preparation = crate::proof_inputs::StagingGuard::begin();
     let mut errors = Vec::new();
     if record
         .contract
@@ -492,6 +518,41 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
     if record.target.is_some() && record.target_sha256.as_ref().is_none_or(|d| !is_digest(d)) {
         errors.push("has no valid target snapshot digest".into());
     }
+    match crate::proof_inputs::retained(run, record) {
+        Ok(Some(manifest)) => {
+            if let Some(target) = &record.target {
+                if Path::new(target).exists() {
+                    match crate::proof_inputs::manifest(
+                        Path::new(target),
+                        manifest.selection.clone(),
+                    ) {
+                        Ok(current) if current == manifest => {}
+                        Ok(current) => errors.push(format!(
+                            "target snapshot differs; {}",
+                            manifest.differences(&current)
+                        )),
+                        Err(e) => errors.push(format!("cannot validate execution inputs: {e}")),
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => errors.push(e),
+    }
+    if !record.harness.is_empty() {
+        if let Err(e) = retained_harness(run, record) {
+            errors.push(e);
+        }
+        if record
+            .test
+            .as_ref()
+            .and_then(|t| record.harness.iter().find(|f| &f.path == t))
+            .map(|f| &f.sha256)
+            != record.test_sha256.as_ref()
+        {
+            errors.push("harness entry test does not match test_sha256".into());
+        }
+    }
     if record.test_from.is_some() {
         let draft = Path::new(DIR).join(record.n.to_string()).join("test-draft");
         let digest = crate::run_artifact::read(run, &draft, crate::run_artifact::DRAFT_BYTES)
@@ -506,7 +567,7 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
             ));
         }
     }
-    if record.test_from.is_none() {
+    if record.test_from.is_none() && record.harness.is_empty() {
         if let (Some(target), Some(test)) = (&record.target, &record.test) {
             let rel = test.replace('\\', "/");
             if Path::new(&rel).is_absolute()
@@ -516,19 +577,19 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
                 errors.push("test must be relative to the recorded target".into());
             } else if Path::new(target).exists() {
                 // Checkout content deliberately follows the target's symlinks.
-                // digest_file streams regular content with constant memory; run
-                // evidence must instead use run_artifact::read.
-                let digest = crate::sha256::digest_file(&Path::new(target).join(rel));
-                if digest.ok().as_ref() != record.test_sha256.as_ref()
-                    || record.test_sha256.is_none()
-                {
-                    errors.push(
+                // Reads are admitted against the preparation byte budget and
+                // deadline; run evidence must instead use run_artifact::read.
+                match crate::proof_inputs::hash_file(&Path::new(target).join(rel)) {
+                    Ok(digest) if Some(&digest) == record.test_sha256.as_ref() => {}
+                    Ok(_) => errors.push(
                         "target test changed or is unreadable; does not match test_sha256".into(),
-                    );
+                    ),
+                    Err(e) => errors.push(format!("target test changed or is unreadable: {e}")),
                 }
             }
         }
     }
+    errors.extend(audit_errors(record));
     if crate::sha256::digest(record.output.as_bytes()) != record.output_sha256 {
         errors.push("redacted output does not match output_sha256".into());
     }
@@ -768,56 +829,6 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
 /// Content identity of the copied target before staging the proof test.
 /// Links are hashed as links, never followed into outside content. All .git
 /// content is included because config and hooks can change execution.
-pub fn tree_digest(root: &Path) -> std::io::Result<String> {
-    fn field(h: &mut crate::sha256::Sha256, bytes: &[u8]) {
-        h.update(&(bytes.len() as u64).to_le_bytes());
-        h.update(bytes);
-    }
-    fn walk(root: &Path, dir: &Path, h: &mut crate::sha256::Sha256) -> std::io::Result<()> {
-        let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            crate::supervise::check_interrupted()?;
-            let path = entry.path();
-            let rel = path.strip_prefix(root).map_err(std::io::Error::other)?;
-            let meta = std::fs::symlink_metadata(&path)?;
-            if crate::platform::contentless(&meta) {
-                continue;
-            }
-            field(h, rel.as_os_str().as_encoded_bytes());
-            if crate::platform::is_link(&meta) {
-                field(h, b"link");
-                let link = std::fs::canonicalize(&path)
-                    .ok()
-                    .and_then(|p| p.strip_prefix(root).ok().map(PathBuf::from))
-                    .map(|p| PathBuf::from("@workspace").join(p))
-                    .unwrap_or(std::fs::read_link(&path)?);
-                field(h, link.as_os_str().as_encoded_bytes());
-            } else {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    field(h, &(meta.permissions().mode() & 0o777).to_le_bytes());
-                }
-                if meta.is_dir() {
-                    field(h, b"dir");
-                    walk(root, &path, h)?;
-                } else if meta.is_file() {
-                    field(h, b"file");
-                    field(h, crate::sha256::digest_file(&path)?.as_bytes());
-                } else {
-                    return Err(std::io::Error::other(format!("unsupported target file type at {}; only regular files, directories and symlinks are supported", path.display())));
-                }
-            }
-        }
-        Ok(())
-    }
-    let root = std::fs::canonicalize(root)?;
-    let mut h = crate::sha256::Sha256::new();
-    walk(&root, &root, &mut h)?;
-    Ok(crate::sha256::hex(&h.finish()))
-}
-
 /// The checkout's commit, read from `.git` as data. Git itself is never run
 /// against the target, since repository config can execute programs.
 pub fn git_head(target: &Path) -> Option<String> {
@@ -877,23 +888,38 @@ fn is_hex40(s: &str) -> bool {
 pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_pem = false;
+    let mut expected_end = None;
     for line in text.split_inclusive('\n') {
         let mut lower = line.to_owned();
         lower.make_ascii_lowercase();
-        if lower.contains("-----begin") && lower.contains("private key") {
-            in_pem = true;
-            out.push_str("[omgs redacted private key]\n");
+        if in_pem {
+            if expected_end.as_deref() == Some(lower.trim()) {
+                in_pem = false;
+                expected_end = None;
+            }
             continue;
         }
-        if in_pem {
-            if lower.contains("-----end") {
-                in_pem = false;
-            }
+        if lower.contains("-----begin") && lower.contains("private key") {
+            in_pem = true;
+            expected_end = pem_end_for_header(&lower);
+            out.push_str("[omgs redacted private key]\n");
             continue;
         }
         out.push_str(&redact_line(line, &lower));
     }
     out
+}
+
+fn pem_end_for_header(lower: &str) -> Option<String> {
+    let label = lower
+        .trim()
+        .strip_prefix("-----begin ")?
+        .strip_suffix("-----")?;
+    (label.ends_with("private key")
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b' '))
+    .then(|| format!("-----end {label}-----"))
 }
 
 /// One line: credential URLs lose their user info, bearer tokens and the
@@ -1169,6 +1195,8 @@ pub fn reproduces(original: &ProofRecord, replay: &ProofRecord) -> bool {
         && original.test == replay.test
         && original.timeout_ms == replay.timeout_ms
         && original.target_head == replay.target_head
+        && original.execution_inputs == replay.execution_inputs
+        && original.harness == replay.harness
         && original.target_sha256 == replay.target_sha256
         && original.test_sha256 == replay.test_sha256
         && original.tier == replay.tier
@@ -1547,7 +1575,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_digest_includes_dirty_changes_and_git_behavior() {
+    fn manifest_includes_dirty_changes_and_git_behavior() {
         let d = crate::platform::temp_root()
             .unwrap()
             .join(format!("omgs-digest-{}", std::process::id()));
@@ -1556,15 +1584,23 @@ mod tests {
         for name in ["a", "nested/.git/config", "nested/.git/hooks/pre-commit"] {
             std::fs::write(d.join(name), b"one").unwrap();
         }
-        let first = tree_digest(&d).unwrap();
+        let first = crate::proof_inputs::manifest(&d, None).unwrap();
         for name in ["a", "nested/.git/config", "nested/.git/hooks/pre-commit"] {
             std::fs::write(d.join(name), b"two").unwrap();
-            assert_ne!(tree_digest(&d).unwrap(), first, "{name}");
+            assert_ne!(
+                crate::proof_inputs::manifest(&d, None).unwrap(),
+                first,
+                "{name}"
+            );
             std::fs::write(d.join(name), b"one").unwrap();
-            assert_eq!(tree_digest(&d).unwrap(), first, "{name}");
+            assert_eq!(
+                crate::proof_inputs::manifest(&d, None).unwrap(),
+                first,
+                "{name}"
+            );
         }
         std::fs::create_dir(d.join("empty")).unwrap();
-        assert_ne!(tree_digest(&d).unwrap(), first);
+        assert_ne!(crate::proof_inputs::manifest(&d, None).unwrap(), first);
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -1622,5 +1658,413 @@ mod tests {
         assert!(load(&run, "../x.json").is_err());
         assert!(load(&run, "proofs/../../etc.json").is_err());
         let _ = std::fs::remove_dir_all(&run);
+    }
+}
+
+pub struct PreparedHarness {
+    pub files: Vec<HarnessFile>,
+    pub contents: Vec<Vec<u8>>,
+}
+
+/// Directory drafts are read once, bounded and without following any link.
+pub fn prepare_harness(dir: &Path, test: &str) -> Result<PreparedHarness, String> {
+    crate::proof_inputs::safe_path(test)?;
+    let prefix = Path::new(test).parent().unwrap_or(Path::new(""));
+    let mut prepared = PreparedHarness {
+        files: vec![],
+        contents: vec![],
+    };
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        prefix: &Path,
+        p: &mut PreparedHarness,
+        total: &mut usize,
+    ) -> Result<(), String> {
+        if dir
+            .strip_prefix(root)
+            .map_err(|e| e.to_string())?
+            .components()
+            .count()
+            > 32
+        {
+            return Err("harness directory exceeds entry or depth limit".into());
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+            crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entries.len() == 256 {
+                return Err("harness directory exceeds entry or depth limit".into());
+            }
+            entries.push(entry);
+        }
+        if entries.is_empty() {
+            return Err("harness directories cannot be empty".into());
+        }
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let path = e.path();
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+            if crate::platform::is_link(&meta) {
+                return Err("harness directories cannot contain links".into());
+            }
+            if meta.is_dir() {
+                walk(root, &path, prefix, p, total)?;
+            } else if meta.is_file() {
+                if p.files.len() >= 128 {
+                    return Err("harness exceeds 128 files".into());
+                }
+                let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
+                let bytes =
+                    crate::platform::read_bounded_in(root, rel, crate::run_artifact::DRAFT_BYTES)
+                        .map_err(|e| e.to_string())?;
+                let permissions = meta.permissions();
+                *total += bytes.len();
+                if *total > crate::run_artifact::DRAFT_BYTES as usize {
+                    return Err("harness exceeds 16 MiB".into());
+                }
+                let dest = prefix
+                    .join(rel)
+                    .to_str()
+                    .ok_or("harness paths must be UTF-8")?
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                crate::proof_inputs::safe_path(&dest)?;
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    permissions.mode() & 0o777
+                };
+                #[cfg(windows)]
+                let mode = u32::from(permissions.readonly());
+                p.files.push(HarnessFile {
+                    path: dest,
+                    sha256: crate::sha256::digest(&bytes),
+                    mode,
+                });
+                p.contents.push(bytes);
+            } else {
+                return Err("harness contains a non-regular file".into());
+            }
+        }
+        Ok(())
+    }
+    walk(dir, dir, prefix, &mut prepared, &mut 0)?;
+    if !prepared.files.iter().any(|f| f.path == test) {
+        return Err("harness directory must contain the --test basename".into());
+    }
+    Ok(prepared)
+}
+
+/// Recognize a retained harness argument, including one from the original run
+/// passed to a separate fix run. Read bytes and modes from its admitted record.
+pub fn harness_artifact(dir: &Path, test: &str) -> Result<Option<PreparedHarness>, String> {
+    crate::proof_inputs::safe_path(test)?;
+    let parent = Path::new(test).parent().unwrap_or(Path::new(""));
+    let mut root = dir;
+    for part in parent.components().rev() {
+        if root.file_name() != Some(part.as_os_str()) {
+            return Ok(None);
+        }
+        root = root.parent().ok_or("invalid retained harness directory")?;
+    }
+    let Some((run, relative)) = artifact_location(root, "harness") else {
+        return Ok(None);
+    };
+    let number = relative
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        .ok_or("invalid proof number")?;
+    let record = load(run, &format!("proofs/{number}.json"))?;
+    if record.test.as_deref() != Some(test) || record.harness.is_empty() {
+        return Err("retained harness does not match proof test".into());
+    }
+    retained_harness(run, &record).map(Some)
+}
+
+/// Identify a proof artifact by its structural path, without resolving away
+/// symlinks before the run-artifact admission boundary can reject them.
+fn artifact_location<'a>(path: &'a Path, leaf: &str) -> Option<(&'a Path, std::path::PathBuf)> {
+    if path.file_name()? != leaf {
+        return None;
+    }
+    let proof = path.parent()?;
+    let number = proof.file_name()?.to_str()?;
+    if number.parse::<u32>().ok()? == 0 {
+        return None;
+    }
+    let proofs = proof.parent()?;
+    if proofs.file_name()? != DIR {
+        return None;
+    }
+    let run = proofs.parent()?;
+    Some((run, Path::new(DIR).join(number).join(leaf)))
+}
+
+pub fn retained_harness(run: &Path, record: &ProofRecord) -> Result<PreparedHarness, String> {
+    let mut contents = Vec::new();
+    let mut total = 0;
+    if record.harness.len() > 128 {
+        return Err("harness exceeds 128 files".into());
+    }
+    let mut paths = std::collections::HashSet::new();
+    for f in &record.harness {
+        crate::proof_inputs::safe_path(&f.path)?;
+        if !paths.insert(&f.path) || f.mode > 0o777 {
+            return Err("invalid harness path or mode".into());
+        }
+        let rel = Path::new(DIR)
+            .join(record.n.to_string())
+            .join("harness")
+            .join(&f.path);
+        let bytes = crate::run_artifact::read(run, &rel, crate::run_artifact::DRAFT_BYTES)
+            .map_err(|e| e.to_string())?;
+        total += bytes.len();
+        if total > crate::run_artifact::DRAFT_BYTES as usize
+            || crate::sha256::digest(&bytes) != f.sha256
+        {
+            return Err("retained harness identity mismatch".into());
+        }
+        contents.push(bytes);
+    }
+    Ok(PreparedHarness {
+        files: record.harness.clone(),
+        contents,
+    })
+}
+
+pub fn keep_harness(dir: &Path, harness: &PreparedHarness) -> Result<(), String> {
+    if harness.files.len() != harness.contents.len() || harness.files.len() > 128 {
+        return Err("invalid prepared harness".into());
+    }
+    for (file, bytes) in harness.files.iter().zip(&harness.contents) {
+        crate::proof_inputs::safe_path(&file.path)?;
+        if crate::sha256::digest(bytes) != file.sha256 {
+            return Err("prepared harness digest mismatch".into());
+        }
+        let path = dir.join("harness").join(&file.path);
+        crate::platform::create_private_tree(path.parent().ok_or("missing harness parent")?)
+            .map_err(|e| e.to_string())?;
+        crate::runmeta::write_atomic_bytes(&path, bytes).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MarkerObservation {
+    pub kind: String,
+    /// 0 is stdout, 1 is stderr. Offsets address the raw full stream.
+    pub stream: usize,
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OutputRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputAudit {
+    pub version: u32,
+    pub marker_observations: Vec<MarkerObservation>,
+    pub stream_bytes: [u64; 2],
+    pub retained_stream_bytes: [u64; 2],
+    /// Ranges address the UTF-8 capture before redaction, stdout then stderr.
+    pub redactions: Vec<OutputRange>,
+    pub captured_text_bytes: u64,
+    pub decoded_capture_bytes: u64,
+}
+
+pub fn output_audit(run: &crate::supervise::Supervised) -> OutputAudit {
+    let mut redactions: Vec<OutputRange> = Vec::new();
+    let mut offset = 0u64;
+    let mut in_pem = false;
+    let mut expected_end = None;
+    for line in run.output.split_inclusive('\n') {
+        let lower = line.to_ascii_lowercase();
+        let start_pem = lower.contains("-----begin") && lower.contains("private key");
+        let hidden = in_pem || start_pem || redact_line(line, &lower) != line;
+        if in_pem {
+            if expected_end.as_deref() == Some(lower.trim()) {
+                in_pem = false;
+                expected_end = None;
+            }
+        } else if start_pem {
+            in_pem = true;
+            expected_end = pem_end_for_header(&lower);
+        }
+        let end = offset + line.len() as u64;
+        if hidden {
+            let bounded = redactions.len() >= 1024;
+            if let Some(range) = redactions.last_mut().filter(|r| r.end == offset || bounded) {
+                range.end = end;
+            } else {
+                redactions.push(OutputRange { start: offset, end });
+            }
+        }
+        offset = end;
+    }
+    OutputAudit {
+        version: 1,
+        marker_observations: run.marker_observations.clone(),
+        stream_bytes: run.stream_bytes,
+        retained_stream_bytes: run.retained_stream_bytes,
+        redactions,
+        captured_text_bytes: offset,
+        decoded_capture_bytes: run.decoded_capture_bytes,
+    }
+}
+
+fn audit_errors(record: &ProofRecord) -> Vec<String> {
+    let Some(audit) = &record.output_audit else {
+        return vec!["missing runner output audit; rerun proof".into()];
+    };
+    let mut errors = Vec::new();
+    if audit.version != 1
+        || audit.captured_text_bytes > audit.decoded_capture_bytes
+        || audit.redactions.len() > 1024
+        || audit.marker_observations.len() > 2
+        || audit
+            .stream_bytes
+            .iter()
+            .try_fold(0u64, |a, b| a.checked_add(*b))
+            != Some(record.output_bytes_total)
+        || (0..2).any(|i| audit.retained_stream_bytes[i] > audit.stream_bytes[i])
+    {
+        errors.push("invalid output audit bounds".into());
+    }
+    let mut kinds = std::collections::HashSet::new();
+    for observation in &audit.marker_observations {
+        let expected = match observation.kind.as_str() {
+            "boundary" => record
+                .contract
+                .expect_marker()
+                .map(|m| boundary_marker(m, &record.marker_nonce)),
+            "control" => record
+                .contract
+                .expect_marker()
+                .map(|_| control_marker(&record.marker_nonce)),
+            _ => None,
+        };
+        if !kinds.insert(observation.kind.as_str())
+            || observation.stream > 1
+            || expected.is_none()
+            || observation.end.checked_sub(observation.start)
+                != expected.as_ref().map(|s| s.len() as u64)
+            || audit
+                .stream_bytes
+                .get(observation.stream)
+                .is_none_or(|n| observation.end > *n)
+        {
+            errors.push("invalid attested marker observation".into());
+        }
+    }
+    let (boundary, control) = record.contract.evidence();
+    if boundary != kinds.contains("boundary") || control != kinds.contains("control") {
+        errors.push("contract flags disagree with attested marker observations".into());
+    }
+    let mut end = 0;
+    for range in &audit.redactions {
+        if range.start < end || range.start >= range.end || range.end > audit.captured_text_bytes {
+            errors.push("invalid output redaction range".into());
+            break;
+        }
+        end = range.end;
+    }
+    errors
+}
+
+#[cfg(test)]
+mod input_regressions {
+    use super::*;
+
+    #[test]
+    fn harness_rejects_child_257_before_inspecting_children() {
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-harness-width-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        // Empty children would fail traversal. At 257 entries the width
+        // refusal must take precedence, before inspecting any child's content.
+        for n in 0..256 {
+            std::fs::create_dir(d.join(format!("child{n:03}"))).unwrap();
+        }
+        assert!(prepare_harness(&d, "main.sh")
+            .err()
+            .unwrap()
+            .contains("empty"));
+        std::fs::create_dir(d.join("child256")).unwrap();
+        assert!(prepare_harness(&d, "main.sh")
+            .err()
+            .unwrap()
+            .contains("entry or depth limit"));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn old_schema_is_refused_before_validation_or_replay() {
+        let error = crate::shape::proof(r#"{"schema":"omgs-proof/2"}"#).unwrap_err();
+        assert!(error.contains("rerun omgs prove") && error.contains(SCHEMA));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_harness_retains_modes_and_refuses_links_unsafe_names_and_bounds() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-harness-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("main.sh"), b"synthetic").unwrap();
+        std::fs::set_permissions(d.join("main.sh"), std::fs::Permissions::from_mode(0o751))
+            .unwrap();
+        let h = prepare_harness(&d, "checks/main.sh").unwrap();
+        assert_eq!(h.files[0].mode, 0o751);
+        assert_eq!(h.contents[0], b"synthetic");
+        assert!(prepare_harness(&d, "../main.sh").is_err());
+        std::os::unix::fs::symlink(d.join("main.sh"), d.join("link")).unwrap();
+        assert!(prepare_harness(&d, "checks/main.sh")
+            .err()
+            .unwrap()
+            .contains("links"));
+        std::fs::remove_file(d.join("link")).unwrap();
+        std::fs::create_dir(d.join("empty")).unwrap();
+        assert!(prepare_harness(&d, "checks/main.sh").is_err());
+        std::fs::remove_dir(d.join("empty")).unwrap();
+        for n in 0..128 {
+            std::fs::write(d.join(format!("extra{n}")), b"").unwrap();
+        }
+        assert!(prepare_harness(&d, "checks/main.sh").is_err());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn unterminated_pem_keeps_markers_hidden_without_inventing_an_end() {
+        let raw = "before\n-----BEGIN PRIVATE KEY-----\nsynthetic-secret\nOMGS_CONTROL_nonce\nOMGS_BOUNDARY_nonce_BOUNDARY\n";
+        let saved = redact(raw);
+        assert_eq!(saved, "before\n[omgs redacted private key]\n");
+        assert!(!saved.contains("synthetic-secret"));
+        assert!(!saved.contains("OMGS_CONTROL"));
+        for fake_end in [
+            "-----end of output",
+            "-----END CERTIFICATE-----",
+            "prefix -----END PRIVATE KEY-----",
+        ] {
+            let raw = format!(
+                "-----BEGIN PRIVATE KEY-----\n{fake_end}\nsynthetic-secret\nOMGS_CONTROL_nonce\n"
+            );
+            assert_eq!(redact(&raw), "[omgs redacted private key]\n");
+        }
+        let closed =
+            "-----BEGIN RSA PRIVATE KEY-----\nsecret\n-----END RSA PRIVATE KEY-----\nafter\n";
+        assert_eq!(redact(closed), "[omgs redacted private key]\nafter\n");
     }
 }

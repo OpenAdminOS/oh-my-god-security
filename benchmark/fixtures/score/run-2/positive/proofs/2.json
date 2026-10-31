@@ -1,5 +1,5 @@
 {
-  "schema": "omgs-proof/2",
+  "schema": "omgs-proof/3",
   "n": 2,
   "finding": "omgs-1dbc0388d873fabe",
   "test": "tests/security/x.test.ts",
@@ -58,5 +58,33 @@
   "output_sha256": "ef72392259197202999f1c01dea51890aa4a523b246f4d017cb335826ef254d4",
   "output_bytes_total": 174,
   "output": "OMGS_BOUNDARY_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_FIXTURE_BOUNDARY\nOMGS_CONTROL_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
-  "omgs_version": "test"
+  "omgs_version": "test",
+  "output_audit": {
+    "version": 1,
+    "marker_observations": [
+      {
+        "kind": "boundary",
+        "stream": 0,
+        "start": 0,
+        "end": 95
+      },
+      {
+        "kind": "control",
+        "stream": 0,
+        "start": 96,
+        "end": 173
+      }
+    ],
+    "stream_bytes": [
+      174,
+      0
+    ],
+    "retained_stream_bytes": [
+      174,
+      0
+    ],
+    "redactions": [],
+    "captured_text_bytes": 174,
+    "decoded_capture_bytes": 174
+  }
 }

@@ -31,6 +31,198 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
+// Explicit sparse admission avoids allocating the 8 GiB regression on Windows.
+fn sparse_fixture(path: &Path, size: u64) {
+    let file = std::fs::File::create(path).unwrap();
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        extern "system" {
+            fn DeviceIoControl(
+                handle: *mut core::ffi::c_void,
+                code: u32,
+                input: *const u8,
+                input_len: u32,
+                output: *mut u8,
+                output_len: u32,
+                returned: *mut u32,
+                overlapped: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+        let mut returned = 0;
+        // SAFETY: the owned handle is live, no buffers are supplied, and
+        // returned points to writable storage. The control marks it sparse.
+        let ok = unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                0x0009_00c4,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+    }
+    file.set_len(size).unwrap();
+}
+
+#[test]
+fn cli_refuses_oversized_sparse_tests_before_hashing_or_retention() {
+    for (name, draft, size, reason) in [
+        (
+            "target",
+            false,
+            (8u64 << 30) + 1,
+            "aggregate source byte budget",
+        ),
+        (
+            "draft",
+            true,
+            (16u64 << 20) + 1,
+            "draft exceeds retained artifact byte limit",
+        ),
+    ] {
+        let d = scratch(&format!("cli-test-size-{name}"));
+        let target = d.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let path = if draft {
+            d.join("draft")
+        } else {
+            target.join("test")
+        };
+        sparse_fixture(&path, size);
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"));
+        command
+            .env("OMGS_HOME", d.join("home"))
+            .args(["prove", "--target"])
+            .arg(&target)
+            .args([
+                "--test",
+                "test",
+                "--cmd",
+                "echo test OVERSIZED_TEST_EXECUTED",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if draft {
+            command.arg("--test-from").arg(&path);
+        }
+        let mut child = command.spawn().unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(15) {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "oversized {name} was not rejected before reading: {}",
+                    text(&output)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+        assert!(text(&output).contains(reason), "{}", text(&output));
+        assert!(!text(&output).contains("OVERSIZED_TEST_EXECUTED"));
+        assert!(!d.join("home/prove").exists());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+fn replay_refuses_an_oversized_target_test_before_hashing_it() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("replay-test-size");
+    let home = d.join("home");
+    let target = d.join("target");
+    std::fs::create_dir(&target).unwrap();
+    let (test, cmd, body): (&str, &str, &[u8]) = if cfg!(windows) {
+        ("x.test.cmd", "cmd.exe /d /c x.test.cmd", b"@exit /b 1\r\n")
+    } else {
+        ("x.test.sh", "sh x.test.sh", b"exit 1")
+    };
+    std::fs::write(target.join(test), body).unwrap();
+    let run = d.join("run");
+    let init = omgs(
+        &home,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let fp = omgs::fingerprint("missing_authz", "GET /x", "db.x", "tenant");
+    let run_arg = run.to_str().unwrap();
+    let proved = omgs(
+        &home,
+        &[
+            "prove",
+            "--run",
+            run_arg,
+            "--finding",
+            &fp,
+            "--test",
+            test,
+            "--cmd",
+            cmd,
+        ],
+    );
+    assert_eq!(proved.status.code(), Some(1), "{}", text(&proved));
+    // Large enough that unbounded hashing cannot finish inside the deadline.
+    sparse_fixture(&target.join(test), 1u64 << 40);
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", &home)
+        .args(["prove", "--run", run_arg, "--replay", "1"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(15) {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("replay hashed the oversized test: {}", text(&output));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+    assert!(
+        text(&output).contains("aggregate source byte budget"),
+        "{}",
+        text(&output)
+    );
+    assert!(!run.join("proofs/2.json").exists());
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn prove_help_describes_blocked_original_and_replay_exits() {
+    let d = scratch("prove-help-blocked");
+    let output = omgs(&d, &["prove", "--help"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let help = text(&output);
+    assert!(help.contains("2 harness, usage or execution error; 3 blocked before execution."));
+    assert!(help.contains(
+        "Replay exits: 0 reproduced; 1 mismatch; 2 setup error; 3 blocked before execution."
+    ));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 /// Runs the CLI with a throwaway data directory, handing it the executor
 /// this test process found so both agree on what is installed.
 fn omgs(home: &Path, args: &[&str]) -> Output {
@@ -125,6 +317,9 @@ fn assert_augmented_tier_refusal(tier: &str, caller: u32) {
         tier: Tier::Test,
         stage: None,
         expected_tree_sha256: None,
+        inputs: None,
+        expected_inputs: None,
+        harness: vec![],
     };
     let ProveOutcome::Blocked { reason } = prove(&request) else {
         panic!("augmentation tier executed");
@@ -1568,6 +1763,9 @@ fn unreachable_tests_never_run_the_command() {
             tier: Tier::Test,
             stage: None,
             expected_tree_sha256: None,
+            inputs: None,
+            expected_inputs: None,
+            harness: vec![],
         };
         let ProveOutcome::Ran(result) = prove(&request) else {
             panic!("the wrapper must run with the real executor");
@@ -2089,7 +2287,13 @@ fn socket_and_fifo_gaps_survive_validation_and_replay() {
         assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
         assert_eq!(
             record.target_sha256.as_deref(),
-            Some(omgs::proof::tree_digest(&target).unwrap().as_str())
+            Some(
+                omgs::proof_inputs::manifest(&target, None)
+                    .unwrap()
+                    .digest()
+                    .unwrap()
+                    .as_str()
+            )
         );
         for path in ["socket", "pipe"] {
             assert!(
@@ -2567,6 +2771,820 @@ fn protected_launchd_storage_is_refused_before_creation_or_executor_discovery() 
     std::fs::remove_dir_all(d).unwrap();
 }
 
+// Set umask only in the CLI child, never in the parallel test process.
+#[cfg(unix)]
+fn omgs_with_umask(home: &Path, args: &[&str], mask: u32) -> Output {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"));
+    command.args(args).env("OMGS_HOME", home);
+    command.env(
+        "OMGS_MXC_EXEC",
+        omgs::sandbox::locate_executor().unwrap().path,
+    );
+    // SAFETY: umask is async-signal-safe and runs only in the forked child.
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(mask as libc::mode_t);
+            Ok(())
+        });
+    }
+    command.output().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn harness_modes_and_scratch_setup_are_independent_of_umask_and_retained_single_file_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("harness-umask");
+    for directory in [false, true] {
+        let base = d.join(if directory { "directory" } else { "single" });
+        omgs::platform::private_dir(&base).unwrap();
+        let target = base.join("target");
+        let run = base.join("run");
+        std::fs::create_dir_all(target.join("existing")).unwrap();
+        std::fs::set_permissions(
+            target.join("existing"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        omgs::platform::private_dir(&run).unwrap();
+        write_private_fixture(
+            run.join(omgs::runmeta::FILE),
+            serde_json::json!({"target":target}).to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("existing", target.join("linked")).unwrap();
+        std::os::unix::fs::symlink("missing", target.join("dangling")).unwrap();
+        let draft = base.join("draft");
+        let body = "#!/bin/sh\necho stable-harness\n";
+        if directory {
+            std::fs::create_dir_all(draft.join("nested")).unwrap();
+            std::fs::write(draft.join("main.sh"), body).unwrap();
+            std::fs::write(draft.join("nested/helper"), "helper").unwrap();
+            std::fs::set_permissions(
+                draft.join("main.sh"),
+                std::fs::Permissions::from_mode(0o640),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                draft.join("nested/helper"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        } else {
+            std::fs::write(&draft, body).unwrap();
+            std::fs::set_permissions(&draft, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let stat = if cfg!(target_os = "macos") {
+            "stat -f %Lp"
+        } else {
+            "stat -c %a"
+        };
+        let mode = if directory { "640" } else { "755" };
+        // All target code runs through prove. Inspect actual staged modes from
+        // inside MXC, including every newly created ancestor and scratch entry.
+        let mut command = format!("test \"$({stat} .)\" = 755 && test \"$({stat} existing)\" = 750 && test \"$({stat} existing/checks)\" = 755 && test \"$({stat} existing/checks/deep)\" = 755 && test \"$({stat} existing/checks/deep/main.sh)\" = {mode} || exit 2; ");
+        if directory {
+            command.push_str(&format!("test \"$({stat} existing/checks/deep/nested)\" = 755 && test \"$({stat} existing/checks/deep/nested/helper)\" = 700 || exit 2; "));
+        }
+        command.push_str(&format!("for p in \"$HOME\" \"$HOME/cache\" \"$HOME/clang-cache\"; do test \"$({stat} \"$p\")\" = 755 || exit 2; done; "));
+        if cfg!(target_os = "macos") {
+            command.push_str(&format!(
+                "test \"$({stat} \"$HOME/openssl.cnf\")\" = 644 || exit 2; "
+            ));
+        }
+        command.push_str(&format!("test \"$({stat} linked)\" = 777 && test \"$({stat} dangling)\" = 777 || exit 2; if test -d \"$CARGO_HOME\"; then test \"$({stat} \"$CARGO_HOME\")\" = 755 || exit 2; for p in \"$CARGO_HOME/registry\" \"$CARGO_HOME/git\"; do if test -L \"$p\"; then test \"$({stat} \"$p\")\" = 777 || exit 2; fi; done; fi; "));
+        command.push_str("sh existing/checks/deep/main.sh; exit 1");
+        let out = omgs_with_umask(
+            &base,
+            &[
+                "prove",
+                "--run",
+                run.to_str().unwrap(),
+                "--test",
+                "existing/checks/deep/main.sh",
+                "--test-from",
+                draft.to_str().unwrap(),
+                "--cmd",
+                &command,
+            ],
+            0o022,
+        );
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        let original = omgs::proof::load(&run, "proofs/1.json").unwrap();
+        assert_eq!(original.exit_code, Some(1));
+        assert!(original.output.contains("stable-harness"));
+        for (index, mask) in [0o022, 0o077, 0o027].into_iter().enumerate() {
+            if !directory {
+                // Bytes and identity stay unchanged when only evidence mode changes.
+                std::fs::set_permissions(
+                    run.join("proofs/1/test-draft"),
+                    std::fs::Permissions::from_mode(if index == 1 { 0o600 } else { 0o700 }),
+                )
+                .unwrap();
+            }
+            let out = omgs_with_umask(
+                &base,
+                &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+                mask,
+            );
+            assert!(out.status.success(), "umask {mask:o}: {}", text(&out));
+            let replay = omgs::proof::load(&run, &format!("proofs/{}.json", index + 2)).unwrap();
+            assert_eq!(original.execution_inputs, replay.execution_inputs);
+            assert_eq!(original.harness, replay.harness);
+            assert_eq!(replay.exit_code, Some(1));
+            assert!(replay.output.contains("stable-harness"));
+            assert!(omgs::proof::runner_evidence(&run, &replay).is_empty());
+        }
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_multifile_harness_replays_exactly_with_redacted_marker_observations() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("selected-harness");
+    let target = d.join("target");
+    let run = d.join("run");
+    let draft = d.join("draft");
+    std::fs::create_dir_all(target.join(".git/hooks")).unwrap();
+    std::fs::create_dir_all(draft.join("nested")).unwrap();
+    std::fs::write(target.join("source"), "synthetic\n").unwrap();
+    std::fs::write(target.join("asset"), "omitted\n").unwrap();
+    std::fs::write(target.join(".git/config"), "config\n").unwrap();
+    std::fs::write(target.join(".git/hooks/check"), "hook\n").unwrap();
+    std::fs::write(
+        draft.join("nested/helper.sh"),
+        "test \"$(cat source)\" = synthetic || exit 2\n",
+    )
+    .unwrap();
+    std::fs::write(draft.join("main.sh"), "#!/bin/sh\n. checks/nested/helper.sh\ntest ! -e asset || exit 2\nprintf '%s\\n' '-----BEGIN PRIVATE KEY-----' 'DO_NOT_RETAIN_SYNTHETIC_SECRET'\nprintf 'OMGS_CONTROL_%s\\nOMGS_BOUNDARY_%s_%s\\n' \"$OMGS_PROOF_NONCE\" \"$OMGS_PROOF_NONCE\" \"$OMGS_PROOF_CONTRACT\"\nexit 1\n").unwrap();
+    let selection = d.join("selection.json");
+    std::fs::write(&selection, r#"{"version":1,"paths":["source"]}"#).unwrap();
+    omgs::platform::private_dir(&run).unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "checks/main.sh",
+            "--test-from",
+            draft.to_str().unwrap(),
+            "--inputs-from",
+            selection.to_str().unwrap(),
+            "--expect-marker",
+            "BOUNDARY_ASSERTION_FAILED",
+            "--cmd",
+            "sh checks/main.sh",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("copy complete") && text(&out).contains("hash complete"));
+    let original = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert_eq!(original.harness.len(), 2);
+    assert!(original.clean() && original.assertion_failure());
+    assert!(!original.output.contains("DO_NOT_RETAIN_SYNTHETIC_SECRET"));
+    assert!(!original.output.contains("OMGS_BOUNDARY_"));
+    let audit = original.output_audit.as_ref().unwrap();
+    assert_eq!(audit.marker_observations.len(), 2);
+    assert_eq!(audit.redactions.len(), 1);
+    assert!(omgs::proof::runner_evidence(&run, &original).is_empty());
+    // Reproduction is decided from streamed workspace identity, even when the
+    // diagnostic artifact is malformed or absent.
+    let manifest_path = run.join("proofs/1/input-manifest.json");
+    let manifest_bytes = std::fs::read(&manifest_path).unwrap();
+    write_private_fixture(&manifest_path, b"{\"version\":4,\"entries\":2000001}\n").unwrap();
+    assert!(omgs::proof::runner_evidence(&run, &original).is_empty());
+    std::fs::remove_file(&manifest_path).unwrap();
+    assert!(omgs::proof::runner_evidence(&run, &original).is_empty());
+    write_private_fixture(&manifest_path, manifest_bytes).unwrap();
+    for version in [3, 99] {
+        let mut unsupported = original.clone();
+        unsupported.execution_inputs.as_mut().unwrap().version = version;
+        assert!(omgs::proof::runner_evidence(&run, &unsupported)
+            .iter()
+            .any(|e| e.contains("unsupported execution input identity version")));
+    }
+    let mut invalid_audit = original.clone();
+    invalid_audit
+        .output_audit
+        .as_mut()
+        .unwrap()
+        .marker_observations[0]
+        .end += 1;
+    assert!(omgs::proof::runner_evidence(&run, &invalid_audit)
+        .iter()
+        .any(|e| e.contains("invalid attested marker observation")));
+    std::fs::remove_dir_all(&draft).unwrap();
+    std::fs::remove_file(&selection).unwrap();
+    std::fs::write(target.join("asset"), "irrelevant change\n").unwrap();
+    let out = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("replay record:") && text(&out).contains("original "));
+    assert!(!text(&out).contains("proof_ref") && !text(&out).contains("proof record:"));
+    let replay = omgs::proof::load(&run, "proofs/2.json").unwrap();
+    assert_eq!(original.execution_inputs, replay.execution_inputs);
+    assert_eq!(original.harness, replay.harness);
+    for path in ["source", ".git/config", ".git/hooks/check"] {
+        let saved = std::fs::read(target.join(path)).unwrap();
+        std::fs::write(target.join(path), "changed").unwrap();
+        let errors = omgs::proof::runner_evidence(&run, &original).join("; ");
+        assert!(errors.contains(path), "{errors}");
+        let refused = omgs(
+            &d,
+            &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+        );
+        assert!(
+            !refused.status.success() && text(&refused).contains(path),
+            "{}",
+            text(&refused)
+        );
+        assert!(!run.join("proofs/3.json").exists());
+        std::fs::write(target.join(path), saved).unwrap();
+    }
+    write_private_fixture(
+        run.join("proofs/1/harness/checks/nested/helper.sh"),
+        "changed",
+    )
+    .unwrap();
+    let refused = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(!refused.status.success() && text(&refused).contains("harness identity mismatch"));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn incidental_git_status_refresh_replays_but_staged_index_changes_do_not() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("index-refresh");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(&target).unwrap();
+    // These commands only construct a synthetic repository. No audited source
+    // or repository-supplied configuration is executed on the host.
+    let git = |args: &[&str]| {
+        let mut command = std::process::Command::new("git");
+        // Git refreshes replace the index. Keep its mode stable at 0664 for
+        // every fixture operation without changing this test process's umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: umask is async-signal-safe and affects only the child.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::umask(0o002);
+                    Ok(())
+                });
+            }
+        }
+        let out = command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-C",
+            ])
+            .arg(&target)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+    };
+    git(&["init", "--quiet", "--template="]);
+    std::fs::write(target.join("source"), "synthetic\n").unwrap();
+    std::fs::write(
+        target.join("test.sh"),
+        "test \"$(cat source)\" = synthetic\n",
+    )
+    .unwrap();
+    git(&["add", "--", "source", "test.sh"]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(target.join(".git/index"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o664
+        );
+    }
+    omgs::platform::private_dir(&run).unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "test.sh",
+            "--cmd",
+            "sh test.sh && GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git ls-files --stage >/dev/null",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let before = std::fs::read(target.join(".git/index")).unwrap();
+    // Same source bytes, new stat metadata: status refreshes only incidental data.
+    std::fs::write(target.join("source"), "synthetic\n").unwrap();
+    git(&["status", "--porcelain"]);
+    let after = std::fs::read(target.join(".git/index")).unwrap();
+    assert_ne!(before, after, "fixture must exercise a real index refresh");
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    let evidence_errors = omgs::proof::runner_evidence(&run, &record);
+    assert!(evidence_errors.is_empty(), "{evidence_errors:?}");
+    let replay = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(replay.status.success(), "{}", text(&replay));
+    // Restore source bytes after staging different content. Only the meaningful
+    // index identity differs from the original, and both paths must refuse it.
+    std::fs::write(target.join("source"), "different\n").unwrap();
+    git(&["add", "--", "source"]);
+    std::fs::write(target.join("source"), "synthetic\n").unwrap();
+    assert!(omgs::proof::runner_evidence(&run, &record)
+        .join("; ")
+        .contains(".git/index"));
+    let refused = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(
+        !refused.status.success() && text(&refused).contains(".git/index"),
+        "{}",
+        text(&refused)
+    );
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_harness_paths_and_outer_harness_errors_are_explicit() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("harness-location");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("source"), "synthetic\n").unwrap();
+    let draft = d.join("external.sh");
+    std::fs::write(&draft, "test \"$(cat source)\" = synthetic || exit 2\nprintf 'OMGS_CONTROL_%s\\nOMGS_BOUNDARY_%s_%s\\n' \"$OMGS_PROOF_NONCE\" \"$OMGS_PROOF_NONCE\" \"$OMGS_PROOF_CONTRACT\"\nexit 1\n").unwrap();
+    omgs::platform::private_dir(&run).unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    for (command, inner, outer) in [
+        ("test -f entry.sh || exit 64; sh entry.sh", 64, 2),
+        ("sh checks/entry.sh", 1, 1),
+    ] {
+        let out = omgs(
+            &d,
+            &[
+                "prove",
+                "--run",
+                run.to_str().unwrap(),
+                "--test",
+                "checks/entry.sh",
+                "--test-from",
+                draft.to_str().unwrap(),
+                "--expect-marker",
+                "BOUNDARY_ASSERTION_FAILED",
+                "--cmd",
+                command,
+            ],
+        );
+        assert_eq!(out.status.code(), Some(outer), "{}", text(&out));
+        assert!(
+            text(&out).contains("proof harness: checks/entry.sh (relative to workspace root "),
+            "{}",
+            text(&out)
+        );
+        let n = if inner == 64 { 1 } else { 2 };
+        let record = omgs::proof::load(&run, &format!("proofs/{n}.json")).unwrap();
+        assert_eq!(record.exit_code, Some(inner));
+        assert_eq!(record.test_reachable, Some(true));
+        assert!(record.clean());
+        assert_eq!(record.assertion_failure(), inner == 1);
+    }
+    assert!(!target.join("checks/entry.sh").exists());
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn source_xattr_changes_replay_only_the_normalized_workspace() {
+    use std::os::unix::ffi::OsStrExt;
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("xattr-replay");
+    let target = d.join("target");
+    let run = d.join("run");
+    omgs::platform::private_dir(&target).unwrap();
+    omgs::platform::private_dir(&run).unwrap();
+    std::fs::write(target.join("source"), "synthetic").unwrap();
+    std::fs::write(target.join("check.sh"),
+        "if /usr/bin/xattr -p user.omgs_fixture source >/dev/null 2>&1; then echo COPIED; else echo NORMALIZED; fi\n").unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    let source = std::ffi::CString::new(target.join("source").as_os_str().as_bytes()).unwrap();
+    let set_xattr = |value: &[u8]| {
+        assert_eq!(
+            unsafe {
+                libc::setxattr(
+                    source.as_ptr(),
+                    c"user.omgs_fixture".as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+    };
+    set_xattr(b"BEFORE");
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "check.sh",
+            "--cmd",
+            "sh check.sh",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let original = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert!(original.output.contains("NORMALIZED") && !original.output.contains("COPIED"));
+    set_xattr(b"AFTER");
+    assert!(omgs::proof::runner_evidence(&run, &original).is_empty());
+    let replay = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(replay.status.success(), "{}", text(&replay));
+    let replay = omgs::proof::load(&run, "proofs/2.json").unwrap();
+    assert!(replay.output.contains("NORMALIZED") && !replay.output.contains("COPIED"));
+    assert_eq!(original.execution_inputs, replay.execution_inputs);
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn timestamp_sensitive_build_replays_with_normalized_workspace_times() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("timestamp-build");
+    let target = d.join("target");
+    let run = d.join("run");
+    omgs::platform::private_dir(&target).unwrap();
+    omgs::platform::private_dir(&run).unwrap();
+    for file in ["source", "cached"] {
+        std::fs::write(target.join(file), "synthetic").unwrap();
+    }
+    let set_time = |file: &str, seconds| {
+        let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+        std::fs::File::options()
+            .write(true)
+            .open(target.join(file))
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(time)
+                    .set_modified(time),
+            )
+            .unwrap();
+    };
+    set_time("source", 946684800);
+    set_time("cached", 946684801);
+    std::fs::write(
+        target.join("build.sh"),
+        "if [ source -nt cached ]; then echo REBUILD; else echo CACHED; fi\n",
+    )
+    .unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "build.sh",
+            "--cmd",
+            "sh build.sh",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let original = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert!(original.output.contains("CACHED") && !original.output.contains("REBUILD"));
+    set_time("source", 1893456000);
+    let replay = omgs(
+        &d,
+        &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+    );
+    assert!(replay.status.success(), "{}", text(&replay));
+    let replay = omgs::proof::load(&run, "proofs/2.json").unwrap();
+    assert!(replay.output.contains("CACHED") && !replay.output.contains("REBUILD"));
+    assert_eq!(original.execution_inputs, replay.execution_inputs);
+    assert_eq!(
+        std::fs::metadata(target.join("source"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1893456000)
+    );
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_text_changes_refuse_replay_even_when_the_destination_is_equivalent() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("link-text-replay");
+    let target = d.join("target");
+    let run = d.join("run");
+    omgs::platform::private_dir(&target).unwrap();
+    omgs::platform::private_dir(&run).unwrap();
+    std::fs::write(target.join("source"), "synthetic").unwrap();
+    std::fs::write(target.join("test.sh"), "readlink selected\n").unwrap();
+    std::os::unix::fs::symlink("source", target.join("selected")).unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target":target}).to_string(),
+    )
+    .unwrap();
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "test.sh",
+            "--cmd",
+            "sh test.sh",
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    for link in ["./source", "@workspace/source"] {
+        std::fs::remove_file(target.join("selected")).unwrap();
+        std::os::unix::fs::symlink(link, target.join("selected")).unwrap();
+        let out = omgs(
+            &d,
+            &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+        );
+        assert!(
+            !out.status.success() && text(&out).contains("selected"),
+            "{}",
+            text(&out)
+        );
+        assert!(!run.join("proofs/2.json").exists());
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn directory_harness_cannot_replace_target_source_or_omitted_target_source() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("harness-target-collision");
+    let target = d.join("target");
+    let draft = d.join("draft");
+    omgs::platform::private_dir(&target).unwrap();
+    omgs::platform::private_dir(&draft).unwrap();
+    std::fs::write(target.join("source"), "synthetic").unwrap();
+    std::fs::write(target.join("security.sh"), "echo ORIGINAL_TARGET\n").unwrap();
+    std::fs::write(draft.join("entry.sh"), "sh security.sh\n").unwrap();
+    std::fs::write(draft.join("security.sh"), "echo REPLACED_TARGET\n").unwrap();
+    let selection = d.join("selection.json");
+    std::fs::write(&selection, r#"{"version":1,"paths":["source"]}"#).unwrap();
+    for (label, selected) in [("full", false), ("selected", true)] {
+        let run = d.join(label);
+        omgs::platform::private_dir(&run).unwrap();
+        write_private_fixture(
+            run.join(omgs::runmeta::FILE),
+            serde_json::json!({"target":target}).to_string(),
+        )
+        .unwrap();
+        let mut args = vec![
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "entry.sh",
+            "--test-from",
+            draft.to_str().unwrap(),
+            "--cmd",
+            "sh entry.sh",
+        ];
+        if selected {
+            args.extend(["--inputs-from", selection.to_str().unwrap()]);
+        }
+        let out = omgs(&d, &args);
+        assert!(
+            !out.status.success() && text(&out).contains("harness destination collides"),
+            "{}",
+            text(&out)
+        );
+        assert!(!text(&out).contains("REPLACED_TARGET"));
+        assert_eq!(
+            std::fs::read(target.join("security.sh")).unwrap(),
+            b"echo ORIGINAL_TARGET\n"
+        );
+        assert!(!target.join("entry.sh").exists());
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn selected_filesystem_aliases_are_refused_before_execution() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("selection-aliases");
+    let target = d.join("target");
+    std::fs::create_dir_all(target.join("Source")).unwrap();
+    std::fs::write(target.join("Source/Entry"), b"synthetic").unwrap();
+    std::fs::create_dir(target.join("unicode")).unwrap();
+    std::fs::write(target.join("unicode/caf\u{e9}"), b"synthetic").unwrap();
+    // Enumerate the actual spelling: macOS may expose decomposed names even
+    // when the file was created with composed text. Linux and Windows need
+    // the same exact-byte contract regardless of lookup behavior.
+    let actual = std::fs::read_dir(target.join("unicode"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .into_string()
+        .unwrap();
+    let alias = if actual == "caf\u{e9}" {
+        "cafe\u{301}"
+    } else {
+        "caf\u{e9}"
+    };
+    let selection = d.join("selection.json");
+    for path in [
+        "source/Entry".to_string(),
+        "Source/entry".to_string(),
+        format!("unicode/{alias}"),
+    ] {
+        std::fs::write(
+            &selection,
+            serde_json::json!({"version": 1, "paths": [path]}).to_string(),
+        )
+        .unwrap();
+        let out = omgs(
+            &d,
+            &[
+                "prove",
+                "--target",
+                target.to_str().unwrap(),
+                "--inputs-from",
+                selection.to_str().unwrap(),
+                "--cmd",
+                "echo ALIAS_WORKLOAD_RAN",
+            ],
+        );
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(
+            text(&out).contains("exactly one directory entry with exact spelling"),
+            "{}",
+            text(&out)
+        );
+        assert!(!text(&out).contains("ALIAS_WORKLOAD_RAN"), "{}", text(&out));
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn concurrent_source_change_during_copy_refuses_a_mixed_snapshot() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("source-changes-during-copy");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("a"), b"0").unwrap();
+    std::fs::write(target.join("z"), b"0").unwrap();
+    // A bounded-memory fixture creates a long enough copy window for the
+    // writer to observe real staging, after the initial source hash.
+    std::fs::File::create(target.join("middle"))
+        .unwrap()
+        .set_len(64 << 20)
+        .unwrap();
+    omgs::platform::private_dir(&run).unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target": target}).to_string(),
+    )
+    .unwrap();
+    let source = target.clone();
+    let workspace = run.join("proofs/1/workspace");
+    let writer = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(45) {
+            if std::fs::metadata(workspace.join("middle"))
+                .is_ok_and(|m| m.len() > 0 && m.len() < 64 << 20)
+            {
+                let first = std::fs::read(workspace.join("a")).unwrap();
+                let last_absent = !workspace.join("z").exists();
+                // Source states are (0,0), (1,0), (1,1). The copy has
+                // already retained a=0 and will subsequently read z=1.
+                std::fs::write(source.join("a"), b"1").unwrap();
+                std::fs::write(source.join("z"), b"1").unwrap();
+                return (first, last_absent);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("did not observe the active copy window");
+    });
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--timeout-ms",
+            "120000",
+            "--cmd",
+            "echo MIXED_WORKLOAD_RAN",
+        ],
+    );
+    let (first, last_absent) = writer.join().unwrap();
+    assert_eq!(first, b"0");
+    assert!(
+        last_absent,
+        "mutation must happen before the second input is copied"
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("target changed during staging"),
+        "{}",
+        text(&out)
+    );
+    assert!(!text(&out).contains("MIXED_WORKLOAD_RAN"), "{}", text(&out));
+    assert!(
+        !run.join("proofs/1.json").exists(),
+        "no clean proof may be published"
+    );
+    assert!(
+        !run.join("proofs/1/workspace").exists(),
+        "blocked workspace must be removed"
+    );
+    std::fs::remove_dir_all(d).unwrap();
+}
+
 fn completed_verifier_fixture(run: &std::path::Path, identity: &str) {
     for value in [
         serde_json::json!({"event":"start","id":"fixture-verifier","role":"verifier","identity":identity,"context":"fixture-context","inputs":["synthetic-input"],"outputs":["findings.json"],"isolation":"procedural"}),
@@ -2574,4 +3592,228 @@ fn completed_verifier_fixture(run: &std::path::Path, identity: &str) {
     ] {
         omgs::attempts::append(run, serde_json::from_value(value).unwrap()).unwrap();
     }
+}
+
+// Retained acceptance inputs must survive removal of the caller's draft files.
+fn acceptance_inputs_fixture(
+    name: &str,
+    scoped: bool,
+) -> (PathBuf, PathBuf, omgs::model::FindingsFile) {
+    let d = scratch(name);
+    let target = d.join("target");
+    let run = d.join("run");
+    let draft = d.join("draft");
+    std::fs::create_dir_all(target.join("asset")).unwrap();
+    std::fs::create_dir_all(&draft).unwrap();
+    std::fs::write(target.join("source"), "synthetic\n").unwrap();
+    let (test, command, entry, helper) = if cfg!(windows) {
+        (
+            "checks/main.cmd",
+            "cmd.exe /d /c checks\\main.cmd",
+            "@echo off\r\ncall checks\\helper.cmd\r\nexit /b %errorlevel%\r\n",
+            if scoped {
+                "@echo off\r\nif exist asset exit /b 2\r\nexit /b 1\r\n"
+            } else {
+                "@echo off\r\nexit /b 1\r\n"
+            },
+        )
+    } else {
+        (
+            "checks/main.sh",
+            "sh checks/main.sh",
+            "#!/bin/sh\n. checks/helper.sh\n",
+            if scoped {
+                "test ! -d asset || exit 2\nexit 1\n"
+            } else {
+                "exit 1\n"
+            },
+        )
+    };
+    let basename = Path::new(test).file_name().unwrap();
+    let helper_name = if cfg!(windows) {
+        "helper.cmd"
+    } else {
+        "helper.sh"
+    };
+    std::fs::write(draft.join(basename), entry).unwrap();
+    std::fs::write(draft.join(helper_name), helper).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(draft.join(basename), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    completed_verifier_fixture(&run, "blue-1");
+    let fp = omgs::fingerprint("missing_authz", "GET /x", "db.x", "tenant");
+    let selection = d.join("selection.json");
+    std::fs::write(&selection, r#"{"version":1,"paths":["source"]}"#).unwrap();
+    let mut args = vec![
+        "prove",
+        "--run",
+        run.to_str().unwrap(),
+        "--finding",
+        &fp,
+        "--test",
+        test,
+        "--test-from",
+        draft.to_str().unwrap(),
+        "--cmd",
+        command,
+    ];
+    if scoped {
+        args.extend(["--inputs-from", selection.to_str().unwrap()]);
+    }
+    let out = omgs(&d, &args);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let file = omgs::shape::findings(&serde_json::json!({"findings":[{
+        "fingerprint":fp,"title":"Unauthorized read","verdict":"confirmed","severity":"high","proof_tier":"test_proven",
+        "attack_class":"missing_authz","entry_point":"GET /x","sink":"db.x","boundary":"tenant",
+        "location":{"path":"source","line":1},"evidence":"Retained test fails.","hunted_by":"red-1","verified_by":"blue-1",
+        "verification":{"state":"final","attempt":"fixture-verifier"},"proof_ref":"proofs/1.json"
+    }]}).to_string()).unwrap();
+    std::fs::remove_dir_all(draft).unwrap();
+    std::fs::remove_file(selection).unwrap();
+    (d, run, file)
+}
+
+fn rerun_acceptance_in_fix_run(
+    d: &Path,
+    run: &Path,
+    acceptance: &omgs::handoff::Acceptance,
+) -> PathBuf {
+    let fix = d.join("fix-run");
+    let target = d.join("target");
+    let init = omgs(
+        d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            fix.to_str().unwrap(),
+            "--no-sensors",
+            "--fix-of",
+            run.to_str().unwrap(),
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let mut args = acceptance.command_args.clone();
+    let index = args.iter().position(|a| a == "--run").unwrap();
+    args[index + 1] = fix.to_str().unwrap().into();
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
+    let out = omgs(d, &args);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    fix
+}
+
+#[test]
+fn retained_directory_harness_stage_exports_entry_and_helper() {
+    if !mxc_ready() {
+        return;
+    }
+    let (d, run, file) = acceptance_inputs_fixture("acceptance-stage", false);
+    let patch = omgs::handoff::stage(&run, &file).unwrap();
+    let extension = if cfg!(windows) { "cmd" } else { "sh" };
+    assert!(
+        patch.contains(&format!("b/checks/main.{extension}")),
+        "{patch}"
+    );
+    assert!(
+        patch.contains(&format!("b/checks/helper.{extension}")),
+        "{patch}"
+    );
+    #[cfg(unix)]
+    assert!(
+        patch.contains("new file mode 100755") && patch.contains("new file mode 100644"),
+        "{patch}"
+    );
+    let retained_helper = run
+        .join("proofs")
+        .join("1")
+        .join("harness")
+        .join("checks")
+        .join(format!("helper.{extension}"));
+    write_private_fixture(retained_helper, "changed").unwrap();
+    assert!(omgs::handoff::stage(&run, &file)
+        .unwrap_err()
+        .contains("harness identity mismatch"));
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn retained_directory_harness_handoff_reruns_entry_and_helper() {
+    if !mxc_ready() {
+        return;
+    }
+    let (d, run, file) = acceptance_inputs_fixture("acceptance-harness", false);
+    let handoff = omgs::handoff::build(&run, &file, None).unwrap();
+    let acceptance = handoff.records[0].acceptance.as_ref().unwrap();
+    assert!(
+        acceptance.command_args.iter().any(|a| a == "--test-from"),
+        "{}",
+        acceptance.command
+    );
+    assert!(omgs::handoff::markdown(&handoff).contains("--test-from"));
+    assert!(serde_json::to_string(&handoff)
+        .unwrap()
+        .contains("--test-from"));
+    let fix = rerun_acceptance_in_fix_run(&d, &run, acceptance);
+    assert_eq!(
+        omgs::proof::load(&run, "proofs/1.json").unwrap().harness,
+        omgs::proof::load(&fix, "proofs/1.json").unwrap().harness
+    );
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn retained_scoped_selection_handoff_omits_behavior_changing_directory() {
+    if !mxc_ready() {
+        return;
+    }
+    let (d, run, file) = acceptance_inputs_fixture("acceptance-selection", true);
+    let handoff = omgs::handoff::build(&run, &file, None).unwrap();
+    let acceptance = handoff.records[0].acceptance.as_ref().unwrap();
+    let index = acceptance
+        .command_args
+        .iter()
+        .position(|a| a == "--inputs-from")
+        .expect("handoff dropped scoped execution input selection");
+    let selection = std::fs::canonicalize(&acceptance.command_args[index + 1]).unwrap();
+    assert!(selection.starts_with(run.join("proofs").join("1")));
+    let rel = selection.strip_prefix(&run).unwrap();
+    let bytes = omgs::run_artifact::read(&run, rel, 65536).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        serde_json::json!({"version":1,"paths":["source"]})
+    );
+    assert!(omgs::handoff::markdown(&handoff).contains("--inputs-from"));
+    assert!(serde_json::to_string(&handoff)
+        .unwrap()
+        .contains("--inputs-from"));
+    let fix = rerun_acceptance_in_fix_run(&d, &run, acceptance);
+    assert_eq!(
+        omgs::proof::load(&run, "proofs/1.json")
+            .unwrap()
+            .execution_inputs,
+        omgs::proof::load(&fix, "proofs/1.json")
+            .unwrap()
+            .execution_inputs
+    );
+    write_private_fixture(&selection, r#"{"version":1,"paths":["asset"]}"#).unwrap();
+    assert!(omgs::handoff::build(&run, &file, None).is_err());
+    std::fs::remove_dir_all(d).unwrap();
 }
