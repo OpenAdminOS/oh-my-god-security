@@ -2627,34 +2627,53 @@ fn dashboard_moves_the_token_out_of_the_address_bar_and_into_a_header() {
 const fs=require('fs'), vm=require('vm');
 const input=JSON.parse(fs.readFileSync(0,'utf8'));
 const element=()=>({textContent:'',innerHTML:'',classList:{toggle(){},add(){}},querySelector(){return element()}});
-const seen={replaced:null,headers:null};
-const context={document:{getElementById(){return element()}},Date,setInterval(){},
-  location:{hash:'#token='+'ab'.repeat(32),pathname:'/',search:''},
+const elements={};
+const seen={replaced:null,headers:null,fetches:0};
+const context={document:{getElementById(id){return elements[id]||(elements[id]=element())}},Date,setInterval(){},
+  location:{hash:input.hash,pathname:'/',search:''},
   history:{replaceState(_s,_t,url){seen.replaced=url;}},
-  fetch(_url,options){seen.headers=options&&options.headers;return new Promise(()=>{});}};
+  fetch(_url,options){seen.fetches++;seen.headers=options&&options.headers;return new Promise(()=>{});}};
 context.globalThis=context;
 vm.createContext(context);vm.runInContext(input.script,context);
+seen.upd=elements.upd?elements.upd.textContent:'';
 console.log(JSON.stringify(seen));
 "#;
-    let mut child = Command::new("node")
-        .args(["-e", harness])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("Node is required to exercise dashboard rendering");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(
-            serde_json::json!({ "script": script })
-                .to_string()
-                .as_bytes(),
-        )
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success());
-    let seen: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let run = |hash: &str| -> serde_json::Value {
+        let mut child = Command::new("node")
+            .args(["-e", harness])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Node is required to exercise dashboard rendering");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                serde_json::json!({ "script": script, "hash": hash })
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let seen = run(&format!("#token={}", "ab".repeat(32)));
     assert_eq!(seen["replaced"], "/");
+    assert_eq!(seen["fetches"], 1);
     assert_eq!(seen["headers"]["X-OMGS-Token"], "ab".repeat(32));
+    // Without a token the page explains what to open and fetches nothing.
+    for hash in ["", "#token=", "#token=NOT-HEX"] {
+        let seen = run(hash);
+        assert_eq!(seen["fetches"], 0, "{hash}");
+        assert!(seen["replaced"].is_null(), "{hash}");
+        assert!(
+            seen["upd"]
+                .as_str()
+                .unwrap()
+                .contains("full address printed by omgs watch"),
+            "{hash}: {seen}"
+        );
+    }
 }

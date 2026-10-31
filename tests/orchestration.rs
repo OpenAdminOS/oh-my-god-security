@@ -376,6 +376,17 @@ fn watch_serves_loopback_and_stops_when_the_run_completes() {
     )
     .unwrap();
     let (listener, port, token) = omgs::watch::bind().unwrap();
+    // Every bind gets a fresh 256-bit token in lowercase hex.
+    let (_, _, other) = omgs::watch::bind().unwrap();
+    for t in [&token, &other] {
+        assert_eq!(t.len(), 64, "{t}");
+        assert!(
+            t.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{t}"
+        );
+    }
+    assert_ne!(token, other);
     let served_token = token.clone();
     assert!(listener.local_addr().unwrap().ip().is_loopback());
     let d = dir.clone();
@@ -857,6 +868,17 @@ fn a_trickling_client_cannot_hold_the_watch_server() {
     )
     .unwrap();
     let (listener, port, token) = omgs::watch::bind().unwrap();
+    // Every bind gets a fresh 256-bit token in lowercase hex.
+    let (_, _, other) = omgs::watch::bind().unwrap();
+    for t in [&token, &other] {
+        assert_eq!(t.len(), 64, "{t}");
+        assert!(
+            t.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{t}"
+        );
+    }
+    assert_ne!(token, other);
     let served_token = token.clone();
     let d = dir.clone();
     let start = std::time::Instant::now();
@@ -1127,6 +1149,17 @@ fn a_slow_response_reader_cannot_hold_the_watch_server() {
     );
     write_private_fixture(dir.join("pipeline-status.json"), big).unwrap();
     let (listener, port, token) = omgs::watch::bind().unwrap();
+    // Every bind gets a fresh 256-bit token in lowercase hex.
+    let (_, _, other) = omgs::watch::bind().unwrap();
+    for t in [&token, &other] {
+        assert_eq!(t.len(), 64, "{t}");
+        assert!(
+            t.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{t}"
+        );
+    }
+    assert_ne!(token, other);
     let served_token = token.clone();
     let d = dir.clone();
     let start = std::time::Instant::now();
