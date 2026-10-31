@@ -2604,3 +2604,52 @@ fn dashboard_controls_are_visible_at_every_dynamic_sink_and_json_is_lossless() {
     let rendered = render_dashboard(&data);
     assert_eq!(rendered["happening"]["textContent"], visible);
 }
+
+// The dashboard keeps the per-run token in memory, removes it from the
+// address bar, and sends it only as the status request header.
+#[test]
+fn dashboard_moves_the_token_out_of_the_address_bar_and_into_a_header() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let script = include_str!("../skill/progress/dashboard.html")
+        .split_once("<script>")
+        .unwrap()
+        .1
+        .split_once("</script>")
+        .unwrap()
+        .0;
+    let harness = r#"
+const fs=require('fs'), vm=require('vm');
+const input=JSON.parse(fs.readFileSync(0,'utf8'));
+const element=()=>({textContent:'',innerHTML:'',classList:{toggle(){},add(){}},querySelector(){return element()}});
+const seen={replaced:null,headers:null};
+const context={document:{getElementById(){return element()}},Date,setInterval(){},
+  location:{hash:'#token='+'ab'.repeat(32),pathname:'/',search:''},
+  history:{replaceState(_s,_t,url){seen.replaced=url;}},
+  fetch(_url,options){seen.headers=options&&options.headers;return new Promise(()=>{});}};
+context.globalThis=context;
+vm.createContext(context);vm.runInContext(input.script,context);
+console.log(JSON.stringify(seen));
+"#;
+    let mut child = Command::new("node")
+        .args(["-e", harness])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("Node is required to exercise dashboard rendering");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            serde_json::json!({ "script": script })
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let seen: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(seen["replaced"], "/");
+    assert_eq!(seen["headers"]["X-OMGS-Token"], "ab".repeat(32));
+}
