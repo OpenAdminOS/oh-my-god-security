@@ -56,7 +56,7 @@ a standalone checkout.
 Do not execute Git against the target: config and hooks can execute programs. An incidental index
 stat refresh does not invalidate a proof, but execution-relevant input changes do.
 
-Version 3 materializes the workspace from fresh directories and regular files in sorted,
+Version 4 materializes the workspace from fresh directories and regular files in sorted,
 depth-first path order. Regular file content is written densely; hard links become independent
 files with link count one. The only source permissions admitted are Unix 0777 bits or the Windows
 read-only bit. Setuid, setgid and sticky bits are removed. Source ownership, extended attributes,
@@ -108,8 +108,9 @@ Generation counts admitted paths before writing the header, enforces the entry l
 constructing each entry, and streams content hashes and canonical JSON into SHA-256.
 Publication streams through a private sibling temporary file, flushes and fsyncs it, then
 renames it atomically before target execution. Publication computes the identity over the
-bytes written; a changed entry count aborts publication. A separately computed identity must still match when republished. No full entry list,
-JSON value, string or serialized manifest buffer is retained. Directory traversal retains
+bytes written; a changed entry count aborts publication. A separately computed identity must
+still match when republished. No full entry list, JSON value, string or serialized manifest
+buffer is retained. Directory traversal retains
 at most 256 sorted children per active directory level and rescans wide directories in
 batches. The 1024-byte canonical path limit bounds recursion depth. Git index normalization
 still uses its separate 16 MiB bound.
@@ -170,3 +171,27 @@ the retained raw prefixes beyond the text cap, the additional omitted text range
 The output digest still covers only the saved redacted text. An unterminated private key block
 remains redacted through the end of the capture; no marker line is treated as a safe end.
 Exact command, harness and configuration artifacts may contain credentials and remain private.
+
+## Assertion and replay requirements
+
+Every non-rejected `test_proven` or `sandbox_exploited` record needs its named test or harness
+failing
+on the target with an assertion (inner exit 1 or 3 through 125 without a contract); a rejected
+control without a contract can also exit 0. Exit 2 is always rejected as a harness or usage
+error. A recipe contract requires exit 1 and both nonce-qualified marker flags, and neither may
+rest on a missing command (126, 127) or a signal. The command must include the full `--test`
+path or its file name as a token. Runner-generated start and end markers catch accidents such as
+executor failure, truncation and timeout. They cannot establish integrity against a hostile
+target: the per-run nonce is visible to sandboxed code, so a target can print a forged end
+marker. They also cannot prove that the named test executed. Replay and the independent evaluator
+remain the stronger check. Missing start indicates an executor error unless the run was killed or
+interrupted; missing end means incomplete execution. Timeout, signal death and executor errors
+are recorded separately. During adjudication the evaluator replays every proof it upholds with
+`omgs prove --run OUTPUT_DIR --replay <n>` and independently checks that
+the real target and intended assertion executed. Replay requires the recorded `timeout_ms` and
+rejects `--timeout-ms` overrides, consumes one proof-run budget unit, checks the marker-derived
+inner exit code and cleanliness, and refuses if either the target commit or the digest of the
+copied target tree (including dirty changes and execution-relevant Git metadata under the
+versioned normalization above) differs from the original
+snapshot; a replay that is NOT reproduced overturns the tier and recomputes identities with `omgs
+fingerprint` after any semantic change, so records are final before adjudication.

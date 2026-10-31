@@ -21,8 +21,10 @@ pub const CLAIM_BYTES: u64 = 64;
 pub const BENCHMARK_BYTES: u64 = 16 << 20;
 
 /// Read relative to a trusted run directory. Every descendant component is
-/// opened without following links; the opened leaf must be a private regular
-/// file with no hardlink aliases. Bounds apply both before and during reading.
+/// opened without following links; the opened leaf must be an owner-held regular
+/// file with no hardlink aliases or shared write grants. Privacy is guaranteed
+/// by the admitted owner-private run root, not by normalizing nested modes.
+/// Bounds apply both before and during reading.
 /// Validation uses the opened descriptor, never an earlier path inspection.
 /// Only NotFound from this contained traversal denotes genuine absence.
 pub fn read(run: &Path, relative: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
@@ -72,6 +74,13 @@ fn has_windows_stream_syntax(relative: &Path) -> bool {
     relative
         .components()
         .any(|c| c.as_os_str().as_encoded_bytes().contains(&b':'))
+}
+
+/// Explicit privacy preflight for role-written output. Never repairs permissions.
+pub fn check_containment(run: &Path, relative: &Path) -> Result<(), String> {
+    crate::platform::check_private_dir(run).map_err(|e| e.to_string())?;
+    read(run, relative, DRAFT_BYTES).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 pub fn text(run: &Path, relative: &Path, limit: u64) -> Result<String, String> {
