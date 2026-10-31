@@ -805,6 +805,11 @@ impl JobDirectory {
         Self::unlink(&self.file, &Self::name("ready")?, 0)?;
         Self::unlink(&self.file, &Self::name("owner")?, 0)?;
         if let Err(error) = self.remove_empty() {
+            // Once owner is unlinked, concurrent recovery may reclaim the empty
+            // directory first. Its removal completes this cleanup.
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok(());
+            }
             // A concurrent insertion or pathname replacement can still prevent
             // rmdir. Restore a marker in the pinned directory for a later retry.
             // Existing markers are never truncated or replaced.
@@ -2384,6 +2389,18 @@ mod tests {
         });
         drop(owner);
         directory.remove().unwrap();
+    }
+    #[test]
+    fn removal_completes_when_recovery_reclaimed_the_empty_directory() {
+        let dir = supervise::capture_root()
+            .unwrap()
+            .join(format!("reclaimed-{}", platform::random_nonce().unwrap()));
+        platform::create_private_dir_new(&dir).unwrap();
+        let directory = JobDirectory::open(&dir).unwrap();
+        // Model recovery removing the ownerless directory before our rmdir.
+        std::fs::remove_dir(&dir).unwrap();
+        directory.remove().unwrap();
+        assert!(!dir.exists());
     }
     #[test]
     fn sealed_anchor_exits_on_owner_death_or_recovery() {
