@@ -692,8 +692,12 @@ fn export_head_bounded(
                 if created_dirs.contains(&dir) {
                     continue;
                 }
-                std::fs::create_dir(out.join(&dir)).map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                let created = out.join(&dir);
+                std::fs::create_dir(&created).map_err(|e| {
+                    // Windows reports a name taken by a file as access denied.
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        || std::fs::symlink_metadata(&created).is_ok()
+                    {
                         format!("head paths alias the same directory on this filesystem: {}; gate export is blocked", dir.display())
                     } else {
                         e.to_string()
@@ -712,7 +716,9 @@ fn export_head_bounded(
                 .create_new(true)
                 .open(&file)
                 .map_err(|e| {
-                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        || std::fs::symlink_metadata(&file).is_ok()
+                    {
                         format!("head paths alias the same file on this filesystem: {path}; gate export is blocked")
                     } else {
                         e.to_string()
