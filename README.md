@@ -449,3 +449,5 @@ lock is refused rather than treated as an immutable snapshot.
 
 Redaction output regressions run in the normal test suite. The ignored
 `redaction_performance` timing check runs separately with one test thread.
+
+Human-facing terminal output escapes control and Unicode formatting characters. JSON output is lossless: escaped characters decode to their original values. Output paths, run directories, and clone roots must not contain control or Unicode formatting characters.

@@ -69,10 +69,35 @@ fn usage() {
     omgs::help::usage();
 }
 
+fn validate_output_paths(args: &[String]) -> Result<(), String> {
+    for (name, value) in options(args) {
+        if matches!(
+            name,
+            "--out" | "--run" | "--runs" | "--fix-of" | "--clone-root"
+        ) {
+            if let Some(value) = value {
+                let path = Path::new(value);
+                omgs::platform::validate_output_path(path)?;
+                let absolute = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .map_err(|e| e.to_string())?
+                        .join(path)
+                };
+                omgs::platform::validate_output_path(&resolve_existing_prefix(&absolute)?)?;
+            }
+        }
+    }
+    omgs::platform::validate_output_path(&data_dir())?;
+    omgs::platform::validate_output_path(&std::env::current_dir().map_err(|e| e.to_string())?)
+}
+
 fn clone_root(args: &[String]) -> Result<PathBuf, String> {
     let path = flag(args, "--clone-root")
         .map(PathBuf::from)
         .unwrap_or_else(|| data_dir().join("targets"));
+    omgs::platform::validate_output_path(&path)?;
     if path.is_absolute() {
         Ok(path)
     } else {
@@ -229,6 +254,10 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(false) => {}
+    }
+    if let Err(e) = validate_output_paths(rest) {
+        cli_error(&e);
+        return ExitCode::from(2);
     }
     let result: Result<(), String> = match cmd {
         "--help" | "-h" | "help" => {
@@ -1607,11 +1636,8 @@ fn cmd_stage_locked(run: &Path) -> Result<(), String> {
     for reason in &staged.excluded {
         omgs::out::err(&omgs::platform::escape_controls(reason));
     }
-    omgs::runmeta::write_atomic(&run.join("proposed-tests.patch"), &staged.patch)?;
-    omgs::out::line(&format!(
-        "wrote {}",
-        run.join("proposed-tests.patch").display()
-    ));
+    let mut writes = omgs::runmeta::Transaction::default();
+    writes.text(run.join("proposed-tests.patch"), staged.patch.clone());
     // Only finalized findings export retained tests. Policy-aware runs also
     // produce the owner-reviewable registry and intent proposal.
     if omgs::run_artifact::optional_text(
@@ -1622,8 +1648,16 @@ fn cmd_stage_locked(run: &Path) -> Result<(), String> {
     .is_some()
         && omgs::runmeta::read(run)?.contains_key("policy")
     {
-        intent_propose_with_tests(run, Some(&staged))?;
+        writes.text(
+            run.join("policy.patch"),
+            prepare_intent_proposal(run, &staged)?,
+        );
     }
+    writes.commit()?;
+    omgs::out::line(&format!(
+        "wrote {}",
+        run.join("proposed-tests.patch").display()
+    ));
     Ok(())
 }
 
@@ -2377,6 +2411,7 @@ fn admit_bundle_cache(fences: &[PathBuf]) -> Result<(), String> {
 
 /// Initialize a run and return its directory.
 fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
+    validate_output_paths(rest)?;
     selected_skill(rest)?;
     let target = flag(rest, "--target").ok_or("audit init requires --target <repo>")?;
     let target = std::fs::canonicalize(&target).map_err(|e| format!("target {target}: {e}"))?;
@@ -2391,6 +2426,7 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
                 .unwrap_or_else(|| std::ffi::OsStr::new("target")),
         )
     });
+    omgs::platform::validate_output_path(&out)?;
     trusted_policy_path(&target, &out)?;
     if omgs::paths::overlaps(&target, &out)? {
         return Err(
@@ -2618,6 +2654,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
             // Claim run-N with an exclusive create, so parallel inits (batch
             // mode) never share a run directory.
             let base = data_dir().join(&repo);
+            omgs::platform::validate_output_path(&base)?;
             outside(&base)?;
             omgs::platform::create_private_tree(&base).map_err(|e| {
                 format!(
@@ -3961,6 +3998,25 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
 
 fn intent_propose(run: &Path) -> Result<(), String> {
     omgs::budget::with_family_lock(run, || intent_propose_with_tests(run, None))
+}
+
+fn prepare_intent_proposal(
+    run: &Path,
+    staged: &omgs::handoff::StagedTests,
+) -> Result<String, String> {
+    let mut answers = run_answers(Some(run))?;
+    let meta = omgs::runmeta::read(run)?;
+    let target = Path::new(
+        meta.get("target")
+            .and_then(|v| v.as_str())
+            .ok_or("run needs target")?,
+    );
+    let store = read_target_store(target)?;
+    let policy = authenticated_policy(run, target)?;
+    for answer in store.answers {
+        omgs::intent::record(&mut answers, answer)?;
+    }
+    omgs::policy::prepare_staged(run, &answers, staged, &policy)
 }
 
 fn intent_propose_with_tests(

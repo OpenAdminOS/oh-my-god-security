@@ -3058,7 +3058,8 @@ fn unicode_formatting_controls_are_visible_in_all_display_formats() {
             }
         }
     }
-    assert!(handoff.contains("Warning: command contains Unicode formatting controls"));
+    assert!(handoff
+        .contains("Warning: command contains escaped control or Unicode formatting characters"));
     let (_, _, blocks) = markdown_structure(&handoff);
     let a = h.records[0].acceptance.as_ref().unwrap();
     assert!(blocks.iter().any(|b| b.contains("src/<U+202E>txt.exe")));
@@ -3756,5 +3757,27 @@ fn replay_fixture_relocates_windows_and_unix_paths_exactly_once() {
         assert_eq!(config["process"]["cwd"], expected);
         assert_eq!(config["process"]["env"][0], format!("HOME={expected}"));
         assert!(!config.to_string().contains("1001001"));
+    }
+}
+
+#[test]
+fn handoff_exact_command_survives_each_control_class() {
+    for c in ['\u{1}', '\u{85}', '\u{202e}', '\u{2028}', '\u{2029}'] {
+        let (dir, file) = report_fixture("exact-control-command");
+        let mut proof = omgs::proof::load(&dir, "proofs/1.json").unwrap();
+        proof.command = format!("printf 'a{c}b'");
+        proof.command_sha256 = omgs::sha256::digest(proof.command.as_bytes());
+        write_private_fixture(dir.join("proofs/1/command.txt"), &proof.command).unwrap();
+        omgs::proof::write(&dir, &proof).unwrap();
+        let handoff = omgs::handoff::build(&dir, &file, None).unwrap();
+        let rendered = omgs::handoff::markdown(&handoff);
+        assert!(rendered.contains("escaped preview is not executable"));
+        assert!(!rendered.contains(c));
+        let (_, _, blocks) = markdown_structure(&rendered);
+        let exact = &handoff.records[0].acceptance.as_ref().unwrap().command;
+        assert!(blocks
+            .iter()
+            .any(|block| serde_json::from_str::<String>(block).ok().as_deref() == Some(exact)));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

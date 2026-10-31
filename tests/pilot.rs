@@ -830,3 +830,82 @@ fn hostile_saved_text_is_inert_at_terminal_and_report_boundaries() {
         }
     }
 }
+
+#[test]
+fn terminal_controls_are_escaped_for_every_class() {
+    let f = Fixture::new();
+    let controls = "\u{1}\u{85}\u{202e}\u{2066}\u{2067}\u{2068}\u{2069}\u{200b}\u{200c}\u{200d}\u{200e}\u{200f}\u{feff}\u{2028}\u{2029}\u{e0001}";
+    for c in controls.chars() {
+        assert!(!omgs::platform::escape_controls(&c.to_string()).contains(c));
+        let models = f.root.join("models.json");
+        std::fs::write(
+            &models,
+            json!({"roles":{format!("hostile{c}"):["test"]}}).to_string(),
+        )
+        .unwrap();
+        let out = f.cli(&[
+            "route",
+            "--run",
+            f.run_str(),
+            "--role",
+            "verifier",
+            "--models",
+            models.to_str().unwrap(),
+        ]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(c));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("hostile"));
+    }
+}
+
+#[test]
+fn failed_stage_preserves_existing_proposal_and_policy_directory() {
+    let f = Fixture::new();
+    let proposal = f.run.join("proposed-tests.patch");
+    std::fs::write(&proposal, "previous proposal\n").unwrap();
+    let policy = f.run.join("policy.patch");
+    std::fs::create_dir(&policy).unwrap();
+    std::fs::write(policy.join("retained"), "previous policy").unwrap();
+    let meta = std::fs::read(f.run.join("run-metadata.json")).unwrap();
+    let out = f.cli(&["stage", "--run", f.run_str()]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(proposal).unwrap(),
+        "previous proposal\n"
+    );
+    assert!(policy.is_dir());
+    assert_eq!(
+        std::fs::read_to_string(policy.join("retained")).unwrap(),
+        "previous policy"
+    );
+    assert_eq!(
+        std::fs::read(f.run.join("run-metadata.json")).unwrap(),
+        meta
+    );
+}
+
+#[test]
+fn output_paths_reject_controls_before_creating_artifacts() {
+    let f = Fixture::new();
+    for c in ['\t', '\u{85}', '\u{202e}', '\u{2028}', '\u{2029}'] {
+        let out_path = f.root.join(format!("new{c}run"));
+        let out = f.cli(&[
+            "audit",
+            "init",
+            "--target",
+            f.target.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--no-sensors",
+        ]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("output paths must not contain"));
+        assert!(out.stdout.is_empty());
+        assert!(!out_path.exists());
+    }
+}

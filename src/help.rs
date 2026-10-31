@@ -2,11 +2,10 @@
 const USAGE: &str = "omgs\n\nUsage:\n  omgs identity [--skill-dir <dir>]\n  omgs artifact-check --run <dir> --path <relative-file>\n  omgs setup [--yes | --dry-run] [--from <skill-dir>] [--install-skills] [--replace] [--verify-mxc] [--write-policy <repo> --mode gate|advisory]\n  omgs review --repo-url <https-url> [--skill-dir <dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--clone-root <dir>] [--out <run-dir>]\n  omgs batch init --list <file> --out <dir> [--skill-dir <dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--clone-root <dir>]\n  omgs batch index --batch <batch.json> --out <dir>\n  omgs audit init --target <repo> [--skill-dir <dir>] [--base <ref>] [--out <run-dir>] [--mode gate|advisory] [--budget <n>] [--no-sensors] [--persona builder|inheritor|team] [--hunter <id>] [--verifier <id>] [--fix-of <original-run>] [--clone-root <dir>]\n  omgs gate --target <checkout> --base <base-sha> --head <head-sha> [--run <dir>]\n  omgs stage --run <run-dir>\n    Only confirmed test_proven or higher with valid runner-attested proofs. Invalid proofs are excluded and reported; pending drafts stay in HANDOFF.md.\n  omgs handoff --run <run-dir> [--finding <id>]\n  omgs intent propose --run <run-dir>\n  omgs budget --run <run-dir> [--charge-calls <n>]\n  omgs bench score --cases <manifest> --runs <run-dir> [--runs <run-dir>]...\n  omgs validate (--findings | --candidates | --dispositions | --evaluation) <file>\n  omgs fingerprint --attack-class <c> --entry-point <e> --sink <s> --boundary <b>\n  omgs prove --cmd <command> [--target <repo>] [--run <run-dir> [--finding <fingerprint>]] [--test <path> [--test-from <draft>]] [--expect-marker <MARKER>] [--replay <n>] [--tier 1|2] [--timeout-ms <n>]\n  omgs approve --target <repo>\n  omgs report --findings <findings.json> --out <dir> [--repo <name>] [--ref <ref>] [--mode gate|advisory] [--sandbox <label>] [--persona builder|inheritor|team] [--hunters <n>] [--verifier <id>] [--agent-calls <n>] [--accounting role=tokens,cost-usd,duration-ms]... [--model role=name]...\n  omgs architecture --in <architecture.json> --out <dir>\n  omgs ledger migrate --run <run-dir>\n  omgs ledger ingest --ledger <file> --dispositions <file>\n  omgs ledger list --ledger <coverage-ledger.json>\n  omgs ledger add --ledger <coverage-ledger.json> --unit <id> --surface <s> [--classes a,b] [--status <status>] [--note <text>]\n  omgs ledger set --ledger <coverage-ledger.json> --unit <id> --status <status> [--evidence <ref>]... [--note <text>]\n  omgs critic --run <run-dir>\n  omgs status --run <run-dir> --stage <id> --state pending|active|done|failed [--label <l>] [--parent <id>] [--detail <d>] [--counter name=n]... [--log <m>]... [--accounting role=tokens,cost-usd,duration-ms]...\n  omgs attempt --run <run-dir> --event <event.json>\n  omgs attempt --run <run-dir> --resolve-blocker <id> --actor <actor> --reason <text> --replacement <attempt-id>\n  omgs watch --run <run-dir> [--max-ms <n>]\n  omgs route --run <run-dir> --role host|hunter|verifier|evaluator|guard [--model <label>] [--refused <model> --reason <text>] [--models <models.json>]\n  omgs intent list [--stack <s>] [--attack-class <c>]\n  omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]\n  omgs check --target <repo> [--out <run-dir>]\n  omgs doctor [--live]\n  omgs update-check [--help]\n\nBoolean options: --replace, --yes, --dry-run, --install-skills, --verify-mxc, --no-sensors and --live. Every other option takes a value. Use --opt=value when a value begins with --; free-text options also accept it as the next argument. Free-text values --help, -h and values beginning with --help= are refused as the next argument; use --opt=value.\n";
 
 pub fn usage() {
-    eprintln!(
-        "omgs {}\n{}",
-        env!("CARGO_PKG_VERSION"),
-        USAGE.trim_start_matches("omgs")
-    );
+    crate::out::err(&format!("omgs {}", env!("CARGO_PKG_VERSION")));
+    for line in USAGE.trim_start_matches("omgs").lines() {
+        crate::out::err(line);
+    }
 }
 
 pub fn command(cmd: &str, args: &[String]) {
@@ -18,9 +17,9 @@ pub fn command(cmd: &str, args: &[String]) {
         || format!("  omgs {cmd} "),
         |s| format!("  omgs {cmd} {s} "),
     );
-    eprintln!("Usage:");
+    crate::out::err("Usage:");
     for line in USAGE.lines().filter(|l| l.starts_with(&prefix)) {
-        eprintln!("{line}");
+        crate::out::err(line);
     }
     let detail = match cmd {
         "artifact-check" => "Checks owner-private run-root containment and bounded single-link regular-file admission without printing content or repairing permissions. Nested owner-held 0644 files and 0755 directories rely on the private root. Before exporting, create a separate private destination with private file modes or ACLs.",
@@ -40,5 +39,6 @@ pub fn command(cmd: &str, args: &[String]) {
         "intent" => "list filters by --stack and canonical attack class; hyphen aliases are accepted and unknown classes diagnosed. answer records owner intent outside target; propose writes policy.patch for review.",
         _ => "Options shown with <value> require a value; bracketed options are optional. --run is an initialized private external run directory. Input errors exit 2; successful operations exit 0. See README and the installed skill detail files for command-specific evidence rules.",
     };
-    eprintln!("\n{detail}");
+    crate::out::err("");
+    crate::out::err(detail);
 }

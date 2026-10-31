@@ -921,6 +921,19 @@ pub fn propose_staged(
     staged: &crate::handoff::StagedTests,
     policy: &AuthenticatedPolicy,
 ) -> Result<std::path::PathBuf, String> {
+    let diff = prepare_staged(run, answers, staged, policy)?;
+    let path = run.join("policy.patch");
+    crate::runmeta::write_atomic(&path, &diff)?;
+    Ok(path)
+}
+
+/// Prepare an export without changing saved artifacts.
+pub fn prepare_staged(
+    run: &Path,
+    answers: &crate::intent::Answers,
+    staged: &crate::handoff::StagedTests,
+    policy: &AuthenticatedPolicy,
+) -> Result<String, String> {
     let s = policy.snapshot();
     let mut p = s.policy.clone();
     propose_tests(run, &mut p, &staged.admitted)?;
@@ -940,9 +953,7 @@ pub fn propose_staged(
     let old = s.original.as_deref().unwrap_or_default();
     let mut diff = file_patch(PATH, old, &new);
     diff.push_str(&staged.patch);
-    let path = run.join("policy.patch");
-    crate::runmeta::write_atomic(&path, &diff)?;
-    Ok(path)
+    Ok(diff)
 }
 
 fn propose_tests(

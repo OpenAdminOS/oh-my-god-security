@@ -254,26 +254,15 @@ pub fn build_view(
     })
 }
 
-/// Unicode 17.0 General_Category=Cf, including bidi and zero-width controls.
-/// https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt
-fn formatting_control(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' |
-        '\u{070F}' | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}' |
-        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' |
-        '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' |
-        '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}' |
-        '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}' |
-        '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
-}
-
 /// Display annotations only. Never apply to retained commands or JSON arguments.
 pub(crate) fn display_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c.is_control() && !matches!(c, '\n' | '\r' | '\t') {
+        if matches!(c, '\n' | '\r' | '\t') {
+            out.push(c);
+        } else if c.is_control() {
             out.extend(c.escape_default());
-        } else if formatting_control(c) {
+        } else if crate::platform::display_control(c) {
             out.push_str(&format!("<U+{:04X}>", c as u32));
         } else {
             out.push(c);
@@ -286,7 +275,7 @@ pub(crate) fn display_text(s: &str) -> String {
 fn command_json(s: &str) -> String {
     let mut out = String::new();
     for c in serde_json::to_string(s).unwrap().chars() {
-        if c.is_control() || formatting_control(c) {
+        if crate::platform::display_control(c) {
             for unit in c.encode_utf16(&mut [0; 2]) {
                 out.push_str(&format!("\\u{unit:04x}"));
             }
@@ -431,8 +420,8 @@ pub fn markdown_at(h: &Handoff, artifact_base: &str) -> String {
                 &serde_json::to_string(&a.recipe_contract).unwrap(),
             ));
             out.push_str("Exact command (use the new FIX_RUN after an authorized edit, retain every other argument):\n\n");
-            if a.command.chars().any(formatting_control) {
-                out.push_str("Warning: command contains Unicode formatting controls. The escaped preview is not executable. Decode the adjacent JSON string for the exact command, or read command and command_args from handoff.json.\n\n");
+            if display_text(&a.command) != a.command {
+                out.push_str("Warning: command contains escaped control or Unicode formatting characters. The escaped preview is not executable. Decode the adjacent JSON string for the exact command, or read command and command_args from handoff.json.\n\n");
                 out.push_str(&markdown_data("Acceptance command preview", &a.command));
                 out.push_str(&markdown_data(
                     "Exact command JSON string",
