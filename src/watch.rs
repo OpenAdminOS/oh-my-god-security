@@ -169,7 +169,7 @@ fn state_of(v: &serde_json::Value) -> &'static str {
 }
 
 /// A UTC timestamp exactly as `omgs status` writes it,
-/// `YYYY-MM-DDTHH:MM:SSZ` with every field in range. Anything else is
+/// `YYYY-MM-DDTHH:MM:SSZ` naming a real calendar date and time. Anything else is
 /// dropped, so a log entry cannot carry an address or identifier.
 fn is_timestamp(t: &str) -> bool {
     let b = t.as_bytes();
@@ -189,24 +189,25 @@ fn is_timestamp(t: &str) -> bool {
             .all(|c| c.is_ascii_digit())
             .then(|| part.parse().ok())?
     };
-    matches!(
-        (
-            num(0, 4),
-            num(5, 7),
-            num(8, 10),
-            num(11, 13),
-            num(14, 16),
-            num(17, 19)
-        ),
-        (
-            Some(_),
-            Some(1..=12),
-            Some(1..=31),
-            Some(0..=23),
-            Some(0..=59),
-            Some(0..=59)
-        )
-    )
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        num(0, 4),
+        num(5, 7),
+        num(8, 10),
+        num(11, 13),
+        num(14, 16),
+        num(17, 19),
+    ) else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days).contains(&day) && hour < 24 && minute < 60 && second < 60
 }
 
 /// One stage with only fixed vocabulary, numbers and generic labels.
