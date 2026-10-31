@@ -10,6 +10,10 @@ pub const WIDTH: u32 = 800;
 pub const HEIGHT: u32 = 600;
 pub const MAX_FILES: usize = 4;
 pub const MAX_BYTES: u64 = 512 * 1024;
+/// Directory entries examined after a run, and the notes and note length kept.
+const MAX_ENTRIES: usize = 4096;
+const MAX_NOTES: usize = 16;
+const NOTE_BYTES: usize = 200;
 /// Longest a single capture may run before the helper stops the browser.
 pub const CAPTURE_SECONDS: u32 = 20;
 /// Why Windows records a screenshot blocker instead of running a browser.
@@ -375,6 +379,7 @@ pub fn collect(scratch: &Path, to: &Path) -> (Vec<Shot>, Vec<String>) {
     let mut names: Vec<String> = match std::fs::read_dir(&dir) {
         Ok(entries) => entries
             .filter_map(Result::ok)
+            .take(MAX_ENTRIES + 1)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect(),
         Err(e) => {
@@ -382,6 +387,8 @@ pub fn collect(scratch: &Path, to: &Path) -> (Vec<Shot>, Vec<String>) {
             return (kept, skipped);
         }
     };
+    let unexamined = names.len() > MAX_ENTRIES;
+    names.truncate(MAX_ENTRIES);
     names.sort();
     for file in names {
         let shown = crate::platform::escape_controls(&file);
@@ -435,7 +442,37 @@ pub fn collect(scratch: &Path, to: &Path) -> (Vec<Shot>, Vec<String>) {
             Err(reason) => skipped.push(format!("{shown}: {reason}")),
         }
     }
-    (kept, skipped)
+    if unexamined {
+        skipped.push(format!(
+            "more than {MAX_ENTRIES} entries; the rest were not examined"
+        ));
+    }
+    (kept, bounded(skipped))
+}
+
+/// Keeps the record small whatever the sandbox left behind: at most
+/// MAX_NOTES notes of at most NOTE_BYTES each, then a count of the rest.
+fn bounded(notes: Vec<String>) -> Vec<String> {
+    let total = notes.len();
+    let mut out: Vec<String> = notes
+        .into_iter()
+        .take(MAX_NOTES)
+        .map(|mut note| {
+            if note.len() > NOTE_BYTES {
+                let mut cut = NOTE_BYTES;
+                while !note.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                note.truncate(cut);
+                note.push_str("...");
+            }
+            note
+        })
+        .collect();
+    if total > MAX_NOTES {
+        out.push(format!("and {} more refused entries", total - MAX_NOTES));
+    }
+    out
 }
 
 /// Standard base64 for data URIs.
@@ -585,6 +622,16 @@ mod tests {
         assert!(admit(&png(10, 10, MAX_BYTES as usize))
             .unwrap_err()
             .contains("larger"));
+    }
+
+    #[test]
+    fn refusal_notes_stay_bounded() {
+        let many: Vec<String> = (0..40).map(|i| format!("junk{i}")).collect();
+        let out = bounded(many);
+        assert_eq!(out.len(), MAX_NOTES + 1);
+        assert_eq!(out[MAX_NOTES], "and 24 more refused entries");
+        let long = bounded(vec!["é".repeat(300)]);
+        assert!(long[0].len() <= NOTE_BYTES + 3 && long[0].ends_with("..."));
     }
 
     #[test]
