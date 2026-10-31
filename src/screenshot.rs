@@ -300,7 +300,7 @@ fn flags(os: &str) -> Vec<String> {
 }
 
 /// File name and text of the capture helper written into scratch. Callers run
-/// it as `sh "${OMGS_SCREENSHOT:-/dev/null}" <name> <url>`. Names are checked
+/// it as `sh "${OMGS_SCREENSHOT:-/dev/null}" <name> <url> || true`. Names are checked
 /// again when files are collected. Windows has no helper.
 pub fn helper(os: &str, browser: &Path, scratch: &Path) -> Result<(String, String), String> {
     let separator = if os == "windows" { "\\" } else { "/" };

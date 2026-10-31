@@ -245,10 +245,11 @@ for contracts, markers, validation, replay requirements, redaction and schema co
 ### Proof screenshots
 
 `omgs prove --screenshots` offers the proof command a capture helper for web and
-rendered-output proofs. The harness calls `sh "${OMGS_SCREENSHOT:-/dev/null}" <name> <url>`
-at the proof moment with an absolute URL such as `file://$PWD/page.html` or a tier 2
-loopback address.
-The guard makes the call a no-op when no browser is available. A headless
+rendered-output proofs. The harness calls
+`sh "${OMGS_SCREENSHOT:-/dev/null}" <name> <url> || true` at the proof moment with an
+absolute URL such as `file://$PWD/page.html` or a tier 2 loopback address. The guards make
+the call a no-op when no browser is available and keep a `set -e` harness running even if
+the helper is gone. A headless
 browser already on the machine renders the page inside the same MXC sandbox at a fixed
 800x600 viewport, with network still denied. Nothing is downloaded. OMGS keeps at most
 4 PNG files of up to 512 KiB each, refuses anything else by name, hashes the kept files

@@ -3847,7 +3847,7 @@ fn screenshots_are_kept_hashed_and_replayed_or_blocked_with_a_reason() {
         (
             "tests/shot.sh",
             "sh tests/shot.sh",
-            "set -e\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/page.html\"\necho AFTER_CAPTURE\nexit 1\n",
+            "set -e\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/page.html\" || true\necho AFTER_CAPTURE\nexit 1\n",
         )
     };
     std::fs::write(target.join(test), body).unwrap();
@@ -4046,7 +4046,7 @@ fn a_failing_screenshot_browser_is_named_in_the_record() {
     std::fs::create_dir_all(target.join("tests")).unwrap();
     std::fs::write(
         target.join("tests/shot.sh"),
-        "set -e\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/missing.html\"\necho AFTER_CAPTURE\nexit 1\n",
+        "set -e\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/missing.html\" || true\necho AFTER_CAPTURE\nexit 1\n",
     )
     .unwrap();
     let init = omgs(
@@ -4121,7 +4121,7 @@ fn a_stalled_screenshot_browser_is_stopped_and_named() {
     .unwrap();
     std::fs::write(
         target.join("tests/shot.sh"),
-        "set -e\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/x.html\"\necho AFTER_CAPTURE\nexit 1\n",
+        "set -e\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/x.html\" || true\necho AFTER_CAPTURE\nexit 1\n",
     )
     .unwrap();
     let init = omgs(
@@ -4165,6 +4165,67 @@ fn a_stalled_screenshot_browser_is_stopped_and_named() {
     assert_eq!(
         shots.skipped,
         ["page: capture timed out after 20 s and the browser was stopped"]
+    );
+    assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// A harness that removes the helper still reaches its assertion with the
+// documented call, and the record says the helper was missing.
+#[cfg(unix)]
+#[test]
+fn a_removed_screenshot_helper_is_named_and_never_stops_the_harness() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("screenshot-removed");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(target.join("tests")).unwrap();
+    std::fs::write(
+        target.join("tests/shot.sh"),
+        "set -e\nrm -f \"$OMGS_SCREENSHOT\"\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/x.html\" || true\necho AFTER_CAPTURE\nexit 1\n",
+    )
+    .unwrap();
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "tests/shot.sh",
+            "--screenshots",
+            "--cmd",
+            "sh tests/shot.sh",
+        ])
+        .env("OMGS_HOME", &d)
+        .env(omgs::screenshot::BROWSER_ENV, "/usr/bin/false")
+        .env(
+            "OMGS_MXC_EXEC",
+            omgs::sandbox::locate_executor().unwrap().path,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("AFTER_CAPTURE"), "{}", text(&out));
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    let shots = record.screenshots.clone().unwrap();
+    assert_eq!(
+        shots.skipped,
+        ["the screenshot helper was missing after the run"]
     );
     assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
     let _ = std::fs::remove_dir_all(&d);

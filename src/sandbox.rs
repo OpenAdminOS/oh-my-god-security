@@ -2004,6 +2004,12 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     if let (Some(shots), Some(_)) = (screenshots.as_mut(), &helper) {
         let (files, mut skipped) =
             crate::screenshot::collect(&scratch, &run_dir.join(crate::screenshot::DIR));
+        let helper_kept =
+            std::fs::symlink_metadata(scratch.join(crate::screenshot::helper_name(os)))
+                .is_ok_and(|m| m.is_file());
+        if !helper_kept {
+            skipped.push("the screenshot helper was missing after the run".into());
+        }
         if files.is_empty() && skipped.is_empty() {
             skipped.push("no screenshot was produced: the command did not run the helper or the browser wrote nothing".into());
         }
