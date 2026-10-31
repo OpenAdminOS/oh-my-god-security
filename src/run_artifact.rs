@@ -1,7 +1,6 @@
 //! Run evidence has one admission boundary, distinct from checkout content.
 use std::path::Path;
 
-pub const DASHBOARD_STATUS_BYTES: u64 = 1 << 20;
 pub const STATUS_BYTES: u64 = 16 << 20;
 pub const FINDINGS_BYTES: u64 = 16 << 20;
 pub const LEDGER_BYTES: u64 = 16 << 20;

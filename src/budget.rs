@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Serialize)]
 pub struct Allowance {
     pub budget_agent_calls: Option<u64>,
+    pub budget_semantics: &'static str,
     pub calls_and_proofs_used: u64,
     pub remaining: Option<u64>,
     pub run_count: usize,
@@ -231,6 +232,7 @@ pub fn allowance(root: &Path) -> Result<Allowance, String> {
     }
     Ok(Allowance {
         budget_agent_calls: cap,
+        budget_semantics: "combined_calls_proofs_replays",
         calls_and_proofs_used: used,
         remaining: cap.map(|cap| cap.saturating_sub(used)),
         run_count: runs.len(),
@@ -316,35 +318,42 @@ pub fn init_fix(
         if child.parent() != root.parent() || child == root {
             return Err("fix run must be a distinct sibling in the trusted runs directory".into());
         }
-        let child_id = run_id(&read_run(&child)?)?.to_string();
-        runmeta::with_lock(&child, || {
-            let mut m = read_run(&child)?;
-            m.insert(
-                "budget_parent".into(),
-                Value::from(root.to_string_lossy().as_ref()),
-            );
-            m.insert("budget_parent_id".into(), Value::from(run_id(&meta)?));
-            if run_id(&m)? != child_id {
-                return Err("linked run identity changed during registration".into());
-            }
-            runmeta::write_atomic(
-                &child.join(runmeta::FILE),
-                &serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?,
-            )
-        })?;
-        let mut runs = fix_runs(&meta, root.parent().unwrap())?;
-        runs.push(RegisteredRun {
-            path: child.clone(),
-            run_id: child_id,
-        });
-        meta.insert(
-            "fix_runs".into(),
-            serde_json::to_value(runs).map_err(|e| e.to_string())?,
-        );
-        runmeta::write_atomic(
-            &root.join(runmeta::FILE),
-            &serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?,
-        )?;
+        let registration = (|| {
+            let child_id = run_id(&read_run(&child)?)?.to_string();
+            runmeta::with_lock(&child, || {
+                let mut m = read_run(&child)?;
+                if run_id(&m)? != child_id {
+                    return Err("linked run identity changed during registration".into());
+                }
+                m.insert(
+                    "budget_parent".into(),
+                    Value::from(root.to_string_lossy().as_ref()),
+                );
+                m.insert("budget_parent_id".into(), Value::from(run_id(&meta)?));
+                let mut runs = fix_runs(&meta, root.parent().unwrap())?;
+                runs.push(RegisteredRun {
+                    path: child.clone(),
+                    run_id: child_id,
+                });
+                meta.insert(
+                    "fix_runs".into(),
+                    serde_json::to_value(runs).map_err(|e| e.to_string())?,
+                );
+                let mut writes = runmeta::Transaction::default();
+                writes.metadata(&child, &m)?;
+                writes.metadata(&root, &meta)?;
+                writes.commit()
+            })
+        })();
+        if let Err(error) = registration {
+            std::fs::remove_dir_all(&child).map_err(|cleanup| {
+                format!(
+                    "{error}; remove unsuccessful fix {}: {cleanup}",
+                    child.display()
+                )
+            })?;
+            return Err(error);
+        }
         Ok(child)
     })
 }
@@ -371,27 +380,60 @@ pub fn with_family_lock<T>(
 
 /// Charge host-reported calls before dispatch, using the same family lock as proofs.
 pub fn charge_calls(run: &Path, calls: u64) -> Result<(), String> {
-    runmeta::update(run, |m| {
-        let root = original(run)?;
-        let total = allowance(&root)?;
-        if total.remaining.is_some_and(|remaining| calls > remaining) {
-            return Err("run budget exhausted: call charge exceeds remaining allowance".into());
-        }
-        let used = m
-            .get("agent_calls_used")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        m.insert(
-            "agent_calls_used".into(),
-            Value::from(used.checked_add(calls).ok_or("call count overflow")?),
-        );
-        Ok(())
-    })
+    runmeta::update(run, |m| charge_calls_locked(run, m, calls))
+}
+
+/// Caller holds the family lock through the metadata transaction.
+pub(crate) fn charge_calls_locked(
+    run: &Path,
+    m: &mut Map<String, Value>,
+    calls: u64,
+) -> Result<(), String> {
+    let root = original(run)?;
+    let total = allowance(&root)?;
+    if total.remaining.is_some_and(|remaining| calls > remaining) {
+        return Err("run budget exhausted: call charge exceeds remaining allowance".into());
+    }
+    let used = m
+        .get("agent_calls_used")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    m.insert(
+        "agent_calls_used".into(),
+        Value::from(used.checked_add(calls).ok_or("call count overflow")?),
+    );
+    Ok(())
 }
 
 pub fn summary(run: &Path) -> Result<String, String> {
     let root = original(run)?;
-    let a = runmeta::with_lock(&root, || allowance(&root))?;
+    runmeta::with_lock(&root, || summary_locked(run))
+}
+
+/// Caller holds the family lock, or is reading a frozen archive snapshot.
+pub fn summary_locked(run: &Path) -> Result<String, String> {
+    summary_proposed_locked(run, &read_run(&run_path(run)?)?)
+}
+
+/// Account for the proposed run counters without persisting them during rendering.
+pub fn summary_proposed_locked(
+    run: &Path,
+    proposed: &Map<String, Value>,
+) -> Result<String, String> {
+    let mut a = allowance(&original(run)?)?;
+    let saved = read_run(&run_path(run)?)?;
+    for key in ["agent_calls_used", "proof_runs_used"] {
+        a.calls_and_proofs_used = a
+            .calls_and_proofs_used
+            .checked_sub(saved.get(key).and_then(Value::as_u64).unwrap_or(0))
+            .and_then(|used| {
+                used.checked_add(proposed.get(key).and_then(Value::as_u64).unwrap_or(0))
+            })
+            .ok_or("cumulative budget usage overflow")?;
+    }
+    a.remaining = a
+        .budget_agent_calls
+        .map(|cap| cap.saturating_sub(a.calls_and_proofs_used));
     Ok(format!(
         "Cumulative budget: {} used of {}; {} remaining across {} run(s)",
         a.calls_and_proofs_used,
@@ -440,6 +482,49 @@ mod regressions {
         )
         .unwrap();
         (dir, root, child)
+    }
+
+    #[test]
+    fn failed_parent_registration_removes_unregistered_child() {
+        let (dir, root, child) = family("registration-parent-failure");
+        std::fs::remove_dir_all(&child).unwrap();
+        runmeta::write_atomic(
+            &root.join(runmeta::FILE),
+            &json!({
+                "run_id":"original", "budget_agent_calls":2, "agent_calls_used":1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let original = std::fs::read(root.join(runmeta::FILE)).unwrap();
+        let result = init_fix(
+            &root,
+            |_| Ok(Some(2)),
+            |_, _, remaining| {
+                assert_eq!(remaining, Some(1));
+                crate::platform::create_private_dir(&child).unwrap();
+                runmeta::write_atomic(
+                    &child.join(runmeta::FILE),
+                    &json!({"run_id":"new-child"}).to_string(),
+                )?;
+                // Fail only the parent publication after initialization has succeeded.
+                std::fs::rename(root.join(runmeta::FILE), root.join("saved-metadata.json"))
+                    .unwrap();
+                crate::platform::create_private_dir(&root.join(runmeta::FILE)).unwrap();
+                Ok(child.clone())
+            },
+        );
+        assert!(result.unwrap_err().contains("destination is a directory"));
+        assert!(!child.exists());
+        assert!(root.join(runmeta::FILE).is_dir());
+        assert_eq!(
+            std::fs::read(root.join("saved-metadata.json")).unwrap(),
+            original
+        );
+        std::fs::remove_dir(root.join(runmeta::FILE)).unwrap();
+        std::fs::rename(root.join("saved-metadata.json"), root.join(runmeta::FILE)).unwrap();
+        assert_eq!(allowance(&root).unwrap().run_count, 1);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

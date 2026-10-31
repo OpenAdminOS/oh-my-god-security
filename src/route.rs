@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub const ROLES: [&str; 4] = ["hunter", "verifier", "evaluator", "guard"];
+pub const ROLES: [&str; 5] = ["host", "hunter", "verifier", "evaluator", "guard"];
 
 /// `models.json`: for each role, the models to try in order.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -78,14 +78,20 @@ pub fn next_model(models: &Models, role: &str, refused: &[String]) -> Result<Str
 pub fn parse_identities(values: &[String]) -> Result<BTreeMap<String, String>, String> {
     let mut models = BTreeMap::new();
     for value in values {
-        let (role, model) = value.split_once('=').ok_or("--model expects role=name")?;
+        let (role, model) = value.split_once('=').ok_or_else(|| {
+            format!(
+                "--model expects role=name; valid roles: {}",
+                ROLES.join(", ")
+            )
+        })?;
+        if model.chars().any(char::is_control) {
+            return Err("--model names must not contain control characters".into());
+        }
         if !ROLES.contains(&role)
             || model.trim().is_empty()
             || models.insert(role.into(), model.into()).is_some()
         {
-            return Err(
-                "--model requires a known role, nonblank model, and one value per role".into(),
-            );
+            return Err(format!("--model requires a known role, nonblank model, and one value per role; valid roles: {}", ROLES.join(", ")));
         }
     }
     Ok(models)

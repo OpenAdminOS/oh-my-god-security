@@ -288,30 +288,65 @@ pub fn critique(
 /// Load a run directory's `findings.json` and critique it together with the
 /// ledger and candidates beside it.
 pub fn critique_run(dir: &Path) -> Result<CriticReport, String> {
-    let findings = crate::shape::findings(&crate::run_artifact::text(
-        dir,
-        Path::new("findings.json"),
-        crate::run_artifact::FINDINGS_BYTES,
-    )?)
-    .map_err(|e| format!("parse findings.json: {e}"))?;
-    critique_dir(dir, &findings)
+    crate::runmeta::with_lock(dir, || critique_run_locked(dir))
 }
 
-/// Critique the given findings against the ledger and every
-/// `candidates*.json` in `dir`. Used by `omgs report`, so the critic result
-/// always describes the exact findings being rendered.
+/// Caller holds the run lock until the diagnostic is emitted.
+pub fn critique_run_locked(dir: &Path) -> Result<CriticReport, String> {
+    published_report(crate::review::View::load_strict_locked(dir)?)
+}
+
+/// Critique exactly the supplied findings through the publication view.
 pub fn critique_dir(dir: &Path, findings: &FindingsFile) -> Result<CriticReport, String> {
+    published_report(crate::review::View::with_findings(dir, findings)?)
+}
+
+fn published_report(view: crate::review::View) -> Result<CriticReport, String> {
+    let mut report = view.meta.critic.ok_or_else(|| {
+        view.meta
+            .review_limits
+            .iter()
+            .find(|s| s.starts_with("artifact unreadable:"))
+            .cloned()
+            .unwrap_or_else(|| "coverage-ledger.json missing".into())
+    })?;
+    for reason in view.meta.review_limits {
+        if !report.gaps.contains(&reason) {
+            report.gaps.push(reason);
+        }
+    }
+    // Preserve distinct diagnostics without counting the same failure again
+    // through the summary. A passing reconciliation still cannot certify an
+    // unfinished review, including deferred coverage and reopened stages.
+    if report.passed() {
+        if let Some(state) = view.state {
+            report.gaps.push(state);
+        }
+    }
+    Ok(report)
+}
+
+/// The canonical view has already checked each proof and final attempt and
+/// performs adjudication once. Reuse this critic's coverage reconciliation.
+pub(crate) fn critique_projection(
+    dir: &Path,
+    findings: &FindingsFile,
+    sensors: Option<&crate::sensors::SensorsReport>,
+) -> Result<Option<CriticReport>, String> {
     critique_dir_inner(
         dir,
         findings,
+        sensors,
         #[cfg(test)]
         || {},
     )
+    .map(Some)
 }
 
 fn critique_dir_inner(
     dir: &Path,
     findings: &FindingsFile,
+    sensors: Option<&crate::sensors::SensorsReport>,
     #[cfg(test)] before_read: impl FnOnce(),
 ) -> Result<CriticReport, String> {
     let ledger: Ledger = crate::shape::ledger(&crate::run_artifact::text(
@@ -360,17 +395,28 @@ fn critique_dir_inner(
         );
     }
     let mut report = critique(&ledger, names.len(), &candidates, findings);
-    if let Some(sensors) = crate::sensors::read_report(dir)? {
+    report
+        .gaps
+        .extend(crate::attempts::ledger_gaps(dir, &ledger)?);
+    let meta = crate::runmeta::read_optional(dir)?.unwrap_or_default();
+    let attempts = crate::attempts::states(&crate::attempts::history(&meta)?)?;
+    for role in ["verifier", "evaluator"] {
+        if !attempts
+            .values()
+            .any(|a| a.role == role && a.state == "complete")
+        {
+            report.gaps.push(format!("{role} completion not recorded"));
+        }
+    }
+    let sensors = match sensors {
+        Some(report) => Some(report.clone()),
+        None => crate::sensors::read_report(dir)?,
+    };
+    if let Some(sensors) = sensors {
         report
             .gaps
             .extend(crate::sensors::reconcile(&sensors, &ledger));
     }
-    for e in crate::proof::validate_proofs(findings, dir) {
-        report.gaps.push(format!("findings {e}"));
-    }
-    report
-        .gaps
-        .extend(crate::adjudication::check(dir, findings)?);
     if let Some(evaluation) = crate::adjudication::load(dir)? {
         for decision in &evaluation.decisions {
             if let Some(f) = findings
@@ -409,7 +455,7 @@ mod replacement_tests {
         crate::runmeta::write_atomic(&candidate, r#"{"hunter":"one","candidates":[]}"#).unwrap();
         let outside = run.join("outside.json");
         crate::runmeta::write_atomic(&outside, r#"{"hunter":"one","candidates":[]}"#).unwrap();
-        let error = super::critique_dir_inner(&run, &Default::default(), || {
+        let error = super::critique_dir_inner(&run, &Default::default(), None, || {
             std::fs::remove_file(&candidate).unwrap();
             std::os::unix::fs::symlink(&outside, &candidate).unwrap();
         })

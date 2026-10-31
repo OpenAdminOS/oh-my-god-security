@@ -1,7 +1,7 @@
 //! `pipeline-status.json`, the optional live progress file the dashboard polls.
 //! `omgs status` updates it so orchestrators never hand-write the JSON.
 
-use crate::runmeta::{clock, now_ms, with_lock, write_atomic};
+use crate::runmeta::{now_ms, timestamp, with_lock};
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
@@ -26,6 +26,7 @@ fn upsert<'v>(
     list: &'v mut Vec<Value>,
     id: &str,
     label: Option<&str>,
+    restart: bool,
 ) -> &'v mut Map<String, Value> {
     let pos = match list
         .iter()
@@ -33,13 +34,35 @@ fn upsert<'v>(
     {
         Some(p) => p,
         None => {
-            list.push(json!({ "id": id, "label": label.unwrap_or(id), "status": "pending" }));
+            list.push(json!({ "id": id, "attempt_id": format!("{id}:1"), "label": label.unwrap_or(id), "status": "pending" }));
             list.len() - 1
         }
     };
     let entry = list[pos]
         .as_object_mut()
         .expect("stage entries are objects");
+    let restarting = entry
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s == "done" || s == "failed");
+    if restarting && restart {
+        let mut previous = entry.clone();
+        previous.remove("history");
+        entry
+            .entry("history")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("validated history")
+            .push(Value::Object(previous));
+        let round = entry["history"].as_array().unwrap().len() + 1;
+        entry.insert("attempt_id".into(), json!(format!("{id}:{round}")));
+        entry.insert("label".into(), json!(label.unwrap_or(id)));
+        entry.remove("children");
+        entry.remove("detail");
+        entry.remove("started_ms");
+        entry.remove("ended_ms");
+        entry.insert("status".into(), json!("pending"));
+    }
     if let Some(l) = label {
         entry.insert("label".into(), json!(l));
     }
@@ -68,7 +91,47 @@ fn set_state(entry: &mut Map<String, Value>, state: &str, detail: Option<&str>, 
 /// Apply one update to the status file in `dir`, creating it when absent,
 /// under the run lock so parallel hunters never drop each other's updates.
 pub fn apply(dir: &Path, u: &Update) -> Result<(), String> {
-    with_lock(dir, || apply_locked(dir, u))
+    apply_with_logs(dir, u, &[])
+}
+
+/// Append all supplied log messages in the same status transaction.
+pub fn apply_with_logs(dir: &Path, u: &Update, logs: &[String]) -> Result<(), String> {
+    if crate::runmeta::read_optional(dir)?.is_some() {
+        crate::budget::with_family_lock(dir, || apply_with_logs_locked(dir, u, logs))
+    } else {
+        with_lock(dir, || apply_with_logs_locked(dir, u, logs))
+    }
+}
+
+/// Caller holds the run lock through the enclosing publication.
+pub fn apply_with_logs_locked(dir: &Path, u: &Update, logs: &[String]) -> Result<(), String> {
+    let mut saved = crate::runmeta::read_optional(dir)?.unwrap_or_default();
+    let (writes, _) = prepare_locked(dir, &mut saved, u, logs)?;
+    writes.commit()
+}
+
+/// Build a status mutation without touching disk. Caller holds family/run locks.
+pub fn prepare_locked(
+    dir: &Path,
+    saved: &mut Map<String, Value>,
+    u: &Update,
+    logs: &[String],
+) -> Result<(crate::runmeta::Transaction, crate::review::View), String> {
+    let proposed = propose_locked(dir, u, logs)?;
+    if u.state != "done" {
+        saved.insert("run_status".into(), json!("in_progress"));
+    }
+    crate::runmeta::check_numeric_fields(saved)?;
+    let view = crate::review::View::with_progress_locked(dir, saved, &proposed, true)?;
+    let mut writes = crate::runmeta::Transaction::default();
+    if crate::runmeta::read_optional(dir)?.is_some() {
+        writes.metadata(dir, saved)?;
+    }
+    writes.text(
+        dir.join(FILE),
+        serde_json::to_string_pretty(&view.progress).map_err(|e| e.to_string())?,
+    );
+    Ok((writes, view))
 }
 
 /// Check an existing status document against the status schema before it is
@@ -88,12 +151,23 @@ pub fn check_document(doc: &Map<String, Value>) -> Result<(), String> {
         {
             return Err(format!("{at}.status must be one of {}", STATES.join(", ")));
         }
+        if o.get("attempt_id").is_some_and(|d| !d.is_string()) {
+            return Err(format!("{at}.attempt_id must be a string"));
+        }
         if o.get("detail").is_some_and(|d| !d.is_string()) {
             return Err(format!("{at}.detail must be a string"));
         }
         for key in ["started_ms", "ended_ms"] {
             if o.get(key).is_some_and(|t| !t.is_u64()) {
                 return Err(format!("{at}.{key} must be an integer"));
+            }
+        }
+        if let Some(history) = o.get("history") {
+            for old in history.as_array().ok_or("history must be an array")? {
+                if old.get("history").is_some() {
+                    return Err("history cannot nest".into());
+                }
+                stage(old, at, nested)?;
             }
         }
         match (o.get("children"), nested) {
@@ -157,7 +231,7 @@ pub fn check_document(doc: &Map<String, Value>) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_locked(dir: &Path, u: &Update) -> Result<(), String> {
+pub fn propose_locked(dir: &Path, u: &Update, logs: &[String]) -> Result<Value, String> {
     if !STATES.contains(&u.state) {
         return Err(format!("--state must be one of {}", STATES.join(", ")));
     }
@@ -195,15 +269,68 @@ fn apply_locked(dir: &Path, u: &Update) -> Result<(), String> {
         .ok_or("stages is not an array")?;
     match u.parent {
         Some(parent) => {
-            let p = upsert(stages, parent, None);
+            let p = upsert(stages, parent, None, false);
             let children = p
                 .entry("children")
                 .or_insert_with(|| json!([]))
                 .as_array_mut()
                 .ok_or("children is not an array")?;
-            set_state(upsert(children, u.stage, u.label), u.state, u.detail, now);
+            set_state(
+                upsert(
+                    children,
+                    u.stage,
+                    u.label,
+                    ["pending", "active"].contains(&u.state),
+                ),
+                u.state,
+                u.detail,
+                now,
+            );
         }
-        None => set_state(upsert(stages, u.stage, u.label), u.state, u.detail, now),
+        None => {
+            let mut matches = Vec::new();
+            for (i, s) in stages.iter().enumerate() {
+                if s["id"].as_str() == Some(u.stage) {
+                    matches.push((i, None));
+                }
+                if let Some(children) = s["children"].as_array() {
+                    for (j, child) in children.iter().enumerate() {
+                        if child["id"].as_str() == Some(u.stage) {
+                            matches.push((i, Some(j)));
+                        }
+                    }
+                }
+            }
+            if matches.len() > 1 {
+                return Err("ambiguous stage id; specify --parent".into());
+            }
+            if let Some((i, Some(_))) = matches.first().copied() {
+                let children = stages[i]["children"].as_array_mut().unwrap();
+                set_state(
+                    upsert(
+                        children,
+                        u.stage,
+                        u.label,
+                        ["pending", "active"].contains(&u.state),
+                    ),
+                    u.state,
+                    u.detail,
+                    now,
+                );
+            } else {
+                set_state(
+                    upsert(
+                        stages,
+                        u.stage,
+                        u.label,
+                        ["pending", "active"].contains(&u.state),
+                    ),
+                    u.state,
+                    u.detail,
+                    now,
+                );
+            }
+        }
     }
     if !u.counters.is_empty() {
         let counters = doc
@@ -215,17 +342,21 @@ fn apply_locked(dir: &Path, u: &Update) -> Result<(), String> {
             counters.insert(k.clone(), json!(n));
         }
     }
-    if let Some(m) = u.log.filter(|m| !m.trim().is_empty()) {
+    for m in u
+        .log
+        .into_iter()
+        .chain(logs.iter().map(String::as_str))
+        .filter(|m| !m.trim().is_empty())
+    {
         let log = doc
             .entry("log")
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or("log is not an array")?;
-        log.push(json!({ "ts": clock(now), "kind": u.state, "m": m }));
+        log.push(json!({ "ts": timestamp(now), "kind": u.state, "m": m }));
         let excess = log.len().saturating_sub(LOG_LIMIT);
         log.drain(..excess);
     }
     doc.insert("updated_ms".into(), json!(now));
-    let text = serde_json::to_string_pretty(&Value::Object(doc)).map_err(|e| e.to_string())?;
-    write_atomic(&path, &format!("{text}\n"))
+    Ok(Value::Object(doc))
 }

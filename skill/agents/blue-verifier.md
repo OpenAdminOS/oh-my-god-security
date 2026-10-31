@@ -62,3 +62,16 @@ and dummy identities only. Never see hunter reasoning beyond the candidate claim
 hunt, infer a rejection from unavailable evidence, mock the enforcement being tested, assign
 severity to pending records or promote a source trace to confirmed. Persona changes defaults only,
 never verdict semantics, sandbox rules or the evidence bar.
+
+## Attempt completion and stops
+
+The host supplies ATTEMPT_ID and records its input/output manifests and context.
+Input isolation is procedural unless the host enforces private views. Do not infer
+filesystem separation from a fresh identity or context label.
+Write scaffolds with `verification.state` set to `draft`. A final decision names
+`verification: {"state":"final","attempt":"ATTEMPT_ID"}`. The host records
+completion after inspecting the finished output; your identity alone is insufficient.
+Until then validation cannot pass. Report any safety stop and cease the affected work.
+Do not record your own completion or authorization, resume a stopped attempt, retry
+a stopped action in another form, or consume quarantined output. Follow the host's
+controlled replacement procedure in BUDGETS-AND-ROUTING.md.

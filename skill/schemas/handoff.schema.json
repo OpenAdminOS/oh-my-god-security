@@ -8,7 +8,8 @@
     "trust",
     "reading",
     "green_fixer_rules",
-    "records"
+    "records",
+    "review_state"
   ],
   "properties": {
     "schema": {
@@ -255,6 +256,9 @@
     "budget": {
       "type": "string",
       "description": "Recorded cumulative allowance snapshot. Refresh with omgs budget before spending."
+    },
+    "review_state": {
+      "type": "string"
     }
   }
 }

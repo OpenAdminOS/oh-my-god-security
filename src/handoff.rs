@@ -10,6 +10,7 @@ pub const RULES: &str = "Fix only the listed confirmed items and approved paths,
 
 #[derive(Serialize)]
 pub struct Handoff {
+    pub review_state: String,
     pub schema: &'static str,
     pub trust: Trust,
     pub reading: &'static str,
@@ -74,9 +75,65 @@ fn quote(s: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// Read, decide and publish while holding the family lock before the run lock.
+/// The writer must not acquire another run or family lock.
+pub fn publish<T>(
+    run: &Path,
+    only: Option<&str>,
+    write: impl FnOnce(&Handoff) -> Result<T, String>,
+) -> Result<T, String> {
+    let run = std::fs::canonicalize(run).map_err(|e| format!("run directory: {e}"))?;
+    let transaction = || {
+        let file = crate::shape::findings(&crate::run_artifact::text(
+            &run,
+            Path::new("findings.json"),
+            crate::run_artifact::FINDINGS_BYTES,
+        )?)?;
+        let errors = crate::model::validate_drafts(&file);
+        if !errors.is_empty() {
+            return Err(errors.join("\n"));
+        }
+        let view = crate::review::View::for_publication_locked(
+            &run,
+            &file,
+            &crate::runmeta::read_optional(&run)?.unwrap_or_default(),
+        )?;
+        if !view.proof_errors.is_empty() {
+            return Err(view.proof_errors.join("; "));
+        }
+        write(&build_view(&run, &view, only)?)
+    };
+    if crate::runmeta::read_optional(&run)?.is_some() {
+        crate::budget::with_family_lock(&run, transaction)
+    } else {
+        crate::runmeta::with_lock(&run, || {
+            if crate::runmeta::read_optional(&run)?.is_some() {
+                return Err("run metadata appeared before handoff publication; retry".into());
+            }
+            transaction()
+        })
+    }
+}
+
 pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Handoff, String> {
     let canonical_run = std::fs::canonicalize(run).map_err(|e| format!("run directory: {e}"))?;
     let run = canonical_run.as_path();
+    crate::runmeta::with_lock(run, || {
+        let view = crate::review::View::for_publication_locked(
+            run,
+            file,
+            &crate::runmeta::read_optional(run)?.unwrap_or_default(),
+        )?;
+        build_view(run, &view, only)
+    })
+}
+
+pub fn build_view(
+    run: &Path,
+    view: &crate::review::View,
+    only: Option<&str>,
+) -> Result<Handoff, String> {
+    let file = &view.findings;
     let mut records = Vec::new();
     for (verdict, prefix) in [(Verdict::Confirmed, 'C'), (Verdict::NeedsValidation, 'V')] {
         for (i, f) in file
@@ -178,12 +235,14 @@ pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Hand
     if only.is_some() && records.is_empty() {
         return Err("finding not found in actionable records (use C1, V1 or a fingerprint)".into());
     }
+    let review_state = if view.complete() {
+        "complete"
+    } else {
+        "incomplete"
+    };
     Ok(Handoff {
-        budget: if crate::runmeta::read_optional(run)?.is_some() {
-            Some(crate::budget::summary(run)?)
-        } else {
-            None
-        },
+        review_state: review_state.into(),
+        budget: view.budget.clone(),
         schema: "omgs-handoff/1",
         trust: Trust {
             record_strings: RECORD_TRUST,
@@ -195,24 +254,15 @@ pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Hand
     })
 }
 
-/// Unicode 17.0 General_Category=Cf, including bidi and zero-width controls.
-/// https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt
-fn formatting_control(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' |
-        '\u{070F}' | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}' |
-        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' |
-        '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' |
-        '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}' |
-        '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}' |
-        '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
-}
-
 /// Display annotations only. Never apply to retained commands or JSON arguments.
 pub(crate) fn display_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if formatting_control(c) {
+        if matches!(c, '\n' | '\r' | '\t') {
+            out.push(c);
+        } else if c.is_control() {
+            out.extend(c.escape_default());
+        } else if crate::platform::display_control(c) {
             out.push_str(&format!("<U+{:04X}>", c as u32));
         } else {
             out.push(c);
@@ -225,7 +275,7 @@ pub(crate) fn display_text(s: &str) -> String {
 fn command_json(s: &str) -> String {
     let mut out = String::new();
     for c in serde_json::to_string(s).unwrap().chars() {
-        if formatting_control(c) {
+        if crate::platform::display_control(c) {
             for unit in c.encode_utf16(&mut [0; 2]) {
                 out.push_str(&format!("\\u{unit:04x}"));
             }
@@ -307,8 +357,8 @@ pub fn markdown(h: &Handoff) -> String {
 
 pub fn markdown_at(h: &Handoff, artifact_base: &str) -> String {
     let mut out = format!(
-        "# How to read verdicts and proof tiers\n\n**Trust boundary:** {}\n\n{}\n\n## Green-fixer rules\n\n{}\n\n",
-        h.trust.record_strings, h.reading, h.green_fixer_rules
+        "# How to read verdicts and proof tiers\n\nReview state: {}\n\n**Trust boundary:** {}\n\n{}\n\n## Green-fixer rules\n\n{}\n\n",
+        markdown_inline(&h.review_state), h.trust.record_strings, h.reading, h.green_fixer_rules
     );
     if let Some(budget) = &h.budget {
         out.push_str(&markdown_data("Budget", budget));
@@ -370,9 +420,13 @@ pub fn markdown_at(h: &Handoff, artifact_base: &str) -> String {
                 &serde_json::to_string(&a.recipe_contract).unwrap(),
             ));
             out.push_str("Exact command (use the new FIX_RUN after an authorized edit, retain every other argument):\n\n");
-            if a.command.chars().any(formatting_control) {
-                out.push_str("Warning: command contains Unicode formatting controls. The escaped preview is not executable. Decode the adjacent JSON string for the exact command, or read command and command_args from handoff.json.\n\n");
-                out.push_str(&markdown_data("Acceptance command preview", &a.command));
+            let command_preview = crate::platform::escape_controls(&a.command);
+            if command_preview != a.command {
+                out.push_str("Warning: command contains escaped control or Unicode formatting characters. The escaped preview is not executable. Decode the adjacent JSON string for the exact command, or read command and command_args from handoff.json.\n\n");
+                out.push_str(&markdown_data(
+                    "Acceptance command preview",
+                    &command_preview,
+                ));
                 out.push_str(&markdown_data(
                     "Exact command JSON string",
                     &command_json(&a.command),
@@ -534,6 +588,10 @@ pub fn stage_validated(run: &Path, file: &FindingsFile) -> Result<StagedTests, S
         };
         let mut errors = crate::model::validate(&one);
         errors.extend(crate::proof::validate_proofs(&one, run));
+        match crate::attempts::finding_gaps(run, &one) {
+            Ok(gaps) => errors.extend(gaps),
+            Err(e) => errors.push(e),
+        }
         if errors.is_empty() {
             admitted.findings.push(f.clone());
         } else {

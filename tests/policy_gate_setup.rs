@@ -215,6 +215,7 @@ fn mxc_ready(root: &Path) -> bool {
 /// An archived, internally consistent runner fixture. It needs no installed
 /// executor and never executes a target. Live runner coverage remains in sandbox.rs.
 fn evidence(run: &Path, target: &Path) {
+    completed_verifier_fixture(run, "blue");
     let fixture =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score/run-1/positive");
     omgs::platform::private_dir(&run.join("proofs/1")).unwrap();
@@ -235,7 +236,7 @@ fn evidence(run: &Path, target: &Path) {
         "fingerprint": proof["finding"], "title":"Boundary read", "verdict":"confirmed", "severity":"high",
         "proof_tier":"test_proven", "attack_class":"missing_authz", "entry_point":"GET /x", "sink":"db.x", "boundary":"tenant",
         "location":{"path":"main.rs","line":1}, "evidence":"Assertion failed after authorized control",
-        "hunted_by":"red", "verified_by":"blue", "proof_ref":"proofs/1.json"
+        "hunted_by":"red", "verified_by":"blue", "verification":{"state":"final","attempt":"fixture-verifier"}, "proof_ref":"proofs/1.json"
     }]});
     // Fixture identity uses its original semantic tuple; recover it from the
     // accompanying findings instead of inventing a different identity.
@@ -299,6 +300,44 @@ fn registered_gate_executes_immutable_head_and_ignores_advisory_artifacts() {
     evidence(&run, &repo); // A different, unregistered confirmed finding is advisory.
     let advisory = gate(&root, &repo, &base, &base, Some(&run), 1);
     assert!(output(&advisory).contains("not yet a registered gate test"));
+    let original = read(&run.join("findings.json"));
+    // Registration changes the advisory, while the immutable registered
+    // failing test continues to decide the gate exit code.
+    let mut matching_policy = p.clone();
+    matching_policy.gate_tests[0].fingerprint = original["findings"][0]["fingerprint"]
+        .as_str()
+        .map(str::to_owned);
+    let registered_base = commit_policy(&repo, &matching_policy);
+    let registered_out = gate(
+        &root,
+        &repo,
+        &registered_base,
+        &registered_base,
+        Some(&run),
+        1,
+    );
+    assert!(!output(&registered_out).contains("not yet a registered gate test"));
+    let base = registered_base;
+    let mut draft = original.clone();
+    draft["findings"][0]["verification"]["state"] = json!("draft");
+    write(&run.join("findings.json"), &draft);
+    let advisory = gate(&root, &repo, &base, &base, Some(&run), 1);
+    assert!(!output(&advisory).contains("advisory: confirmed finding"));
+    write(&run.join("findings.json"), &original);
+    omgs::attempts::append(
+        &run,
+        omgs::attempts::Event::Stop {
+            id: "fixture-verifier".into(),
+            actor: "host".into(),
+            kind: "policy".into(),
+            reason: "Observed stop".into(),
+            artifacts: vec!["findings.json".into()],
+            disposition: "quarantined".into(),
+        },
+    )
+    .unwrap();
+    let advisory = gate(&root, &repo, &base, &base, Some(&run), 1);
+    assert!(!output(&advisory).contains("advisory: confirmed finding"));
     std::fs::write(run.join("findings.json"), "corrupt").unwrap();
     std::fs::write(run.join("run-metadata.json"), "corrupt").unwrap();
     std::fs::remove_dir_all(run.join("proofs")).unwrap();
@@ -2176,4 +2215,13 @@ fn deep_gate_exports_are_cleaned_and_unsupported_depth_exits_three() {
         }
     }
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn completed_verifier_fixture(run: &std::path::Path, identity: &str) {
+    for value in [
+        serde_json::json!({"event":"start","id":"fixture-verifier","role":"verifier","identity":identity,"context":"fixture-context","inputs":["synthetic-input"],"outputs":["findings.json"],"isolation":"procedural"}),
+        serde_json::json!({"event":"complete","id":"fixture-verifier","actor":"fixture-host","reason":"Synthetic completion fixture"}),
+    ] {
+        omgs::attempts::append(run, serde_json::from_value(value).unwrap()).unwrap();
+    }
 }

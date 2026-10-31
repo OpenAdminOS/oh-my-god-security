@@ -11,6 +11,8 @@
         "type": "object",
         "required": ["id", "surface", "attack_classes", "status"],
         "properties": {
+        "attempt_ref": { "type": "string", "minLength": 1 },
+        "blocker_ref": { "type": "string", "minLength": 1 },
           "id": { "type": "string" },
           "surface": { "type": "string" },
           "attack_classes": { "type": "array", "items": { "type": "string" } },

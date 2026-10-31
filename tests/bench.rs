@@ -5,6 +5,9 @@ fn copy_private(from: &std::path::Path, to: &std::path::Path) {
     omgs::platform::create_private_tree(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
+        if entry.file_name() == ".omgs-run.lock" {
+            continue;
+        }
         let dest = to.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
             copy_private(&entry.path(), &dest);
@@ -16,28 +19,25 @@ fn copy_private(from: &std::path::Path, to: &std::path::Path) {
 }
 
 fn root() -> PathBuf {
-    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    ROOT.get_or_init(|| {
-        // Checked-out files can be owned by Administrators on Windows. Build
-        // valid archived run fixtures using the same private writer as the CLI.
-        let dir = omgs::platform::temp_root()
-            .unwrap()
-            .join(format!("omgs-score-source-{}", std::process::id()));
-        copy_private(
-            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score"),
-            &dir,
-        );
-        dir
-    })
-    .clone()
+    let dir = omgs::platform::temp_root().unwrap().join(format!(
+        "omgs-score-source-{}",
+        omgs::platform::random_nonce().unwrap()
+    ));
+    copy_private(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score"),
+        &dir,
+    );
+    dir
 }
+
 fn fixture() -> Value {
     serde_json::from_str(include_str!("../benchmark/fixtures/score/cases.json")).unwrap()
 }
 fn score() -> Value {
+    let root = root();
     omgs::bench::score(
-        &root().join("cases.json"),
-        &[root().join("run-1"), root().join("run-2")],
+        &root.join("cases.json"),
+        &[root.join("run-1"), root.join("run-2")],
     )
     .unwrap()
 }
@@ -98,7 +98,7 @@ fn golden_hand_computed_metrics() {
         json!({"numerator":1,"denominator":1,"value":1.0})
     );
     for r in c["runs"].as_array().unwrap() {
-        assert_eq!(r["blocked_or_exhausted"].as_array().unwrap().len(), 1);
+        assert_eq!(r["blocked_or_exhausted"].as_array().unwrap().len(), 3);
         assert_eq!(r["paired_outcomes"].as_array().unwrap().len(), 8);
     }
 }
@@ -156,6 +156,7 @@ fn required_fields_are_never_defaulted() {
 }
 #[test]
 fn examples_aliases_and_manifest_semantics_fail_closed() {
+    let root = root();
     let mut v = fixture();
     v["examples_only"] = json!(true);
     assert!(omgs::bench::manifest(&v).is_err());
@@ -185,11 +186,11 @@ fn examples_aliases_and_manifest_semantics_fail_closed() {
         v["cases"][0]["expected_findings"][1]["aliases"].clone();
     assert!(omgs::bench::manifest(&v).is_err());
     assert!(omgs::bench::score(
-        &root().join("cases.json"),
-        &[root().join("run-1"), root().join("run-1")]
+        &root.join("cases.json"),
+        &[root.join("run-1"), root.join("run-1")]
     )
     .is_err());
-    assert!(omgs::bench::score(&root().join("cases.json"), &[root().join("run-1")]).is_err());
+    assert!(omgs::bench::score(&root.join("cases.json"), &[root.join("run-1")]).is_err());
 }
 #[test]
 fn cli_emits_json_and_markdown_offline() {
@@ -212,7 +213,7 @@ fn cli_emits_json_and_markdown_offline() {
         score()
     );
     assert!(String::from_utf8_lossy(&out.stderr)
-        .contains("| not_applicable:development:1 | r1 | 1/4 (0.25) |"));
+        .contains("| not&#95;applicable:development:1 | r1 | 1/4 (0.25) |"));
 }
 
 struct SavedRuns(PathBuf);
@@ -224,7 +225,10 @@ impl SavedRuns {
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        copy_private(&root(), &dir);
+        copy_private(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/score"),
+            &dir,
+        );
         Self(dir)
     }
     fn edit(&self, path: &str, mutate: impl FnOnce(&mut Value)) {
@@ -586,4 +590,391 @@ fn missing_or_invalid_source_findings_are_reported() {
         r["observations"][0]["findings"][0]["proof_tier"] = json!("sandbox_exploited")
     });
     assert_invalid_positive(&saved, "does not match source");
+}
+
+#[test]
+fn archived_verifier_lifecycle_controls_scoring() {
+    for state in ["active", "stopped", "missing"] {
+        let saved = SavedRuns::new();
+        for snapshot in ["positive", "fixed"] {
+            saved.edit(&format!("run-1/{snapshot}/run-metadata.json"), |meta| {
+                let records = meta["attempts"].as_array_mut().unwrap();
+                match state {
+                    "active" => { records.pop(); }
+                    "stopped" => records.push(json!({"at":"2026-01-01T00:00:02Z","record":{
+                        "event":"stop","id":"fixture-verifier","actor":"host","kind":"policy",
+                        "reason":"Stop archived output","artifacts":["findings.json"],"disposition":"quarantined"
+                    }})),
+                    _ => records.clear(),
+                }
+            });
+        }
+        let score = saved.score();
+        let result = &score["cohorts"][0]["runs"][0];
+        let source = saved.0.join("run-1/positive");
+        let view = omgs::review::View::load(&source).unwrap();
+        let fixed = omgs::review::View::load(&saved.0.join("run-1/fixed")).unwrap();
+        assert_eq!(
+            result["needs_validation"]["numerator"],
+            view.needs_validation + fixed.needs_validation
+        );
+        assert_eq!(result["verifier_false_rejection_rate"]["numerator"], 0);
+        assert_invalid_positive(
+            &saved,
+            if state == "missing" {
+                "no recorded attempt"
+            } else {
+                "completed attempt"
+            },
+        );
+        assert_invalid_fixed(
+            &saved,
+            if state == "missing" {
+                "no recorded attempt"
+            } else {
+                "completed attempt"
+            },
+        );
+    }
+    // The unchanged completed archive remains eligible.
+    assert_eq!(score()["cohorts"][0]["runs"][0]["recall"]["numerator"], 1);
+}
+
+#[test]
+fn benchmark_accounting_uses_host_attempt_subtotals_and_cumulative_turns() {
+    let saved = SavedRuns::new();
+    saved.edit("run-1/run-metadata.json", |meta| {
+        meta["accounting"]["host"] = json!({"tokens":50,"cost_usd":0.25,"duration_ms":500});
+        meta["accounting"]["blue-verifier@blue"] = json!({"tokens":150,"cost_usd":0.75,"duration_ms":1500,"covered_turn":"one","unreported":false});
+        meta["attempts"] = json!([
+            {"at":"first","record":{"event":"start","id":"blue","role":"verifier","identity":"blue","context":"synthetic","inputs":["in"],"outputs":["out"],"isolation":"procedural"}},
+            {"at":"first","record":{"event":"dispatch","id":"blue","turn":"one","actor":"host","reason":"Authorized turn"}}
+        ]);
+    });
+    let usage = |score: Value| score["cost_per_run"][0]["numerator"].clone();
+    let first = usage(saved.score());
+    assert_eq!(first["tokens"], 500);
+    assert_eq!(first["cost_usd"], 2.5);
+    assert_eq!(first["duration_ms"], 5000);
+    saved.edit("run-1/run-metadata.json", |meta| {
+        meta["attempts"].as_array_mut().unwrap().push(json!({"at":"later","record":{"event":"dispatch","id":"blue","turn":"two","actor":"host","reason":"Authorized continuation"}}));
+    });
+    let later = usage(saved.score());
+    assert!(later["tokens"].is_null());
+    assert!(later["cost_usd"].is_null());
+    assert_eq!(later["known_subtotals"]["tokens"], 500);
+    assert_eq!(later["unknown_usage"]["tokens"], 1);
+    assert_eq!(later["roles"]["blue-verifier@blue"]["unreported"], true);
+    saved.edit("run-1/run-metadata.json", |meta| {
+        meta["accounting"]["blue-verifier@blue"] =
+            json!({"tokens":200,"cost_usd":1.0,"duration_ms":2000,"covered_turn":"two"});
+    });
+    let refreshed = usage(saved.score());
+    assert_eq!(refreshed["tokens"], 550);
+    assert_eq!(refreshed["cost_usd"], 2.75);
+    saved.edit("run-1/run-metadata.json", |meta| {
+        meta["accounting"]["blue-verifier@unknown"] =
+            json!({"tokens":null,"cost_usd":null,"duration_ms":null});
+        meta["attempts"].as_array_mut().unwrap().push(json!({"at":"later","record":{"event":"start","id":"unknown","role":"verifier","identity":"unknown","context":"synthetic","inputs":["in"],"outputs":["out"],"isolation":"procedural"}}));
+    });
+    let unknown = usage(saved.score());
+    assert!(unknown["cost_usd"].is_null());
+    assert_eq!(unknown["known_subtotals"]["cost_usd"], 2.75);
+    assert_eq!(unknown["unknown_usage"]["cost_usd"], 1);
+    saved.edit("run-1/run-metadata.json", |meta| {
+        meta["accounting"]["host"] = json!({"tokens":null,"cost_usd":null,"duration_ms":null});
+    });
+    assert_eq!(usage(saved.score())["unknown_usage"]["cost_usd"], 2);
+}
+
+#[test]
+fn empty_observations_reconcile_shared_lifecycle_stages_coverage_and_evaluation() {
+    for state in [
+        "complete",
+        "active",
+        "stopped",
+        "deferred",
+        "reopened",
+        "evaluator_gap",
+    ] {
+        let saved = SavedRuns::new();
+        let run = saved.0.join("run-1/fixed");
+        let put = |name: &str, value: Value| {
+            omgs::runmeta::write_atomic(&run.join(name), &value.to_string()).unwrap()
+        };
+        saved.edit("run-1/benchmark-run.json", |r| {
+            let o = &mut r["observations"][1];
+            o["findings"] = json!([]);
+            o["adjudications"] = json!([]);
+            o["status"] = json!("complete");
+        });
+        put("findings.json", json!({"findings":[]}));
+        put("candidates-empty.json", json!({"candidates":[]}));
+        put(
+            "coverage-ledger.json",
+            json!({"units":[{"id":"surface","surface":"source.rs","attack_classes":[],"status":if state == "deferred" {"deferred"} else {"covered"},"evidence":["source.rs"],"note":"Awaiting review"}]}),
+        );
+        for event in [
+            json!({"event":"start","id":"independent","role":"evaluator","identity":"independent","context":"independent","inputs":["synthetic"],"outputs":["synthetic"],"isolation":"procedural"}),
+            json!({"event":"complete","id":"independent","actor":"host","reason":"Reviewed output"}),
+        ] {
+            omgs::attempts::append(&run, serde_json::from_value(event).unwrap()).unwrap();
+        }
+        put(
+            "evaluation.json",
+            json!({"evaluator":"independent","attempt":"independent","source_ref":"synthetic","decisions":[],"gaps":if state == "evaluator_gap" {json!(["Unresolved boundary"])} else {json!([])}}),
+        );
+        if matches!(state, "active" | "stopped") {
+            omgs::attempts::append(&run,serde_json::from_value(json!({"event":"dispatch","id":"fixture-verifier","turn":"continued","actor":"host","reason":"Authorized continuation"})).unwrap()).unwrap();
+            if state == "stopped" {
+                omgs::attempts::append(&run,serde_json::from_value(json!({"event":"stop","id":"fixture-verifier","actor":"host","kind":"policy","reason":"Stopped output","artifacts":["findings.json"],"disposition":"quarantined"})).unwrap()).unwrap();
+            }
+        }
+        if state == "reopened" {
+            omgs::status::apply(
+                &run,
+                &omgs::status::Update {
+                    stage: "hunt",
+                    label: None,
+                    parent: None,
+                    state: "active",
+                    detail: None,
+                    counters: &[],
+                    log: None,
+                },
+            )
+            .unwrap();
+        }
+        let view = omgs::review::View::load(&run).unwrap();
+        assert_eq!(
+            view.complete(),
+            state == "complete",
+            "{state}: {:?}",
+            view.state
+        );
+        let score = saved.score();
+        let r = &score["cohorts"][0]["runs"][0];
+        let context = r["snapshot_context"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["snapshot_id"] == "fixed")
+            .unwrap();
+        assert_eq!(
+            context["status"],
+            if view.complete() {
+                "complete"
+            } else {
+                "incomplete"
+            }
+        );
+        assert_eq!(
+            r["blocked_or_exhausted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["snapshot_id"] == "fixed"),
+            !view.complete()
+        );
+        assert!(r["paired_outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|o| o["snapshot_id"] == "fixed")
+            .all(|o| o["status"] == context["status"]));
+    }
+}
+
+#[test]
+fn verifier_metrics_use_canonical_outcomes_including_absorbed_candidates() {
+    for label in ["rejected", "pending"] {
+        let saved = SavedRuns::new();
+        let baseline = saved.score();
+        saved.edit("run-1/benchmark-run.json", |r| {
+            r["observations"][0]["candidates"][0]["verifier"] = json!(label);
+            r["observations"][0]["candidates"][1]["verifier"] = json!("pending");
+        });
+        let scored = saved.score();
+        for metric in ["verifier_false_rejection_rate", "true_candidates_pending"] {
+            assert_eq!(
+                scored["cohorts"][0]["runs"][0][metric],
+                baseline["cohorts"][0]["runs"][0][metric]
+            );
+        }
+        // The second candidate is now absorbed by a confirmed source record.
+        saved.edit("run-1/positive/findings.json", |f| {
+            let removed = f["findings"].as_array_mut().unwrap().remove(1);
+            f["findings"][0]["candidates"] = json!([removed["fingerprint"]]);
+        });
+        saved.edit("run-1/benchmark-run.json", |r| {
+            r["observations"][0]["findings"]
+                .as_array_mut()
+                .unwrap()
+                .remove(1);
+        });
+        let scored = saved.score();
+        let run = &scored["cohorts"][0]["runs"][0];
+        assert_eq!(run["verifier_false_rejection_rate"]["numerator"], 0);
+        assert_eq!(run["true_candidates_pending"]["numerator"], 1);
+    }
+}
+
+#[test]
+fn scoring_archives_establishes_locks_and_preserves_token_splits() {
+    let saved = SavedRuns::new();
+    for role in ["red-hunter", "blue-verifier", "evaluator", "green-fixer"] {
+        saved.edit("run-1/run-metadata.json", |m| {
+            m["accounting"][role]["input_tokens"] = json!(10);
+            m["accounting"][role]["output_tokens"] = json!(5);
+        });
+    }
+    fn data_bytes(dir: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() == ".omgs-run.lock" {
+                continue;
+            }
+            if entry.file_type().unwrap().is_dir() {
+                files.extend(data_bytes(&entry.path()));
+            } else {
+                files.insert(entry.path(), std::fs::read(entry.path()).unwrap());
+            }
+        }
+        files
+    }
+    let before = data_bytes(&saved.0);
+    let score = saved.score();
+    let usage = &score["cost_per_run"][0]["numerator"];
+    assert_eq!(usage["input_tokens"], 40);
+    assert_eq!(usage["output_tokens"], 20);
+    assert_eq!(data_bytes(&saved.0), before);
+    for repetition in ["run-1", "run-2"] {
+        let dir = saved.0.join(repetition);
+        assert!(dir.join(".omgs-run.lock").is_file());
+        assert!(dir.join("positive").join(".omgs-run.lock").is_file());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fn readonly(dir: &std::path::Path, mode: u32) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    readonly(&path, mode);
+                }
+            }
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        // Existing locks must also be usable through read-only descriptors.
+        for dir in [saved.0.join("run-1"), saved.0.join("run-1/positive")] {
+            let lock = dir.join(".omgs-run.lock");
+            omgs::runmeta::write_atomic(&lock, "").unwrap();
+            std::fs::set_permissions(lock, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        readonly(&saved.0, 0o500);
+        let result = saved.try_score();
+        readonly(&saved.0, 0o700);
+        assert!(result.is_ok(), "{result:?}");
+    }
+}
+
+#[test]
+fn benchmark_retains_all_source_locks_until_output_is_written() {
+    let saved = SavedRuns::new();
+    let mut inputs = Vec::new();
+    for repetition in ["run-1", "run-2"] {
+        let dir = saved.0.join(repetition);
+        inputs.push(dir.clone());
+        let export: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("benchmark-run.json")).unwrap())
+                .unwrap();
+        for observation in export["observations"].as_array().unwrap() {
+            if let Some(source) = observation["source_run"].as_str() {
+                inputs.push(dir.join(source));
+            }
+        }
+    }
+    inputs.sort();
+    inputs.dedup();
+    for dir in &inputs {
+        omgs::runmeta::with_lock(dir, || Ok(())).unwrap();
+    }
+    let mut mutation = None;
+    omgs::bench::publish_score(
+        &saved.0.join("cases.json"),
+        &[saved.0.join("run-1"), saved.0.join("run-2")],
+        |score| {
+            let paths = inputs.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            mutation = Some(std::thread::spawn(move || {
+                for dir in &paths {
+                    let lock = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(dir.join(".omgs-run.lock"))
+                        .unwrap();
+                    assert!(matches!(
+                        lock.try_lock(),
+                        Err(std::fs::TryLockError::WouldBlock)
+                    ));
+                }
+                send.send(()).unwrap();
+                omgs::runmeta::with_lock(&paths[0], || Ok(())).unwrap();
+            }));
+            receive
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            // Both output formats are materialized while every source is pinned.
+            assert!(!serde_json::to_vec(&score).unwrap().is_empty());
+            assert!(!omgs::bench::markdown(&score).is_empty());
+            Ok(())
+        },
+    )
+    .unwrap();
+    mutation.unwrap().join().unwrap();
+}
+
+#[test]
+fn hostile_fixture_labels_are_inert_in_summary_and_json() {
+    let dir = root();
+    let hostile = "hostile\u{85}\u{1b}[2J\n::error::forged <img src=x onerror=alert(1)> [x](javascript:alert(1)) @mention";
+    let path = dir.join("run-1/benchmark-run.json");
+    let mut run: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    run["run_id"] = hostile.into();
+    omgs::runmeta::write_atomic(&path, &run.to_string()).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["bench", "score", "--cases"])
+        .arg(dir.join("cases.json"))
+        .arg("--runs")
+        .arg(dir.join("run-1"))
+        .arg("--runs")
+        .arg(dir.join("run-2"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for bytes in [&out.stdout, &out.stderr] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.lines().any(|l| l.starts_with("::error::")));
+    }
+    let mut result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["cohorts"][0]["runs"][0]["run_id"], hostile);
+    // Cohort names are computed today. Exercise the renderer boundary as well.
+    result["cohorts"][0]["cohort"] = hostile.into();
+    for text in [
+        String::from_utf8(out.stderr).unwrap(),
+        omgs::bench::markdown(&result),
+    ] {
+        assert!(!text.contains('\u{1b}'));
+        assert!(!text.lines().any(|l| l.starts_with("::error::")));
+        assert!(!text.contains("<img src=x"));
+        assert!(!text.contains("[x](javascript:"));
+        assert!(!text.contains(" @mention"));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }

@@ -139,7 +139,7 @@ impl Temp {
             omgs::platform::random_nonce().unwrap()
         ));
         omgs::platform::create_private_tree(&root).unwrap();
-        Self(root)
+        Self(std::fs::canonicalize(root).unwrap())
     }
 }
 impl Drop for Temp {
@@ -1176,36 +1176,40 @@ fn legacy_cli_migration_binds_metadata_and_allows_partition_closure() {
 #[test]
 fn edited_scope_root_cannot_redirect_cli_or_critic_resolution() {
     let t = Temp::new();
+    let run = t.0.join("run");
     let target = t.0.join("target");
     let other = t.0.join("other");
-    for dir in [&target, &other] {
+    for dir in [&run, &target, &other] {
         omgs::platform::private_dir(dir).unwrap();
     }
-    write_json(&t.0.join("run-metadata.json"), &json!({"target": target}));
+    write_json(&run.join("run-metadata.json"), &json!({"target": target}));
     let mut l = Ledger::default();
     l.extra.insert("scope_root".into(), json!(target.join(".")));
-    assert!(omgs::mapping::validate_run_root(&l, &t.0).is_ok());
+    assert!(omgs::mapping::validate_run_root(&l, &run).is_ok());
     l.extra.insert("scope_root".into(), json!(other));
-    write_json(&t.0.join("coverage-ledger.json"), &l);
-    let before = std::fs::read(t.0.join("coverage-ledger.json")).unwrap();
+    write_json(&run.join("coverage-ledger.json"), &l);
+    let before = std::fs::read(run.join("coverage-ledger.json")).unwrap();
     for args in [
         vec!["ledger", "list", "--ledger"],
         vec!["ledger", "migrate", "--run"],
     ] {
         let path = if args[1] == "list" {
-            t.0.join("coverage-ledger.json")
+            run.join("coverage-ledger.json")
         } else {
-            t.0.clone()
+            run.clone()
         };
         let out = command(&t).args(args).arg(path).output().unwrap();
         assert!(!out.status.success(), "{out:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("this run's target"));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("this run's target"),
+            "{out:?}"
+        );
     }
-    assert!(omgs::critic::critique_dir(&t.0, &Default::default())
+    assert!(omgs::critic::critique_dir(&run, &Default::default())
         .unwrap_err()
         .contains("this run's target"));
     assert_eq!(
-        std::fs::read(t.0.join("coverage-ledger.json")).unwrap(),
+        std::fs::read(run.join("coverage-ledger.json")).unwrap(),
         before
     );
 }

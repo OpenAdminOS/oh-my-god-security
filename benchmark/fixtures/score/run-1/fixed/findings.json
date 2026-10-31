@@ -17,7 +17,11 @@
       "evidence": "Fixture source trace and archived failing assertion.",
       "hunted_by": "fixture-hunter",
       "verified_by": "fixture-verifier",
-      "severity": "high"
+      "severity": "high",
+      "verification": {
+        "state": "final",
+        "attempt": "fixture-verifier"
+      }
     }
   ]
 }
