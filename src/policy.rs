@@ -1223,14 +1223,15 @@ mod scratch_tests {
                 );
             }
         }
-        // Aliased parent directories with distinct children, in both orders,
-        // and a file aliasing a directory never merge.
         let base = git_fixture(&repo, &["rev-parse", "HEAD:checks/entry.sh"]);
+        // Git sorts tree entries, so each pair fixes which spelling exports
+        // first: both parent spellings first, and file-first and
+        // directory-first collisions.
         for (index, (first, second)) in [
             ("Checks/helper.sh", "checks/entry.sh"),
-            ("checks/entry.sh", "Checks/helper.sh"),
+            ("Checks/entry.sh", "checks/helper.sh"),
             ("Checks", "checks/entry.sh"),
-            ("checks/entry.sh", "CHECKS"),
+            ("Checks/entry.sh", "checks"),
         ]
         .into_iter()
         .enumerate()
