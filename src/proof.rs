@@ -434,6 +434,9 @@ pub fn command_names(command: &str, test: &str) -> bool {
 /// were recorded. This catches hand-written or edited records; it is not a
 /// defence against a process that runs as the user and forges every file.
 pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
+    // Standalone validation owns the preparation limits; prove and replay
+    // already hold them, so this guard then shares their budget.
+    let _preparation = crate::proof_inputs::StagingGuard::begin();
     let mut errors = Vec::new();
     if record
         .contract
@@ -574,15 +577,14 @@ pub fn runner_evidence(run: &Path, record: &ProofRecord) -> Vec<String> {
                 errors.push("test must be relative to the recorded target".into());
             } else if Path::new(target).exists() {
                 // Checkout content deliberately follows the target's symlinks.
-                // digest_file streams regular content with constant memory; run
-                // evidence must instead use run_artifact::read.
-                let digest = crate::sha256::digest_file(&Path::new(target).join(rel));
-                if digest.ok().as_ref() != record.test_sha256.as_ref()
-                    || record.test_sha256.is_none()
-                {
-                    errors.push(
+                // Reads are admitted against the preparation byte budget and
+                // deadline; run evidence must instead use run_artifact::read.
+                match crate::proof_inputs::hash_file(&Path::new(target).join(rel)) {
+                    Ok(digest) if Some(&digest) == record.test_sha256.as_ref() => {}
+                    Ok(_) => errors.push(
                         "target test changed or is unreadable; does not match test_sha256".into(),
-                    );
+                    ),
+                    Err(e) => errors.push(format!("target test changed or is unreadable: {e}")),
                 }
             }
         }

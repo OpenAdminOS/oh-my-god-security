@@ -136,6 +136,81 @@ fn cli_refuses_oversized_sparse_tests_before_hashing_or_retention() {
 }
 
 #[test]
+fn replay_refuses_an_oversized_target_test_before_hashing_it() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("replay-test-size");
+    let home = d.join("home");
+    let target = d.join("target");
+    std::fs::create_dir(&target).unwrap();
+    let (test, cmd, body): (&str, &str, &[u8]) = if cfg!(windows) {
+        ("x.test.cmd", "cmd.exe /d /c x.test.cmd", b"@exit /b 1\r\n")
+    } else {
+        ("x.test.sh", "sh x.test.sh", b"exit 1")
+    };
+    std::fs::write(target.join(test), body).unwrap();
+    let run = d.join("run");
+    let init = omgs(
+        &home,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let fp = omgs::fingerprint("missing_authz", "GET /x", "db.x", "tenant");
+    let run_arg = run.to_str().unwrap();
+    let proved = omgs(
+        &home,
+        &[
+            "prove",
+            "--run",
+            run_arg,
+            "--finding",
+            &fp,
+            "--test",
+            test,
+            "--cmd",
+            cmd,
+        ],
+    );
+    assert_eq!(proved.status.code(), Some(1), "{}", text(&proved));
+    // Large enough that unbounded hashing cannot finish inside the deadline.
+    sparse_fixture(&target.join(test), 1u64 << 40);
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .env("OMGS_HOME", &home)
+        .args(["prove", "--run", run_arg, "--replay", "1"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(15) {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("replay hashed the oversized test: {}", text(&output));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+    assert!(
+        text(&output).contains("aggregate source byte budget"),
+        "{}",
+        text(&output)
+    );
+    assert!(!run.join("proofs/2.json").exists());
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
 fn prove_help_describes_blocked_original_and_replay_exits() {
     let d = scratch("prove-help-blocked");
     let output = omgs(&d, &["prove", "--help"]);
