@@ -2578,7 +2578,10 @@ fn launchd_jobs_are_removed_after_success_failure_timeout_and_interruption() {
                 break job;
             }
             let exited = child.try_wait().unwrap().is_some();
-            if exited || started.elapsed().as_secs() >= 10 {
+            // Observation only: under 32 parallel isolation tests each proof
+            // copies and verifies the unoptimized anchor binary before its job
+            // is ready. A product startup failure exits and is reported above.
+            if exited || started.elapsed().as_secs() >= 30 {
                 if !exited {
                     child.kill().unwrap();
                 }
