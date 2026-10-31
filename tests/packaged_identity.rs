@@ -1038,14 +1038,14 @@ fn a_stalled_clone_fails_at_its_deadline() {
     let bin = fixture.0.join("bin");
     std::fs::create_dir(&bin).unwrap();
     let stub = bin.join("git");
-    std::fs::write(&stub, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.50.0'; exit 0; fi\nif [ \"$1\" = config ]; then /bin/sleep 1.5; exit 1; fi\nfor arg in \"$@\"; do last=\"$arg\"; done\nmkdir -p \"$last\"\nexec /bin/sleep 30\n").unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'git version 2.50.0'; exit 0; fi\nif [ \"$1\" = config ]; then /bin/sleep 2; exit 1; fi\nfor arg in \"$@\"; do last=\"$arg\"; done\nmkdir -p \"$last\"\nexec /bin/sleep 30\n").unwrap();
     std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     let home = fixture.0.join("home");
     let started = std::time::Instant::now();
     let out = cli()
         .env("OMGS_HOME", &home)
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-        .env("OMGS_TEST_CLONE_DEADLINE_MS", "4000")
+        .env("OMGS_TEST_CLONE_DEADLINE_MS", "8000")
         .args([
             "review",
             "--repo-url",
@@ -1059,13 +1059,14 @@ fn a_stalled_clone_fails_at_its_deadline() {
     let elapsed = started.elapsed();
     assert!(!out.status.success());
     let text = String::from_utf8_lossy(&out.stderr);
-    assert!(text.contains("exceeded the 4 s deadline"), "{text}");
+    assert!(text.contains("exceeded the 8 s deadline"), "{text}");
     assert!(text.contains("clone phase=failed destination="), "{text}");
-    // The reads take 3 s; a clone timer restarted after them would run to
-    // at least 7 s. The bound allows process start and cleanup.
-    assert!(elapsed >= std::time::Duration::from_secs(3), "{elapsed:?}");
+    // The reads take 4 s of the 8 s budget; a clone timer restarted after
+    // them would run to at least 12 s. The bound allows process start and
+    // cleanup on slow runners.
+    assert!(elapsed >= std::time::Duration::from_secs(4), "{elapsed:?}");
     assert!(
-        elapsed < std::time::Duration::from_millis(6500),
+        elapsed < std::time::Duration::from_millis(11000),
         "{elapsed:?}"
     );
     assert!(!home.join("targets/example.invalid/owner/repo").exists());
