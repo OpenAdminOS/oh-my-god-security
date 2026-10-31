@@ -223,6 +223,9 @@ pub fn build_view(
                 if let crate::proof::Contract::Recipe { expect_marker, .. } = &p.contract {
                     args.extend(["--expect-marker".into(), expect_marker.clone()]);
                 }
+                if p.screenshots.is_some() {
+                    args.push("--screenshots".into());
+                }
                 args.push(format!("--cmd={command}"));
                 Some(Acceptance {
                     proof_ref: reference.clone(),

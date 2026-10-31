@@ -197,6 +197,7 @@ fn run_in_scratch(
         denied: Vec::new(),
         rust: None,
         list_parents,
+        screenshot: None,
     };
     let mut config = mxc_config(&input);
     // Only private scratch is writable. In particular, the target and rules

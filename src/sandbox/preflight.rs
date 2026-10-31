@@ -784,6 +784,7 @@ pub(super) mod tests {
                     denied: vec![],
                     rust: None,
                     list_parents: false,
+                    screenshot: None,
                 });
                 assert_eq!(config["process"]["timeout"], 0);
             }

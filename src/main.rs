@@ -17,6 +17,7 @@ fn boolean_option(name: &str) -> bool {
         "--replace",
         "--verify-mxc",
         "--no-sensors",
+        "--screenshots",
         "--live",
         "--help",
         "-h",
@@ -131,7 +132,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "validate" => ("--findings --candidates --dispositions --evaluation", false),
         "fingerprint" => ("--attack-class --entry-point --sink --boundary", false),
         "prove" => (
-            "--cmd --target --run --finding --test --test-from --inputs-from --expect-marker --replay --tier --timeout-ms",
+            "--cmd --target --run --finding --test --test-from --inputs-from --expect-marker --replay --tier --timeout-ms --screenshots",
             false,
         ),
         "approve" => ("--target", false),
@@ -629,8 +630,9 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
                 "--target",
                 "--timeout-ms",
                 "--inputs-from",
+                "--screenshots",
             ] {
-                if flag(args, conflicting).is_some() {
+                if flag(args, conflicting).is_some() || has(args, conflicting) {
                     return Err(format!(
                         "--replay takes everything from the record; drop {conflicting}"
                     ));
@@ -1043,7 +1045,12 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             return Err(e);
         }
     }
+    let screenshots = match &replay {
+        Some(r) => r.screenshots.is_some(),
+        None => has(args, "--screenshots"),
+    };
     let request = ProveRequest {
+        screenshots,
         expect_marker: expect_marker.clone(),
         command: command.clone(),
         test: test.clone(),
@@ -1157,6 +1164,7 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         enforced: result.enforced.clone(),
         gaps: result.gaps.clone(),
         notes: result.notes.clone(),
+        screenshots: result.screenshots.clone(),
         output_sha256: omgs::sha256::digest(output.as_bytes()),
         output_bytes_total: s.output_bytes_total,
         output,
@@ -1559,6 +1567,7 @@ fn cmd_doctor_inner(args: &[String], remaining: &mut Vec<String>) -> Result<(), 
             format!("cat {inside_test}; cat '{}'", secret.display())
         };
         let request = ProveRequest {
+            screenshots: false,
             expect_marker: None,
             command: cmd,
             test: Some(inside_test.into()),
@@ -1639,6 +1648,7 @@ fn cmd_doctor_inner(args: &[String], remaining: &mut Vec<String>) -> Result<(), 
                 return Err(error.to_string());
             }
             let reach = ProveRequest {
+                screenshots: false,
                 expect_marker: None,
                 command: doctor_probe_command(os, name),
                 test: None,
@@ -2036,6 +2046,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 models,
                 reroutes: run_reroutes(findings_dir.as_deref())?,
                 intent_answers: run_answers(findings_dir.as_deref())?,
+                screenshots: Default::default(),
                 accounting,
                 persona,
                 report_depth,
@@ -2051,6 +2062,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             if let Some(run) = &findings_dir {
                 meta.artifact_base = omgs::report::artifact_base(dir, run)?;
+                meta.screenshots = omgs::report::screenshots(run, &file);
             }
             let sensors = findings_dir
                 .as_deref()

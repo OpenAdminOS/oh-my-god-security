@@ -369,6 +369,7 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             denied: vec![],
             rust: None,
             list_parents: false,
+            screenshot: None,
         })
         .to_string();
         write_private_fixture(proof_dir.join("mxc-config.json"), &config).unwrap();
@@ -436,6 +437,7 @@ fn attest(dir: &std::path::Path, mut findings: FindingsFile) -> FindingsFile {
             },
             gaps: omgs::sandbox::declared_controls(os, tier).1,
             notes: vec![],
+            screenshots: None,
             output_sha256: omgs::sha256::digest(b""),
             output_bytes_total: 0,
             output: String::new(),
@@ -2226,6 +2228,7 @@ fn check_saved_config_roots(name: &str, cargo_bin: Option<std::path::PathBuf>) {
             rustup_home: Some(rustup),
         }),
         list_parents: false,
+        screenshot: None,
     });
     let config_path = proof_dir.join("mxc-config.json");
     let findings_path = dir.join("findings.json");
@@ -2516,6 +2519,7 @@ fn windows_unc_proof_directories_match_writer_and_validator() {
                 denied: vec![],
                 rust: None,
                 list_parents: true,
+                screenshot: None,
             },
             r"C:\Windows",
         );

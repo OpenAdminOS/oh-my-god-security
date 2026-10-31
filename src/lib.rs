@@ -31,6 +31,7 @@ pub mod run_artifact;
 pub mod runmeta;
 pub mod sandbox;
 pub mod scratch;
+pub mod screenshot;
 pub mod sensors;
 pub mod setup;
 pub mod sha256;

@@ -36,6 +36,149 @@ pub struct ReportMeta {
     pub reroutes: Vec<String>,
     /// The reviewer's recorded intent answers for this run.
     pub intent_answers: crate::intent::Answers,
+    /// Verified proof screenshots by proof reference.
+    pub screenshots: std::collections::BTreeMap<String, ProofShots>,
+}
+
+/// A proof's screenshot outcome as the report shows it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProofShots {
+    pub blocker: Option<String>,
+    pub skipped: Vec<String>,
+    pub shots: Vec<ShownShot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownShot {
+    pub name: String,
+    pub sha256: String,
+    pub width: u32,
+    pub height: u32,
+    /// Run-relative location of the kept original.
+    pub path: String,
+    /// Base64 of bytes that still match the recorded digest.
+    pub data: Option<String>,
+    pub problem: Option<String>,
+}
+
+/// Loads and verifies every screenshot named by the proofs these findings
+/// reference. A file that is missing or changed since the proof ran is never
+/// embedded; the report says so instead.
+pub fn screenshots(
+    run: &std::path::Path,
+    file: &FindingsFile,
+) -> std::collections::BTreeMap<String, ProofShots> {
+    let mut out = std::collections::BTreeMap::new();
+    for reference in file.findings.iter().filter_map(|f| f.proof_ref.as_ref()) {
+        if out.contains_key(reference) {
+            continue;
+        }
+        let Ok(record) = crate::proof::load(run, reference) else {
+            continue;
+        };
+        let Some(recorded) = record.screenshots else {
+            continue;
+        };
+        let shots = recorded
+            .files
+            .iter()
+            .map(|shot| {
+                let path = std::path::Path::new(crate::proof::DIR)
+                    .join(record.n.to_string())
+                    .join(crate::screenshot::relative(&shot.name));
+                let verified = crate::screenshot::valid_name(&shot.name)
+                    .then(|| {
+                        crate::run_artifact::read(run, &path, crate::screenshot::MAX_BYTES).ok()
+                    })
+                    .flatten()
+                    .filter(|bytes| {
+                        crate::sha256::digest(bytes) == shot.sha256
+                            && crate::screenshot::admit(bytes) == Ok((shot.width, shot.height))
+                    });
+                ShownShot {
+                    name: shot.name.clone(),
+                    sha256: shot.sha256.clone(),
+                    width: shot.width,
+                    height: shot.height,
+                    path: path.to_string_lossy().replace('\\', "/"),
+                    problem: verified
+                        .is_none()
+                        .then(|| "missing or changed since the proof ran".to_string()),
+                    data: verified.map(|bytes| crate::screenshot::base64(&bytes)),
+                }
+            })
+            .collect();
+        out.insert(
+            reference.clone(),
+            ProofShots {
+                blocker: recorded.blocker,
+                skipped: recorded.skipped,
+                shots,
+            },
+        );
+    }
+    out
+}
+
+fn render_shots_html(shots: &ProofShots) -> String {
+    let mut out = String::new();
+    for shot in &shots.shots {
+        match &shot.data {
+            Some(data) => out.push_str(&format!(
+                "<figure class=\"shot\"><img src=\"data:image/png;base64,{data}\" width=\"{w}\" height=\"{h}\" alt=\"Proof screenshot {name}\"><figcaption>Screenshot {name}, {w}x{h}, sha256 <code>{sha}</code>. Dummy data only; the proof test, not this image, is the evidence.</figcaption></figure>",
+                w = shot.width,
+                h = shot.height,
+                name = html_escape(&shot.name),
+                sha = html_escape(&shot.sha256),
+            )),
+            None => out.push_str(&format!(
+                "<p class=\"note\">Screenshot {} not shown: {}.</p>",
+                html_escape(&shot.name),
+                html_escape(shot.problem.as_deref().unwrap_or("unavailable"))
+            )),
+        }
+    }
+    if let Some(blocker) = &shots.blocker {
+        out.push_str(&format!(
+            "<p class=\"note\">No screenshot: {}</p>",
+            html_escape(blocker)
+        ));
+    }
+    for skipped in &shots.skipped {
+        out.push_str(&format!(
+            "<p class=\"note\">Screenshot refused: {}</p>",
+            html_escape(skipped)
+        ));
+    }
+    out
+}
+
+fn render_shots_markdown(shots: &ProofShots, meta: &ReportMeta) -> String {
+    let mut out = String::new();
+    for shot in &shots.shots {
+        out.push_str(&format!(
+            "Screenshot {}: {} ({}x{}, sha256 {}){}\n\n",
+            markdown_inline(&shot.name),
+            markdown_link(&shot.path, &meta.artifact_base),
+            shot.width,
+            shot.height,
+            markdown_inline(&shot.sha256),
+            match &shot.problem {
+                Some(problem) => format!(", not verified: {}", markdown_inline(problem)),
+                None => String::new(),
+            }
+        ));
+    }
+    if let Some(blocker) = &shots.blocker {
+        out.push_str(&format!("No screenshot: {}\n\n", markdown_inline(blocker)));
+    }
+    for skipped in &shots.skipped {
+        out.push_str(&format!(
+            "Screenshot refused: {}\n\n",
+            markdown_inline(skipped)
+        ));
+    }
+    out
 }
 
 /// The intent question a record asks: its own text, else the library text
@@ -300,6 +443,9 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         for r in list {
             let f = r.f;
             out.push_str(&format!("<a id=\"{}\"></a>\n\n### {}: {}\n\n{}\n\nVerdict: {}. Tier: {}. Severity: {}.\n\nFingerprint: {}\n\nProof record: {}\n\n", r.anchor, r.reference, markdown_inline(&f.title), location_line(f), verdict_label(f.verdict).1, tier_label(f), f.severity.map(|s| s.label()).unwrap_or("none"), markdown_inline(&f.fingerprint), proof_link(f, meta)));
+            if let Some(shots) = f.proof_ref.as_ref().and_then(|p| meta.screenshots.get(p)) {
+                out.push_str(&render_shots_markdown(shots, meta));
+            }
             push_intent(&mut out, meta, f);
             if let Some(brief) = &f.fix_brief {
                 out.push_str("#### Fix brief\n\n");
@@ -823,6 +969,9 @@ fn render_finding(r: &Record, meta: &ReportMeta) -> String {
             html_escape(&format!("{}{p}", meta.artifact_base)),
             html_escape(p)
         ));
+        if let Some(shots) = meta.screenshots.get(p) {
+            evidence.push_str(&render_shots_html(shots));
+        }
     }
     let fingerprint = if f.fingerprint.trim().is_empty() {
         "not recorded".to_string()
@@ -1195,7 +1344,7 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
     );
 
     format!(
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><title>OMGS security review: {repo}</title><style>{CSS}</style></head><body><a class=\"skip\" href=\"#main\">Skip to report</a>{masthead}{nav}<main id=\"main\"><div class=\"wrap\">{summary}{index}{confirmed_html}{intent_html}{pending_html}{rejected_html}{timeline_html}{coverage_html}{reading_html}</div></main>{footer}</body></html>\n",
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'\"><title>OMGS security review: {repo}</title><style>{CSS}</style></head><body><a class=\"skip\" href=\"#main\">Skip to report</a>{masthead}{nav}<main id=\"main\"><div class=\"wrap\">{summary}{index}{confirmed_html}{intent_html}{pending_html}{rejected_html}{timeline_html}{coverage_html}{reading_html}</div></main>{footer}</body></html>\n",
         repo = html_escape(&meta.repo),
     )
 }
@@ -1228,6 +1377,9 @@ h2{margin:0 0 6px;font-size:19px;font-weight:650}
 .intro{margin:0 0 16px;max-width:70ch;color:var(--muted)}
 .lede{margin:0 0 16px;font-size:16px}
 .note{margin:12px 0 0;font-size:13.5px;color:var(--muted)}
+figure.shot{margin:12px 0 0}
+figure.shot img{display:block;max-width:100%;height:auto;border:1px solid var(--line)}
+figure.shot figcaption{font-size:13.5px;color:var(--muted)}
 .counts{list-style:none;display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 16px;padding:0}
 .count{background:var(--surface);border:1px solid var(--line);border-top:4px solid var(--line);border-radius:8px;padding:14px 16px}
 .count .n{display:block;font-size:30px;font-weight:650;line-height:1.1;font-variant-numeric:tabular-nums}

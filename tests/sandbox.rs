@@ -308,6 +308,7 @@ fn assert_augmented_tier_refusal(tier: &str, caller: u32) {
     };
     let lib_dir = d.join("library-proof");
     let request = ProveRequest {
+        screenshots: false,
         expect_marker: None,
         command: "echo REFUSAL_WORKLOAD_RAN".into(),
         test: None,
@@ -1754,6 +1755,7 @@ fn unreachable_tests_never_run_the_command() {
     std::fs::create_dir_all(target.join("directory")).unwrap();
     for (n, test) in ["missing test's file", "directory"].iter().enumerate() {
         let request = ProveRequest {
+            screenshots: false,
             expect_marker: None,
             command: "echo UNREACHABLE_COMMAND_RAN".into(),
             test: Some((*test).into()),
@@ -2576,7 +2578,10 @@ fn launchd_jobs_are_removed_after_success_failure_timeout_and_interruption() {
                 break job;
             }
             let exited = child.try_wait().unwrap().is_some();
-            if exited || started.elapsed().as_secs() >= 10 {
+            // Observation only: under 32 parallel isolation tests each proof
+            // copies and verifies the unoptimized anchor binary before its job
+            // is ready. A product startup failure exits and is reported above.
+            if exited || started.elapsed().as_secs() >= 30 {
                 if !exited {
                     child.kill().unwrap();
                 }
@@ -3816,4 +3821,495 @@ fn retained_scoped_selection_handoff_omits_behavior_changing_directory() {
     write_private_fixture(&selection, r#"{"version":1,"paths":["asset"]}"#).unwrap();
     assert!(omgs::handoff::build(&run, &file, None).is_err());
     std::fs::remove_dir_all(d).unwrap();
+}
+
+// Screenshots are opt-in evidence: a usable browser yields kept, hashed PNG
+// files that replay and validation check; without one the proof still runs
+// and the record names the blocker.
+#[test]
+fn screenshots_are_kept_hashed_and_replayed_or_blocked_with_a_reason() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("screenshots");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(target.join("tests")).unwrap();
+    std::fs::write(
+        target.join("page.html"),
+        "<!doctype html><title>dummy</title><h1>Dummy account settings</h1>",
+    )
+    .unwrap();
+    let (test, command, body) = if cfg!(windows) {
+        (
+            "tests/shot.cmd",
+            "cmd.exe /d /c tests\\shot.cmd",
+            "@if defined OMGS_SCREENSHOT call \"%OMGS_SCREENSHOT%\" page \"file:///%CD:\\=/%/page.html\"\r\n@echo AFTER_CAPTURE\r\n@exit /b 1\r\n",
+        )
+    } else {
+        (
+            "tests/shot.sh",
+            "sh tests/shot.sh",
+            "set -e\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/page.html\" || true\necho AFTER_CAPTURE\nexit 1\n",
+        )
+    };
+    std::fs::write(target.join(test), body).unwrap();
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            test,
+            "--screenshots",
+            "--cmd",
+            command,
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    // The documented guarded call never stops a set -e harness, with or
+    // without a browser.
+    assert!(text(&out).contains("AFTER_CAPTURE"), "{}", text(&out));
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    let shots = record.screenshots.clone().expect("screenshots requested");
+    let expected = omgs::screenshot::browser(
+        std::env::consts::OS,
+        std::env::var_os(omgs::screenshot::BROWSER_ENV),
+    );
+    match expected {
+        Ok(_) => {
+            assert!(shots.blocker.is_none(), "{shots:?}");
+            assert_eq!(shots.files.len(), 1, "{shots:?}\n{}", text(&out));
+            let shot = &shots.files[0];
+            assert_eq!(shot.name, "page");
+            assert!(shot.width <= 800 && shot.height <= 600);
+            let kept = run.join("proofs/1/screenshots/page.png");
+            assert_eq!(
+                omgs::sha256::digest(&std::fs::read(&kept).unwrap()),
+                shot.sha256
+            );
+            assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+            let replay = omgs(
+                &d,
+                &["prove", "--run", run.to_str().unwrap(), "--replay", "1"],
+            );
+            assert_eq!(replay.status.code(), Some(0), "{}", text(&replay));
+            let again = omgs::proof::load(&run, "proofs/2.json").unwrap();
+            assert_eq!(again.screenshots.unwrap().files.len(), 1);
+            // A changed screenshot invalidates the proof record.
+            let mut bytes = std::fs::read(&kept).unwrap();
+            bytes.push(0);
+            std::fs::write(&kept, bytes).unwrap();
+            assert!(omgs::proof::runner_evidence(&run, &record)
+                .iter()
+                .any(|e| e.contains("screenshot page does not match")));
+        }
+        Err(reason) => {
+            assert_eq!(shots.blocker.as_deref(), Some(reason.as_str()));
+            assert!(shots.files.is_empty() && shots.browser.is_none());
+            assert!(record.readable_roots.iter().all(|r| !r.contains("chrome")));
+            assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// The fix round trip a green fixer performs: the handoff's exact acceptance
+// command fails against the vulnerable code and passes once the fix lands.
+#[cfg(target_os = "macos")]
+#[test]
+fn installer_trust_fix_round_trip_turns_the_acceptance_command_green() {
+    if !mxc_ready() {
+        return;
+    }
+    if omgs::platform::which("swiftc").is_none() {
+        eprintln!("skipping: swiftc not found");
+        return;
+    }
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("benchmark/fixtures/installer-trust");
+    let d = scratch("fix-round-trip");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::copy(fixture.join("main.swift"), target.join("main.swift")).unwrap();
+    std::fs::copy(
+        fixture.join("vulnerable/Verifier.swift"),
+        target.join("Verifier.swift"),
+    )
+    .unwrap();
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    completed_verifier_fixture(&run, "blue-1");
+    let fp = omgs::fingerprint(
+        "installer_signer_trust_bypass",
+        "install(request)",
+        "decide(_:)",
+        "signing team",
+    );
+    let command =
+        "swiftc main.swift Verifier.swift -o \"$TMPDIR/probe\" || exit 2; \"$TMPDIR/probe\"";
+    let vulnerable = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--finding",
+            &fp,
+            "--test",
+            "main.swift",
+            "--expect-marker",
+            "BOUNDARY_ASSERTION_FAILED",
+            "--cmd",
+            command,
+        ],
+    );
+    assert_eq!(vulnerable.status.code(), Some(1), "{}", text(&vulnerable));
+    assert!(text(&vulnerable).contains("proof support for test_proven: yes"));
+    let file = omgs::shape::findings(&serde_json::json!({"findings":[{
+        "fingerprint":fp,"title":"Nil expected team accepts a mismatched signer","verdict":"confirmed","severity":"high","proof_tier":"test_proven",
+        "attack_class":"installer_signer_trust_bypass","entry_point":"install(request)","sink":"decide(_:)","boundary":"signing team",
+        "location":{"path":"Verifier.swift","line":1},"evidence":"The invariant harness fails on the vulnerable decision.","hunted_by":"red-1","verified_by":"blue-1",
+        "verification":{"state":"final","attempt":"fixture-verifier"},"proof_ref":"proofs/1.json",
+        "fix_brief":"Refuse unnotarized or mismatched signers when no team is expected; refuse downgrades and mismatched payload versions."
+    }]}).to_string()).unwrap();
+    let handoff = omgs::handoff::build(&run, &file, None).unwrap();
+    let acceptance = handoff.records[0].acceptance.as_ref().expect("acceptance");
+    // The green fixer edits only the listed code; the proof test stays.
+    std::fs::copy(
+        fixture.join("fixed/Verifier.swift"),
+        target.join("Verifier.swift"),
+    )
+    .unwrap();
+    let fix = d.join("fix-run");
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            fix.to_str().unwrap(),
+            "--no-sensors",
+            "--fix-of",
+            run.to_str().unwrap(),
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let mut args = acceptance.command_args.clone();
+    let index = args.iter().position(|a| a == "--run").unwrap();
+    args[index + 1] = fix.to_str().unwrap().into();
+    let args: Vec<_> = args.iter().map(String::as_str).collect();
+    let fixed = omgs(&d, &args);
+    assert_eq!(fixed.status.code(), Some(0), "{}", text(&fixed));
+    assert!(text(&fixed).contains("BOUNDARY_ASSERTION_OK"));
+    assert!(text(&fixed).contains("OMGS_CONTROL_"));
+    let record = omgs::proof::load(&fix, "proofs/1.json").unwrap();
+    assert_eq!(record.test.as_deref(), Some("main.swift"));
+    assert!(record.clean());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// A browser that exits with an error leaves its status in the record.
+#[cfg(unix)]
+#[test]
+fn a_failing_screenshot_browser_is_named_in_the_record() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("screenshot-failure");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(target.join("tests")).unwrap();
+    std::fs::write(
+        target.join("tests/shot.sh"),
+        "set -e\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/missing.html\" || true\necho AFTER_CAPTURE\nexit 1\n",
+    )
+    .unwrap();
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"));
+    c.args([
+        "prove",
+        "--run",
+        run.to_str().unwrap(),
+        "--test",
+        "tests/shot.sh",
+        "--screenshots",
+        "--cmd",
+        "sh tests/shot.sh",
+    ])
+    .env("OMGS_HOME", &d)
+    .env(omgs::screenshot::BROWSER_ENV, "/usr/bin/false")
+    .env(
+        "OMGS_MXC_EXEC",
+        omgs::sandbox::locate_executor().unwrap().path,
+    );
+    let out = c.output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    // The helper is best effort: a set -e harness still reaches its assertion.
+    assert!(text(&out).contains("AFTER_CAPTURE"), "{}", text(&out));
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    let shots = record.screenshots.clone().unwrap();
+    assert_eq!(shots.browser.as_deref(), Some("/usr/bin/false"));
+    assert!(shots.files.is_empty());
+    assert_eq!(shots.skipped, ["page: the browser exited with status 1"]);
+    assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// A browser that never finishes is stopped by the helper's watchdog; the
+// harness still reaches its assertion and the record names the timeout.
+#[cfg(unix)]
+#[test]
+fn a_stalled_screenshot_browser_is_stopped_and_named() {
+    use std::os::unix::fs::PermissionsExt;
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("screenshot-stall");
+    let browser = d.join("browser");
+    std::fs::create_dir_all(&browser).unwrap();
+    // The stub starts a child of its own before stalling; the watchdog must
+    // stop the whole capture process group so the proof stays clean.
+    std::fs::write(
+        browser.join("stall"),
+        "#!/bin/sh\n/bin/sleep 600 &\nexec /bin/sleep 601\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        browser.join("stall"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    // The second harness removes the output directory first: the watchdog
+    // must still stop the browser group when it cannot write its marker.
+    for (case, prefix, expected) in [
+        (
+            "kept",
+            "",
+            "page: capture timed out after 20 s and the browser was stopped",
+        ),
+        (
+            "removed-output",
+            "rm -rf \"$(dirname \"$OMGS_SCREENSHOT\")/screenshots\"\n",
+            "the screenshot output directory was missing after the run",
+        ),
+    ] {
+        let target = d.join(format!("target-{case}"));
+        let run = d.join(format!("run-{case}"));
+        std::fs::create_dir_all(target.join("tests")).unwrap();
+        std::fs::write(
+            target.join("tests/shot.sh"),
+            format!("set -e\n{prefix}sh \"${{OMGS_SCREENSHOT:-/dev/null}}\" page \"file://$PWD/x.html\" || true\necho AFTER_CAPTURE\nexit 1\n"),
+        )
+        .unwrap();
+        let init = omgs(
+            &d,
+            &[
+                "audit",
+                "init",
+                "--target",
+                target.to_str().unwrap(),
+                "--out",
+                run.to_str().unwrap(),
+                "--no-sensors",
+            ],
+        );
+        assert!(init.status.success(), "{}", text(&init));
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .args([
+                "prove",
+                "--run",
+                run.to_str().unwrap(),
+                "--test",
+                "tests/shot.sh",
+                "--screenshots",
+                "--cmd",
+                "sh tests/shot.sh",
+            ])
+            .env("OMGS_HOME", &d)
+            .env(omgs::screenshot::BROWSER_ENV, browser.join("stall"))
+            .env(
+                "OMGS_MXC_EXEC",
+                omgs::sandbox::locate_executor().unwrap().path,
+            )
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{case}: {}", text(&out));
+        assert!(
+            text(&out).contains("AFTER_CAPTURE"),
+            "{case}: {}",
+            text(&out)
+        );
+        let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+        assert!(record.clean(), "{case}: {record:?}");
+        let shots = record.screenshots.clone().unwrap();
+        assert!(shots.files.is_empty());
+        assert_eq!(shots.skipped, [expected], "{case}");
+        assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// A harness that removes the helper still reaches its assertion with the
+// documented call, and the record says the helper was missing.
+#[cfg(unix)]
+#[test]
+fn a_removed_screenshot_helper_is_named_and_never_stops_the_harness() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("screenshot-removed");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(target.join("tests")).unwrap();
+    std::fs::write(
+        target.join("tests/shot.sh"),
+        "set -e\nrm -f \"$OMGS_SCREENSHOT\"\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/x.html\" || true\necho AFTER_CAPTURE\nexit 1\n",
+    )
+    .unwrap();
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "tests/shot.sh",
+            "--screenshots",
+            "--cmd",
+            "sh tests/shot.sh",
+        ])
+        .env("OMGS_HOME", &d)
+        .env(omgs::screenshot::BROWSER_ENV, "/usr/bin/false")
+        .env(
+            "OMGS_MXC_EXEC",
+            omgs::sandbox::locate_executor().unwrap().path,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("AFTER_CAPTURE"), "{}", text(&out));
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    let shots = record.screenshots.clone().unwrap();
+    assert_eq!(
+        shots.skipped,
+        ["the screenshot helper was missing after the run"]
+    );
+    assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// Status markers are created with mkdir and never opened, so FIFOs planted at
+// their names by the harness cannot block the helper.
+#[cfg(unix)]
+#[test]
+fn planted_fifo_markers_never_block_the_capture_helper() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("screenshot-fifo");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir_all(target.join("tests")).unwrap();
+    std::fs::write(
+        target.join("tests/shot.sh"),
+        "set -e\nout=\"$(dirname \"$OMGS_SCREENSHOT\")/screenshots\"\nmkfifo \"$out/page.failed-1\" \"$out/page.timeout\"\nsh \"${OMGS_SCREENSHOT:-/dev/null}\" page \"file://$PWD/x.html\" || true\necho AFTER_CAPTURE\nexit 1\n",
+    )
+    .unwrap();
+    let init = omgs(
+        &d,
+        &[
+            "audit",
+            "init",
+            "--target",
+            target.to_str().unwrap(),
+            "--out",
+            run.to_str().unwrap(),
+            "--no-sensors",
+        ],
+    );
+    assert!(init.status.success(), "{}", text(&init));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--test",
+            "tests/shot.sh",
+            "--screenshots",
+            "--timeout-ms",
+            "60000",
+            "--cmd",
+            "sh tests/shot.sh",
+        ])
+        .env("OMGS_HOME", &d)
+        .env(omgs::screenshot::BROWSER_ENV, "/usr/bin/false")
+        .env(
+            "OMGS_MXC_EXEC",
+            omgs::sandbox::locate_executor().unwrap().path,
+        )
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("AFTER_CAPTURE"), "{}", text(&out));
+    let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
+    assert!(record.clean(), "{record:?}");
+    let shots = record.screenshots.clone().unwrap();
+    assert!(shots.files.is_empty());
+    assert!(shots
+        .skipped
+        .contains(&"page: the browser exited with status 1".to_string()));
+    assert!(omgs::proof::runner_evidence(&run, &record).is_empty());
+    let _ = std::fs::remove_dir_all(&d);
 }
