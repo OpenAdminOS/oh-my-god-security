@@ -246,13 +246,15 @@ for contracts, markers, validation, replay requirements, redaction and schema co
 
 `omgs prove --screenshots` offers the proof command a capture helper for web and
 rendered-output proofs. The harness calls `sh "$OMGS_SCREENSHOT" <name> <url>`
-(`call "%OMGS_SCREENSHOT%" <name> <url>` on Windows) at the proof moment, and a headless
+(`call "%OMGS_SCREENSHOT%" <name> <url>` on Windows) at the proof moment with an absolute
+URL such as `file://$PWD/page.html` or a tier 2 loopback address, and a headless
 browser already on the machine renders the page inside the same MXC sandbox at a fixed
 800x600 viewport, with network still denied. Nothing is downloaded. OMGS keeps at most
 4 PNG files of up to 512 KiB each, refuses anything else by name, hashes the kept files
 into the proof record, and REPORT.html embeds verified copies inline. `validate` and
-replay fail when a kept file changes. Screenshots must show dummy data only and never
-replace the failing test.
+replay fail when a kept file changes. The helper always exits 0, so a failed capture
+never changes the proof's outcome; the record names the browser's exit status instead.
+Screenshots must show dummy data only and never replace the failing test.
 
 On Linux and Windows OMGS looks for Chrome, Edge or Chromium in their standard install
 locations; `OMGS_BROWSER` overrides the choice. On macOS the full Chrome, Edge and

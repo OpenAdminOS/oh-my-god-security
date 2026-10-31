@@ -72,8 +72,10 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 /// Width and height of a structurally complete PNG: signature, a valid IHDR
-/// first, checksummed chunks, image data, and IEND as the last bytes. Pixel
-/// data is not decoded.
+/// first, checksummed chunks with letter types, only known critical chunks,
+/// a palette exactly where the colour type needs one and before the image
+/// data, one run of consecutive IDAT chunks, and IEND as the last bytes.
+/// Pixel data is not decoded.
 pub fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
     const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
     if bytes.len() < 8 || bytes[..8] != SIGNATURE {
@@ -83,7 +85,10 @@ pub fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
         |at: usize| u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
     let mut at = 8;
     let mut dimensions = None;
+    let mut color = 0u8;
+    let mut palette = false;
     let mut image_data = false;
+    let mut image_data_ended = false;
     loop {
         if at + 12 > bytes.len() {
             return Err("truncated PNG".into());
@@ -98,10 +103,17 @@ pub fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
         if crc32(&bytes[at + 4..end]) != word(end) {
             return Err("PNG chunk checksum mismatch".into());
         }
+        if !kind.iter().all(u8::is_ascii_alphabetic) {
+            return Err("PNG chunk type is not four letters".into());
+        }
+        if image_data && kind != b"IDAT" {
+            image_data_ended = true;
+        }
         match (dimensions.is_none(), kind) {
             (true, b"IHDR") if length == 13 => {
                 let (width, height) = (word(at + 8), word(at + 12));
-                let (depth, color) = (bytes[at + 16], bytes[at + 17]);
+                let depth = bytes[at + 16];
+                color = bytes[at + 17];
                 let valid = match color {
                     0 => [1, 2, 4, 8, 16].contains(&depth),
                     3 => [1, 2, 4, 8].contains(&depth),
@@ -119,7 +131,24 @@ pub fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
             (true, _) | (false, b"IHDR") => {
                 return Err("PNG does not start with one IHDR chunk".into())
             }
-            (false, b"IDAT") => image_data = true,
+            (false, b"PLTE") => {
+                if palette || image_data || matches!(color, 0 | 4) {
+                    return Err("PNG palette is misplaced or not allowed".into());
+                }
+                if length == 0 || length > 768 || !length.is_multiple_of(3) {
+                    return Err("PNG palette has an invalid length".into());
+                }
+                palette = true;
+            }
+            (false, b"IDAT") => {
+                if image_data_ended {
+                    return Err("PNG image data is not consecutive".into());
+                }
+                if color == 3 && !palette {
+                    return Err("indexed PNG has no palette".into());
+                }
+                image_data = true;
+            }
             (false, b"IEND") => {
                 if length != 0 || end + 4 != bytes.len() {
                     return Err("PNG has data after its end".into());
@@ -128,6 +157,10 @@ pub fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
                     return Err("PNG has no image data".into());
                 }
                 return dimensions.ok_or_else(|| "PNG has no header".into());
+            }
+            // Unknown critical chunks (uppercase first letter) cannot be skipped.
+            (false, kind) if kind[0].is_ascii_uppercase() => {
+                return Err("PNG has an unknown critical chunk".into());
             }
             _ => {}
         }
@@ -278,7 +311,7 @@ pub fn helper(os: &str, browser: &Path, scratch: &Path) -> Result<(String, Strin
         };
         let out = quoted(&out)?;
         let text = format!(
-            "@echo off\r\n\"{}\" {} \"--user-data-dir={}\" \"--screenshot={out}\\%~1.png\" \"%~2\"\r\nset omgs_status=%errorlevel%\r\nif not \"%omgs_status%\"==\"0\" (echo %omgs_status%)> \"{out}\\%~1.failed\"\r\nexit /b %omgs_status%\r\n",
+            "@echo off\r\n\"{}\" {} \"--user-data-dir={}\" \"--screenshot={out}\\%~1.png\" \"%~2\"\r\nset omgs_status=%errorlevel%\r\nif not \"%omgs_status%\"==\"0\" (echo %omgs_status%)> \"{out}\\%~1.failed\"\r\nexit /b 0\r\n",
             quoted(browser)?,
             flags(os).join(" "),
             quoted(&profile)?,
@@ -293,8 +326,12 @@ pub fn helper(os: &str, browser: &Path, scratch: &Path) -> Result<(String, Strin
         Ok(format!("'{s}'"))
     };
     let out = quoted(&out)?;
+    // Chrome binds a singleton socket under TMPDIR; a socket path must fit in
+    // about 107 bytes, so the browser runs from a scratch directory with a
+    // relative TMPDIR instead of the long absolute scratch path.
+    let tmp = quoted(&PathBuf::from(format!("{scratch}{separator}browser-tmp")))?;
     let text = format!(
-        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 2;; esac\n{} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\"\nstatus=$?\n[ \"$status\" -eq 0 ] || echo \"$status\" > {out}/\"$1\".failed\nexit \"$status\"\n",
+        "#!/bin/sh\ncase \"$1\" in ''|*[!A-Za-z0-9_-]*) echo 'omgs-screenshot: name must be 1 to 64 letters, digits, - or _' >&2; exit 0;; esac\nmkdir -p {tmp} && cd {tmp} || exit 0\nTMPDIR=. {} {} --user-data-dir={} --screenshot={out}/\"$1\".png \"$2\"\nstatus=$?\n[ \"$status\" -eq 0 ] || echo \"$status\" > {out}/\"$1\".failed\nexit 0\n",
         quoted(browser)?,
         flags(os).join(" "),
         quoted(&profile)?,
@@ -483,6 +520,48 @@ mod tests {
         let crc = crc32(&depth[12..29]);
         depth[29..33].copy_from_slice(&crc.to_be_bytes());
         assert!(admit(&depth).unwrap_err().contains("unsupported"));
+        // Structural rules beyond checksums.
+        let build = |color: u8, chunks: &[(&[u8; 4], Vec<u8>)]| {
+            let mut b = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+            let mut header = Vec::new();
+            header.extend_from_slice(&10u32.to_be_bytes());
+            header.extend_from_slice(&10u32.to_be_bytes());
+            header.extend_from_slice(&[8, color, 0, 0, 0]);
+            chunk(&mut b, b"IHDR", &header);
+            for (kind, data) in chunks {
+                chunk(&mut b, kind, data);
+            }
+            chunk(&mut b, b"IEND", &[]);
+            b
+        };
+        let idat = || (b"IDAT", vec![0u8; 4]);
+        let plte = || (b"PLTE", vec![0u8; 3]);
+        assert!(admit(&build(3, &[idat()]))
+            .unwrap_err()
+            .contains("no palette"));
+        assert_eq!(admit(&build(3, &[plte(), idat()])).unwrap(), (10, 10));
+        assert!(admit(&build(2, &[idat(), plte(), idat()]))
+            .unwrap_err()
+            .contains("misplaced"));
+        assert!(admit(&build(0, &[plte(), idat()]))
+            .unwrap_err()
+            .contains("misplaced"));
+        assert!(admit(&build(2, &[(b"PLTE", vec![0u8; 4]), idat()]))
+            .unwrap_err()
+            .contains("invalid length"));
+        assert!(admit(&build(6, &[idat(), (b"tEXt", vec![b'a']), idat()]))
+            .unwrap_err()
+            .contains("not consecutive"));
+        assert!(admit(&build(6, &[(b"ZZZZ", vec![]), idat()]))
+            .unwrap_err()
+            .contains("unknown critical"));
+        assert!(admit(&build(6, &[(b"zz1z", vec![]), idat()]))
+            .unwrap_err()
+            .contains("four letters"));
+        assert_eq!(
+            admit(&build(6, &[(b"tEXt", vec![b'a']), idat(), idat()])).unwrap(),
+            (10, 10)
+        );
         assert!(admit(&png(10, 10, MAX_BYTES as usize))
             .unwrap_err()
             .contains("larger"));
@@ -556,7 +635,7 @@ mod tests {
         let (name, text) =
             helper("linux", Path::new("/opt/c/chrome"), Path::new("/r/scratch")).unwrap();
         assert_eq!(name, "omgs-screenshot");
-        assert!(text.contains("'/opt/c/chrome' --headless"));
+        assert!(text.contains("mkdir -p '/r/scratch/browser-tmp' && cd '/r/scratch/browser-tmp' || exit 0\nTMPDIR=. '/opt/c/chrome' --headless"));
         assert!(text.contains("--window-size=800,600"));
         assert!(text.contains("--screenshot='/r/scratch/screenshots'/\"$1\".png \"$2\""));
         assert!(!text.contains("--single-process"));

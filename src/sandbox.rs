@@ -1714,6 +1714,7 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     // Everything that can fail for screenshot reasons is settled here, before
     // any grant, so a failure becomes the record's blocker instead.
     let mut helper = None;
+    let mut browser_grant = None;
     if let Some(shots) = screenshots.as_mut() {
         let helper_scratch = PathBuf::from(mxc_path(&scratch));
         match crate::screenshot::browser(os, std::env::var_os(crate::screenshot::BROWSER_ENV))
@@ -1725,7 +1726,8 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             }) {
             Ok((b, text, root)) => {
                 shots.browser = Some(mxc_path(&b));
-                readonly.extend(root);
+                readonly.extend(root.clone());
+                browser_grant = root;
                 helper = Some(text);
             }
             Err(reason) => shots.blocker = Some(reason),
@@ -1796,10 +1798,14 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
     let screenshot = match helper
         .as_ref()
         .map(|h| write_screenshot_helper(h, &scratch))
-        .transpose()
     {
-        Ok(helper) => helper,
-        Err(reason) => return blocked(reason),
+        Some(Ok(path)) => Some(path),
+        Some(Err(reason)) => {
+            screenshots_unavailable(&mut screenshots, &mut helper, &scratch, os, reason);
+            readonly.retain(|r| Some(r) != browser_grant.as_ref());
+            None
+        }
+        None => None,
     };
     #[cfg(target_os = "macos")]
     {
@@ -1930,10 +1936,13 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             if digest != target_sha256 {
                 return blocked("target changed before MXC retry".into());
             }
-            if let Some(h) = &helper {
-                if let Err(reason) = write_screenshot_helper(h, &scratch) {
-                    return blocked(reason);
-                }
+            if let Some(Err(reason)) = helper
+                .as_ref()
+                .map(|h| write_screenshot_helper(h, &scratch))
+            {
+                screenshots_unavailable(&mut screenshots, &mut helper, &scratch, os, reason);
+                input.readonly.retain(|r| Some(r) != browser_grant.as_ref());
+                input.screenshot = None;
             }
             for gap in retry_gaps {
                 if !extra_gaps.contains(&gap) {
@@ -2045,6 +2054,24 @@ fn admit_browser(
     #[cfg(target_os = "macos")]
     crate::tcc::admit_path(&root).map_err(|e| format!("browser directory refused: {e}"))?;
     Ok((!readonly.iter().any(|r| root.starts_with(r))).then_some(root))
+}
+
+/// A helper that cannot be written leaves the proof running without
+/// screenshots; the record names why and grants nothing for the browser.
+fn screenshots_unavailable(
+    screenshots: &mut Option<crate::screenshot::Screenshots>,
+    helper: &mut Option<(String, String)>,
+    scratch: &Path,
+    os: &str,
+    reason: String,
+) {
+    let _ = std::fs::remove_file(scratch.join(crate::screenshot::helper_name(os)));
+    let _ = std::fs::remove_dir_all(scratch.join(crate::screenshot::DIR));
+    *helper = None;
+    if let Some(shots) = screenshots.as_mut() {
+        shots.browser = None;
+        shots.blocker = Some(reason);
+    }
 }
 
 /// Writes the prepared capture helper and its output directory into the

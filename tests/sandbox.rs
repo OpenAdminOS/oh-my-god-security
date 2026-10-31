@@ -4043,7 +4043,7 @@ fn a_failing_screenshot_browser_is_named_in_the_record() {
     std::fs::create_dir_all(target.join("tests")).unwrap();
     std::fs::write(
         target.join("tests/shot.sh"),
-        "sh \"$OMGS_SCREENSHOT\" page \"file://$PWD/missing.html\"\nexit 1\n",
+        "set -e\nsh \"$OMGS_SCREENSHOT\" page \"file://$PWD/missing.html\"\necho AFTER_CAPTURE\nexit 1\n",
     )
     .unwrap();
     let init = omgs(
@@ -4078,6 +4078,8 @@ fn a_failing_screenshot_browser_is_named_in_the_record() {
     );
     let out = c.output().unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    // The helper is best effort: a set -e harness still reaches its assertion.
+    assert!(text(&out).contains("AFTER_CAPTURE"), "{}", text(&out));
     let record = omgs::proof::load(&run, "proofs/1.json").unwrap();
     let shots = record.screenshots.clone().unwrap();
     assert_eq!(shots.browser.as_deref(), Some("/usr/bin/false"));
