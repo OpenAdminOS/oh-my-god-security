@@ -142,15 +142,28 @@ st_size, st_mtime and st_ctime with nanoseconds. Windows stamps bind volume seri
 size, LastWriteTime and ChangeTime from FILE_BASIC_INFO through no-follow handles.
 After copying and all source content reads, a fresh stamp walk must have identical membership
 and stamps. Directory stamps detect membership changes even if entries are removed again.
-OS change times detect writes even if original bytes and modification times are restored.
+Change stamp comparison detects accidental or ordinary concurrent modification on all platforms.
+Unix ctime cannot be set by user space. On Windows, a process with write attribute access can
+set or suppress ChangeTime and LastWriteTime; deliberate forgery by such a same user process
+is outside the documented threat model.
 The stamp stream is hashed incrementally without retaining an entry map. These stamps guard
 staging only and are never part of replay identity.
 OMGS also streams the source identity before copying, then both the staged identity and a fresh
 source identity after copying. All three must agree before any target execution, including for
 a fresh proof. Any stamp, membership or content difference, or failed source recheck refuses
 execution with `target changed during staging`; no proof record is emitted. There is no retry.
-This detects modifications during staging without locking the source or claiming an atomic
-filesystem snapshot. Keep the source unchanged until staging completes.
+This comparison guards ordinary concurrent modification without locking the source or claiming
+an atomic filesystem snapshot. Keep the source unchanged until staging completes.
+
+Staging has a fixed 8 GiB aggregate content read budget across source hashing, dense copying and
+staged hashing, and a ten-minute deadline from before the first walk through completion of
+staging, independent of the executor timeout. Repeated reads count again; the budget is reserved
+from each file size before reading or copying. Files are read only through their admitted size;
+growth or truncation refuses with `target changed during staging`. Byte budget or deadline
+exhaustion refuses before executor startup. Deadline and interruption checks run between files,
+directory entries and read chunks. Shared harness and selection ancestors are enumerated once
+per parent per check, with every sibling charged to the shared traversal entry budget. These
+fixed limits have no configuration override.
 
 `--test-from` accepts a regular file or a directory outside the target. A directory's files are
 mapped beneath the parent of `--test`, and must include that test's basename. For example,

@@ -347,6 +347,8 @@ storage is refused before launchd submission.
 
 There is no stronger claim against a same-user process with arbitrary file
 access: it can replace the executable, private state or all local proof records.
+This also excludes deliberate Windows ChangeTime or LastWriteTime forgery through
+write attribute access during staging. Users must keep the target unchanged while staging.
 Sandboxed target code has no grant to these files or launchd service endpoints.
 
 The owner holds a per-job advisory lock. An anchor monitors loss of that lock or

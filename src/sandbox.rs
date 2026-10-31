@@ -885,7 +885,7 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
             "{outside_links} target link(s) resolve outside the target or do not resolve: {action}"
         ));
     }
-    supervise::check_interrupted().map_err(|e| e.to_string())?;
+    crate::proof_inputs::check_staging()?;
     std::fs::create_dir_all(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
     set_input_permissions(dst, root_mode())?;
     let roots = (root, dst.to_path_buf());
@@ -1018,7 +1018,7 @@ fn inspect_target(
     count: &mut usize,
 ) -> Result<(), String> {
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
-        supervise::check_interrupted().map_err(|e| e.to_string())?;
+        crate::proof_inputs::check_staging()?;
         let entry = entry.map_err(|e| e.to_string())?;
         crate::proof_inputs::admit_entry(count)?;
         let path = entry.path();
@@ -1104,7 +1104,7 @@ fn copy_recursive(
     count: &mut usize,
 ) -> Result<(), String> {
     crate::proof_inputs::children_selected(&roots.0, src, selection, count, |entry, count| {
-        supervise::check_interrupted().map_err(|e| e.to_string())?;
+        crate::proof_inputs::check_staging()?;
         let path = entry.path();
         let rel = path.strip_prefix(&roots.0).map_err(|e| e.to_string())?;
         let name = rel
@@ -1128,9 +1128,7 @@ fn copy_recursive(
             // stage_file uses create_new and dense writes, with no clone/copy
             // operation that could retain xattrs, ACLs, flags or sparse holes.
             if crate::proof_inputs::canonical_git_index(rel) {
-                let bytes =
-                    platform::read_bounded_in(&roots.0, rel, crate::proof_inputs::MAX_INDEX_BYTES)
-                        .map_err(|e| e.to_string())?;
+                let bytes = crate::proof_inputs::read_index(&path)?;
                 let bytes = crate::proof_inputs::normalize_index(&bytes)?;
                 stage_content(
                     dst,
@@ -1207,7 +1205,7 @@ pub fn tier2_unavailable(os: &str) -> Option<String> {
 /// on the way would otherwise make this unsandboxed write land on the host.
 pub fn stage_file(workspace: &Path, rel: &str, draft: &Path) -> std::io::Result<()> {
     // Caller-supplied source drafts follow the checkout content policy.
-    let source = platform::open_regular(draft)?;
+    let source = crate::proof_inputs::admitted_file(draft).map_err(std::io::Error::other)?;
     let meta = source.metadata()?;
     let permissions =
         crate::proof_inputs::permissions(crate::proof_inputs::mode(&meta), meta.permissions());
@@ -1267,7 +1265,7 @@ fn stage_content(
         .open(&dest)?;
     let mut bytes = vec![0u8; 1 << 16];
     loop {
-        supervise::check_interrupted()?;
+        crate::proof_inputs::check_staging().map_err(Error::other)?;
         let n = source.read(&mut bytes)?;
         if n == 0 {
             break;
@@ -1287,7 +1285,7 @@ fn stage_content(
 /// file names only, never an existing target entry or metadata tree.
 /// Restrict names to unambiguous portable ASCII rather than trying to emulate
 /// every filesystem's Unicode folding and generated DOS short-name rules.
-fn preflight_harness(workspace: &Path, paths: &[&str]) -> Result<(), String> {
+pub(crate) fn preflight_harness(workspace: &Path, paths: &[&str]) -> Result<(), String> {
     if paths.is_empty() {
         return Ok(());
     }
@@ -1329,53 +1327,7 @@ fn preflight_harness(workspace: &Path, paths: &[&str]) -> Result<(), String> {
             }
         }
     }
-    for path in paths {
-        let mut dir = workspace.to_path_buf();
-        let parts: Vec<_> = path.split('/').collect();
-        for (i, part) in parts.iter().enumerate() {
-            let mut exact = false;
-            for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-                let entry = entry.map_err(|e| e.to_string())?;
-                let name = entry.file_name();
-                let name = name
-                    .to_str()
-                    .ok_or("target has an ambiguous non-UTF-8 harness sibling")?;
-                if !name.is_ascii() {
-                    return Err("target has an ambiguous Unicode harness sibling".into());
-                }
-                if name.trim_end_matches([' ', '.']).eq_ignore_ascii_case(part) {
-                    if name != *part || i + 1 == parts.len() {
-                        return Err(format!(
-                            "harness destination collides with target entry: {path}"
-                        ));
-                    }
-                    let meta =
-                        std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
-                    if !meta.is_dir() || platform::is_link(&meta) {
-                        return Err(format!(
-                            "harness destination collides with target entry: {path}"
-                        ));
-                    }
-                    exact = true;
-                }
-            }
-            dir.push(part);
-            if !exact {
-                // The OS lookup catches aliases such as Windows generated short
-                // names even when directory enumeration uses a different name.
-                match std::fs::symlink_metadata(&dir) {
-                    Ok(_) => {
-                        return Err(format!(
-                            "harness destination collides with target entry: {path}"
-                        ))
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                    Err(e) => return Err(e.to_string()),
-                }
-            }
-        }
-    }
-    Ok(())
+    crate::proof_inputs::check_paths(workspace, paths, true)
 }
 
 /// A readable root that contains, or is contained in, the run directory.
@@ -1435,6 +1387,7 @@ fn stage_workspace(
     readonly: &[PathBuf],
     nonce: &str,
 ) -> Result<StagedWorkspace, String> {
+    let _staging = crate::proof_inputs::StagingGuard::begin();
     let mut gaps = Vec::new();
     let mut source_before = None;
     let mut stamps_before = None;
@@ -1630,6 +1583,7 @@ fn stage_workspace(
     )
     .map_err(|e| format!("cannot write command wrapper: {e}"))?;
     crate::proof_inputs::normalize_timestamps(workspace)?;
+    crate::proof_inputs::check_staging()?;
     Ok(StagedWorkspace {
         digest,
         manifest,
@@ -2020,6 +1974,83 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_refuses_oversized_sparse_source_before_copy_and_expired_postwalk() {
+        let base = crate::platform::scratch_root().unwrap().join(format!(
+            "staging-limits-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        crate::platform::create_private_dir_new(&base).unwrap();
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let input = target.join("input");
+        let run_dir = base.join("proof");
+        crate::platform::create_private_dir_new(&run_dir).unwrap();
+        let request = ProveRequest {
+            command: "never executed".into(),
+            expect_marker: None,
+            test: None,
+            timeout_ms: 1000,
+            target: Some(target.clone()),
+            run_dir: run_dir.clone(),
+            tier: Tier::Test,
+            stage: None,
+            expected_tree_sha256: None,
+            inputs: None,
+            expected_inputs: None,
+            harness: vec![],
+        };
+        let sparse = std::fs::File::create(&input).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            extern "system" {
+                fn DeviceIoControl(
+                    handle: *mut core::ffi::c_void,
+                    code: u32,
+                    input: *const u8,
+                    input_len: u32,
+                    output: *mut u8,
+                    output_len: u32,
+                    returned: *mut u32,
+                    overlapped: *mut core::ffi::c_void,
+                ) -> i32;
+            }
+            let mut returned = 0;
+            // SAFETY: the owned file handle is live, no buffers are passed,
+            // and returned points to writable storage. FSCTL_SET_SPARSE makes
+            // the oversized fixture cheap on Windows as well as Unix.
+            let ok = unsafe {
+                DeviceIoControl(
+                    sparse.as_raw_handle(),
+                    0x0009_00c4,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+        }
+        sparse
+            .set_len(crate::proof_inputs::MAX_SOURCE_BYTES + 1)
+            .unwrap();
+        drop(sparse);
+        let workspace = run_dir.join("workspace");
+        let result = stage_workspace(&request, &workspace, &run_dir.join("scratch"), &[], "nonce");
+        assert!(matches!(result, Err(ref e) if e.contains("aggregate source byte budget")));
+        assert!(!workspace.exists());
+        std::fs::write(&input, b"ab").unwrap();
+        STAGING_HOOK
+            .with(|hook| *hook.borrow_mut() = Some(Box::new(crate::proof_inputs::expire_staging)));
+        let result = stage_workspace(&request, &workspace, &run_dir.join("scratch"), &[], "nonce");
+        assert!(matches!(result, Err(ref e) if e.contains("staging deadline exceeded")));
+        assert!(!run_dir.join("config.json").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn restored_source_writes_and_membership_changes_refuse_staging() {

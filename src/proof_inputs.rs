@@ -11,6 +11,142 @@ pub const MAX_ENTRIES: usize = crate::policy::GateLimits::MAX_ENTRIES;
 pub const MAX_MANIFEST_BYTES: u64 = MAX_ENTRIES as u64 * 6400 + 65536;
 pub(crate) const MAX_INDEX_BYTES: u64 = 16 << 20;
 
+// Fixed preparation limits, independent of the later executor timeout.
+pub(crate) const MAX_SOURCE_BYTES: u64 = 8 << 30;
+const STAGING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+// Staging is synchronous. Nested manifest passes reuse the outer operation
+// budget; the owning guard clears it on success, error or unwind. Standalone
+// manifest generation gets the same bounds without changing its public API.
+thread_local! {
+    static STAGING: std::cell::RefCell<Option<(std::time::Instant, u64)>> = const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    static ENUMERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+pub(crate) struct StagingGuard(bool);
+impl StagingGuard {
+    pub(crate) fn begin() -> Self {
+        Self(STAGING.with(|state| {
+            let mut state = state.borrow_mut();
+            if state.is_some() {
+                false
+            } else {
+                *state = Some((std::time::Instant::now() + STAGING_TIMEOUT, 0));
+                true
+            }
+        }))
+    }
+}
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            STAGING.with(|state| *state.borrow_mut() = None);
+        }
+    }
+}
+#[cfg(test)]
+pub(crate) fn expire_staging() {
+    STAGING.with(|state| state.borrow_mut().as_mut().unwrap().0 = std::time::Instant::now());
+}
+pub(crate) fn check_staging() -> Result<(), String> {
+    crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
+    STAGING.with(|state| {
+        if state
+            .borrow()
+            .as_ref()
+            .is_some_and(|(end, _)| std::time::Instant::now() >= *end)
+        {
+            Err("proof staging deadline exceeded (10 minutes)".into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+// Reserve the complete admitted size before any content read or destination write.
+pub(crate) fn admitted_file(path: &Path) -> Result<AdmittedFile, String> {
+    check_staging()?;
+    let file = crate::platform::open_regular(path).map_err(|e| e.to_string())?;
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    STAGING.with(|state| {
+        if let Some((_, used)) = state.borrow_mut().as_mut() {
+            if size > MAX_SOURCE_BYTES - *used {
+                return Err(
+                    "proof staging aggregate source byte budget exceeded (8 GiB)".to_string(),
+                );
+            }
+            *used += size;
+        } else if size > MAX_SOURCE_BYTES {
+            return Err("proof staging aggregate source byte budget exceeded (8 GiB)".to_string());
+        }
+        Ok(())
+    })?;
+    Ok(AdmittedFile {
+        file,
+        size,
+        remaining: size,
+    })
+}
+pub(crate) struct AdmittedFile {
+    file: std::fs::File,
+    size: u64,
+    remaining: u64,
+}
+impl AdmittedFile {
+    pub(crate) fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+}
+impl std::io::Read for AdmittedFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::Error;
+        check_staging().map_err(Error::other)?;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let changed = || Error::other("target changed during staging: file size changed");
+        if self.file.metadata()?.len() != self.size {
+            return Err(changed());
+        }
+        if self.remaining == 0 {
+            if self.file.read(&mut [0u8; 1])? != 0 {
+                return Err(changed());
+            }
+            return Ok(0);
+        }
+        let limit = self.remaining.min(buf.len() as u64) as usize;
+        let n = self.file.read(&mut buf[..limit])?;
+        if n == 0 {
+            return Err(changed());
+        }
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+pub(crate) fn read_index(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut file = admitted_file(path)?;
+    if file.size > MAX_INDEX_BYTES {
+        return Err("Git index exceeds byte limit".into());
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+fn hash_file(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut file = admitted_file(path)?;
+    let mut hash = crate::sha256::Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    Ok(crate::sha256::hex(&hash.finish()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Selection {
@@ -374,6 +510,7 @@ pub fn permissions(mode: u32, current: std::fs::Permissions) -> std::fs::Permiss
 /// Hash normalized index bytes as well as all other Git state. The same index
 /// normalization is applied while freshly staging the disposable workspace.
 pub fn manifest(root: &Path, selection: Option<Selection>) -> Result<Manifest, String> {
+    let _budget = StagingGuard::begin();
     let mut manifest = descriptor(root, selection)?;
     manifest.sha256 = manifest.stream(std::io::sink())?;
     Ok(manifest)
@@ -385,6 +522,7 @@ pub fn manifest_to(
     selection: Option<Selection>,
     path: &Path,
 ) -> Result<Manifest, String> {
+    let _budget = StagingGuard::begin();
     let mut manifest = descriptor(root, selection)?;
     let mut digest = String::new();
     crate::runmeta::write_atomic_stream(path, None, |file| {
@@ -419,28 +557,112 @@ fn descriptor(root: &Path, selection: Option<Selection>) -> Result<Manifest, Str
 /// Also used on the completed workspace: every selected component must occur
 /// exactly once, and none may have become a link during materialization.
 pub(crate) fn verify_selection(root: &Path, selection: &Selection) -> Result<(), String> {
-    for selected in &selection.paths {
-        let mut dir = root.to_path_buf();
-        for part in selected.split('/') {
-            let mut matches = 0;
-            let mut count = 0;
-            for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-                let entry = entry.map_err(|e| e.to_string())?;
-                crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
-                admit_entry(&mut count)?;
-                if entry.file_name() == std::ffi::OsStr::new(part) {
-                    matches += 1;
+    check_paths(
+        root,
+        &selection
+            .paths
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        false,
+    )
+}
+
+/// Group requested components by parent, retaining only requested names.
+pub(crate) fn check_paths(root: &Path, paths: &[&str], harness: bool) -> Result<(), String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut parents: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
+    for path in paths {
+        let mut parent = String::new();
+        let parts: Vec<_> = path.split('/').collect();
+        for (i, part) in parts.iter().enumerate() {
+            parents
+                .entry(parent.clone())
+                .or_default()
+                .insert((*part).into(), i + 1 == parts.len());
+            if !parent.is_empty() {
+                parent.push('/');
+            }
+            parent.push_str(part);
+        }
+    }
+    let mut missing = BTreeSet::new();
+    let mut scanned = 0;
+    for (parent, wanted) in parents {
+        check_staging()?;
+        if missing
+            .iter()
+            .any(|p: &String| parent == *p || parent.starts_with(&format!("{p}/")))
+        {
+            continue;
+        }
+        let dir = root.join(&parent);
+        let lookup: BTreeMap<_, _> = wanted
+            .iter()
+            .map(|(part, leaf)| {
+                (
+                    if harness {
+                        part.to_ascii_lowercase()
+                    } else {
+                        part.clone()
+                    },
+                    (part, leaf),
+                )
+            })
+            .collect();
+        let mut found = BTreeSet::new();
+        #[cfg(test)]
+        ENUMERATIONS.with(|n| n.set(n.get() + 1));
+        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            check_staging()?;
+            admit_entry(&mut scanned)?;
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name();
+            if harness && !name.to_str().is_some_and(str::is_ascii) {
+                return Err("target has an ambiguous Unicode or non-UTF-8 harness sibling".into());
+            }
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let key = if harness {
+                name.trim_end_matches([' ', '.']).to_ascii_lowercase()
+            } else {
+                name.to_owned()
+            };
+            if let Some((part, leaf)) = lookup.get(&key) {
+                if harness && (name != *part || **leaf) {
+                    return Err("harness destination collides with target entry".into());
                 }
+                let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
+                if crate::platform::is_link(&meta)
+                    || (!meta.is_dir() && (harness || !meta.is_file()))
+                {
+                    return Err(
+                        "selected input or harness ancestor must not be a link or unsupported file"
+                            .into(),
+                    );
+                }
+                found.insert((*part).clone());
             }
-            if matches != 1 {
-                return Err(format!(
-                    "selected input must match exactly one directory entry with exact spelling: {selected}"
-                ));
+        }
+        for part in wanted.keys().filter(|part| !found.contains(*part)) {
+            if !harness {
+                return Err(
+                    "selected input must match exactly one directory entry with exact spelling"
+                        .into(),
+                );
             }
-            dir.push(part);
-            let meta = std::fs::symlink_metadata(&dir).map_err(|e| e.to_string())?;
-            if crate::platform::is_link(&meta) || (!meta.is_dir() && !meta.is_file()) {
-                return Err("selected input must be a file or directory without links".into());
+            let relative = if parent.is_empty() {
+                part.clone()
+            } else {
+                format!("{parent}/{part}")
+            };
+            match std::fs::symlink_metadata(root.join(&relative)) {
+                Ok(_) => return Err("harness destination collides with target entry".into()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    missing.insert(relative);
+                }
+                Err(e) => return Err(e.to_string()),
             }
         }
     }
@@ -536,7 +758,7 @@ fn sorted_names<T>(
     let mut names = Vec::new();
     let mut bytes = 0;
     for (scanned, entry) in entries.into_iter().enumerate() {
-        crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
+        check_staging()?;
         if scanned >= limits.entries {
             return Err(format!(
                 "execution input directory {} exceeds {} entries",
@@ -615,7 +837,7 @@ fn walk_budgeted(
     emit: &mut impl FnMut(Entry) -> Result<(), String>,
 ) -> Result<(), String> {
     children_selected(root, dir, selection, scanned, |entry, scanned| {
-        crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
+        check_staging()?;
         let path = entry.path();
         let rel = path.strip_prefix(root).map_err(|e| e.to_string())?;
         let name = rel
@@ -639,15 +861,11 @@ fn walk_budgeted(
             ("dir", crate::sha256::digest(b""))
         } else if meta.is_file() {
             if canonical_git_index(rel) {
-                let bytes = crate::platform::read_bounded_in(root, rel, MAX_INDEX_BYTES)
-                    .map_err(|e| e.to_string())?;
+                let bytes = read_index(&path)?;
                 let bytes = normalize_index(&bytes).map_err(|e| format!("{name}: {e}"))?;
                 ("file", crate::sha256::digest(&bytes))
             } else {
-                (
-                    "file",
-                    crate::sha256::digest_file(&path).map_err(|e| e.to_string())?,
-                )
+                ("file", hash_file(&path)?)
             }
         } else {
             return Err(format!("unsupported execution input: {name}"));
@@ -679,6 +897,7 @@ pub(crate) fn source_stamps(
         count: &mut usize,
         hash: &mut crate::sha256::Sha256,
     ) -> Result<(), String> {
+        check_staging()?;
         let rel = path
             .strip_prefix(root)
             .map_err(|e| e.to_string())?
@@ -711,6 +930,7 @@ pub(crate) fn source_stamps(
 /// Never follow links: outside and dangling links remain sandbox inputs.
 pub(crate) fn normalize_timestamps(root: &Path) -> Result<(), String> {
     fn visit(path: &Path) -> std::io::Result<()> {
+        check_staging().map_err(std::io::Error::other)?;
         let meta = std::fs::symlink_metadata(path)?;
         if meta.is_dir() && !crate::platform::is_link(&meta) {
             for entry in std::fs::read_dir(path)? {
@@ -984,6 +1204,81 @@ pub fn retained(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_reads_refuse_growth_truncation_and_aggregate_overflow() {
+        use std::io::Read;
+        let d = scratch("bounded-reads");
+        let path = d.join("input");
+        let _budget = StagingGuard::begin();
+        for size in [3, 1] {
+            std::fs::write(&path, b"ab").unwrap();
+            let mut reader = admitted_file(&path).unwrap();
+            reader.read_exact(&mut [0u8; 1]).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+            assert!(reader
+                .read_to_end(&mut Vec::new())
+                .unwrap_err()
+                .to_string()
+                .contains("target changed during staging"));
+        }
+        std::fs::write(&path, b"ab").unwrap();
+        STAGING.with(|state| state.borrow_mut().as_mut().unwrap().1 = MAX_SOURCE_BYTES - 3);
+        drop(admitted_file(&path).unwrap());
+        assert!(admitted_file(&path)
+            .err()
+            .unwrap()
+            .contains("aggregate source byte budget"));
+        std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn staging_deadline_is_checked_between_chunks_and_directory_entries() {
+        use std::io::Read;
+        let d = scratch("deadline");
+        std::fs::write(d.join("input"), b"ab").unwrap();
+        let _budget = StagingGuard::begin();
+        let mut reader = admitted_file(&d.join("input")).unwrap();
+        STAGING.with(|state| state.borrow_mut().as_mut().unwrap().0 = std::time::Instant::now());
+        assert!(reader
+            .read(&mut [0u8; 1])
+            .unwrap_err()
+            .to_string()
+            .contains("staging deadline exceeded"));
+        assert!(check_paths(&d, &["input"], false)
+            .unwrap_err()
+            .contains("staging deadline exceeded"));
+        drop(reader);
+        std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn shared_ancestor_checks_enumerate_each_parent_once() {
+        let d = scratch("shared-parents");
+        std::fs::create_dir(d.join("wide")).unwrap();
+        for i in 0..1024 {
+            std::fs::write(d.join(format!("wide/file{i}")), b"").unwrap();
+        }
+        let selected: Vec<_> = (0..128).map(|i| format!("wide/file{i}")).collect();
+        let paths: Vec<_> = selected.iter().map(String::as_str).collect();
+        ENUMERATIONS.with(|n| n.set(0));
+        check_paths(&d, &paths, false).unwrap();
+        ENUMERATIONS.with(|n| assert_eq!(n.get(), 2));
+        let harness: Vec<_> = (0..128).map(|i| format!("wide/new{i}")).collect();
+        ENUMERATIONS.with(|n| n.set(0));
+        crate::sandbox::preflight_harness(
+            &d,
+            &harness.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        ENUMERATIONS.with(|n| assert_eq!(n.get(), 2));
+        std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
+    }
 
     fn scratch(label: &str) -> std::path::PathBuf {
         let base = crate::platform::temp_root().unwrap().join(format!(
