@@ -84,6 +84,9 @@ pub fn parse_identities(values: &[String]) -> Result<BTreeMap<String, String>, S
                 ROLES.join(", ")
             )
         })?;
+        if model.chars().any(char::is_control) {
+            return Err("--model names must not contain control characters".into());
+        }
         if !ROLES.contains(&role)
             || model.trim().is_empty()
             || models.insert(role.into(), model.into()).is_some()

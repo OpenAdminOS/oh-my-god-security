@@ -3779,7 +3779,7 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         })?;
-        println!("{label}");
+        println!("{}", omgs::platform::escape_controls(&label));
         return Ok(());
     }
     let newly = flag(args, "--refused");
@@ -3905,12 +3905,13 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
         Ok(next)
     })?;
     match next {
+        // Saved routes and models.json are editable files: never echo raw controls.
         Ok(model) => {
-            println!("{model}");
+            println!("{}", omgs::platform::escape_controls(&model));
             Ok(())
         }
         Err(e) => {
-            eprintln!("blocked: {e}");
+            eprintln!("blocked: {}", omgs::platform::escape_controls(&e));
             Err("__EXIT1__".into())
         }
     }

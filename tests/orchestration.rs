@@ -380,6 +380,42 @@ fn watch_serves_loopback_and_stops_when_the_run_completes() {
 }
 
 #[test]
+fn route_labels_never_echo_terminal_controls() {
+    let dir = scratch("route-controls");
+    write_private_fixture(
+        dir.join("run-metadata.json"),
+        r#"{"run_status":"in_progress"}"#,
+    )
+    .unwrap();
+    let run = dir.to_str().unwrap();
+    for label in ["fake\n::error::forged", "fake\rline", "fake\u{1b}[31mred"] {
+        let out = omgs(&["route", "--run", run, "--role", "hunter", "--model", label]);
+        assert_eq!(out.status.code(), Some(2), "{out:?}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains('\u{1b}'));
+    }
+    // A hand edited models.json is printed escaped on later lookups.
+    let models = dir.join("models.json");
+    std::fs::write(
+        &models,
+        r#"{"roles":{"hunter":["model\n::error::forged\u001b[31m"]}}"#,
+    )
+    .unwrap();
+    let out = omgs(&[
+        "route",
+        "--run",
+        run,
+        "--role",
+        "hunter",
+        "--models",
+        models.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(!stdout.contains('\u{1b}'), "{stdout}");
+    assert!(stdout.contains("\\n::error::forged"), "{stdout}");
+}
+
+#[test]
 fn route_follows_fallbacks_and_records_reroutes() {
     let dir = scratch("route");
     write_private_fixture(
