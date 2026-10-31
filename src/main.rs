@@ -2116,8 +2116,10 @@ fn trusted_store(target: &Path) -> Result<PathBuf, String> {
     // canonicalization cannot race that replacement; the leaf is checked
     // separately here and opened without following links by read_store.
     let parent = path.parent().ok_or("intent answer store needs a parent")?;
-    let resolved = resolve_existing_prefix(parent)?
-        .join(path.file_name().ok_or("intent answer store needs a name")?);
+    // Compare the parent, never the leaf: the store is a regular file, so it
+    // lies inside the target exactly when its directory does. Opening the leaf
+    // outside the writer's lock fails on Windows while it is being replaced.
+    let resolved = resolve_existing_prefix(parent)?;
     if omgs::paths::overlaps(&resolved, target)? {
         return Err(format!(
             "the intent answer store {} resolves inside the target {}; refusing to use it",
