@@ -732,6 +732,10 @@ mod tests {
         assert!(text.contains("kill -9 -\"$browser\" 2>/dev/null || kill -9 \"$browser\""));
         assert!(text.contains("wait \"$watchdog\"\nkill -9 -\"$browser\" 2>/dev/null\n"));
         assert!(text.contains("--window-size=800,600"));
+        // Chrome's own page timeout fires before the watchdog stops it.
+        assert_eq!(CAPTURE_SECONDS, 30);
+        assert!(text.contains("--timeout=25000"));
+        assert!(text.contains("if [ \"$i\" -ge 30 ]; then kill -9"));
         assert!(text.contains("--screenshot='/r/scratch/screenshots'/\"$1\".png \"$2\""));
         assert!(!text.contains("--single-process"));
         assert!(text.contains(
