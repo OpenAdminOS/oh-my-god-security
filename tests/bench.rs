@@ -820,7 +820,7 @@ fn verifier_metrics_use_canonical_outcomes_including_absorbed_candidates() {
 }
 
 #[test]
-fn scoring_archives_never_creates_lock_files_and_preserves_token_splits() {
+fn scoring_archives_establishes_locks_and_preserves_token_splits() {
     let saved = SavedRuns::new();
     for role in ["red-hunter", "blue-verifier", "evaluator", "green-fixer"] {
         saved.edit("run-1/run-metadata.json", |m| {
@@ -828,20 +828,32 @@ fn scoring_archives_never_creates_lock_files_and_preserves_token_splits() {
             m["accounting"][role]["output_tokens"] = json!(5);
         });
     }
+    fn data_bytes(dir: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() == ".omgs-run.lock" {
+                continue;
+            }
+            if entry.file_type().unwrap().is_dir() {
+                files.extend(data_bytes(&entry.path()));
+            } else {
+                files.insert(entry.path(), std::fs::read(entry.path()).unwrap());
+            }
+        }
+        files
+    }
+    let before = data_bytes(&saved.0);
     let score = saved.score();
     let usage = &score["cost_per_run"][0]["numerator"];
     assert_eq!(usage["input_tokens"], 40);
     assert_eq!(usage["output_tokens"], 20);
-    fn no_locks(dir: &std::path::Path) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
-            assert_ne!(entry.file_name(), ".omgs-run.lock");
-            if entry.file_type().unwrap().is_dir() {
-                no_locks(&entry.path());
-            }
-        }
+    assert_eq!(data_bytes(&saved.0), before);
+    for repetition in ["run-1", "run-2"] {
+        let dir = saved.0.join(repetition);
+        assert!(dir.join(".omgs-run.lock").is_file());
+        assert!(dir.join("positive").join(".omgs-run.lock").is_file());
     }
-    no_locks(&saved.0);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

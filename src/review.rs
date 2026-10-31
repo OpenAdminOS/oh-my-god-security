@@ -42,6 +42,12 @@ impl View {
         Self::build_options(run, None, false, None, None, true, None)
     }
 
+    /// Strict diagnostic commands must preserve malformed-input errors.
+    /// Caller holds the run lock through the diagnostic.
+    pub fn load_strict_locked(run: &Path) -> Result<Self, String> {
+        Self::build_locked(run, None, false)
+    }
+
     /// Caller holds every archive input lock through output publication.
     pub fn load_archive_locked(run: &Path) -> Result<Self, String> {
         Self::build_locked(run, None, true)

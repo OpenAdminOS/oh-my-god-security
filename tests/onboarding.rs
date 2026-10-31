@@ -20,6 +20,8 @@ fn readme_has_newcomer_headings() {
 #[test]
 fn every_subcommand_has_help_without_initializing_state() {
     for command in [
+        "identity",
+        "artifact-check",
         "setup",
         "review",
         "audit",

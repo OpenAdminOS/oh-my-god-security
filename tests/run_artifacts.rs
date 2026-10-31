@@ -401,3 +401,27 @@ fn unix_artifact_names_with_colons_remain_literal() {
         assert_eq!(read(&f.0, Path::new(name), 64).unwrap(), b"literal");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn permissive_role_outputs_rely_on_private_outer_containment() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let fixture = Fixture::new();
+    let path = fixture.leaf("drafts/role.txt");
+    std::fs::write(&path, "synthetic evidence").unwrap();
+    std::fs::set_permissions(
+        path.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        read(&fixture.0, Path::new("drafts/role.txt"), 100).unwrap(),
+        b"synthetic evidence"
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+    std::fs::set_permissions(&fixture.0, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(check_containment(&fixture.0, Path::new("drafts/role.txt")).is_err());
+    std::fs::set_permissions(&fixture.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(check_containment(&fixture.0, Path::new("drafts/role.txt")).is_ok());
+}

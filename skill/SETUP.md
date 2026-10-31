@@ -7,17 +7,30 @@ intent or authorization.
 
 | Value | Required meaning |
 | --- | --- |
-| `SKILL_DIR` | Absolute directory containing this file and its linked guides. |
+| `SKILL_DIR` | Resolved absolute directory containing this file and its linked guides, with no symlink components. `identity` refuses linked paths. |
 | `TARGET` | Canonical absolute path to the authorized local repository. |
 | `OUTPUT_DIR` | Private run directory outside `TARGET`, including after symlink resolution. All reports, ledger entries, proof drafts, logs, and retained proof artifacts belong here. Runner-managed ephemeral scratch must also remain outside the target. |
 | `SOURCE_REF` | Exact source commit, plus a recorded worktree diff identity if reviewing uncommitted changes. Never silently mix revisions. |
 
 Read `VERSION` beside this file. Resolve `OMGS_BIN` in this order: `omgs` on PATH, then
 `${OMGS_HOME}/bin/omgs` when `OMGS_HOME` is set (Windows: `%OMGS_HOME%\bin\omgs.exe`), then
-`$HOME/.local/share/omgs/bin/omgs` (Windows: `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`). Run
-only `--version` on an existing installation and require the exact string `omgs <VERSION>`. On
+`$HOME/.local/share/omgs/bin/omgs` (Windows: `%USERPROFILE%\.local\share\omgs\bin\omgs.exe`).
+Run only `--version` on an existing installation and require the exact string `omgs <VERSION>`. On
 mismatch, stop and report both versions clearly. Do not continue a review with a mismatched binary
 or silently replace it.
+
+Version alone cannot detect same-version skew. After the version matches, `identity` is the next
+allowed command. Before review, run
+`"<OMGS_BIN>" identity --skill-dir "<SKILL_DIR>"`. Require success and retain its JSON with the
+run notes: `build_revision` is the full build commit (with `+dirty` for local tracked edits), and
+`bundled_skill_sha256` identifies every packaged file, including paths, using `omgs-skill/1`.
+Any missing, extra or changed file fails the comparison. Stop on mismatch, report the selected and
+bundled digests, and obtain matching release artifacts through the consent flow. Never bypass a
+mismatch with version equality. Repeat this check after any consented installation or refresh.
+Pass `--skill-dir "<SKILL_DIR>"` on `review`, `audit init` and `batch init`, or export
+`OMGS_SKILL_DIR` to that absolute directory so the check runs before clone or initialization.
+Without an external selection, those commands use the binary's bundled skill. `--version` keeps
+its exact compatibility format; `identity` exposes the stronger identity without network access.
 
 After the exact version match passes (including after a consented first installation), run
 `"<OMGS_BIN>" update-check` once per run at setup, before the review starts. This check only
@@ -98,3 +111,24 @@ At a terminal, `omgs setup` offers skill installation, a live MXC deny test and 
 policy. Review its consent prompt before accepting these steps. For explicit headless flags and
 replacement rules, read [POLICY-AND-GATE.md](POLICY-AND-GATE.md#base-policy-gate-and-setup).
 Run `omgs doctor --live` before a proof recipe to check runtime reachability inside MXC.
+
+### Review bundle selection
+
+`review`, `batch init` and `audit init` bind one exact bundle before review work. An explicit
+`--skill-dir` takes precedence over `OMGS_SKILL_DIR`; either must match the binary's bundled digest.
+Without either, the binary materializes its embedded bundle in owner-private storage under
+`OMGS_HOME/skill-bundles/<digest>` (the default data directory applies when unset). Run metadata
+and the handoff brief record the absolute directory and exact identity. Load `SKILL.md`, guides and
+role briefs from that directory, even when an older same-version skill is already installed.
+A modified cache fails identity validation rather than being silently replaced.
+
+OMGS treats missing paths differing only by case, or ambiguous Unicode spellings of missing
+components, as possibly the same location and refuses overlap. Existing aliases are compared by
+filesystem identity, including case and Unicode normalization aliases on filesystems that support
+them. Choose clearly distinct locations for the cache, stores, clone root, targets and run output
+when an overlap is refused.
+
+For source archives, packaging may supply a full commit SHA with `OMGS_BUILD_REVISION` or a
+`BUILD-REVISION` file at the source root. Plain source builds without metadata report
+`unknown revision`. Release artifact verification always requires an exact commit revision and
+matching bundle digest; unknown revision builds cannot pass release verification.

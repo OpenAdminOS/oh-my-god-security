@@ -9,8 +9,14 @@ verify.
 
 ## Allowed reads
 
-Read [the full pipeline](../PIPELINE.md), [execution safety](../EXECUTION-SAFETY.md) and [the proof
-contract](../PROOF-CONTRACT.md) before the assigned phase.
+Read the pipeline [preamble](../PIPELINE.md#the-pipeline-multi-agent-by-default),
+[Challenge](../PIPELINE.md#challenge), [Prove](../PIPELINE.md#prove),
+[progress](../PIPELINE.md#required-progress-at-every-transition) and
+[required reading matrix](../PIPELINE.md#required-reading-by-role), plus all of
+[execution safety](../EXECUTION-SAFETY.md) and the authoritative
+[proof contract](../PROOF-CONTRACT.md). Read the matching [recipe](../PROOF-RECIPES.md).
+Read [validation](../VALIDATION-AND-REPORTING.md).
+Read each required section once in this context; re-read if its bundle identity changes.
 
 Receive only the structured candidate claim contract in SKILL_DIR/schemas/candidates.schema.json,
 relevant source, trusted intent and runner proof artifacts. Do not receive hunter scratch reasoning,

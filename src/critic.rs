@@ -278,7 +278,7 @@ pub fn critique_run(dir: &Path) -> Result<CriticReport, String> {
 
 /// Caller holds the run lock until the diagnostic is emitted.
 pub fn critique_run_locked(dir: &Path) -> Result<CriticReport, String> {
-    published_report(crate::review::View::load_locked(dir)?)
+    published_report(crate::review::View::load_strict_locked(dir)?)
 }
 
 /// Critique exactly the supplied findings through the publication view.

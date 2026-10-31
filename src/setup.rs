@@ -27,6 +27,114 @@ pub fn detected(home: &Path) -> Vec<PathBuf> {
 // lookup is used for the default installation.
 include!(concat!(env!("OUT_DIR"), "/skill.rs"));
 
+/// SHA-256 over sorted UTF-8 relative paths and bytes, with u64 big-endian
+/// lengths and a domain separator. Modes and timestamps do not affect identity.
+fn digest<'a>(files: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> String {
+    let mut files: Vec<_> = files.into_iter().collect();
+    files.sort_by_key(|(path, _)| *path);
+    let mut hash = crate::sha256::Sha256::new();
+    hash.update(b"omgs-skill/1\0");
+    for (path, bytes) in files {
+        hash.update(&(path.len() as u64).to_be_bytes());
+        hash.update(path.as_bytes());
+        hash.update(&(bytes.len() as u64).to_be_bytes());
+        hash.update(bytes);
+    }
+    crate::sha256::hex(&hash.finish())
+}
+
+pub fn bundled_digest() -> String {
+    digest(BUNDLED.iter().copied())
+}
+
+pub fn check_identity(root: &Path) -> Result<String, String> {
+    let files = manifest(root)?;
+    check_manifest_identity(root, &files)
+}
+
+fn check_manifest_identity(
+    root: &Path,
+    files: &std::collections::BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<String, String> {
+    let names: Vec<_> = files
+        .keys()
+        .map(|p| {
+            p.components()
+                .map(|c| c.as_os_str().to_str().expect("validated UTF-8"))
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect();
+    let actual = digest(
+        names
+            .iter()
+            .zip(files.values())
+            .map(|(p, b)| (p.as_str(), b.as_slice())),
+    );
+    let expected = bundled_digest();
+    if actual != expected {
+        return Err(format!("skill identity mismatch at {}: selected sha256 {actual}, bundled sha256 {expected}, binary revision {}; stop and use matching release artifacts", root.display(), env!("OMGS_BUILD_REVISION")));
+    }
+    Ok(actual)
+}
+
+pub fn identity() -> serde_json::Value {
+    let text = ARTIFACT_IDENTITY
+        .strip_prefix("OMGS_IDENTITY_V1:")
+        .unwrap()
+        .strip_suffix(":OMGS_IDENTITY_END")
+        .unwrap();
+    serde_json::from_str(text).expect("build-generated identity")
+}
+
+/// Materialize the embedded bundle in admitted owner-private storage.
+pub fn materialize(root: &Path) -> Result<PathBuf, String> {
+    materialize_selected(root, None)
+}
+
+/// Snapshot an external selection before validation and publish only those
+/// validated bytes. Never point a review at mutable external storage or replace
+/// an existing cache tree: a changed cache is an identity error.
+pub fn materialize_selected(root: &Path, from: Option<&Path>) -> Result<PathBuf, String> {
+    let files = match from {
+        Some(from) => {
+            let files = manifest(from)?;
+            check_manifest_identity(from, &files)?;
+            files
+        }
+        None => BUNDLED
+            .iter()
+            .map(|(name, bytes)| (PathBuf::from(name), bytes.to_vec()))
+            .collect(),
+    };
+    let parent = root.parent().ok_or("bundle cache needs a parent")?;
+    crate::platform::create_private_tree(parent).map_err(|e| e.to_string())?;
+    crate::runmeta::with_lock_file(&parent.join(".bundle.lock"), || {
+        if !root.exists() {
+            let nonce = crate::platform::random_nonce().map_err(|e| e.to_string())?;
+            let staged = parent.join(format!(".bundle-stage-{nonce}"));
+            crate::platform::create_private_dir_new(&staged).map_err(|e| e.to_string())?;
+            let publish = || -> Result<(), String> {
+                for (name, bytes) in &files {
+                    let path = staged.join(name);
+                    crate::platform::create_private_tree(path.parent().unwrap())
+                        .map_err(|e| e.to_string())?;
+                    crate::platform::write_private_new(&path, bytes).map_err(|e| e.to_string())?;
+                }
+                check_identity(&staged)?;
+                std::fs::rename(&staged, root).map_err(|e| e.to_string())
+            };
+            if let Err(error) = publish() {
+                let _ = std::fs::remove_dir_all(&staged);
+                return Err(error);
+            }
+        }
+        crate::platform::check_private_dir(root).map_err(|e| e.to_string())?;
+        check_identity(root)?;
+        std::fs::canonicalize(root).map_err(|e| e.to_string())
+    })
+}
+
 fn unlinked(path: &Path) -> Result<(), String> {
     for parent in path.ancestors() {
         match std::fs::symlink_metadata(parent) {

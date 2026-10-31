@@ -29,3 +29,26 @@ specified; `timed_out`, `killed`, `interrupted` and `executor_error` false; and 
 Cleanliness is necessary but does not prove the semantic assertion or production impact.
 `timeout_ms` is the inner execution timeout; the outer wall clock adds 15000 ms for executor
 startup and cleanup. This allowance is not extra target execution time.
+
+## Assertion and replay requirements
+
+Every non-rejected `test_proven` or `sandbox_exploited` record needs its named test or harness
+failing
+on the target with an assertion (inner exit 1 or 3 through 125 without a contract); a rejected
+control without a contract can also exit 0. Exit 2 is always rejected as a harness or usage
+error. A recipe contract requires exit 1 and both nonce-qualified marker flags, and neither may
+rest on a missing command (126, 127) or a signal. The command must include the full `--test`
+path or its file name as a token. Runner-generated start and end markers catch accidents such as
+executor failure, truncation and timeout. They cannot establish integrity against a hostile
+target: the per-run nonce is visible to sandboxed code, so a target can print a forged end
+marker. They also cannot prove that the named test executed. Replay and the independent evaluator
+remain the stronger check. Missing start indicates an executor error unless the run was killed or
+interrupted; missing end means incomplete execution. Timeout, signal death and executor errors
+are recorded separately. During adjudication the evaluator replays every proof it upholds with
+`omgs prove --run OUTPUT_DIR --replay <n>` and independently checks that
+the real target and intended assertion executed. Replay requires the recorded `timeout_ms` and
+rejects `--timeout-ms` overrides, consumes one proof-run budget unit, checks the marker-derived
+inner exit code and cleanliness, and refuses if either the target commit or the digest of the
+copied target tree (including all `.git` content and dirty changes) differs from the original
+snapshot; a replay that is NOT reproduced overturns the tier and recomputes identities with `omgs
+fingerprint` after any semantic change, so records are final before adjudication.

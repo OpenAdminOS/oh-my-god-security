@@ -447,5 +447,5 @@ first publication. Writable archives receive a lock file. For read-only archives
 establish lock files before freezing the archive; an archive without an enforceable
 lock is refused rather than treated as an immutable snapshot.
 
-Redaction output regressions run in the normal test suite. The separate timing
-check runs only with `cargo test --lib redaction_performance -- --ignored --test-threads=1`.
+Redaction output regressions run in the normal test suite. The ignored
+`redaction_performance` timing check runs separately with one test thread.

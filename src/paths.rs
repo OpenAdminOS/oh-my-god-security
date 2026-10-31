@@ -3,6 +3,89 @@
 use serde::Serialize;
 use std::path::{Component, Path};
 
+/// A physical overlap check without probe writes. Existing components use OS
+/// identity, so case, normalization, symlinks and junctions cannot hide ancestry.
+/// Missing components can alias only below the same existing directory. ASCII
+/// spellings are folded there; non-ASCII spellings are conservatively ambiguous
+/// without a filesystem-specific normalization oracle.
+pub fn overlaps(left: &Path, right: &Path) -> Result<bool, String> {
+    struct Location {
+        ancestors: Vec<(u64, u64)>,
+        missing: Vec<std::ffi::OsString>,
+    }
+    fn locate(path: &Path) -> Result<Location, String> {
+        let absolute = std::path::absolute(path).map_err(|e| e.to_string())?;
+        let mut existing = absolute.as_path();
+        let mut missing = Vec::new();
+        loop {
+            match std::fs::metadata(existing) {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let name = existing.file_name().ok_or_else(|| {
+                        format!(
+                            "cannot resolve {}; use a path without '..' after a missing directory",
+                            path.display()
+                        )
+                    })?;
+                    missing.push(name.to_os_string());
+                    existing = existing.parent().ok_or("path has no existing ancestor")?;
+                }
+                Err(e) => return Err(format!("inspect {}: {e}", existing.display())),
+            }
+        }
+        let existing = std::fs::canonicalize(existing).map_err(|e| e.to_string())?;
+        if !missing.is_empty() && !existing.is_dir() {
+            return Err(format!("{} is not a directory", existing.display()));
+        }
+        let ancestors = existing
+            .ancestors()
+            .map(identity)
+            .collect::<Result<_, _>>()?;
+        missing.reverse();
+        Ok(Location { ancestors, missing })
+    }
+    fn identity(path: &Path) -> Result<(u64, u64), String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+            Ok((meta.dev(), meta.ino()))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(0x0200_0000)
+                .open(path)
+                .map_err(|e| e.to_string())?;
+            crate::platform::windows_file_identity(&file)
+                .map(|(volume, index)| (u64::from(volume), index))
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err("filesystem identity unavailable".into())
+        }
+    }
+    let a = locate(left)?;
+    let b = locate(right)?;
+    if a.missing.is_empty() && b.ancestors.contains(&a.ancestors[0])
+        || b.missing.is_empty() && a.ancestors.contains(&b.ancestors[0])
+    {
+        return Ok(true);
+    }
+    if a.ancestors[0] != b.ancestors[0] {
+        // A missing entry cannot alias an entry that an OS lookup found.
+        return Ok(false);
+    }
+    Ok(a.missing.iter().zip(&b.missing).all(|(a, b)| {
+        let a = a.as_encoded_bytes();
+        let b = b.as_encoded_bytes();
+        a.eq_ignore_ascii_case(b) || !a.is_ascii() || !b.is_ascii()
+    }))
+}
+
 /// Render native separators only. Escape literal backslashes and percent signs
 /// in components so a Unix filename cannot become a different display path.
 pub fn display(path: &Path) -> String {
@@ -164,4 +247,120 @@ fn conventional_test_suffix(file: &str) -> bool {
                     && prefix.chars().last().is_some_and(|c| c.is_lowercase()))
         })
     })
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::overlaps;
+    use std::path::{Path, PathBuf};
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            let path = crate::platform::temp_root().unwrap().join(format!(
+                "omgs-overlap-{}",
+                crate::platform::random_nonce().unwrap()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+        fn check(&self, a: &str, b: &str, expected: bool) {
+            let a = self.0.join(a);
+            let b = self.0.join(b);
+            assert_eq!(overlaps(&a, &b).unwrap(), expected, "{a:?} {b:?}");
+            assert_eq!(overlaps(&b, &a).unwrap(), expected, "{b:?} {a:?}");
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_suffixes_compare_only_under_the_same_physical_parent() {
+        let f = Fixture::new();
+        for (a, b, expected) in [
+            ("cache", "CACHE", true),
+            ("cache/run", "CACHE", true),
+            ("cache", "CACHE/run", true),
+            ("cache", "cache-other", false),
+            ("cache/a", "CACHE/b", false),
+            ("Ä/a", "ä/A/run", true),
+            ("é/run", "e\u{301}/RUN", true),
+            ("é/a", "e\u{301}/b", false),
+            ("cache/é", "elsewhere/é", false),
+        ] {
+            f.check(a, b, expected);
+        }
+        for name in ["left", "right"] {
+            std::fs::create_dir(f.0.join(name)).unwrap();
+        }
+        f.check("left", "right", false);
+        f.check("left/missing", "right/MISSING", false);
+        std::fs::create_dir(f.0.join("cache")).unwrap();
+        f.check("cache", "cache/run", true);
+        f.check("cache/a", "cache/b", false);
+        // Lookup found cache, so a genuinely missing sibling is not an alias.
+        f.check("cache", "other", false);
+        if !f.0.join("CACHE").exists() {
+            f.check("cache", "CACHE/run", false);
+            std::fs::create_dir(f.0.join("CACHE")).unwrap();
+            f.check("cache", "CACHE", false);
+            f.check("cache/run", "CACHE/run", false);
+        }
+    }
+
+    #[test]
+    fn existing_aliases_use_filesystem_identity_and_ancestor_chains() {
+        let f = Fixture::new();
+        for (name, alias) in [("Repo", "repo"), ("Ä", "ä"), ("é", "e\u{301}")] {
+            let dir = f.0.join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::create_dir(dir.join("child")).unwrap();
+            f.check(name, &format!("{name}/child/run"), true);
+            if f.0.join(alias).exists() {
+                f.check(name, alias, true);
+                f.check(name, &format!("{alias}/child/run"), true);
+                f.check(
+                    &format!("{name}/missing"),
+                    &format!("{alias}/MISSING/run"),
+                    true,
+                );
+            }
+        }
+        std::fs::write(f.0.join("file"), "fixture").unwrap();
+        std::fs::hard_link(f.0.join("file"), f.0.join("hardlink")).unwrap();
+        f.check("file", "hardlink", true);
+        assert!(overlaps(&f.0.join("file/child"), &f.0).is_err());
+        // Unix refuses '..' after a missing directory. Win32 path parsing
+        // removes it lexically before the filesystem sees it, which is exact
+        // there because a missing component cannot be a link.
+        #[cfg(unix)]
+        assert!(overlaps(&f.0.join("missing/../other"), &f.0).is_err());
+        #[cfg(windows)]
+        assert!(overlaps(&f.0.join("missing/../other"), &f.0).unwrap());
+    }
+
+    #[test]
+    fn linked_ancestors_resolve_before_missing_suffixes() {
+        let f = Fixture::new();
+        let real = f.0.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = f.0.join("alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(windows)]
+        assert!(std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .status()
+            .unwrap()
+            .success());
+        f.check("alias", "real", true);
+        f.check("alias/missing/run", "real/MISSING", true);
+        f.check("alias/missing", "real/distinct", false);
+        assert!(overlaps(Path::new(&link), &real).unwrap());
+    }
 }

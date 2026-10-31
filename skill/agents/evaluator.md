@@ -9,8 +9,14 @@ hunting and verification and must not have authored the records you judge.
 
 ## Allowed reads
 
-Read [the full pipeline](../PIPELINE.md), [execution safety](../EXECUTION-SAFETY.md) and [the proof
-contract](../PROOF-CONTRACT.md) before the assigned phase.
+Read the pipeline [preamble](../PIPELINE.md#the-pipeline-multi-agent-by-default),
+[Adjudicate](../PIPELINE.md#adjudicate), [Prove](../PIPELINE.md#prove),
+[progress](../PIPELINE.md#required-progress-at-every-transition) and
+[required reading matrix](../PIPELINE.md#required-reading-by-role), plus all of
+[execution safety](../EXECUTION-SAFETY.md) and the authoritative
+[proof contract](../PROOF-CONTRACT.md). Read the matching [recipe](../PROOF-RECIPES.md).
+Read [validation](../VALIDATION-AND-REPORTING.md).
+Read each required section once in this context; re-read if its bundle identity changes.
 
 Read finalized records, structured candidate claims, relevant source, trusted intent, ledger and all
 retained proof artifacts. Do not use hunter confidence or private reasoning as evidence.

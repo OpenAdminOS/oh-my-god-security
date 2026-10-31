@@ -2313,6 +2313,12 @@ fn malformed_review_artifacts_allow_failed_status_and_safe_dashboard() {
             "{name}: {}",
             String::from_utf8_lossy(&result.stderr)
         );
+        let diagnostic = cli(&run, &["critic"]);
+        assert_eq!(
+            diagnostic.status.code(),
+            Some(2),
+            "{name}: malformed review input must remain a diagnostic error"
+        );
         let view = omgs::review::View::load(&run.0).unwrap();
         assert!(!view.complete());
         assert!(

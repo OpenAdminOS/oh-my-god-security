@@ -350,6 +350,7 @@ jobs:
           set -euo pipefail
           mkdir -p release
           find staging -type f \( -name 'omgs-*' -o -name 'mxc-*' -o -name MXC-LICENSE.txt \) -exec cp {} release/ \;
+          python3 packaging/verify_identity.py '${{ needs.prepare.outputs.sha }}' skill release/omgs-*
           python3 packaging/release.py packages '${{ needs.prepare.outputs.version }}' release packaging/generated
           cp packaging/generated/* release/
           cp RELEASE-NOTES.md release/
