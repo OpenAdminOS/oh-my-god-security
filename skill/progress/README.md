@@ -27,8 +27,8 @@ foreign Host headers, and exits shortly after `omgs report` marks the run comple
 requests need the per-run token from the URL fragment (`#token=...`) in an `X-OMGS-Token` header,
 so other local users, other accounts' processes and web pages cannot read it. The dashboard drops
 the fragment from the address bar after reading it. Keep the printed URL in your own session and
-never write it to shared files. The served status is a fixed projection: known step names,
-states, times, counts and fixed sentences. Stage details, custom labels, log messages and finding
+never write it to shared files. The served status is a fixed projection: the run directory name,
+known step names, states, times, counts and fixed sentences. Stage details, custom labels, log messages and finding
 or lead titles stay in the run directory and never reach the page. The server
 itself never opens a browser. Never bind a non-loopback interface or serve the run directory with a
 generic file server.

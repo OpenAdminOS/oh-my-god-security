@@ -69,10 +69,10 @@ status until watch exits. Anyone who obtains the full URL can read the status me
 in the person's own session: never write watch output or the URL to files, logs, run artifacts or
 shared locations, never paste it into reports, and never share it. Browsers never send the fragment
 to the server or in referrers, and the dashboard removes it from the address bar after reading it.
-The page shows only known step names, states, times, counts and fixed sentences; `--detail`,
-custom labels, `--log` messages and finding or lead titles stay in the run directory. Never bind
-a non-loopback interface or serve the run directory with a generic file server. The page and its
-status schema live in [progress/](progress/).
+The page shows only the run directory name, known step names, states, times, counts and fixed
+sentences; `--detail`, custom labels, `--log` messages and finding or lead titles stay in the run
+directory. Never bind a non-loopback interface or serve the run directory with a generic file
+server. The page and its status schema live in [progress/](progress/).
 
 ## Attempt history and incomplete publication
 
