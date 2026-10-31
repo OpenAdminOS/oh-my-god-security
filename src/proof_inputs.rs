@@ -320,7 +320,7 @@ fn check_entry_count(count: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn admit_entry(count: &mut usize) -> Result<(), String> {
+pub(crate) fn admit_entry(count: &mut usize) -> Result<(), String> {
     check_entry_count(*count + 1)?;
     *count += 1;
     Ok(())
@@ -401,6 +401,7 @@ pub fn manifest_to(
 fn descriptor(root: &Path, selection: Option<Selection>) -> Result<Manifest, String> {
     if let Some(s) = &selection {
         s.validate()?;
+        verify_selection(root, s)?;
     }
     let mut count = 0;
     // Count first so the canonical header precedes entries. No content is retained.
@@ -414,18 +415,86 @@ fn descriptor(root: &Path, selection: Option<Selection>) -> Result<Manifest, Str
     })
 }
 
+/// Require the literal directory-entry spelling, never a filesystem alias.
+/// Also used on the completed workspace: every selected component must occur
+/// exactly once, and none may have become a link during materialization.
+pub(crate) fn verify_selection(root: &Path, selection: &Selection) -> Result<(), String> {
+    for selected in &selection.paths {
+        let mut dir = root.to_path_buf();
+        for part in selected.split('/') {
+            let mut matches = 0;
+            let mut count = 0;
+            for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
+                admit_entry(&mut count)?;
+                if entry.file_name() == std::ffi::OsStr::new(part) {
+                    matches += 1;
+                }
+            }
+            if matches != 1 {
+                return Err(format!(
+                    "selected input must match exactly one directory entry with exact spelling: {selected}"
+                ));
+            }
+            dir.push(part);
+            let meta = std::fs::symlink_metadata(&dir).map_err(|e| e.to_string())?;
+            if crate::platform::is_link(&meta) || (!meta.is_dir() && !meta.is_file()) {
+                return Err("selected input must be a file or directory without links".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 // Fixed-size sorted batches avoid collecting an arbitrarily wide directory.
 // The admitted path length also bounds recursion depth. Order is component-wise.
-fn children(
+pub(crate) fn children(
     dir: &Path,
+    visit: impl FnMut(std::fs::DirEntry) -> Result<(), String>,
+) -> Result<(), String> {
+    children_with_limit(dir, MAX_ENTRIES, visit)
+}
+
+fn children_with_limit(
+    dir: &Path,
+    limit: usize,
     mut visit: impl FnMut(std::fs::DirEntry) -> Result<(), String>,
 ) -> Result<(), String> {
+    sorted_children(dir, limit, &mut 0, |entry, _| visit(entry))
+}
+
+/// Charge all siblings on the first scan, before retaining any names. Rescans
+/// do not charge the same siblings twice; recursion shares the traversal budget.
+pub(crate) fn children_budgeted(
+    dir: &Path,
+    count: &mut usize,
+    visit: impl FnMut(std::fs::DirEntry, &mut usize) -> Result<(), String>,
+) -> Result<(), String> {
+    sorted_children(dir, MAX_ENTRIES, count, visit)
+}
+
+fn sorted_children(
+    dir: &Path,
+    limit: usize,
+    count: &mut usize,
+    mut visit: impl FnMut(std::fs::DirEntry, &mut usize) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut first_scan = true;
     let mut after = None;
     loop {
         let mut batch = std::collections::BTreeMap::new();
+        let mut scanned = 0;
         for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
+            scanned += 1;
+            if scanned > limit {
+                return Err(format!("execution input directory exceeds {limit} entries"));
+            }
             crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
+            if first_scan {
+                admit_entry(count)?;
+            }
             let name = entry
                 .file_name()
                 .into_string()
@@ -443,9 +512,10 @@ fn children(
         if batch.is_empty() {
             return Ok(());
         }
+        first_scan = false;
         after = batch.last_key_value().map(|(name, _)| name.clone());
         for (_, entry) in batch {
-            visit(entry)?;
+            visit(entry, count)?;
         }
     }
 }
@@ -990,6 +1060,57 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .ends_with(".tmp")));
+        std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn directory_scan_budget_is_checked_before_visiting_or_retaining_all_names() {
+        let d = scratch("scan-budget");
+        for i in 0..257 {
+            std::fs::write(d.join(format!("p{i:04}")), b"").unwrap();
+        }
+        let mut visited = 0;
+        let error = children_with_limit(&d, 256, |_| {
+            visited += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.contains("exceeds 256 entries"));
+        assert_eq!(visited, 0, "reject the oversized first scan before copying");
+        children_with_limit(&d, 257, |_| {
+            visited += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, 257, "rescan batches must visit each name once");
+        std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn selection_checks_exact_components_and_missing_materialized_paths() {
+        let d = scratch("selection-spelling");
+        std::fs::create_dir(d.join("Source")).unwrap();
+        std::fs::write(d.join("Source/Entry"), b"synthetic").unwrap();
+        for path in ["source/Entry", "Source/entry", "Source/missing"] {
+            let selection = Selection {
+                version: 1,
+                paths: vec![path.into()],
+            };
+            let error = manifest(&d, Some(selection)).unwrap_err();
+            assert!(
+                error.contains("exactly one directory entry with exact spelling"),
+                "{error}"
+            );
+        }
+        let selection = Selection {
+            version: 1,
+            paths: vec!["Source/Entry".into()],
+        };
+        let copy = d.join("copy");
+        std::fs::create_dir_all(copy.join("Source")).unwrap();
+        assert!(verify_selection(&copy, &selection).is_err());
+        std::fs::write(copy.join("Source/Entry"), b"synthetic").unwrap();
+        verify_selection(&copy, &selection).unwrap();
         std::fs::remove_dir_all(d.parent().unwrap()).unwrap();
     }
 

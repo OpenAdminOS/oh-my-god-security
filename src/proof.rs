@@ -1668,22 +1668,26 @@ pub fn prepare_harness(dir: &Path, test: &str) -> Result<PreparedHarness, String
         p: &mut PreparedHarness,
         total: &mut usize,
     ) -> Result<(), String> {
-        let mut entries = std::fs::read_dir(dir)
+        if dir
+            .strip_prefix(root)
             .map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        if entries.is_empty() {
-            return Err("harness directories cannot be empty".into());
-        }
-        if entries.len() > 256
-            || dir
-                .strip_prefix(root)
-                .map_err(|e| e.to_string())?
-                .components()
-                .count()
-                > 32
+            .components()
+            .count()
+            > 32
         {
             return Err("harness directory exceeds entry or depth limit".into());
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+            crate::supervise::check_interrupted().map_err(|e| e.to_string())?;
+            let entry = entry.map_err(|e| e.to_string())?;
+            if entries.len() == 256 {
+                return Err("harness directory exceeds entry or depth limit".into());
+            }
+            entries.push(entry);
+        }
+        if entries.is_empty() {
+            return Err("harness directories cannot be empty".into());
         }
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
@@ -1920,6 +1924,30 @@ fn audit_errors(record: &ProofRecord) -> Vec<String> {
 #[cfg(test)]
 mod input_regressions {
     use super::*;
+
+    #[test]
+    fn harness_rejects_child_257_before_inspecting_children() {
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-harness-width-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        // Empty children would fail traversal. At 257 entries the width
+        // refusal must take precedence, before inspecting any child's content.
+        for n in 0..256 {
+            std::fs::create_dir(d.join(format!("child{n:03}"))).unwrap();
+        }
+        assert!(prepare_harness(&d, "main.sh")
+            .err()
+            .unwrap()
+            .contains("empty"));
+        std::fs::create_dir(d.join("child256")).unwrap();
+        assert!(prepare_harness(&d, "main.sh")
+            .err()
+            .unwrap()
+            .contains("entry or depth limit"));
+        std::fs::remove_dir_all(d).unwrap();
+    }
 
     #[test]
     fn old_schema_is_refused_before_validation_or_replay() {

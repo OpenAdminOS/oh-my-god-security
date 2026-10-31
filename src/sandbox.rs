@@ -836,10 +836,25 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
 
 const MAX_SPECIAL_PATHS: usize = 20;
 
+#[derive(Default)]
+struct PathSummary {
+    count: usize,
+    paths: Vec<PathBuf>,
+}
+
+impl PathSummary {
+    fn push(&mut self, path: PathBuf) {
+        self.count += 1;
+        self.paths.push(path);
+        self.paths.sort();
+        self.paths.truncate(MAX_SPECIAL_PATHS);
+    }
+}
+
 fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
     let mut gaps = Vec::new();
-    let mut special_paths = Vec::new();
-    let mut links = Vec::new();
+    let mut special_paths = PathSummary::default();
+    let mut links = 0;
     let mut outside_links = 0;
     let root = std::fs::canonicalize(src).map_err(|e| e.to_string())?;
     inspect_target(
@@ -848,11 +863,12 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
         &mut special_paths,
         &mut links,
         &mut outside_links,
+        &mut 0,
     )?;
-    special_paths.sort();
-    let specials = special_paths.len();
+    let specials = special_paths.count;
     gaps.extend(
         special_paths
+            .paths
             .iter()
             .take(MAX_SPECIAL_PATHS)
             .map(|path| format!("skipped target socket or FIFO: {}", path.display())),
@@ -873,9 +889,9 @@ fn copy_tree_with_gaps(src: &Path, dst: &Path) -> Result<Vec<String>, String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
     set_input_permissions(dst, root_mode())?;
     let roots = (root, dst.to_path_buf());
-    copy_recursive(&roots.0, dst, &roots, None)?;
+    copy_recursive(&roots.0, dst, &roots, None, &mut 0)?;
     set_input_permissions(dst, root_mode())?;
-    record_live_links(&roots.0, dst, &links, &mut gaps);
+    record_live_links(&roots.0, dst, dst, &mut PathSummary::default(), &mut gaps)?;
     Ok(gaps)
 }
 
@@ -887,6 +903,7 @@ fn copy_selected(
     selection: &crate::proof_inputs::Selection,
 ) -> Result<Vec<String>, String> {
     selection.validate()?;
+    crate::proof_inputs::verify_selection(root, selection)?;
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     set_input_permissions(dst, root_mode())?;
     let mut paths = selection.paths.clone();
@@ -897,7 +914,8 @@ fn copy_selected(
         paths.push(".git".into());
     }
     paths.sort();
-    let mut specials = Vec::new();
+    let mut specials = PathSummary::default();
+    let mut inspected = 0;
     for rel in &paths {
         let mut from = root.to_path_buf();
         for part in Path::new(rel) {
@@ -912,10 +930,17 @@ fn copy_selected(
             return Err("selected input must be a file or directory".into());
         }
         if meta.is_dir() {
-            let mut links = Vec::new();
+            let mut links = 0;
             let mut outside = 0;
-            inspect_target(root, &from, &mut specials, &mut links, &mut outside)?;
-            if !links.is_empty() {
+            inspect_target(
+                root,
+                &from,
+                &mut specials,
+                &mut links,
+                &mut outside,
+                &mut inspected,
+            )?;
+            if links != 0 {
                 return Err("scoped inputs cannot contain links".into());
             }
         }
@@ -933,18 +958,20 @@ fn copy_selected(
         dst,
         &(root.to_path_buf(), dst.to_path_buf()),
         Some(&selection),
+        &mut 0,
     )?;
+    crate::proof_inputs::verify_selection(dst, &selection)?;
     set_input_permissions(dst, root_mode())?;
-    specials.sort();
     let mut gaps: Vec<_> = specials
+        .paths
         .iter()
         .take(MAX_SPECIAL_PATHS)
         .map(|p| format!("skipped target socket or FIFO: {}", p.display()))
         .collect();
-    if specials.len() > MAX_SPECIAL_PATHS {
+    if specials.count > MAX_SPECIAL_PATHS {
         gaps.push(format!(
             "skipped {} additional target sockets or FIFOs",
-            specials.len() - MAX_SPECIAL_PATHS
+            specials.count - MAX_SPECIAL_PATHS
         ));
     }
     Ok(gaps)
@@ -985,13 +1012,15 @@ fn set_input_permissions(path: &Path, mode: u32) -> Result<(), String> {
 fn inspect_target(
     root: &Path,
     dir: &Path,
-    specials: &mut Vec<PathBuf>,
-    links: &mut Vec<PathBuf>,
+    specials: &mut PathSummary,
+    links: &mut usize,
     outside_links: &mut usize,
+    count: &mut usize,
 ) -> Result<(), String> {
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         supervise::check_interrupted().map_err(|e| e.to_string())?;
         let entry = entry.map_err(|e| e.to_string())?;
+        crate::proof_inputs::admit_entry(count)?;
         let path = entry.path();
         let relative = path.strip_prefix(root).map_err(|e| e.to_string())?;
         let name = relative
@@ -1002,20 +1031,14 @@ fn inspect_target(
         let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
         if platform::is_link(&meta) {
             crate::proof_inputs::admit_link(&entry.path())?;
-            links.push(
-                entry
-                    .path()
-                    .strip_prefix(root)
-                    .map_err(|e| e.to_string())?
-                    .to_path_buf(),
-            );
+            *links += 1;
             if !std::fs::canonicalize(entry.path()).is_ok_and(|p| p.starts_with(root)) {
                 *outside_links += 1;
             }
             continue;
         }
         if meta.is_dir() {
-            inspect_target(root, &entry.path(), specials, links, outside_links)?;
+            inspect_target(root, &entry.path(), specials, links, outside_links, count)?;
         } else if platform::contentless(&meta) {
             specials.push(
                 entry
@@ -1034,26 +1057,42 @@ fn inspect_target(
     Ok(())
 }
 
-fn record_live_links(root: &Path, dst: &Path, links: &[PathBuf], gaps: &mut Vec<String>) {
+fn record_live_links(
+    root: &Path,
+    dst: &Path,
+    dir: &Path,
+    live: &mut PathSummary,
+    gaps: &mut Vec<String>,
+) -> Result<(), String> {
     if cfg!(unix) {
-        let mut live: Vec<_> = links
-            .iter()
-            .filter(|rel| std::fs::canonicalize(dst.join(rel)).is_ok_and(|p| p.starts_with(root)))
-            .collect();
-        live.sort();
-        for rel in live.iter().take(MAX_SPECIAL_PATHS) {
-            gaps.push(format!(
-                "target link reaches live target from workspace: {}",
-                rel.display()
-            ));
-        }
-        if live.len() > MAX_SPECIAL_PATHS {
-            gaps.push(format!(
-                "{} additional target links reach live target from workspace",
-                live.len() - MAX_SPECIAL_PATHS
-            ));
+        crate::proof_inputs::children(dir, |entry| {
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+            if platform::is_link(&meta) {
+                if std::fs::canonicalize(&path).is_ok_and(|p| p.starts_with(root)) {
+                    live.push(path.strip_prefix(dst).map_err(|e| e.to_string())?.into());
+                }
+            } else if meta.is_dir() {
+                record_live_links(root, dst, &path, live, gaps)?;
+            }
+            Ok(())
+        })?;
+        if dir == dst {
+            for rel in &live.paths {
+                gaps.push(format!(
+                    "target link reaches live target from workspace: {}",
+                    rel.display()
+                ));
+            }
+            if live.count > MAX_SPECIAL_PATHS {
+                gaps.push(format!(
+                    "{} additional target links reach live target from workspace",
+                    live.count - MAX_SPECIAL_PATHS
+                ));
+            }
         }
     }
+    Ok(())
 }
 
 /// `roots` is (canonical source root, destination root) of the whole copy.
@@ -1062,13 +1101,9 @@ fn copy_recursive(
     dst: &Path,
     roots: &(PathBuf, PathBuf),
     selection: Option<&crate::proof_inputs::Selection>,
+    count: &mut usize,
 ) -> Result<(), String> {
-    let mut entries = std::fs::read_dir(src)
-        .map_err(|e| format!("read {}: {e}", src.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
+    crate::proof_inputs::children_budgeted(src, count, |entry, count| {
         supervise::check_interrupted().map_err(|e| e.to_string())?;
         let path = entry.path();
         let rel = path.strip_prefix(&roots.0).map_err(|e| e.to_string())?;
@@ -1083,7 +1118,7 @@ fn copy_recursive(
                     || name.starts_with(&format!("{p}/"))
             })
         }) {
-            continue;
+            return Ok(());
         }
         crate::proof_inputs::safe_path(&name)?;
         let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
@@ -1096,7 +1131,7 @@ fn copy_recursive(
             copy_link(&path, &to)?;
         } else if meta.is_dir() {
             create_staging_dir(&to).map_err(|e| e.to_string())?;
-            copy_recursive(&path, &to, roots, selection)?;
+            copy_recursive(&path, &to, roots, selection, count)?;
             set_input_permissions(&to, crate::proof_inputs::mode(&meta))?;
         } else if meta.is_file() {
             // stage_file uses create_new and dense writes, with no clone/copy
@@ -1133,8 +1168,8 @@ fn copy_recursive(
                 path.display()
             ));
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 // Linux creates symlinks as 0777 regardless of umask. macOS filters their
@@ -1404,6 +1439,7 @@ fn stage_workspace(
     nonce: &str,
 ) -> Result<StagedWorkspace, String> {
     let mut gaps = Vec::new();
+    let mut source_before = None;
     if let Some(target) = &req.target {
         let target = std::fs::canonicalize(target).map_err(|e| format!("target: {e}"))?;
         if !target.is_dir() {
@@ -1412,6 +1448,15 @@ fn stage_workspace(
         if workspace.starts_with(&target) {
             return Err("the proof directory must be outside the target tree".into());
         }
+        if target.join(".git").is_file()
+            || std::fs::symlink_metadata(target.join(".git")).is_ok_and(|m| platform::is_link(&m))
+        {
+            return Err(
+                "external Git directories are not execution inputs; use a standalone checkout"
+                    .into(),
+            );
+        }
+        source_before = Some(crate::proof_inputs::manifest(&target, req.inputs.clone())?);
         eprintln!(
             "proof inputs: copy started ({})",
             if req.inputs.is_some() {
@@ -1421,14 +1466,6 @@ fn stage_workspace(
             }
         );
         let started = std::time::Instant::now();
-        if target.join(".git").is_file()
-            || std::fs::symlink_metadata(target.join(".git")).is_ok_and(|m| platform::is_link(&m))
-        {
-            return Err(
-                "external Git directories are not execution inputs; use a standalone checkout"
-                    .into(),
-            );
-        }
         gaps = match &req.inputs {
             Some(selection) => copy_selected(&target, workspace, selection)?,
             None => copy_tree_with_gaps(&target, workspace)?,
@@ -1471,6 +1508,16 @@ fn stage_workspace(
         manifest.as_ref().map(|m| m.count).unwrap_or(0),
         started.elapsed().as_millis()
     );
+    if let Some(target) = &req.target {
+        let source_after = crate::proof_inputs::manifest(target, req.inputs.clone())
+            .map_err(|e| format!("target changed during staging: {e}"))?;
+        if source_before.as_ref() != Some(&source_after) || manifest.as_ref() != Some(&source_after)
+        {
+            return Err(
+                "target changed during staging; refusing to execute inconsistent inputs".into(),
+            );
+        }
+    }
     if req
         .expected_tree_sha256
         .as_ref()
@@ -2433,6 +2480,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn selected_copy_is_batched_exact_and_charges_omitted_siblings_before_copying() {
+        let d = crate::platform::temp_root().unwrap().join(format!(
+            "omgs-selected-width-{}",
+            crate::platform::random_nonce().unwrap()
+        ));
+        let src = d.join("source");
+        std::fs::create_dir_all(src.join("selected/nested")).unwrap();
+        for n in (0..300).rev() {
+            std::fs::write(src.join(format!("selected/nested/p{n:04}")), b"synthetic").unwrap();
+            std::fs::write(src.join(format!("omitted{n:04}")), b"omitted").unwrap();
+        }
+        let selection = crate::proof_inputs::Selection {
+            version: 1,
+            paths: vec!["selected".into()],
+        };
+        let dst = d.join("copy");
+        copy_selected(&src, &dst, &selection).unwrap();
+        assert_eq!(
+            crate::proof_inputs::manifest(&src, Some(selection.clone())).unwrap(),
+            crate::proof_inputs::manifest(&dst, Some(selection.clone())).unwrap()
+        );
+        assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(dst.join("selected/nested"))
+                .unwrap()
+                .count(),
+            300
+        );
+        let capped = d.join("capped");
+        std::fs::create_dir(&capped).unwrap();
+        let mut count = crate::proof_inputs::MAX_ENTRIES - 1;
+        let error = copy_recursive(
+            &src,
+            &capped,
+            &(src.clone(), capped.clone()),
+            Some(&selection),
+            &mut count,
+        )
+        .unwrap_err();
+        assert!(error.contains("exceeds"));
+        assert_eq!(count, crate::proof_inputs::MAX_ENTRIES);
+        assert_eq!(std::fs::read_dir(&capped).unwrap().count(), 0);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn fresh_staging_normalizes_hardlinks_sparse_files_and_special_modes() {
@@ -2867,7 +2960,7 @@ mod tests {
             std::os::unix::fs::symlink(root.join("file"), copy.join(link)).unwrap();
         }
         let mut gaps = Vec::new();
-        record_live_links(&root, &copy, &links, &mut gaps);
+        record_live_links(&root, &copy, &copy, &mut PathSummary::default(), &mut gaps).unwrap();
         assert_eq!(gaps.len(), 21);
         assert!(gaps[0].ends_with("link-00"));
         assert!(gaps[19].ends_with("link-19"));

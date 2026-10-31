@@ -3244,3 +3244,143 @@ fn directory_harness_cannot_replace_target_source_or_omitted_target_source() {
     }
     std::fs::remove_dir_all(d).unwrap();
 }
+
+#[test]
+fn selected_filesystem_aliases_are_refused_before_execution() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("selection-aliases");
+    let target = d.join("target");
+    std::fs::create_dir_all(target.join("Source")).unwrap();
+    std::fs::write(target.join("Source/Entry"), b"synthetic").unwrap();
+    std::fs::create_dir(target.join("unicode")).unwrap();
+    std::fs::write(target.join("unicode/caf\u{e9}"), b"synthetic").unwrap();
+    // Enumerate the actual spelling: macOS may expose decomposed names even
+    // when the file was created with composed text. Linux and Windows need
+    // the same exact-byte contract regardless of lookup behavior.
+    let actual = std::fs::read_dir(target.join("unicode"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name()
+        .into_string()
+        .unwrap();
+    let alias = if actual == "caf\u{e9}" {
+        "cafe\u{301}"
+    } else {
+        "caf\u{e9}"
+    };
+    let selection = d.join("selection.json");
+    for path in [
+        "source/Entry".to_string(),
+        "Source/entry".to_string(),
+        format!("unicode/{alias}"),
+    ] {
+        std::fs::write(
+            &selection,
+            serde_json::json!({"version": 1, "paths": [path]}).to_string(),
+        )
+        .unwrap();
+        let out = omgs(
+            &d,
+            &[
+                "prove",
+                "--target",
+                target.to_str().unwrap(),
+                "--inputs-from",
+                selection.to_str().unwrap(),
+                "--cmd",
+                "echo ALIAS_WORKLOAD_RAN",
+            ],
+        );
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(
+            text(&out).contains("exactly one directory entry with exact spelling"),
+            "{}",
+            text(&out)
+        );
+        assert!(!text(&out).contains("ALIAS_WORKLOAD_RAN"), "{}", text(&out));
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[test]
+fn concurrent_source_change_during_copy_refuses_a_mixed_snapshot() {
+    if !mxc_ready() {
+        return;
+    }
+    let d = scratch("source-changes-during-copy");
+    let target = d.join("target");
+    let run = d.join("run");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("a"), b"0").unwrap();
+    std::fs::write(target.join("z"), b"0").unwrap();
+    // A bounded-memory fixture creates a long enough copy window for the
+    // writer to observe real staging, after the initial source hash.
+    std::fs::File::create(target.join("middle"))
+        .unwrap()
+        .set_len(64 << 20)
+        .unwrap();
+    omgs::platform::private_dir(&run).unwrap();
+    write_private_fixture(
+        run.join(omgs::runmeta::FILE),
+        serde_json::json!({"target": target}).to_string(),
+    )
+    .unwrap();
+    let source = target.clone();
+    let workspace = run.join("proofs/1/workspace");
+    let writer = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(45) {
+            if std::fs::metadata(workspace.join("middle"))
+                .is_ok_and(|m| m.len() > 0 && m.len() < 64 << 20)
+            {
+                let first = std::fs::read(workspace.join("a")).unwrap();
+                let last_absent = !workspace.join("z").exists();
+                // Source states are (0,0), (1,0), (1,1). The copy has
+                // already retained a=0 and will subsequently read z=1.
+                std::fs::write(source.join("a"), b"1").unwrap();
+                std::fs::write(source.join("z"), b"1").unwrap();
+                return (first, last_absent);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("did not observe the active copy window");
+    });
+    let out = omgs(
+        &d,
+        &[
+            "prove",
+            "--run",
+            run.to_str().unwrap(),
+            "--timeout-ms",
+            "120000",
+            "--cmd",
+            "echo MIXED_WORKLOAD_RAN",
+        ],
+    );
+    let (first, last_absent) = writer.join().unwrap();
+    assert_eq!(first, b"0");
+    assert!(
+        last_absent,
+        "mutation must happen before the second input is copied"
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("target changed during staging"),
+        "{}",
+        text(&out)
+    );
+    assert!(!text(&out).contains("MIXED_WORKLOAD_RAN"), "{}", text(&out));
+    assert!(
+        !run.join("proofs/1.json").exists(),
+        "no clean proof may be published"
+    );
+    assert!(
+        !run.join("proofs/1/workspace").exists(),
+        "blocked workspace must be removed"
+    );
+    std::fs::remove_dir_all(d).unwrap();
+}

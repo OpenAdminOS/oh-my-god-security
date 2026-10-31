@@ -87,8 +87,12 @@ For a smaller immutable input boundary, pass `--inputs-from SELECTION.json`, con
 `{"version":1,"paths":["src/decision.rs","Cargo.toml"]}`. Paths can name files or directories.
 Everything else is absent from the workspace, except root `.git`, which is always included.
 Selections allow 1 to 256 canonical relative non-overlapping paths; scoped trees cannot contain
-links. Include the actual decision code, enforcement chain, configuration and required local
-dependencies. Omitted dependencies must block the proof, never be replaced with fabricated
+links. Every component must exactly match one enumerated on-disk directory entry, including
+case and Unicode normalization bytes. Filesystem lookup aliases are refused even if the host
+resolves them successfully. After copying, every selected path, including automatically included
+root Git metadata, must again be present exactly once under its exact spelling. Include the actual
+decision code, enforcement chain, configuration and required local dependencies. Omitted
+dependencies must block the proof, never be replaced with fabricated
 security behavior. Disclose the selection and challenge its sufficiency during evaluation.
 Target names containing backslashes or colons are refused with the canonical relative path
 error before copying, including on Unix. Git indexes are normalized during fresh create-new
@@ -112,8 +116,11 @@ bytes written; a changed entry count aborts publication. A separately computed i
 still match when republished. No full entry list, JSON value, string or serialized manifest
 buffer is retained. Directory traversal retains
 at most 256 sorted children per active directory level and rescans wide directories in
-batches. The 1024-byte canonical path limit bounds recursion depth. Git index normalization
-still uses its separate 16 MiB bound.
+batches, including during workspace copying. Every enumerated sibling is charged against the
+2,000,000 entry traversal budget before selection filtering; each directory scan also refuses
+entry 2,000,001 before retaining its name. Gap diagnostics retain only the first 20 sorted paths
+and aggregate counts. The 1024-byte canonical path limit bounds recursion depth. Git index
+normalization still uses its separate 16 MiB bound.
 
 Validation and replay recompute the target or staged workspace digest and compare it with
 the proof record. They do not open the retained manifest to decide reproduction. Only mismatch
@@ -125,13 +132,21 @@ allocating another entry. Diagnostics stop at the first divergent entry, reporti
 two paths. Diagnostic failures cannot allow reproduction. Copy and hash phases report elapsed
 time and entry count.
 Each execution receives a fresh disposable copy; no mutable workspace cache is reused.
+Before copying, OMGS streams the source identity. After copying, it streams both the staged
+identity and a fresh source identity. All three must agree before any target execution, including
+for a fresh proof. A mismatch or failed source recheck refuses execution with
+`target changed during staging`; no proof record is emitted. This detects concurrent changes
+that would otherwise combine files into a state absent from the source. It is a comparison
+boundary, not an atomic filesystem snapshot or a lock against writers that restore prior bytes.
 
 `--test-from` accepts a regular file or a directory outside the target. A directory's files are
 mapped beneath the parent of `--test`, and must include that test's basename. For example,
 `--test checks/main.swift --test-from DRAFT_DIR` stages `DRAFT_DIR/main.swift` at
 `checks/main.swift` and `DRAFT_DIR/stubs.swift` at `checks/stubs.swift`. Directory harnesses retain
 at most 128 regular files and 16 MiB total, with canonical relative paths, per-file hashes and
-modes. Links, special files, empty directories, and paths deeper than 32 directories are refused.
+modes. Each harness directory retains at most 256 child names and refuses immediately when
+child 257 is enumerated, before reading child contents. Links, special files, empty directories,
+and paths deeper than 32 directories are refused.
 Before staging any file, all destinations are checked against both the copied workspace and
 the original target, including omitted input paths. Existing file, directory or link destinations
 are rejected. Existing directory ancestors are allowed only under their exact names, without

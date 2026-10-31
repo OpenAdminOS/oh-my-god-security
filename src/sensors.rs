@@ -820,7 +820,9 @@ mod offline_tests {
     #[test]
     fn occurrence_process_fixture() {
         if let Ok(record) = std::env::var(OCCURRENCE_FIXTURE_ENV) {
-            println!("OCCURRENCE_RECORD:{record}");
+            // Serial libtest prints its status prefix before the test body.
+            // Start a separate line so the parent can parse either test mode.
+            println!("\nOCCURRENCE_RECORD:{record}");
         }
     }
 
@@ -893,6 +895,7 @@ mod offline_tests {
                         ])
                         .env("OMGS_HOME", &home)
                         .env("RUSTUP_AUTO_INSTALL", "0")
+                        .env("RUST_TEST_THREADS", "1")
                         .env(OCCURRENCE_FIXTURE_ENV, item.to_string())
                         .output()
                         .unwrap();
