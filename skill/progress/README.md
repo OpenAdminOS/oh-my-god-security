@@ -23,7 +23,11 @@ for opener commands and the full consent flow. To serve the view:
 
 It binds 127.0.0.1 on an ephemeral port and prints the URL, serves only this page and
 `pipeline-status.json` (never findings, reports, or anything else in the run directory), rejects
-foreign Host headers, and exits shortly after `omgs report` marks the run complete. The server
+foreign Host headers, and exits shortly after `omgs report` marks the run complete. Status
+requests need the per-run token from the URL fragment (`#token=...`) in an `X-OMGS-Token` header,
+so other local users, other accounts' processes and web pages cannot read it. The dashboard drops
+the fragment from the address bar after reading it. Keep the printed URL in your own session and
+never write it to shared files. The status never quotes finding or lead titles. The server
 itself never opens a browser. Never bind a non-loopback interface or serve the run directory with a
 generic file server.
 

@@ -274,17 +274,36 @@ fn watch_routes_and_host_rules() {
         r#"{"stages":[],"updated_ms":5}"#,
     )
     .unwrap();
-    write_private_fixture(dir.join("findings.json"), r#"{"findings":[]}"#).unwrap();
+    write_private_fixture(
+        dir.join("findings.json"),
+        r#"{"findings":[{"fingerprint":"omgs-0000000000000001","title":"Synthetic secret title","verdict":"needs_validation","proof_tier":"traced","attack_class":"missing_authz","entry_point":"GET /x","sink":"db.x","boundary":"tenant","location":{"path":"a","line":1},"evidence":"Synthetic evidence.","hunted_by":"red-1"}]}"#,
+    )
+    .unwrap();
     let req = |line: &str, host: &str| format!("{line}\r\nHost: {host}\r\n\r\n");
-    let r = respond(&req("GET / HTTP/1.1", "127.0.0.1:4000"), 4000, &dir);
+    let r = respond(&req("GET / HTTP/1.1", "127.0.0.1:4000"), 4000, "t0k", &dir);
     assert_eq!(r.status, 200);
     assert!(String::from_utf8_lossy(&r.body).contains("pipeline-status.json"));
-    let r = respond(
-        &req("GET /pipeline-status.json?_=1 HTTP/1.1", "localhost:4000"),
-        4000,
-        &dir,
-    );
+    let status = |token_headers: &str| {
+        respond(
+            &format!("GET /pipeline-status.json?_=1 HTTP/1.1\r\nHost: localhost:4000\r\n{token_headers}\r\n"),
+            4000,
+            "t0k",
+            &dir,
+        )
+    };
+    // Status needs exactly one matching per-run token header.
+    for headers in [
+        "",
+        "X-OMGS-Token: wrong\r\n",
+        "X-OMGS-Token: t0\r\n",
+        "X-OMGS-Token: t0k\r\nX-OMGS-Token: t0k\r\n",
+    ] {
+        assert_eq!(status(headers).status, 403, "{headers:?}");
+    }
+    let r = status("x-omgs-token: t0k\r\n");
     assert_eq!(r.status, 200);
+    // The status never quotes finding or candidate titles.
+    assert!(!String::from_utf8_lossy(&r.body).contains("Synthetic secret title"));
     let progress: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
     assert_eq!(progress["updated_ms"], 5);
     assert_eq!(progress["review_complete"], false);
@@ -297,29 +316,34 @@ fn watch_routes_and_host_rules() {
         let r = respond(
             &req(&format!("GET {path} HTTP/1.1"), "127.0.0.1:4000"),
             4000,
+            "t0k",
             &dir,
         );
         assert_eq!(r.status, 404, "{path}");
     }
     assert_eq!(
-        respond(&req("POST / HTTP/1.1", "127.0.0.1:4000"), 4000, &dir).status,
+        respond(&req("POST / HTTP/1.1", "127.0.0.1:4000"), 4000, "t0k", &dir).status,
         405
     );
     for host in ["evil.example:4000", "127.0.0.1:4001", "127.0.0.1"] {
         assert_eq!(
-            respond(&req("GET / HTTP/1.1", host), 4000, &dir).status,
+            respond(&req("GET / HTTP/1.1", host), 4000, "t0k", &dir).status,
             403,
             "{host}"
         );
     }
     assert_eq!(
-        respond("GET / HTTP/1.1\r\n\r\n", 4000, &dir).status,
+        respond("GET / HTTP/1.1\r\n\r\n", 4000, "t0k", &dir).status,
         403,
         "no Host"
     );
     let two = "GET / HTTP/1.1\r\nHost: 127.0.0.1:4000\r\nHost: evil.example\r\n\r\n";
-    assert_eq!(respond(two, 4000, &dir).status, 403, "duplicate Host");
-    assert_eq!(respond("garbage\r\n\r\n", 4000, &dir).status, 400);
+    assert_eq!(
+        respond(two, 4000, "t0k", &dir).status,
+        403,
+        "duplicate Host"
+    );
+    assert_eq!(respond("garbage\r\n\r\n", 4000, "t0k", &dir).status, 400);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -332,16 +356,23 @@ fn watch_serves_loopback_and_stops_when_the_run_completes() {
         r#"{"run_status":"in_progress"}"#,
     )
     .unwrap();
-    let (listener, port) = omgs::watch::bind().unwrap();
+    let (listener, port, token) = omgs::watch::bind().unwrap();
+    let served_token = token.clone();
     assert!(listener.local_addr().unwrap().ip().is_loopback());
     let d = dir.clone();
     let server = std::thread::spawn(move || {
-        omgs::watch::serve(listener, port, &d, std::time::Duration::from_secs(60))
+        omgs::watch::serve(
+            listener,
+            port,
+            &served_token,
+            &d,
+            std::time::Duration::from_secs(60),
+        )
     });
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     write!(
         s,
-        "GET /pipeline-status.json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        "GET /pipeline-status.json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-OMGS-Token: {token}\r\n\r\n"
     )
     .unwrap();
     let mut resp = String::new();
@@ -806,11 +837,18 @@ fn a_trickling_client_cannot_hold_the_watch_server() {
         r#"{"run_status":"in_progress"}"#,
     )
     .unwrap();
-    let (listener, port) = omgs::watch::bind().unwrap();
+    let (listener, port, token) = omgs::watch::bind().unwrap();
+    let served_token = token.clone();
     let d = dir.clone();
     let start = std::time::Instant::now();
     let server = std::thread::spawn(move || {
-        omgs::watch::serve(listener, port, &d, std::time::Duration::from_millis(300))
+        omgs::watch::serve(
+            listener,
+            port,
+            &served_token,
+            &d,
+            std::time::Duration::from_millis(300),
+        )
     });
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     let writer = std::thread::spawn(move || {
@@ -1069,17 +1107,24 @@ fn a_slow_response_reader_cannot_hold_the_watch_server() {
         "x".repeat(900_000)
     );
     write_private_fixture(dir.join("pipeline-status.json"), big).unwrap();
-    let (listener, port) = omgs::watch::bind().unwrap();
+    let (listener, port, token) = omgs::watch::bind().unwrap();
+    let served_token = token.clone();
     let d = dir.clone();
     let start = std::time::Instant::now();
     let server = std::thread::spawn(move || {
-        omgs::watch::serve(listener, port, &d, std::time::Duration::from_millis(300))
+        omgs::watch::serve(
+            listener,
+            port,
+            &served_token,
+            &d,
+            std::time::Duration::from_millis(300),
+        )
     });
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     use std::io::Write;
     write!(
         s,
-        "GET /pipeline-status.json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        "GET /pipeline-status.json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-OMGS-Token: {token}\r\n\r\n"
     )
     .unwrap();
     // Never read the response.
@@ -1449,12 +1494,13 @@ fn watch_never_serves_a_linked_or_special_status_file() {
     write_private_fixture(dir.join("findings.json"), "SECRET FINDING").unwrap();
     std::os::unix::fs::symlink(dir.join("findings.json"), dir.join("pipeline-status.json"))
         .unwrap();
-    let req = "GET /pipeline-status.json HTTP/1.1\r\nHost: 127.0.0.1:4000\r\n\r\n";
-    let r = omgs::watch::respond(req, 4000, &dir);
+    let req =
+        "GET /pipeline-status.json HTTP/1.1\r\nHost: 127.0.0.1:4000\r\nX-OMGS-Token: t0k\r\n\r\n";
+    let r = omgs::watch::respond(req, 4000, "t0k", &dir);
     assert!(!String::from_utf8_lossy(&r.body).contains("SECRET"));
     std::fs::remove_file(dir.join("pipeline-status.json")).unwrap();
     std::fs::hard_link(dir.join("findings.json"), dir.join("pipeline-status.json")).unwrap();
-    let r = omgs::watch::respond(req, 4000, &dir);
+    let r = omgs::watch::respond(req, 4000, "t0k", &dir);
     assert!(
         !String::from_utf8_lossy(&r.body).contains("SECRET"),
         "hardlink"
@@ -1463,7 +1509,7 @@ fn watch_never_serves_a_linked_or_special_status_file() {
     let fifo = std::ffi::CString::new(dir.join("pipeline-status.json").to_str().unwrap()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     let start = std::time::Instant::now();
-    let r = omgs::watch::respond(req, 4000, &dir);
+    let r = omgs::watch::respond(req, 4000, "t0k", &dir);
     assert!(
         start.elapsed() < std::time::Duration::from_secs(1),
         "FIFO must not block"

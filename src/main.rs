@@ -3951,13 +3951,14 @@ fn cmd_watch(args: &[String]) -> Result<(), String> {
         Some(v) => v.parse().map_err(|_| "--max-ms needs a whole number")?,
         None => 4 * 60 * 60 * 1000,
     };
-    let (listener, port) = omgs::watch::bind()?;
+    let (listener, port, token) = omgs::watch::bind()?;
     omgs::out::line(&format!(
-        "progress: http://127.0.0.1:{port}/ (loopback only; stops when the run completes)"
+        "progress: http://127.0.0.1:{port}/#token={token} (loopback only; the token is for you alone; stops when the run completes)"
     ));
     omgs::watch::serve(
         listener,
         port,
+        &token,
         &run,
         std::time::Duration::from_millis(max_ms),
     );

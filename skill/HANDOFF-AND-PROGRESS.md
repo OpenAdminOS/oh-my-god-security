@@ -54,17 +54,23 @@ consent as yes. Continue the review without a browser if the user says no or doe
 headless or non-interactive session, do not open a browser.
 
 After an explicit yes in an interactive session, start `omgs watch --run OUTPUT_DIR` in the
-background at Initialize, capture and print its loopback URL, then open that exact printed URL
-with the default browser using the OS opener: `open "$URL"` on macOS, `xdg-open "$URL"` on Linux,
-or `start "" "%URL%"` from Windows cmd (the empty argument is the window title). Do not guess a
-port. If watch or the opener fails, report the reason and continue the review. Without yes, starting
-watch in the background and printing its URL remains allowed, but never open a browser without
-that explicit yes. Ask only once per run; an unanswered prompt must not stall the review.
+background at Initialize, read its loopback URL from the command's own output, then open that exact
+URL with the default browser using the OS opener: `open "$URL"` on macOS, `xdg-open "$URL"` on
+Linux, or `start "" "%URL%"` from Windows cmd (the empty argument is the window title). Do not guess
+a port. If watch or the opener fails, report the reason and continue the review. Without yes,
+starting watch in the background and printing its URL remains allowed, but never open a browser
+without that explicit yes. Ask only once per run; an unanswered prompt must not stall the review.
 
 Watch binds `127.0.0.1` on an ephemeral port, serves just the dashboard and `pipeline-status.json`
 (never findings or reports), rejects foreign Host headers, and exits on its own shortly after
-`omgs report` marks the run complete. Never bind a non-loopback interface or serve the run directory
-with a generic file server. The page and its status schema live in [progress/](progress/).
+`omgs report` marks the run complete. The printed URL ends in `#token=...`, a fresh per-run
+bearer token that keeps other local users, other accounts' processes and web pages from reading run
+status until watch exits. Anyone who obtains the full URL can read the status meanwhile, so keep it
+in the person's own session: never write watch output or the URL to files, logs, run artifacts or
+shared locations, never paste it into reports, and never share it. Browsers never send the fragment
+to the server or in referrers, and the dashboard removes it from the address bar after reading it.
+The status names no finding or lead titles. Never bind a non-loopback interface or serve the run
+directory with a generic file server. The page and its status schema live in [progress/](progress/).
 
 ## Attempt history and incomplete publication
 
