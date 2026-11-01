@@ -124,6 +124,7 @@ fn main() {
             assert!(!target.join("src/.semgrepignore").exists());
             assert!(!target.join("docs/.SEMGREPIGNORE").exists());
             assert!(!target.join("docs/.semgrepignore").exists());
+            assert!(!target.join("tests/.semgrepignore").exists());
             // Another scanner's ignore file is not this scanner's concern.
             assert!(target.join(".GitLeaksIgnore").exists());
         }

@@ -73,6 +73,8 @@ impl Fixture {
         std::fs::write(target.join("src/.semgrepignore"), "*\n").unwrap();
         // Case variants still resolve as the ignore file on case-insensitive volumes.
         std::fs::write(target.join("docs/.SEMGREPIGNORE"), "*\n").unwrap();
+        // A Unicode fold (U+017F) that case-insensitive APFS resolves as .semgrepignore.
+        std::fs::write(target.join("tests/.\u{17f}emgrepignore"), "*\n").unwrap();
         std::fs::write(target.join(".GitLeaksIgnore"), "fixture\n").unwrap();
         std::fs::write(target.join("vendor/.gitleaksignore"), "fixture\n").unwrap();
         std::fs::write(
@@ -478,6 +480,7 @@ fn semgrep_suppressions_are_disabled_and_skips_are_accountable() {
     assert!(f.target.join(".semgrepignore").exists());
     assert!(f.target.join("src/.semgrepignore").exists());
     assert!(f.target.join("docs/.SEMGREPIGNORE").exists());
+    assert!(f.target.join("tests/.\u{17f}emgrepignore").exists());
     assert!(f.target.join(".GitLeaksIgnore").exists());
 }
 

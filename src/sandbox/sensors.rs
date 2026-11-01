@@ -305,13 +305,23 @@ fn run_in_scratch(
     Ok((output, run.exit_code.ok_or("missing sensor exit status")?))
 }
 
-/// Remove every staged file or directory named like one of `names`,
-/// compared without ASCII case, because a case-insensitive scratch volume
-/// resolves `.SEMGREPIGNORE` as `.semgrepignore`.
+/// Remove every staged file or directory named like one of `names`. Names
+/// are compared without ASCII case, and then each directory is asked for
+/// every name directly, so whatever a case- or normalization-insensitive
+/// scratch volume resolves (such as `.SEMGREPIGNORE` or a Unicode fold) is
+/// removed too. Links are removed, never followed.
 fn remove_ignore_files(dir: &Path, names: &[&str]) -> Result<(), String> {
     if names.is_empty() {
         return Ok(());
     }
+    let remove = |path: &Path, meta: &std::fs::Metadata| {
+        if meta.is_dir() && !platform::is_link(meta) {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        }
+        .map_err(|_| "cannot remove a copied scanner ignore file")
+    };
     for entry in std::fs::read_dir(dir).map_err(|_| "cannot inspect copied ignore files")? {
         let entry = entry.map_err(|_| "cannot inspect copied ignore entry")?;
         let meta = std::fs::symlink_metadata(entry.path())
@@ -321,14 +331,20 @@ fn remove_ignore_files(dir: &Path, names: &[&str]) -> Result<(), String> {
             .to_str()
             .is_some_and(|n| names.iter().any(|i| i.eq_ignore_ascii_case(n)));
         if ignored {
-            if meta.is_dir() && !platform::is_link(&meta) {
-                std::fs::remove_dir_all(entry.path())
-            } else {
-                std::fs::remove_file(entry.path())
-            }
-            .map_err(|_| "cannot remove a copied scanner ignore file")?;
+            remove(&entry.path(), &meta)?;
         } else if meta.is_dir() && !platform::is_link(&meta) {
             remove_ignore_files(&entry.path(), names)?;
+        }
+    }
+    for name in names {
+        let path = dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => remove(&path, &meta)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("cannot inspect copied ignore metadata".into()),
+        }
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return Err("a copied scanner ignore file still resolves after removal".into());
         }
     }
     Ok(())
