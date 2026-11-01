@@ -974,7 +974,8 @@ fn per_verifier_findings_files_merge_into_one() {
         let file = omgs::model::FindingsFile {
             findings: findings.to_vec(),
         };
-        std::fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
+        // Owner-private like every run input; Windows refuses inherited DACLs.
+        omgs::runmeta::write_atomic(&path, &serde_json::to_string(&file).unwrap()).unwrap();
         path
     };
     let a = write("findings-blue-1.json", first);
