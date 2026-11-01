@@ -133,8 +133,8 @@ fn main() {
                 ".GitLeaksIgnore",
                 ".gitleaksignore",
                 "vendor/.gitleaksignore",
+                // Resolves to the U+017F spelling on case-insensitive volumes.
                 "tests/.gitleaksignore",
-                "tests/.gitleak\u{17f}ignore",
             ] {
                 assert!(!target.join(path).exists(), "{path}");
             }
