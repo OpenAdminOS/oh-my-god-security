@@ -121,6 +121,25 @@ pub fn parse(text: &str) -> Result<Evaluation, String> {
     {
         return Err("attempt must be a nonblank string when present".into());
     }
+    // Check `upheld` before serde, which would read `null` as absent and
+    // accept positional arrays or omitted members.
+    for d in v["decisions"].as_array().unwrap() {
+        let Some(upheld) = d.get("upheld") else {
+            continue;
+        };
+        if d.get("decision").and_then(Value::as_str) != Some("uphold") {
+            return Err("upheld is recorded only for an uphold decision".into());
+        }
+        if !upheld.as_object().is_some_and(|o| {
+            ["verdict", "proof_tier", "severity", "proof_ref"]
+                .iter()
+                .all(|k| o.contains_key(*k))
+        }) {
+            return Err(
+                "upheld must be an object with verdict, proof_tier, severity and proof_ref".into(),
+            );
+        }
+    }
     let e: Evaluation = serde_json::from_value(v).map_err(|e| e.to_string())?;
     nonblank(&e.evaluator, "evaluator")?;
     nonblank(&e.source_ref, "source_ref")?;

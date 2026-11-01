@@ -1017,10 +1017,32 @@ fn an_uphold_is_bound_to_what_it_adjudicated() {
     assert_eq!(gaps.len(), 1, "{gaps:?}");
     assert!(gaps[0].contains("proof_ref proofs/1.json; now"), "{gaps:?}");
     // Only an uphold records what it upheld.
-    let mut adjust = evaluation(Some(bound));
+    let mut adjust = evaluation(Some(bound.clone()));
     adjust["decisions"][0]["decision"] = json!("adjust");
     adjust["decisions"][0]["required_changes"] = json!(["lower severity"]);
     assert!(omgs::adjudication::parse(&adjust.to_string())
         .unwrap_err()
         .contains("only for an uphold"));
+    // A null record is still a record, and shapes other than the full object are refused.
+    adjust["decisions"][0]["upheld"] = Value::Null;
+    assert!(omgs::adjudication::parse(&adjust.to_string())
+        .unwrap_err()
+        .contains("only for an uphold"));
+    for shape in [
+        json!(["needs_validation", "traced", null, null]),
+        json!({"verdict":"needs_validation","proof_tier":"traced"}),
+        json!({"verdict":"needs_validation","proof_tier":"traced","severity":null}),
+        Value::Null,
+    ] {
+        let text = evaluation(Some(shape.clone())).to_string();
+        assert!(
+            omgs::adjudication::parse(&text)
+                .unwrap_err()
+                .contains("must be an object"),
+            "{shape}"
+        );
+    }
+    let mut extra = bound;
+    extra["note"] = json!("x");
+    assert!(omgs::adjudication::parse(&evaluation(Some(extra)).to_string()).is_err());
 }
