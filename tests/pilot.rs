@@ -1023,4 +1023,20 @@ fn per_verifier_findings_files_merge_into_one() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(std::fs::read(f.run.join("findings.json")).unwrap(), before);
+    // Inputs that fit alone but not together are refused, leaving the file.
+    let big = |name: &str, salt: &str| {
+        let mut r = first[0].clone();
+        r.entry_point = format!("{} {salt}", r.entry_point);
+        r.fingerprint = omgs::fingerprint(&r.attack_class, &r.entry_point, &r.sink, &r.boundary);
+        r.evidence = "x".repeat(9 << 20);
+        write(name, &[r])
+    };
+    let (e, g) = (
+        big("findings-big-1.json", "one"),
+        big("findings-big-2.json", "two"),
+    );
+    let out = merge(&[&e, &g]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("byte limit"));
+    assert_eq!(std::fs::read(f.run.join("findings.json")).unwrap(), before);
 }

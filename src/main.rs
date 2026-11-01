@@ -518,8 +518,18 @@ fn cmd_findings(args: &[String]) -> Result<(), String> {
                 added += 1;
             }
         }
-        let text = serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?;
-        omgs::runmeta::write_atomic(&target, &format!("{text}\n"))?;
+        let text = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?
+        );
+        if text.len() as u64 > omgs::run_artifact::FINDINGS_BYTES {
+            return Err(format!(
+                "merged findings.json would be {} bytes, over the {} byte limit every reader enforces; nothing was written",
+                text.len(),
+                omgs::run_artifact::FINDINGS_BYTES
+            ));
+        }
+        omgs::runmeta::write_atomic(&target, &text)?;
         omgs::out::line(&format!(
             "merged {added} new finding(s) from {} file(s); findings.json holds {}",
             sources.len(),

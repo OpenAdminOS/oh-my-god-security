@@ -248,10 +248,22 @@ fn coverage_counts(meta: &ReportMeta) -> (usize, usize) {
 /// missing records are skipped; they are reported by proof validation.
 pub fn sandbox_text(run: &std::path::Path, recorded: &str) -> String {
     let mut ran = std::collections::BTreeMap::<String, usize>::new();
-    for n in 1..=10_000u32 {
-        if !crate::proof::record_path(run, n).exists() {
-            break;
-        }
+    // Reservations can leave numbers without a record, so list the directory
+    // for canonical `<n>.json` names instead of stopping at the first gap.
+    let mut numbers: Vec<u32> = std::fs::read_dir(run.join("proofs"))
+        .into_iter()
+        .flatten()
+        .take(100_000)
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let n: u32 = name.to_str()?.strip_suffix(".json")?.parse().ok()?;
+            (crate::proof::reference(n) == format!("proofs/{}", name.to_str()?)).then_some(n)
+        })
+        .collect();
+    numbers.sort_unstable();
+    numbers.truncate(10_000);
+    for n in numbers {
         if let Ok(record) = crate::proof::load(run, &crate::proof::reference(n)) {
             *ran.entry(format!(
                 "MXC {} ({})",
