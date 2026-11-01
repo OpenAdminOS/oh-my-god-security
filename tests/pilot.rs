@@ -240,7 +240,7 @@ fn evaluator_missing_verdict_independence_and_report_limits() {
             .count(),
         findings.findings.len()
     );
-    let decisions: Vec<_> = findings.findings.iter().map(|r| json!({"fingerprint":r.fingerprint,"decision":"uphold","reason":"independent trace","evidence":[],"required_changes":[]})).collect();
+    let decisions: Vec<_> = findings.findings.iter().map(|r| json!({"fingerprint":r.fingerprint,"decision":"uphold","upheld":{"verdict":r.verdict,"proof_tier":r.proof_tier,"severity":r.severity,"proof_ref":r.proof_ref},"reason":"independent trace","evidence":[],"required_changes":[]})).collect();
     f.put("evaluation.json", json!({"evaluator":"red-1","source_ref":source,"decisions":decisions,"gaps":["synthetic transport not tested"]}));
     assert!(omgs::adjudication::check(&f.run, &findings)
         .unwrap()
@@ -267,7 +267,7 @@ fn evaluator_identity_uses_unicode_normalization_and_bounded_reads() {
         r.verified_by = Some("VÉRIFIER".into());
     }
     let source = read(f.run.join("run-metadata.json"))["source_ref"].clone();
-    let decisions: Vec<_> = findings.findings.iter().map(|r| json!({"fingerprint":r.fingerprint,"decision":"uphold","reason":"independent trace","evidence":[],"required_changes":[]})).collect();
+    let decisions: Vec<_> = findings.findings.iter().map(|r| json!({"fingerprint":r.fingerprint,"decision":"uphold","upheld":{"verdict":r.verdict,"proof_tier":r.proof_tier,"severity":r.severity,"proof_ref":r.proof_ref},"reason":"independent trace","evidence":[],"required_changes":[]})).collect();
     let evaluation =
         json!({"evaluator":" vérifier ","source_ref":source,"decisions":decisions,"gaps":[]});
     f.put("evaluation.json", evaluation.clone());
@@ -955,4 +955,72 @@ fn paired_exports_preserve_markdown_when_html_destination_is_a_directory() {
         );
         assert_eq!(std::fs::read_dir(out_dir).unwrap().count(), 2);
     }
+}
+
+// An uphold binds the verdict, tier, severity and proof reference it
+// adjudicated; any later edit to them is a gap until adjudicated again.
+#[test]
+fn an_uphold_is_bound_to_what_it_adjudicated() {
+    let f = Fixture::new();
+    let mut findings =
+        omgs::shape::findings(include_str!("fixtures/report-run/findings.json")).unwrap();
+    findings.findings.truncate(1);
+    findings.findings[0].fingerprint = "omgs-00000000000000aa".into();
+    findings.findings[0].verified_by = Some("blue".into());
+    let r = findings.findings[0].clone();
+    let source = read(f.run.join("run-metadata.json"))["source_ref"].clone();
+    let evaluation = |upheld: Option<Value>| {
+        let mut d = json!({"fingerprint":r.fingerprint,"decision":"uphold","reason":"independent trace","evidence":[],"required_changes":[]});
+        if let Some(u) = upheld {
+            d["upheld"] = u;
+        }
+        json!({"evaluator":"independent","source_ref":source,"decisions":[d],"gaps":[]})
+    };
+    let rebind = |findings: &omgs::model::FindingsFile, upheld: Option<Value>| {
+        f.put("evaluation.json", evaluation(upheld));
+        omgs::adjudication::check(&f.run, findings)
+            .unwrap()
+            .into_iter()
+            .filter(|g| g.contains("adjudicate it again"))
+            .collect::<Vec<_>>()
+    };
+    let bound = json!({"verdict":r.verdict,"proof_tier":r.proof_tier,"severity":r.severity,"proof_ref":r.proof_ref});
+    assert!(rebind(&findings, Some(bound.clone())).is_empty());
+    let missing = rebind(&findings, None);
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(missing[0].contains("does not record"), "{missing:?}");
+    let edits: [fn(&mut omgs::model::Finding); 3] = [
+        |x| x.verdict = omgs::model::Verdict::Rejected,
+        |x| x.proof_tier = omgs::model::ProofTier::SandboxExploited,
+        |x| x.severity = Some(omgs::model::Severity::Critical),
+    ];
+    let mut checked = 0;
+    for (i, edit) in edits.iter().enumerate() {
+        let mut changed = findings.clone();
+        edit(&mut changed.findings[0]);
+        if serde_json::to_value(&changed.findings[0]).unwrap()
+            == serde_json::to_value(&findings.findings[0]).unwrap()
+        {
+            continue;
+        }
+        let gaps = rebind(&changed, Some(bound.clone()));
+        assert_eq!(gaps.len(), 1, "edit {i}: {gaps:?}");
+        assert!(gaps[0].contains("changed after adjudication"), "{gaps:?}");
+        checked += 1;
+    }
+    assert!(checked >= 2, "{checked}");
+    // A proof reference the finding no longer carries is a change too.
+    assert!(r.proof_ref.is_none());
+    let mut other_proof = bound.clone();
+    other_proof["proof_ref"] = json!("proofs/1.json");
+    let gaps = rebind(&findings, Some(other_proof));
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert!(gaps[0].contains("proof_ref proofs/1.json; now"), "{gaps:?}");
+    // Only an uphold records what it upheld.
+    let mut adjust = evaluation(Some(bound));
+    adjust["decisions"][0]["decision"] = json!("adjust");
+    adjust["decisions"][0]["required_changes"] = json!(["lower severity"]);
+    assert!(omgs::adjudication::parse(&adjust.to_string())
+        .unwrap_err()
+        .contains("only for an uphold"));
 }

@@ -44,6 +44,49 @@
               "type": "string",
               "minLength": 1
             }
+          },
+          "upheld": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "verdict": {
+                "enum": [
+                  "confirmed",
+                  "needs_validation",
+                  "rejected"
+                ]
+              },
+              "proof_tier": {
+                "enum": [
+                  "traced",
+                  "test_proven",
+                  "sandbox_exploited"
+                ]
+              },
+              "severity": {
+                "enum": [
+                  "critical",
+                  "high",
+                  "medium",
+                  "low",
+                  "informational",
+                  null
+                ]
+              },
+              "proof_ref": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1
+              }
+            },
+            "required": [
+              "verdict",
+              "proof_tier",
+              "severity",
+              "proof_ref"
+            ]
           }
         },
         "required": [
@@ -70,6 +113,27 @@
                 "required_changes": {
                   "minItems": 1
                 }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "decision": {
+                  "const": "uphold"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "upheld"
+              ]
+            },
+            "else": {
+              "not": {
+                "required": [
+                  "upheld"
+                ]
               }
             }
           }
