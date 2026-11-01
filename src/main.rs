@@ -464,27 +464,30 @@ fn cmd_findings(args: &[String]) -> Result<(), String> {
     let run = Path::new(&run);
     omgs::runmeta::with_lock(run, || {
         let target = run.join("findings.json");
-        let mut merged = match omgs::run_artifact::optional_text(
+        // The existing file goes through the same identity and conflict
+        // checks as every input, so a merge never rewrites an invalid file.
+        let mut inputs = Vec::new();
+        if let Some(text) = omgs::run_artifact::optional_text(
             run,
             Path::new("findings.json"),
             omgs::run_artifact::FINDINGS_BYTES,
         )? {
-            Some(text) => omgs::shape::findings(&text)
-                .map_err(|e| format!("parse {}: {e}", target.display()))?,
-            None => omgs::model::FindingsFile::default(),
-        };
-        let mut origin: std::collections::BTreeMap<String, String> = merged
-            .findings
-            .iter()
-            .map(|f| (f.fingerprint.clone(), "findings.json".to_string()))
-            .collect();
-        let mut added = 0;
+            let file = omgs::shape::findings(&text)
+                .map_err(|e| format!("parse {}: {e}", target.display()))?;
+            inputs.push(("findings.json".to_string(), file, false));
+        }
         for source in &sources {
             let text = omgs::run_artifact::text_path(
                 Path::new(source),
                 omgs::run_artifact::FINDINGS_BYTES,
             )?;
             let file = omgs::shape::findings(&text).map_err(|e| format!("parse {source}: {e}"))?;
+            inputs.push((source.clone(), file, true));
+        }
+        let mut merged = omgs::model::FindingsFile::default();
+        let mut origin: std::collections::BTreeMap<String, String> = Default::default();
+        let mut added = 0;
+        for (source, file, incoming) in inputs {
             for finding in file.findings {
                 let expected = omgs::fingerprint(
                     &finding.attack_class,
@@ -515,7 +518,9 @@ fn cmd_findings(args: &[String]) -> Result<(), String> {
                 }
                 origin.insert(finding.fingerprint.clone(), source.clone());
                 merged.findings.push(finding);
-                added += 1;
+                if incoming {
+                    added += 1;
+                }
             }
         }
         let text = format!(

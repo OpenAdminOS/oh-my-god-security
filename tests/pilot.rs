@@ -1040,4 +1040,20 @@ fn per_verifier_findings_files_merge_into_one() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("byte limit"));
     assert_eq!(std::fs::read(f.run.join("findings.json")).unwrap(), before);
+    // The existing file is checked like any input and never rewritten when invalid.
+    let empty = write("findings-empty.json", &[]);
+    let existing = f.run.join("findings.json");
+    for (bad, code) in [(invalid.clone(), 1), ([first, &changed].concat(), 2)] {
+        let file = omgs::model::FindingsFile { findings: bad };
+        omgs::runmeta::write_atomic(&existing, &serde_json::to_string(&file).unwrap()).unwrap();
+        let before = std::fs::read(&existing).unwrap();
+        let out = merge(&[&empty]);
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), before);
+    }
 }
