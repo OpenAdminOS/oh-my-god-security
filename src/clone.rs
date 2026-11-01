@@ -509,7 +509,9 @@ mod tests {
     fn configuration_output_cut_at_the_cap_is_refused() {
         let mut cmd = Command::new("/bin/sh");
         cmd.args(["-c", "head -c 1100000 /dev/zero"]);
-        let err = bounded(cmd, &Deadline::after(10_000), STEP_MS).unwrap_err();
+        // Capturing a megabyte is slow on loaded runners; the step cap is not
+        // under test here, so allow it a generous budget.
+        let err = bounded(cmd, &Deadline::after(120_000), 120_000).unwrap_err();
         assert!(err.contains("exceeded its limit"), "{err}");
     }
 
