@@ -134,6 +134,13 @@ pub fn parse(text: &str) -> Result<Evaluation, String> {
         // {"needs_validation": null} as an enum value, so require strings.
         let text = |v: Option<&Value>| v.is_some_and(Value::is_string);
         let text_or_null = |v: Option<&Value>| v.is_some_and(|v| v.is_string() || v.is_null());
+        if upheld
+            .get("proof_ref")
+            .and_then(Value::as_str)
+            .is_some_and(|r| r.trim().is_empty())
+        {
+            return Err("upheld proof_ref must be null or a nonblank reference".into());
+        }
         if !upheld.as_object().is_some_and(|o| {
             text(o.get("verdict"))
                 && text(o.get("proof_tier"))

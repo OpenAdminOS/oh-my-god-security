@@ -1047,7 +1047,51 @@ fn an_uphold_is_bound_to_what_it_adjudicated() {
             "{shape}"
         );
     }
-    let mut extra = bound;
+    let mut extra = bound.clone();
     extra["note"] = json!("x");
     assert!(omgs::adjudication::parse(&evaluation(Some(extra)).to_string()).is_err());
+    // Enum names must be the published ones, and a proof reference nonblank.
+    let mut wrong = bound.clone();
+    wrong["verdict"] = json!("Confirmed");
+    assert!(omgs::adjudication::parse(&evaluation(Some(wrong)).to_string()).is_err());
+    let mut blank = bound.clone();
+    blank["proof_ref"] = json!(" ");
+    assert!(
+        omgs::adjudication::parse(&evaluation(Some(blank)).to_string())
+            .unwrap_err()
+            .contains("nonblank")
+    );
+    // An overturn carries no record either.
+    let mut overturn = evaluation(Some(bound.clone()));
+    overturn["decisions"][0]["decision"] = json!("overturn");
+    overturn["decisions"][0]["required_changes"] = json!(["reject"]);
+    assert!(omgs::adjudication::parse(&overturn.to_string())
+        .unwrap_err()
+        .contains("only for an uphold"));
+    // The gap reaches the report's evaluator lines.
+    let mut changed = findings.clone();
+    changed.findings[0].severity = Some(omgs::model::Severity::Critical);
+    if serde_json::to_value(&changed.findings[0]).unwrap()
+        == serde_json::to_value(&findings.findings[0]).unwrap()
+    {
+        changed.findings[0].severity = Some(omgs::model::Severity::Low);
+    }
+    f.put("evaluation.json", evaluation(Some(bound)));
+    let lines = omgs::adjudication::report_lines(&f.run, &changed).unwrap();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("changed after adjudication")),
+        "{lines:?}"
+    );
+    // The critic shows every adjudication gap as a review limit.
+    let critic = omgs::critic::critique_dir(&f.run, &changed).unwrap();
+    assert!(
+        critic
+            .gaps
+            .iter()
+            .any(|g| g.starts_with("Adjudication gap: ")),
+        "{:?}",
+        critic.gaps
+    );
 }
