@@ -372,6 +372,17 @@ pub fn partition_errors(ledger: &Ledger) -> Vec<String> {
                     if !["covered", "out_of_scope"].contains(&child.status.as_str()) {
                         errors.push(format!("{}: child '{id}' remains {}", u.id, child.status));
                     }
+                    // A reasoned exclusion (such as tests:excluded) claims no
+                    // class and owns no scope, so it can be listed as a child
+                    // without counting toward class coverage.
+                    if child.status == "out_of_scope"
+                        && child.attack_classes.is_empty()
+                        && !child.extra.contains_key("scope_paths")
+                        && !child.extra.contains_key("child_units")
+                        && child.note.as_deref().is_some_and(|n| !n.trim().is_empty())
+                    {
+                        continue;
+                    }
                     let scopes = child
                         .extra
                         .get("scope_paths")

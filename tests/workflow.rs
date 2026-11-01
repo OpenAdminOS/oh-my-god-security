@@ -721,6 +721,29 @@ fn critic_reports_each_gap_class() {
     ));
 }
 
+// The report's critic line is the same gap list `omgs critic` prints:
+// reconciliation gaps plus review limits, so a clean reconciliation with
+// open evaluator or architecture limits never reads as a pass.
+#[test]
+fn report_critic_line_includes_review_limits() {
+    let (ledger, cands, findings) = complete_run();
+    let meta = ReportMeta {
+        critic: Some(critique(&ledger, 1, &cands, &findings)),
+        review_limits: vec![
+            "Evaluator gap: transport not tested".into(),
+            "architecture unexamined: external IdP".into(),
+        ],
+        ..ReportMeta::default()
+    };
+    let md = render_markdown(&findings, &meta);
+    assert!(!md.contains("Coverage critic: pass"), "{md}");
+    assert!(md.contains("Coverage critic: 2 gap(s)"), "{md}");
+    assert!(md.contains("- Evaluator gap: transport not tested"), "{md}");
+    let html = render_html(&findings, &meta);
+    assert!(html.contains("Coverage critic: 2 gap(s)"));
+    assert!(html.contains("architecture unexamined: external IdP"));
+}
+
 #[test]
 fn report_renders_critic_result() {
     let (ledger, cands, findings) = complete_run();

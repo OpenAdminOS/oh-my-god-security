@@ -243,9 +243,86 @@ fn coverage_counts(meta: &ReportMeta) -> (usize, usize) {
             .count(),
     )
 }
-fn critic_text(meta: &ReportMeta) -> String {
+/// The sandbox line: the recorded run setting, plus the MXC versions and
+/// containment that actually ran this run's proof records. Unreadable or
+/// missing records are skipped; they are reported by proof validation.
+pub fn sandbox_text(run: &std::path::Path, recorded: &str) -> String {
+    let mut ran = std::collections::BTreeMap::<String, usize>::new();
+    // Reservations can leave numbers without a record, so list the directory
+    // for canonical `<n>.json` names instead of stopping at the first gap.
+    let mut numbers: Vec<u32> = std::fs::read_dir(run.join("proofs"))
+        .into_iter()
+        .flatten()
+        .take(100_000)
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let n: u32 = name.to_str()?.strip_suffix(".json")?.parse().ok()?;
+            (crate::proof::reference(n) == format!("proofs/{}", name.to_str()?)).then_some(n)
+        })
+        .collect();
+    numbers.sort_unstable();
+    numbers.truncate(10_000);
+    for n in numbers {
+        if let Ok(record) = crate::proof::load(run, &crate::proof::reference(n)) {
+            *ran.entry(format!(
+                "MXC {} ({})",
+                record.mxc_version, record.containment
+            ))
+            .or_default() += 1;
+        }
+    }
+    if ran.is_empty() {
+        return recorded.to_string();
+    }
+    let used = ran
+        .iter()
+        .map(|(executor, count)| format!("{executor} ran {count} proof record(s)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if recorded == crate::sandbox::REQUIRED_TEXT
+        || recorded == "MXC required; runtime version not recorded"
+    {
+        used
+    } else {
+        format!("{recorded}; {used}")
+    }
+}
+
+/// The gaps `omgs critic` reports for this run: the coverage reconciliation
+/// plus every review limit, or the completion state when both are clean.
+/// The report shows exactly this list so the two never disagree.
+fn critic_gaps(file: &FindingsFile, meta: &ReportMeta) -> Option<Vec<String>> {
+    let critic = meta.critic.as_ref()?;
+    let mut gaps = critic.gaps.clone();
+    for limit in &meta.review_limits {
+        if !gaps.contains(limit) {
+            gaps.push(limit.clone());
+        }
+    }
+    if gaps.is_empty() {
+        gaps.extend(review_state(file, meta));
+    }
+    Some(gaps)
+}
+
+fn critic_text(file: &FindingsFile, meta: &ReportMeta) -> String {
     let (blocked, deferred) = coverage_counts(meta);
-    format!("{}; blocked units: {blocked}; deferred units: {deferred}. Reconciliation does not establish complete coverage", meta.critic.as_ref().map(|c| c.summary()).unwrap_or_else(|| "not run".into()))
+    let summary = match (meta.critic.as_ref(), critic_gaps(file, meta)) {
+        (Some(c), Some(gaps)) => format!(
+            "{} (inspected: {} units, {} candidates, {} findings)",
+            if gaps.is_empty() {
+                "pass".to_string()
+            } else {
+                format!("{} gap(s)", gaps.len())
+            },
+            c.units,
+            c.candidates,
+            c.findings
+        ),
+        _ => "not run".into(),
+    };
+    format!("{summary}; blocked units: {blocked}; deferred units: {deferred}. Reconciliation does not establish complete coverage")
 }
 
 /// One line describing who ran the review and at what cost. Each unrecorded
@@ -411,7 +488,7 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
     out.push_str(&format!(
         "Run: {}\n\nCoverage critic: {}\n\n",
         markdown_inline(&run_meta_text(meta)),
-        markdown_inline(&critic_text(meta))
+        markdown_inline(&critic_text(file, meta))
     ));
     if let Some(models) = models_text(meta) {
         out.push_str(&format!("Models: {}\n\n", markdown_inline(&models)));
@@ -509,9 +586,9 @@ pub fn render_markdown(file: &FindingsFile, meta: &ReportMeta) -> String {
         }
         out.push('\n');
     }
-    if let Some(critic) = meta.critic.as_ref().filter(|c| !c.passed()) {
+    if let Some(gaps) = critic_gaps(file, meta).filter(|g| !g.is_empty()) {
         out.push_str("### Coverage critic gaps\n\n");
-        for gap in &critic.gaps {
+        for gap in &gaps {
             out.push_str(&format!("- {}\n", markdown_inline(gap)));
         }
         out.push('\n');
@@ -1274,18 +1351,18 @@ pub fn render_html(file: &FindingsFile, meta: &ReportMeta) -> String {
         coverage_body =
             format!("<details><summary>Coverage details</summary>{coverage_body}</details>");
     }
-    let critic_body = match &meta.critic {
-        None => format!("<p class=\"note\">Coverage critic: {}.</p>", html_escape(&critic_text(meta))),
-        Some(c) if c.passed() => format!(
+    let critic_body = match critic_gaps(file, meta) {
+        None => format!("<p class=\"note\">Coverage critic: {}.</p>", html_escape(&critic_text(file, meta))),
+        Some(gaps) if gaps.is_empty() => format!(
             "<p class=\"note\">Coverage critic: {}. Every candidate was verified by someone other than its hunter, and every unit was examined or closed with a reason.</p>",
-            html_escape(&critic_text(meta))
+            html_escape(&critic_text(file, meta))
         ),
-        Some(c) => {
+        Some(gaps) => {
             let mut items = format!(
                 "<div class=\"callout c-missing\"><h4>Coverage critic: {}</h4><ul class=\"gaps\">",
-                html_escape(&critic_text(meta))
+                html_escape(&critic_text(file, meta))
             );
-            for gap in &c.gaps {
+            for gap in &gaps {
                 items.push_str(&format!("<li>{}</li>", html_escape(gap)));
             }
             items.push_str("</ul></div>");

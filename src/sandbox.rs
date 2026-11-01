@@ -16,6 +16,9 @@ use std::process::Command;
 
 /// The MXC release the executors below are pinned to.
 pub const MXC_VERSION: &str = "1.0.1";
+/// Run metadata sandbox text written at init, before any proof runs.
+pub const REQUIRED_TEXT: &str =
+    "MXC required for proofs; each proof record names the executor that ran it";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Executor {

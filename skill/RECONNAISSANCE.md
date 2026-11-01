@@ -81,6 +81,12 @@ scope needs a reason; the CLI requires `--note` for all three. Out of scope neve
 units discovered during the run with `omgs ledger add --ledger <run-dir>/coverage-ledger.json --unit
 <id> --surface <s> --classes <a,b>`.
 
+Seeded stack units such as `stack:shell`, `stack:powershell`, `stack:python` and `stack:swift` are
+checklists: before they can close, each class they name needs a bounded child unit (or a reasoned
+`out_of_scope` exclusion of that class). Plan those children during the first mapping pass so no
+extra hunter is needed. A reasoned exclusion unit such as `tests:excluded` may also be listed as a
+child; it owns no scope and never counts toward a class.
+
 Example unit: `GET /api/projects/[id]` by a member of tenant A, tenant A to tenant B project rows,
 `idor_tenant_isolation`, sink `loadProject`, invariant that only current-tenant rows can be
 returned.

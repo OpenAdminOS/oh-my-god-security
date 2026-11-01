@@ -425,3 +425,41 @@ fn permissive_role_outputs_rely_on_private_outer_containment() {
     std::fs::set_permissions(&fixture.0, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert!(check_containment(&fixture.0, Path::new("drafts/role.txt")).is_ok());
 }
+
+// The report's sandbox line names the MXC version and containment that ran
+// the run's proof records instead of the init placeholder.
+#[test]
+fn report_sandbox_line_names_the_executor_that_ran_proofs() {
+    let f = Fixture::new();
+    let placeholder = omgs::sandbox::REQUIRED_TEXT;
+    assert_eq!(omgs::report::sandbox_text(&f.0, placeholder), placeholder);
+    f.leaf("proofs/1.json");
+    for n in 1..=2 {
+        let mut record = proof_record();
+        record.n = n;
+        record.mxc_version = "1.0.1".into();
+        record.containment = "seatbelt".into();
+        omgs::proof::write(&f.0, &record).unwrap();
+    }
+    assert_eq!(
+        omgs::report::sandbox_text(&f.0, placeholder),
+        "MXC 1.0.1 (seatbelt) ran 2 proof record(s)"
+    );
+    assert_eq!(
+        omgs::report::sandbox_text(&f.0, "custom label"),
+        "custom label; MXC 1.0.1 (seatbelt) ran 2 proof record(s)"
+    );
+    // A released reservation leaves a gap; later records still count.
+    std::fs::remove_file(omgs::proof::record_path(&f.0, 1)).unwrap();
+    let mut record = proof_record();
+    record.n = 5;
+    record.mxc_version = "1.0.1".into();
+    record.containment = "seatbelt".into();
+    omgs::proof::write(&f.0, &record).unwrap();
+    std::fs::write(f.0.join("proofs/notes.json"), "{}").unwrap();
+    std::fs::write(f.0.join("proofs/07.json"), "{}").unwrap();
+    assert_eq!(
+        omgs::report::sandbox_text(&f.0, placeholder),
+        "MXC 1.0.1 (seatbelt) ran 2 proof record(s)"
+    );
+}

@@ -34,7 +34,9 @@ every assigned candidate. Only confirmed records carry severity and fix_brief. T
 proof_ref. A rejected claim requires decisive counterevidence. Unknown intent or blocked proof
 remains needs_validation, with exact missing facts, optional library intent_id and a plain language
 intent_question. Proven tiers require the matching clean runner-created proof_ref. Do not fabricate
-proof JSON.
+proof JSON. When the host runs several verifiers in parallel, each writes
+OUTPUT_DIR/findings-VERIFIER.json instead and the host combines them with
+`omgs findings merge --run OUTPUT_DIR --from FILE...`; never edit another verifier's file.
 
 ## Exact commands
 

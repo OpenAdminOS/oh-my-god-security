@@ -957,6 +957,107 @@ fn paired_exports_preserve_markdown_when_html_destination_is_a_directory() {
     }
 }
 
+// Parallel verifiers each write their own findings file; the host merges
+// them into the single findings.json without losing or silently replacing
+// records.
+#[test]
+fn per_verifier_findings_files_merge_into_one() {
+    let f = Fixture::new();
+    let mut all = omgs::shape::findings(include_str!("fixtures/report-run/findings.json")).unwrap();
+    for r in &mut all.findings {
+        r.fingerprint = omgs::fingerprint(&r.attack_class, &r.entry_point, &r.sink, &r.boundary);
+    }
+    assert!(all.findings.len() >= 2);
+    let (first, second) = all.findings.split_at(1);
+    let write = |name: &str, findings: &[omgs::model::Finding]| {
+        let path = f.run.join(name);
+        let file = omgs::model::FindingsFile {
+            findings: findings.to_vec(),
+        };
+        // Owner-private like every run input; Windows refuses inherited DACLs.
+        omgs::runmeta::write_atomic(&path, &serde_json::to_string(&file).unwrap()).unwrap();
+        path
+    };
+    let a = write("findings-blue-1.json", first);
+    let b = write("findings-blue-2.json", second);
+    let merge = |sources: &[&Path]| {
+        let mut args = vec!["findings", "merge", "--run", f.run_str()];
+        for s in sources {
+            args.push("--from");
+            args.push(s.to_str().unwrap());
+        }
+        f.cli(&args)
+    };
+    let out = merge(&[&a, &b]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let merged =
+        omgs::shape::findings(&std::fs::read_to_string(f.run.join("findings.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        serde_json::to_value(&merged).unwrap(),
+        serde_json::to_value(&all).unwrap()
+    );
+    // Re-merging identical records is a no-op.
+    assert!(merge(&[&a]).status.success());
+    // The same fingerprint with different content is refused and nothing changes.
+    let mut changed = first.to_vec();
+    changed[0].evidence = "a different account".into();
+    let c = write("findings-blue-3.json", &changed);
+    let before = std::fs::read(f.run.join("findings.json")).unwrap();
+    let out = merge(&[&c]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reconcile"));
+    assert_eq!(std::fs::read(f.run.join("findings.json")).unwrap(), before);
+    // A record whose fingerprint is not its computed identity is refused.
+    let mut invalid = second.to_vec();
+    invalid[0].fingerprint = "omgs-00000000000000ff".into();
+    let d = write("findings-blue-4.json", &invalid);
+    let out = merge(&[&d]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(f.run.join("findings.json")).unwrap(), before);
+    // Inputs that fit alone but not together are refused, leaving the file.
+    let big = |name: &str, salt: &str| {
+        let mut r = first[0].clone();
+        r.entry_point = format!("{} {salt}", r.entry_point);
+        r.fingerprint = omgs::fingerprint(&r.attack_class, &r.entry_point, &r.sink, &r.boundary);
+        r.evidence = "x".repeat(9 << 20);
+        write(name, &[r])
+    };
+    let (e, g) = (
+        big("findings-big-1.json", "one"),
+        big("findings-big-2.json", "two"),
+    );
+    let out = merge(&[&e, &g]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("byte limit"));
+    assert_eq!(std::fs::read(f.run.join("findings.json")).unwrap(), before);
+    // The existing file is checked like any input and never rewritten when invalid.
+    let empty = write("findings-empty.json", &[]);
+    let existing = f.run.join("findings.json");
+    for (bad, code) in [(invalid.clone(), 1), ([first, &changed].concat(), 2)] {
+        let file = omgs::model::FindingsFile { findings: bad };
+        omgs::runmeta::write_atomic(&existing, &serde_json::to_string(&file).unwrap()).unwrap();
+        let before = std::fs::read(&existing).unwrap();
+        let out = merge(&[&empty]);
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), before);
+    }
+}
+
 // An uphold binds the verdict, tier, severity and proof reference it
 // adjudicated; any later edit to them is a gap until adjudicated again.
 #[test]
