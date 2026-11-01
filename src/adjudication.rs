@@ -1,5 +1,5 @@
 //! Strict role handoffs and mechanical adjudication accountability.
-use crate::model::{FindingsFile, Verdict};
+use crate::model::{Finding, FindingsFile, ProofTier, Severity, Verdict};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -25,6 +25,43 @@ pub struct Decision {
     pub reason: String,
     pub evidence: Vec<String>,
     pub required_changes: Vec<String>,
+    /// What an uphold adjudicated. A finding whose verdict, tier, severity
+    /// or proof reference differs from this was changed afterwards and
+    /// needs another adjudication pass.
+    #[serde(default)]
+    pub upheld: Option<Upheld>,
+}
+#[derive(Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Upheld {
+    pub verdict: Verdict,
+    pub proof_tier: ProofTier,
+    pub severity: Option<Severity>,
+    pub proof_ref: Option<String>,
+}
+impl Upheld {
+    fn of(f: &Finding) -> Self {
+        Self {
+            verdict: f.verdict,
+            proof_tier: f.proof_tier,
+            severity: f.severity,
+            proof_ref: f.proof_ref.clone(),
+        }
+    }
+}
+fn upheld_label(u: &Upheld) -> String {
+    let name = |v: serde_json::Result<Value>| {
+        v.ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_else(|| "none".into())
+    };
+    format!(
+        "verdict {}, tier {}, severity {}, proof_ref {}",
+        name(serde_json::to_value(u.verdict)),
+        name(serde_json::to_value(u.proof_tier)),
+        name(serde_json::to_value(u.severity)),
+        u.proof_ref.as_deref().unwrap_or("none")
+    )
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -84,6 +121,35 @@ pub fn parse(text: &str) -> Result<Evaluation, String> {
     {
         return Err("attempt must be a nonblank string when present".into());
     }
+    // Check `upheld` before serde, which would read `null` as absent and
+    // accept positional arrays or omitted members.
+    for d in v["decisions"].as_array().unwrap() {
+        let Some(upheld) = d.get("upheld") else {
+            continue;
+        };
+        if d.get("decision").and_then(Value::as_str) != Some("uphold") {
+            return Err("upheld is recorded only for an uphold decision".into());
+        }
+        // Serde also reads an externally tagged object such as
+        // {"needs_validation": null} as an enum value, so require strings.
+        let text = |v: Option<&Value>| v.is_some_and(Value::is_string);
+        let text_or_null = |v: Option<&Value>| v.is_some_and(|v| v.is_string() || v.is_null());
+        if upheld
+            .get("proof_ref")
+            .and_then(Value::as_str)
+            .is_some_and(|r| r.trim().is_empty())
+        {
+            return Err("upheld proof_ref must be null or a nonblank reference".into());
+        }
+        if !upheld.as_object().is_some_and(|o| {
+            text(o.get("verdict"))
+                && text(o.get("proof_tier"))
+                && text_or_null(o.get("severity"))
+                && text_or_null(o.get("proof_ref"))
+        }) {
+            return Err("upheld must be an object with string verdict and proof_tier, and string or null severity and proof_ref".into());
+        }
+    }
     let e: Evaluation = serde_json::from_value(v).map_err(|e| e.to_string())?;
     nonblank(&e.evaluator, "evaluator")?;
     nonblank(&e.source_ref, "source_ref")?;
@@ -105,6 +171,9 @@ pub fn parse(text: &str) -> Result<Evaluation, String> {
         }
         if d.decision != "uphold" && d.required_changes.is_empty() {
             return Err("adjust and overturn require required_changes".into());
+        }
+        if d.decision != "uphold" && d.upheld.is_some() {
+            return Err("upheld is recorded only for an uphold decision".into());
         }
     }
     for lead in &e.leads {
@@ -267,6 +336,19 @@ pub fn check(run: &Path, findings: &FindingsFile) -> Result<Vec<String>, String>
             gaps.push(format!("{}: evaluator changes unresolved", f.fingerprint));
         }
         if d.decision == "uphold" {
+            match &d.upheld {
+                None => gaps.push(format!(
+                    "{}: uphold does not record the verdict, tier, severity and proof_ref it adjudicated; adjudicate it again",
+                    f.fingerprint
+                )),
+                Some(upheld) if *upheld != Upheld::of(f) => gaps.push(format!(
+                    "{}: changed after adjudication (upheld {}; now {}); adjudicate it again",
+                    f.fingerprint,
+                    upheld_label(upheld),
+                    upheld_label(&Upheld::of(f))
+                )),
+                Some(_) => {}
+            }
             if let Some(reference) = &f.proof_ref {
                 let original = crate::proof::load(run, reference)?;
                 let replayed = d

@@ -587,7 +587,7 @@ fn adjudicate_fixture(dir: &std::path::Path, findings: &FindingsFile) {
             evidence.push(omgs::proof::reference(replay.n));
             omgs::proof::write(dir, &replay).unwrap();
         }
-        decisions.push(serde_json::json!({"fingerprint":f.fingerprint,"decision":"uphold",
+        decisions.push(serde_json::json!({"fingerprint":f.fingerprint,"decision":"uphold","upheld":{"verdict":f.verdict,"proof_tier":f.proof_tier,"severity":f.severity,"proof_ref":f.proof_ref},
             "reason":"Synthetic independent evaluation", "evidence":evidence,"required_changes":[]}));
     }
     write_private_fixture(
