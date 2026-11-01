@@ -11,6 +11,9 @@ pub struct SensorRequest<'a> {
     pub limits: supervise::Limits,
     pub semgrep: bool,
     pub config: &'static str,
+    /// Ignore files the scanner would honour; every copy is removed from
+    /// the staged input, whatever its letter case.
+    pub ignore_files: &'static [&'static str],
 }
 
 fn quote(arg: &str) -> Result<String, String> {
@@ -130,15 +133,13 @@ fn run_in_scratch(
             gaps.push(format!("input skip: {record}"));
         }
     }
-    if req.semgrep {
-        if budget.semgrep_oversized > 0 {
-            gaps.push(format!(
-                "{} input files exceed Semgrep's 1000000 byte target limit; not scanned by Semgrep",
-                budget.semgrep_oversized
-            ));
-        }
-        remove_semgrep_ignores(&target)?;
+    if req.semgrep && budget.semgrep_oversized > 0 {
+        gaps.push(format!(
+            "{} input files exceed Semgrep's 1000000 byte target limit; not scanned by Semgrep",
+            budget.semgrep_oversized
+        ));
     }
+    remove_ignore_files(&target, req.ignore_files)?;
     if overlapping_root(&root, &readonly).is_some() {
         // The private workspace is intentionally within root, but no granted
         // runtime/database/target may encompass the whole disposable directory.
@@ -304,20 +305,30 @@ fn run_in_scratch(
     Ok((output, run.exit_code.ok_or("missing sensor exit status")?))
 }
 
-fn remove_semgrep_ignores(dir: &Path) -> Result<(), String> {
+/// Remove every staged file or directory named like one of `names`,
+/// compared without ASCII case, because a case-insensitive scratch volume
+/// resolves `.SEMGREPIGNORE` as `.semgrepignore`.
+fn remove_ignore_files(dir: &Path, names: &[&str]) -> Result<(), String> {
+    if names.is_empty() {
+        return Ok(());
+    }
     for entry in std::fs::read_dir(dir).map_err(|_| "cannot inspect copied ignore files")? {
         let entry = entry.map_err(|_| "cannot inspect copied ignore entry")?;
         let meta = std::fs::symlink_metadata(entry.path())
             .map_err(|_| "cannot inspect copied ignore metadata")?;
-        if entry.file_name() == ".semgrepignore" {
+        let name = entry.file_name();
+        let ignored = name
+            .to_str()
+            .is_some_and(|n| names.iter().any(|i| i.eq_ignore_ascii_case(n)));
+        if ignored {
             if meta.is_dir() && !platform::is_link(&meta) {
                 std::fs::remove_dir_all(entry.path())
             } else {
                 std::fs::remove_file(entry.path())
             }
-            .map_err(|_| "cannot remove copied semgrepignore")?;
+            .map_err(|_| "cannot remove a copied scanner ignore file")?;
         } else if meta.is_dir() && !platform::is_link(&meta) {
-            remove_semgrep_ignores(&entry.path())?;
+            remove_ignore_files(&entry.path(), names)?;
         }
     }
     Ok(())
@@ -648,6 +659,7 @@ fn python_runtime_grants(
         artifacts: req.artifacts,
         readonly,
         env: Vec::new(),
+        ignore_files: &[],
         limits: req.limits.clone(),
         semgrep: false,
         config: "",

@@ -537,6 +537,11 @@ fn run_offline(
         } else {
             ""
         },
+        ignore_files: match tool {
+            "semgrep" => &[".semgrepignore"],
+            "gitleaks" => &[".gitleaksignore"],
+            _ => &[],
+        },
     });
     let (output, code, gaps) = match result {
         Ok(result) => result,

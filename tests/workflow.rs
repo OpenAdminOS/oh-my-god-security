@@ -2530,6 +2530,19 @@ fn windows_unc_proof_directories_match_writer_and_validator() {
         let bytes = serde_json::to_vec(&config).unwrap();
         record.config_sha256 = omgs::sha256::digest(&bytes);
         std::fs::write(dir.join("proofs/1/mxc-config.json"), bytes).unwrap();
+        // Every folder the sandbox may list is named in the record.
+        record.gaps = omgs::sandbox::declared_controls("windows", omgs::sandbox::Tier::Test).1;
+        omgs::proof::write(&dir, &record).unwrap();
+        assert!(has(
+            &omgs::proof::validate_proofs(&findings, &dir),
+            "parent folders the sandbox could list"
+        ));
+        let listing = omgs::sandbox::listing_gap(&config).expect("parent listing granted");
+        assert!(
+            listing.ends_with(r"\\server\share\run\proofs\1"),
+            "{listing}"
+        );
+        record.gaps.push(listing);
         omgs::proof::write(&dir, &record).unwrap();
         let errors = omgs::proof::validate_proofs(&findings, &dir);
         assert!(errors.is_empty(), "{prefix}: {errors:?}");
