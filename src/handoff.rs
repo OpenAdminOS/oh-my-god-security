@@ -66,9 +66,23 @@ fn location(l: &Location) -> Location {
     }
 }
 fn quote(s: &str) -> String {
-    // Display commands use POSIX quoting on Unix and PowerShell quoting on Windows.
-    let escaped = if cfg!(windows) {
-        s.replace('\'', "''")
+    quote_for(s, cfg!(windows))
+}
+
+/// Display commands use POSIX quoting on Unix and PowerShell quoting on
+/// Windows. PowerShell ends a single-quoted literal at the ASCII apostrophe
+/// and at U+2018 to U+201B, and reads any of them doubled as one literal
+/// character, so each is doubled.
+fn quote_for(s: &str, windows: bool) -> String {
+    let escaped = if windows {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            out.push(c);
+            if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+                out.push(c);
+            }
+        }
+        out
     } else {
         s.replace('\'', "'\"'\"'")
     };
@@ -666,4 +680,19 @@ pub fn stage_validated(run: &Path, file: &FindingsFile) -> Result<StagedTests, S
         patch,
         excluded,
     })
+}
+
+#[cfg(test)]
+mod quote_tests {
+    #[test]
+    fn powershell_quoting_doubles_every_single_quote_character() {
+        let quoted = super::quote_for("a'b\u{2018}c\u{2019}d\u{201A}e\u{201B}f", true);
+        assert_eq!(
+            quoted,
+            "'a''b\u{2018}\u{2018}c\u{2019}\u{2019}d\u{201A}\u{201A}e\u{201B}\u{201B}f'"
+        );
+        assert_eq!(super::quote_for("it's", false), "'it'\"'\"'s'");
+        // Double quotes and $() stay literal inside a PowerShell single-quoted string.
+        assert_eq!(super::quote_for("\"$(x)\"", true), "'\"$(x)\"'");
+    }
 }

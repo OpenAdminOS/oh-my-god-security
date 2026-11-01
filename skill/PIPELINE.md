@@ -55,8 +55,9 @@ a 120 second deadline and 4 MiB output cap. See README for the teardown margin.
 TruffleHog uses `--no-verification --no-update --no-ignore-tag`. OSV-Scanner uses
 `--offline-vulnerabilities --offline --no-call-analysis --no-resolve --no-ignore` and an OMGS-owned
 empty `--config`, bypassing repository suppression files. Semgrep requires local
-`OMGS_SEMGREP_CONFIG` rules; registry fetching is disabled. The copied `.semgrepignore` files are
-removed, `.gitignore` and inline `nosemgrep` are disabled. Tool-reported skipped input and
+`OMGS_SEMGREP_CONFIG` rules; registry fetching is disabled. The copied `.semgrepignore` and
+`.gitleaksignore` files are removed in any letter case, `.gitignore` and inline `nosemgrep` are
+disabled. Tool-reported skipped input and
 diagnostics remain gaps.
 
 A missing `OMGS_OSV_DB` cache (default `<OMGS data dir>/osv-db`) is a gap, never permission to

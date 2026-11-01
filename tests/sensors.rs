@@ -71,6 +71,13 @@ impl Fixture {
         std::fs::write(target.join(".gitignore"), "*\n").unwrap();
         std::fs::write(target.join(".semgrepignore"), "*\n").unwrap();
         std::fs::write(target.join("src/.semgrepignore"), "*\n").unwrap();
+        // Case variants still resolve as the ignore file on case-insensitive volumes.
+        std::fs::write(target.join("docs/.SEMGREPIGNORE"), "*\n").unwrap();
+        // A Unicode fold (U+017F) that case-insensitive APFS resolves as .semgrepignore.
+        std::fs::write(target.join("tests/.\u{17f}emgrepignore"), "*\n").unwrap();
+        std::fs::write(target.join(".GitLeaksIgnore"), "fixture\n").unwrap();
+        std::fs::write(target.join("vendor/.gitleaksignore"), "fixture\n").unwrap();
+        std::fs::write(target.join("tests/.gitleak\u{17f}ignore"), "fixture\n").unwrap();
         std::fs::write(
             target.join("src/main.rs"),
             "secret // trufflehog:ignore // nosemgrep",
@@ -473,6 +480,9 @@ fn semgrep_suppressions_are_disabled_and_skips_are_accountable() {
     assert!(report["gaps"].to_string().contains("paths.skipped"));
     assert!(f.target.join(".semgrepignore").exists());
     assert!(f.target.join("src/.semgrepignore").exists());
+    assert!(f.target.join("docs/.SEMGREPIGNORE").exists());
+    assert!(f.target.join("tests/.\u{17f}emgrepignore").exists());
+    assert!(f.target.join(".GitLeaksIgnore").exists());
 }
 
 #[test]
@@ -573,6 +583,7 @@ fn sensor_timeout_child() {
         artifacts: &root.join("artifacts"),
         readonly: vec![],
         env: vec![],
+        ignore_files: &[],
         semgrep: false,
         config: "",
         limits: omgs::supervise::Limits {
@@ -1399,4 +1410,26 @@ fn short_secret_guesses_cannot_be_confirmed_from_persisted_artifacts() {
         first[0]["occurrence"],
         read(&second.join("sensor-hits.json"))[0]["occurrence"]
     );
+}
+
+// Gitleaks never sees a staged .gitleaksignore in any letter case, and the
+// target keeps its own copies.
+#[test]
+fn gitleaks_ignore_files_are_removed_from_the_staged_input() {
+    if !ready() {
+        return;
+    }
+    let f = Fixture::new();
+    f.tool("gitleaks", "[]", 0);
+    let report = omgs::sensors::read_report(&f.init("gitleaks-ignore"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        report.tools_run.contains(&"gitleaks".into()),
+        "{:?}",
+        report.gaps
+    );
+    assert!(f.target.join(".GitLeaksIgnore").exists());
+    assert!(f.target.join("vendor/.gitleaksignore").exists());
+    assert!(f.target.join("tests/.gitleak\u{17f}ignore").exists());
 }
