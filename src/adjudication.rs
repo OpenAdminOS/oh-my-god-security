@@ -130,14 +130,17 @@ pub fn parse(text: &str) -> Result<Evaluation, String> {
         if d.get("decision").and_then(Value::as_str) != Some("uphold") {
             return Err("upheld is recorded only for an uphold decision".into());
         }
+        // Serde also reads an externally tagged object such as
+        // {"needs_validation": null} as an enum value, so require strings.
+        let text = |v: Option<&Value>| v.is_some_and(Value::is_string);
+        let text_or_null = |v: Option<&Value>| v.is_some_and(|v| v.is_string() || v.is_null());
         if !upheld.as_object().is_some_and(|o| {
-            ["verdict", "proof_tier", "severity", "proof_ref"]
-                .iter()
-                .all(|k| o.contains_key(*k))
+            text(o.get("verdict"))
+                && text(o.get("proof_tier"))
+                && text_or_null(o.get("severity"))
+                && text_or_null(o.get("proof_ref"))
         }) {
-            return Err(
-                "upheld must be an object with verdict, proof_tier, severity and proof_ref".into(),
-            );
+            return Err("upheld must be an object with string verdict and proof_tier, and string or null severity and proof_ref".into());
         }
     }
     let e: Evaluation = serde_json::from_value(v).map_err(|e| e.to_string())?;

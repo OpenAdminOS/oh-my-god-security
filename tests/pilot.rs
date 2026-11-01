@@ -1033,6 +1033,11 @@ fn an_uphold_is_bound_to_what_it_adjudicated() {
         json!({"verdict":"needs_validation","proof_tier":"traced"}),
         json!({"verdict":"needs_validation","proof_tier":"traced","severity":null}),
         Value::Null,
+        // Externally tagged enum objects that serde would otherwise accept.
+        json!({"verdict":{"needs_validation":null},"proof_tier":"traced","severity":null,"proof_ref":null}),
+        json!({"verdict":"needs_validation","proof_tier":{"traced":null},"severity":null,"proof_ref":null}),
+        json!({"verdict":"needs_validation","proof_tier":"traced","severity":{"critical":null},"proof_ref":null}),
+        json!({"verdict":"needs_validation","proof_tier":"traced","severity":null,"proof_ref":["proofs/1.json"]}),
     ] {
         let text = evaluation(Some(shape.clone())).to_string();
         assert!(
