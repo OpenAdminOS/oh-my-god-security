@@ -1294,3 +1294,40 @@ fn audit_init_rejects_non_utf8_canonical_target_without_panicking() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("UTF-8 target path"));
     assert!(!run.exists());
 }
+
+// A reasoned exclusion unit, such as tests:excluded, can be listed as a
+// checklist child without a scope or class, and never counts as coverage.
+#[test]
+fn reasoned_exclusion_units_can_be_checklist_children() {
+    let mut parent = unit("stack:python", "covered");
+    parent
+        .extra
+        .insert("child_units".into(), json!(["get", "tests:excluded"]));
+    let child = unit("get", "covered");
+    let mut excluded = Unit::new("tests:excluded", "tests/", &[], "out_of_scope");
+    excluded.evidence = vec!["tests/test_app.py".into()];
+    excluded.note = Some("reviewed, not security relevant: unit tests only".into());
+    excluded
+        .extra
+        .insert("excluded_paths".into(), json!(["tests/test_app.py"]));
+    let errors = validate_ledger(&ledger(vec![parent.clone(), child, excluded.clone()]));
+    assert!(errors.is_empty(), "{errors:?}");
+    // It cannot stand in for the class the parent names.
+    assert!(has(
+        &validate_ledger(&ledger(vec![
+            {
+                let mut p = parent.clone();
+                p.extra
+                    .insert("child_units".into(), json!(["tests:excluded"]));
+                p
+            },
+            excluded.clone()
+        ])),
+        "parent class 'missing_authz' is unaccounted for"
+    ));
+    // Without a reason it is not an exclusion.
+    let mut silent = excluded;
+    silent.note = None;
+    let child = unit("get", "covered");
+    assert!(!validate_ledger(&ledger(vec![parent, child, silent])).is_empty());
+}

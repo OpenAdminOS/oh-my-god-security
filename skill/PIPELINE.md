@@ -169,7 +169,9 @@ recorded, using the existing keys `candidates`, `confirmed`, `needs_validation`,
    independent verifier that did not do the hunting dedupes the candidates by fingerprint and
    adversarially tries to disprove each one, following shared and delegated controls, rejecting the
    leads a control defeats, and recording exact missing facts. Run `omgs validate` on the records
-   before proof; keep valid unresolved candidates pending.
+   before proof; keep valid unresolved candidates pending. Parallel verifiers each write
+   `OUTPUT_DIR/findings-<verifier>.json`; combine them with `omgs findings merge --run OUTPUT_DIR
+   --from <file>...`, which refuses conflicting records for the same fingerprint.
 
    ```sh
    omgs status --run OUTPUT_DIR --stage verify --state active --detail "Checking each lead"
@@ -221,6 +223,10 @@ recorded, using the existing keys `candidates`, `confirmed`, `needs_validation`,
    ```sh
    omgs status --run OUTPUT_DIR --stage adjudicate --state active --detail "Reviewing the evidence"
    ```
+
+   The evaluator's gaps describe the run as it saw it. When the host later closes a ledger
+   placeholder or fixes a record the evaluator flagged, run the evaluator again so evaluation.json
+   reflects the current run; never edit or delete its gaps by hand.
 
 ### Report
 

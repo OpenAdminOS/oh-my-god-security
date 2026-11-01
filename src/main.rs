@@ -130,6 +130,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "batch" if args.first().is_some_and(|a| a == "index") => ("--batch --out", true),
         "bench" if args.first().is_some_and(|a| a == "score") => ("--cases --runs", true),
         "validate" => ("--findings --candidates --dispositions --evaluation", false),
+        "findings" if args.first().is_some_and(|a| a == "merge") => ("--run --from", true),
         "fingerprint" => ("--attack-class --entry-point --sink --boundary", false),
         "prove" => (
             "--cmd --target --run --finding --test --test-from --inputs-from --expect-marker --replay --tier --timeout-ms --screenshots",
@@ -171,7 +172,9 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "doctor" => ("--live", false),
         "update-check" => ("", false),
         "help" | "--help" | "-h" | "--version" | "-V" => ("", false),
-        "audit" | "batch" | "ledger" | "intent" | "bench" if args == ["--help"] || args == ["-h"] => {
+        "audit" | "batch" | "ledger" | "intent" | "bench" | "findings"
+            if args == ["--help"] || args == ["-h"] =>
+        {
             ("", false)
         }
         _ => return Err(format!("unknown command or subcommand '{cmd}'")),
@@ -192,7 +195,8 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
             || (cmd == "status" && ["--counter", "--log"].contains(&option))
             || (cmd == "bench" && option == "--runs")
             || (["status", "report"].contains(&cmd) && option == "--accounting")
-            || (cmd == "report" && option == "--model");
+            || (cmd == "report" && option == "--model")
+            || (cmd == "findings" && option == "--from");
         if !seen.insert(option) && !repeatable {
             return Err(format!("duplicate option '{option}'"));
         }
@@ -280,6 +284,7 @@ fn main() -> ExitCode {
         "review" => cmd_review(rest),
         "audit" => cmd_audit(rest),
         "validate" => cmd_validate(rest),
+        "findings" => cmd_findings(rest),
         "fingerprint" => cmd_fingerprint(rest),
         "bench" => cmd_bench(rest),
         "prove" => cmd_prove(rest),
@@ -438,6 +443,90 @@ fn cmd_budget(args: &[String]) -> Result<(), String> {
 fn read_findings(path: &str) -> Result<FindingsFile, String> {
     let text = omgs::run_artifact::text_path(Path::new(path), omgs::run_artifact::FINDINGS_BYTES)?;
     omgs::shape::findings(&text).map_err(|e| format!("parse {path}: {e}"))
+}
+
+/// Merge per-verifier findings files into the run's single findings.json.
+/// Parallel verifiers each write their own file; the host merges them under
+/// the run lock. A fingerprint present in two inputs with different content
+/// is refused, as is a record whose fingerprint is not its computed identity.
+/// Drafts merge as drafts; `omgs validate --findings` checks the result.
+fn cmd_findings(args: &[String]) -> Result<(), String> {
+    let usage = "usage: omgs findings merge --run <run-dir> --from <file> [--from <file>]...";
+    let (sub, rest) = args.split_first().ok_or(usage)?;
+    if sub != "merge" {
+        return Err(usage.into());
+    }
+    let run = flag(rest, "--run").ok_or("findings merge requires --run <run-dir>")?;
+    let sources = flags(rest, "--from");
+    if sources.is_empty() {
+        return Err("findings merge requires at least one --from <file>".into());
+    }
+    let run = Path::new(&run);
+    omgs::runmeta::with_lock(run, || {
+        let target = run.join("findings.json");
+        let mut merged = match omgs::run_artifact::optional_text(
+            run,
+            Path::new("findings.json"),
+            omgs::run_artifact::FINDINGS_BYTES,
+        )? {
+            Some(text) => omgs::shape::findings(&text)
+                .map_err(|e| format!("parse {}: {e}", target.display()))?,
+            None => omgs::model::FindingsFile::default(),
+        };
+        let mut origin: std::collections::BTreeMap<String, String> = merged
+            .findings
+            .iter()
+            .map(|f| (f.fingerprint.clone(), "findings.json".to_string()))
+            .collect();
+        let mut added = 0;
+        for source in &sources {
+            let text = omgs::run_artifact::text_path(
+                Path::new(source),
+                omgs::run_artifact::FINDINGS_BYTES,
+            )?;
+            let file = omgs::shape::findings(&text).map_err(|e| format!("parse {source}: {e}"))?;
+            for finding in file.findings {
+                let expected = omgs::fingerprint(
+                    &finding.attack_class,
+                    &finding.entry_point,
+                    &finding.sink,
+                    &finding.boundary,
+                );
+                if finding.fingerprint != expected {
+                    omgs::out::err(&format!(
+                        "invalid: {source}: '{}' has fingerprint '{}', expected {expected}",
+                        omgs::platform::escape_controls(&finding.title),
+                        omgs::platform::escape_controls(&finding.fingerprint)
+                    ));
+                    return Err("__EXIT1__".into());
+                }
+                if let Some(existing) = merged
+                    .findings
+                    .iter()
+                    .find(|m| m.fingerprint == finding.fingerprint)
+                {
+                    if serde_json::to_value(existing).ok() == serde_json::to_value(&finding).ok() {
+                        continue;
+                    }
+                    return Err(format!(
+                        "{} differs between {} and {source}; reconcile the records before merging",
+                        finding.fingerprint, origin[&finding.fingerprint]
+                    ));
+                }
+                origin.insert(finding.fingerprint.clone(), source.clone());
+                merged.findings.push(finding);
+                added += 1;
+            }
+        }
+        let text = serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?;
+        omgs::runmeta::write_atomic(&target, &format!("{text}\n"))?;
+        omgs::out::line(&format!(
+            "merged {added} new finding(s) from {} file(s); findings.json holds {}",
+            sources.len(),
+            merged.findings.len()
+        ));
+        Ok(())
+    })
 }
 
 fn cmd_validate(args: &[String]) -> Result<(), String> {
@@ -2063,6 +2152,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
             if let Some(run) = &findings_dir {
                 meta.artifact_base = omgs::report::artifact_base(dir, run)?;
                 meta.screenshots = omgs::report::screenshots(run, &file);
+                meta.sandbox = omgs::report::sandbox_text(run, &meta.sandbox);
             }
             let sensors = findings_dir
                 .as_deref()
@@ -3028,7 +3118,7 @@ fn audit_init_limited(rest: &[String], inventory_limit: usize) -> Result<PathBuf
     let mut meta = serde_json::json!({
         "repo": repo, "target": target.to_string_lossy(), "source_ref": source_ref,
         "run_id": omgs::platform::random_nonce().map_err(|e| e.to_string())?,
-        "sandbox": "MXC required; runtime version not recorded",
+        "sandbox": omgs::sandbox::REQUIRED_TEXT,
         "mode": mode, "budget_agent_calls": budget, "execution_profile": "standard",
         "policy": policy,
         "persona": persona.map(|p| p.name), "report_depth": persona.map_or("full", |p| p.report_depth),
@@ -4695,6 +4785,7 @@ mod cli_tests {
         ("batch", "init"),
         ("batch", "index"),
         ("validate", ""),
+        ("findings", "merge"),
         ("fingerprint", ""),
         ("bench", "score"),
         ("prove", ""),

@@ -52,6 +52,13 @@ Small trust files use bounded, single-link, no-follow reads. On macOS and Linux,
 SIGHUP during preparation remove the proof directory and release a charged reservation; once
 execution begins, interrupted runs retain their charge and an unclean record.
 
+A harness that runs `git` inside the sandbox cannot read the host's system Git configuration (for
+example Homebrew's under `/opt/homebrew/etc`); set `GIT_CONFIG_NOSYSTEM=1` before calling it. Code
+that checks owner-private storage up to the filesystem root, or that starts its own supervisor,
+fails inside MXC because ancestors such as `/Users` are not readable there. Replace only that helper
+outside the decision under test with a plain private directory, and disclose the substitution in
+the finding's evidence.
+
 ## Role-written artifacts
 
 On Unix set `umask 077` before writing role artifacts, create directories with mode 0700 and files
