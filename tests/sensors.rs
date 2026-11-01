@@ -77,6 +77,7 @@ impl Fixture {
         std::fs::write(target.join("tests/.\u{17f}emgrepignore"), "*\n").unwrap();
         std::fs::write(target.join(".GitLeaksIgnore"), "fixture\n").unwrap();
         std::fs::write(target.join("vendor/.gitleaksignore"), "fixture\n").unwrap();
+        std::fs::write(target.join("tests/.gitleak\u{17f}ignore"), "fixture\n").unwrap();
         std::fs::write(
             target.join("src/main.rs"),
             "secret // trufflehog:ignore // nosemgrep",
@@ -1430,4 +1431,5 @@ fn gitleaks_ignore_files_are_removed_from_the_staged_input() {
     );
     assert!(f.target.join(".GitLeaksIgnore").exists());
     assert!(f.target.join("vendor/.gitleaksignore").exists());
+    assert!(f.target.join("tests/.gitleak\u{17f}ignore").exists());
 }

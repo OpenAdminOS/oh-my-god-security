@@ -129,7 +129,13 @@ fn main() {
             assert!(target.join(".GitLeaksIgnore").exists());
         }
         "gitleaks" => {
-            for path in [".GitLeaksIgnore", ".gitleaksignore", "vendor/.gitleaksignore"] {
+            for path in [
+                ".GitLeaksIgnore",
+                ".gitleaksignore",
+                "vendor/.gitleaksignore",
+                "tests/.gitleaksignore",
+                "tests/.gitleak\u{17f}ignore",
+            ] {
                 assert!(!target.join(path).exists(), "{path}");
             }
             assert!(target.join(".semgrepignore").exists());
