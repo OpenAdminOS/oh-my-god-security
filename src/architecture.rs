@@ -838,9 +838,13 @@ fn md_code(s: &str) -> String {
 }
 
 pub(crate) fn md_inline(s: &str) -> String {
+    let s = crate::handoff::display_text(s);
     let mut out = String::with_capacity(s.len());
-    for ch in crate::handoff::display_text(s).chars() {
+    for (i, ch) in s.char_indices() {
         match ch {
+            // A literal scheme separator lets GFM autolink a bare URL, as
+            // REPORT.md and HANDOFF.md already prevent.
+            ':' if s[i..].starts_with("://") => out.push_str("&#58;"),
             '\n' | '\r' => out.push(' '),
             '|' => out.push_str("\\|"),
             '<' => out.push_str("&lt;"),

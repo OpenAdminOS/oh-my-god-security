@@ -722,6 +722,23 @@ pub fn declared_controls(os: &str, tier: Tier) -> (Vec<String>, Vec<String>) {
     (enforced, gaps)
 }
 
+/// The folders a Windows config lets sandboxed code list, named so the
+/// proof record states exactly which directory names it could see.
+pub fn listing_gap(config: &serde_json::Value) -> Option<String> {
+    let paths = config
+        .pointer("/processContainer/filesystem/enumeratePaths")?
+        .as_array()?
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect::<Vec<_>>();
+    (!paths.is_empty()).then(|| {
+        format!(
+            "sandboxed code can list the names of entries directly inside these parent folders: {}",
+            paths.join(", ")
+        )
+    })
+}
+
 pub fn conditional_gaps(os: &str) -> Vec<String> {
     let mut gaps = Vec::new();
     if os != "linux" {
@@ -1983,6 +2000,13 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
             .push("named proof test readability was not established inside the sandbox".into());
     }
     let (mut enforced, mut gaps) = declared_controls(os, req.tier);
+    if let Some(gap) = serde_json::from_str(&config_text)
+        .ok()
+        .as_ref()
+        .and_then(listing_gap)
+    {
+        gaps.push(gap);
+    }
     enforced.retain(|control| {
         !matches!(
             control.as_str(),

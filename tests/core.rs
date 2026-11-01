@@ -879,6 +879,22 @@ fn architecture_markdown_neutralizes_link_injection() {
     );
 }
 
+// Bare URLs in target-derived map text never become autolinks in
+// ARCHITECTURE.md, matching REPORT.md and HANDOFF.md.
+#[test]
+fn architecture_markdown_keeps_bare_urls_inert() {
+    let mut a = arch();
+    a.components[1].name = "Sign in at http://localhost:8080/login".into();
+    a.components[1].tech = "HTTPS://Example.com and ftp://x".into();
+    let md = render_architecture_markdown(&a);
+    assert!(!md.contains("://"), "{md}");
+    assert!(md.contains("http&#58;//localhost"), "{md}");
+    assert!(md.contains("HTTPS&#58;//Example"), "{md}");
+    // A colon that is not a scheme separator stays readable.
+    a.components[1].name = "Port: 8080".into();
+    assert!(render_architecture_markdown(&a).contains("Port: 8080"));
+}
+
 #[test]
 fn architecture_validate_catches_structural_gaps() {
     // empty/missing component zone must fail, not hide the component

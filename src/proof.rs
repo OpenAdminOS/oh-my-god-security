@@ -852,6 +852,11 @@ fn config_evidence(record: &ProofRecord, config: &serde_json::Value, command: &s
         },
         record.system_root.as_deref().unwrap_or(r"C:\Windows"),
     );
+    if let Some(gap) = crate::sandbox::listing_gap(config) {
+        if !record.gaps.contains(&gap) {
+            errors.push("does not name the parent folders the sandbox could list".into());
+        }
+    }
     if config.pointer("/process/env") != expected.pointer("/process/env") {
         errors.push("MXC config process.env must match full allowlisted KEY=value entries reconstructed from the record".into());
     }

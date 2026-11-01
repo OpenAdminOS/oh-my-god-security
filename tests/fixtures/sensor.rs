@@ -122,6 +122,23 @@ fn main() {
             assert!(has("--disable-nosem") && has("--no-git-ignore"));
             assert!(!target.join(".semgrepignore").exists());
             assert!(!target.join("src/.semgrepignore").exists());
+            assert!(!target.join("docs/.SEMGREPIGNORE").exists());
+            assert!(!target.join("docs/.semgrepignore").exists());
+            assert!(!target.join("tests/.semgrepignore").exists());
+            // Another scanner's ignore file is not this scanner's concern.
+            assert!(target.join(".GitLeaksIgnore").exists());
+        }
+        "gitleaks" => {
+            for path in [
+                ".GitLeaksIgnore",
+                ".gitleaksignore",
+                "vendor/.gitleaksignore",
+                // Resolves to the U+017F spelling on case-insensitive volumes.
+                "tests/.gitleaksignore",
+            ] {
+                assert!(!target.join(path).exists(), "{path}");
+            }
+            assert!(target.join(".semgrepignore").exists());
         }
         _ => {}
     }
