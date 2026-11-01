@@ -423,7 +423,7 @@ fn check(recipe: Recipe) -> bool {
         omgs::shape::findings(&std::fs::read_to_string(&findings_path).unwrap()).unwrap();
     let eval_path = run.join("evaluation.json");
     let mut evaluation = json!({"evaluator":"independent-replay-context","source_ref":"synthetic",
-        "decisions":[{"fingerprint":fp,"decision":"uphold","reason":"reconstructed invariant",
+        "decisions":[{"fingerprint":fp,"decision":"uphold","upheld":{"verdict":final_findings.findings.iter().find(|f| f.fingerprint == fp).unwrap().verdict,"proof_tier":final_findings.findings.iter().find(|f| f.fingerprint == fp).unwrap().proof_tier,"severity":final_findings.findings.iter().find(|f| f.fingerprint == fp).unwrap().severity,"proof_ref":final_findings.findings.iter().find(|f| f.fingerprint == fp).unwrap().proof_ref},"reason":"reconstructed invariant",
             "evidence":[],"required_changes":[]}],"gaps":["fixture-only reachability"]});
     std::fs::write(&eval_path, evaluation.to_string()).unwrap();
     assert!(omgs::adjudication::check(&run, &final_findings)

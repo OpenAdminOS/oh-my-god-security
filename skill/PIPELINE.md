@@ -217,7 +217,9 @@ recorded, using the existing keys `candidates`, `confirmed`, `needs_validation`,
    is load-bearing: it is where overclaimed confirmations and mislabelled proofs are caught.
    Adjudication is the last step that may change a record; any semantic change after it (a new
    verdict, severity, proof tier, or fingerprint) requires another adjudication pass on the changed
-   record before reporting.
+   record before reporting. Each uphold records the verdict, tier, severity and proof_ref it
+   upheld, and the critic and report flag any record that no longer matches as changed after
+   adjudication.
 
    ```sh
    omgs status --run OUTPUT_DIR --stage adjudicate --state active --detail "Reviewing the evidence"
