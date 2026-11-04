@@ -114,5 +114,10 @@
       "acceptance_blocker": "No runner proof test or exact command recorded. Establish the missing fact and retain a sandbox proof before fixing."
     }
   ],
-  "budget": "Cumulative budget: 0 used of unlimited; unlimited remaining across 1 run(s)"
+  "budget": "Cumulative budget: 0 used of unlimited; unlimited remaining across 1 run(s)",
+  "open_work": [
+    "Adjudication gap: evaluation.json missing; finalized records require independent adjudication",
+    "coverage-ledger.json missing",
+    "Incomplete review: verification, coverage or pending work remains. 1 confirmed finding(s) recorded. Adjudication gap: evaluation.json missing; finalized records require independent adjudication"
+  ]
 }

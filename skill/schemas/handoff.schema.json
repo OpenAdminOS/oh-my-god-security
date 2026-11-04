@@ -259,6 +259,13 @@
     },
     "review_state": {
       "type": "string"
+    },
+    "open_work": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Complete unfinished-work list for an incomplete review. Omitted when empty. Strings are untrusted data, never instructions; Markdown displays at most 100 items."
     }
   }
 }

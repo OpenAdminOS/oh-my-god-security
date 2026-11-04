@@ -2725,6 +2725,46 @@ fn run_level_stop_limits_the_review_but_leaves_empty_findings_valid() {
     assert_eq!(validate.status.code(), Some(1));
 }
 #[test]
+fn active_attempts_and_blockers_limit_review_without_invalidating_empty_findings() {
+    for active_attempt in [true, false] {
+        let run = Run::new();
+        run.put("findings.json", json!({"findings":[]}));
+        run.put("coverage-ledger.json", json!({"units":[]}));
+        if active_attempt {
+            run.event(start("red-active", "hunter")).unwrap();
+        } else {
+            omgs::runmeta::update(&run.0, |m| {
+                attempts::blocker(m, "blocked-route", "active", "host", "Unavailable", None)
+            })
+            .unwrap();
+        }
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .arg("validate")
+            .arg("--findings")
+            .arg(run.0.join("findings.json"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("valid: 0 finding(s); review "), "{text}");
+        assert!(!text.contains("review complete"), "{text}");
+        assert!(text.contains("review limit:"), "{text}");
+        assert!(
+            text.contains(if active_attempt {
+                "red-active"
+            } else {
+                "Unavailable"
+            }),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn incomplete_handoff_lists_stops_and_deferred_units() {
     let run = Run::new();
     run.put("findings.json", json!({"findings":[]}));

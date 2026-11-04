@@ -145,7 +145,7 @@ pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Hand
     })
 }
 
-/// Bound on listed unfinished items; REPORT.md keeps the complete list.
+/// Bound on Markdown unfinished items; handoff.json keeps the complete list.
 const OPEN_WORK_ITEMS: usize = 100;
 
 pub fn build_view(

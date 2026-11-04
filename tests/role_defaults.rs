@@ -1295,6 +1295,12 @@ fn every_excluded_class_requires_review_and_reports_the_reason() {
         assert!(!with_evidence(&format!("{}.bak:1-5 sampled", sorted[0]))
             .status
             .success());
+        let before_whitespace = std::fs::read(&ledger_path).unwrap();
+        assert!(with_evidence(&format!("{} sampled header only", sorted[0]))
+            .status
+            .success());
+        // Restore the fixture so the colon case cannot reuse whitespace evidence.
+        std::fs::write(&ledger_path, before_whitespace).unwrap();
         let resolved = cli(&[
             "ledger",
             "set",
