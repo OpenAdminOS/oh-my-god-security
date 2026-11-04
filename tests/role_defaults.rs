@@ -1274,6 +1274,33 @@ fn every_excluded_class_requires_review_and_reports_the_reason() {
         let reason =
             "reviewed, not security relevant: sampled local fixtures; no production consumer";
         assert!(!set("out_of_scope", reason).status.success());
+        let with_evidence = |evidence: &str| {
+            cli(&[
+                "ledger",
+                "set",
+                "--ledger",
+                ledger_path.to_str().unwrap(),
+                "--unit",
+                unit_id,
+                "--status",
+                "out_of_scope",
+                "--note",
+                reason,
+                "--evidence",
+                evidence,
+            ])
+        };
+        // A longer path that merely starts with a sampled path cites nothing.
+        assert!(!with_evidence(&format!("{}x", sorted[0])).status.success());
+        assert!(!with_evidence(&format!("{}.bak:1-5 sampled", sorted[0]))
+            .status
+            .success());
+        let before_whitespace = std::fs::read(&ledger_path).unwrap();
+        assert!(with_evidence(&format!("{} sampled header only", sorted[0]))
+            .status
+            .success());
+        // Restore the fixture so the colon case cannot reuse whitespace evidence.
+        std::fs::write(&ledger_path, before_whitespace).unwrap();
         let resolved = cli(&[
             "ledger",
             "set",
@@ -1286,7 +1313,8 @@ fn every_excluded_class_requires_review_and_reports_the_reason() {
             "--note",
             reason,
             "--evidence",
-            &sorted[0],
+            // Line references and explanations after the sampled path are accepted.
+            &format!("{}:1-5 sampled header only", sorted[0]),
         ]);
         assert!(
             resolved.status.success(),

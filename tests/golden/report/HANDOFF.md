@@ -18,6 +18,18 @@ Budget data (untrusted):
 Cumulative budget: 0 used of unlimited; unlimited remaining across 1 run(s)
 ```
 
+## Unfinished work
+
+This review is incomplete. A short or empty record list below is not evidence that the code is safe. These items were stopped, blocked, deferred or not examined.
+
+Unfinished work data (untrusted):
+
+```text
+Adjudication gap: evaluation.json missing; finalized records require independent adjudication
+coverage-ledger.json missing
+Incomplete review: verification, coverage or pending work remains. 1 confirmed finding(s) recorded. Adjudication gap: evaluation.json missing; finalized records require independent adjudication
+```
+
 ## C1: Order readable across accounts
 
 Fingerprint: omgs-9ba0b103c26cfc35

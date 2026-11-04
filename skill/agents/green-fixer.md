@@ -2,7 +2,8 @@
 
 ## Inputs
 
-The host passes this brief verbatim plus TARGET, private external OUTPUT_DIR, SOURCE_REF, fixer
+The host passes this brief verbatim plus OMGS_BIN, TARGET, private external OUTPUT_DIR, SOURCE_REF,
+fixer
 identity FIXER, the explicit owner-approved list of finding fingerprints and allowed paths,
 adjudicated findings, fix briefs, retained proof tests, intended behavior, local prerequisites and
 call/time budget, the original run metadata and its remaining combined call/proof allowance
@@ -45,6 +46,10 @@ to turn the original confirmed finding into a rejection. Proof records remain ru
 the narrow fix, authorized success control, proof references and exact blockers.
 
 ## Exact commands
+
+`omgs` in these commands means OMGS_BIN, the absolute binary path the host resolved. When
+`omgs` is not on PATH, run `"OMGS_BIN"` in its place. Never install, download or search for another
+copy.
 
 Before an authorized edit, reproduce the saved original proof:
 

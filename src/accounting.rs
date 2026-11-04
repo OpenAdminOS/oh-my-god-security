@@ -247,7 +247,8 @@ pub fn lines(values: &Accounting) -> Vec<String> {
                 total.map_or_else(|| "overflow".into(), |n| n.to_string())
             )
         };
-        let cost: f64 = parts.iter().filter_map(|u| u.cost_usd).sum();
+        // An empty f64 sum is -0.0; adding 0.0 prints it as 0.
+        let cost: f64 = parts.iter().filter_map(|u| u.cost_usd).sum::<f64>() + 0.0;
         let unknown_cost = parts
             .iter()
             .filter(|u| u.cost_usd.is_none() || u.unreported)

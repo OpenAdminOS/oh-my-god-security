@@ -615,6 +615,12 @@ fn cmd_validate_locked(args: &[String]) -> Result<(), String> {
             view.findings.findings.len(),
             omgs::platform::escape_controls(view.state.as_deref().unwrap_or("complete"))
         ));
+        for gap in &view.attempt_gaps {
+            omgs::out::line(&format!(
+                "review limit: {}",
+                omgs::platform::escape_controls(gap)
+            ));
+        }
         Ok(())
     } else {
         for e in &errors {

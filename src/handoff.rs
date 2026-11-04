@@ -18,6 +18,9 @@ pub struct Handoff {
     pub records: Vec<Item>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget: Option<String>,
+    /// Stopped, blocked, deferred and unexamined work of an incomplete review.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub open_work: Vec<String>,
 }
 #[derive(Serialize)]
 pub struct Trust {
@@ -141,6 +144,9 @@ pub fn build(run: &Path, file: &FindingsFile, only: Option<&str>) -> Result<Hand
         build_view(run, &view, only)
     })
 }
+
+/// Bound on Markdown unfinished items; handoff.json keeps the complete list.
+const OPEN_WORK_ITEMS: usize = 100;
 
 pub fn build_view(
     run: &Path,
@@ -289,9 +295,23 @@ pub fn build_view(
     } else {
         "incomplete"
     };
+    let mut open_work = Vec::new();
+    if !view.complete() {
+        let mut seen = std::collections::BTreeSet::new();
+        open_work = view
+            .meta
+            .coverage
+            .iter()
+            .filter(|line| line.starts_with("blocked:") || line.starts_with("deferred:"))
+            .chain(&view.reasons)
+            .filter(|line| seen.insert(line.as_str()))
+            .cloned()
+            .collect();
+    }
     Ok(Handoff {
         review_state: review_state.into(),
         budget: view.budget.clone(),
+        open_work,
         schema: "omgs-handoff/1",
         trust: Trust {
             record_strings: RECORD_TRUST,
@@ -411,6 +431,17 @@ pub fn markdown_at(h: &Handoff, artifact_base: &str) -> String {
     );
     if let Some(budget) = &h.budget {
         out.push_str(&markdown_data("Budget", budget));
+    }
+    if !h.open_work.is_empty() {
+        out.push_str("## Unfinished work\n\nThis review is incomplete. A short or empty record list below is not evidence that the code is safe. These items were stopped, blocked, deferred or not examined.\n\n");
+        let visible = &h.open_work[..h.open_work.len().min(OPEN_WORK_ITEMS)];
+        out.push_str(&markdown_data("Unfinished work", &visible.join("\n")));
+        if h.open_work.len() > OPEN_WORK_ITEMS {
+            out.push_str(&format!(
+                "{} more item(s) are retained in the open_work array in handoff.json beside this handoff.\n\n",
+                h.open_work.len() - OPEN_WORK_ITEMS
+            ));
+        }
     }
     for r in &h.records {
         out.push_str(&format!(
