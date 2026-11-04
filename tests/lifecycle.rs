@@ -2761,3 +2761,68 @@ fn incomplete_handoff_lists_stops_and_deferred_units() {
         "{json}"
     );
 }
+
+#[test]
+fn truncated_handoff_retains_all_work_without_a_report_for_every_persona() {
+    for persona in ["builder", "inheritor", "team"] {
+        for command in ["handoff", "report"] {
+            let run = Run::new();
+            run.put("findings.json", json!({"findings":[]}));
+            omgs::runmeta::update(&run.0, |meta| {
+                meta.insert("persona".into(), json!(persona));
+                Ok(())
+            })
+            .unwrap();
+            let units: Vec<_> = (0..101)
+                .map(|i| {
+                    json!({
+                        "id": format!("surface-{i:03}"), "surface":"source.rs",
+                        "attack_classes":[], "status":"deferred", "note":"Awaiting review"
+                    })
+                })
+                .collect();
+            run.put("coverage-ledger.json", json!({"units":units}));
+            let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"));
+            cmd.arg(command);
+            if command == "handoff" {
+                cmd.arg("--run").arg(&run.0);
+            } else {
+                cmd.arg("--findings")
+                    .arg(run.0.join("findings.json"))
+                    .arg("--out")
+                    .arg(&run.0);
+            }
+            let output = cmd.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{persona} {command}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let markdown = std::fs::read_to_string(run.0.join("HANDOFF.md")).unwrap();
+            assert!(
+                markdown.contains("open_work array in handoff.json"),
+                "{markdown}"
+            );
+            assert!(
+                !markdown.contains("surface-100"),
+                "Markdown should stay bounded"
+            );
+            let handoff: Value =
+                serde_json::from_slice(&std::fs::read(run.0.join("handoff.json")).unwrap())
+                    .unwrap();
+            let work = handoff["open_work"].as_array().unwrap();
+            for i in 0..101 {
+                assert!(
+                    work.iter().any(|v| v
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("deferred: surface-{i:03}"))),
+                    "missing unit {i}"
+                );
+            }
+            if command == "handoff" {
+                assert!(!run.0.join("REPORT.md").exists());
+            }
+        }
+    }
+}

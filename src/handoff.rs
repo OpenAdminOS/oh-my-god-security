@@ -307,11 +307,6 @@ pub fn build_view(
             .filter(|line| seen.insert(line.as_str()))
             .cloned()
             .collect();
-        if open_work.len() > OPEN_WORK_ITEMS {
-            let more = open_work.len() - OPEN_WORK_ITEMS;
-            open_work.truncate(OPEN_WORK_ITEMS);
-            open_work.push(format!("{more} more item(s) are listed in REPORT.md"));
-        }
     }
     Ok(Handoff {
         review_state: review_state.into(),
@@ -439,7 +434,14 @@ pub fn markdown_at(h: &Handoff, artifact_base: &str) -> String {
     }
     if !h.open_work.is_empty() {
         out.push_str("## Unfinished work\n\nThis review is incomplete. A short or empty record list below is not evidence that the code is safe. These items were stopped, blocked, deferred or not examined.\n\n");
-        out.push_str(&markdown_data("Unfinished work", &h.open_work.join("\n")));
+        let visible = &h.open_work[..h.open_work.len().min(OPEN_WORK_ITEMS)];
+        out.push_str(&markdown_data("Unfinished work", &visible.join("\n")));
+        if h.open_work.len() > OPEN_WORK_ITEMS {
+            out.push_str(&format!(
+                "{} more item(s) are retained in the open_work array in handoff.json beside this handoff.\n\n",
+                h.open_work.len() - OPEN_WORK_ITEMS
+            ));
+        }
     }
     for r in &h.records {
         out.push_str(&format!(
