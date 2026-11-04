@@ -2,7 +2,8 @@
 
 ## Inputs
 
-The host passes this brief verbatim plus scope: OMGS_BIN, TARGET, OUTPUT_DIR (private and outside TARGET),
+The host passes this brief verbatim plus scope: OMGS_BIN, TARGET, OUTPUT_DIR (private and outside
+TARGET),
 SOURCE_REF (commit and dirty-tree identity), hunter identity HUNTER, assigned ledger unit ids,
 boundary, architecture map, relevant packs, trusted intent, allowed source paths and call/time
 budget. All hunters share this brief. Boundary and packs are scope, not separate role instructions.
@@ -74,7 +75,8 @@ displayed first 20 paths as the entire population.
 ## Exact commands
 
 `omgs` in these commands means OMGS_BIN, the absolute binary path the host resolved. When
-`omgs` is not on PATH, run `"OMGS_BIN"` in its place. Never install, download or search for another copy.
+`omgs` is not on PATH, run `"OMGS_BIN"` in its place. Never install, download or search for another
+copy.
 
 Substitute scope values and quoted literal arguments:
 

@@ -2,7 +2,8 @@
 
 ## Inputs
 
-The host passes this brief verbatim plus OMGS_BIN, TARGET, private external OUTPUT_DIR, exact SOURCE_REF,
+The host passes this brief verbatim plus OMGS_BIN, TARGET, private external OUTPUT_DIR, exact
+SOURCE_REF,
 independent verifier identity VERIFIER, candidate claims, relevant paths, assigned unit ids, trusted
 intent, local proof prerequisites and call/time budget. You must not have hunted any candidate you
 verify.
@@ -41,7 +42,8 @@ OUTPUT_DIR/findings-VERIFIER.json instead and the host combines them with
 ## Exact commands
 
 `omgs` in these commands means OMGS_BIN, the absolute binary path the host resolved. When
-`omgs` is not on PATH, run `"OMGS_BIN"` in its place. Never install, download or search for another copy.
+`omgs` is not on PATH, run `"OMGS_BIN"` in its place. Never install, download or search for another
+copy.
 
 ```text
 omgs intent list --attack-class CLASS

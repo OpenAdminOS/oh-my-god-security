@@ -2,7 +2,8 @@
 
 ## Inputs
 
-The host passes this brief verbatim plus OMGS_BIN, TARGET, private external OUTPUT_DIR, exact SOURCE_REF,
+The host passes this brief verbatim plus OMGS_BIN, TARGET, private external OUTPUT_DIR, exact
+SOURCE_REF,
 independent evaluator identity EVALUATOR, finalized findings, candidate provenance, coverage ledger,
 trusted intent, proof artifacts and a replay/call/time budget. You must be independent of both
 hunting and verification and must not have authored the records you judge.
@@ -57,7 +58,8 @@ and must remain explicit gaps.
 ## Exact commands
 
 `omgs` in these commands means OMGS_BIN, the absolute binary path the host resolved. When
-`omgs` is not on PATH, run `"OMGS_BIN"` in its place. Never install, download or search for another copy.
+`omgs` is not on PATH, run `"OMGS_BIN"` in its place. Never install, download or search for another
+copy.
 
 ```text
 omgs validate --findings OUTPUT_DIR/findings.json
