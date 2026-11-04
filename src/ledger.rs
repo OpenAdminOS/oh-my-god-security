@@ -80,6 +80,15 @@ impl Unit {
     }
 }
 
+/// Evidence cites a path when it is the path alone or the path followed by a
+/// line reference or explanation, as in `docs/a.md:3-9 sample only`.
+fn cites(evidence: &str, path: &str) -> bool {
+    let (evidence, path) = (evidence.trim(), path.trim());
+    evidence.strip_prefix(path).is_some_and(|rest| {
+        rest.is_empty() || rest.starts_with(':') || rest.starts_with(char::is_whitespace)
+    })
+}
+
 /// Rule violations for one unit, without the "units[i]" prefix.
 fn unit_errors(u: &Unit) -> Vec<String> {
     let mut errors = Vec::new();
@@ -112,7 +121,7 @@ fn unit_errors(u: &Unit) -> Vec<String> {
             paths
                 .iter()
                 .filter_map(|v| v.as_str())
-                .any(|path| !path.trim().is_empty() && u.evidence.iter().any(|e| e.trim() == path))
+                .any(|path| !path.trim().is_empty() && u.evidence.iter().any(|e| cites(e, path)))
         }) {
             errors.push(
                 "excluded files require evidence citing at least one sampled excluded_paths path"

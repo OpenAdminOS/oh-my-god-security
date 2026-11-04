@@ -315,6 +315,12 @@ fn t64_usage_retains_unknown_attempts_and_replaces_cumulative_continuations() {
     );
     assert!(lines.contains("Aggregate incomplete"));
     assert!(!lines.contains("subtotal 250"));
+    // Every cost is unknown, so the known subtotal is 0, never -0.
+    assert!(
+        lines.contains("cost USD known subtotal 0, 2 unknown attempt(s)"),
+        "{lines}"
+    );
+    assert!(!lines.contains("-0"), "{lines}");
 }
 #[test]
 fn t66_parentless_child_updates_uniquely_and_ambiguity_is_atomic() {
@@ -2676,4 +2682,82 @@ console.log(JSON.stringify(seen));
             "{hash}: {seen}"
         );
     }
+}
+#[test]
+fn run_level_stop_limits_the_review_but_leaves_empty_findings_valid() {
+    let run = Run::new();
+    run.put("findings.json", json!({"findings":[]}));
+    run.put("coverage-ledger.json", json!({"units":[]}));
+    run.event(start("red-agent", "hunter")).unwrap();
+    run.event(stop("red-agent", "provider")).unwrap();
+    let validate = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .arg("validate")
+        .arg("--findings")
+        .arg(run.0.join("findings.json"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&validate.stdout);
+    assert_eq!(
+        validate.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    assert!(stdout.contains("valid: 0 finding(s); review "), "{stdout}");
+    assert!(!stdout.contains("review complete"), "{stdout}");
+    assert!(
+        stdout.contains("review limit: attempt red-agent: stopped"),
+        "{stdout}"
+    );
+    // A record that depends on a stopped attempt is still invalid.
+    let mut f = finding();
+    f.findings[0].verification = Some(omgs::model::Verification {
+        state: "final".into(),
+        attempt: "red-agent".into(),
+    });
+    run.put("findings.json", serde_json::to_value(&f).unwrap());
+    let validate = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .arg("validate")
+        .arg("--findings")
+        .arg(run.0.join("findings.json"))
+        .output()
+        .unwrap();
+    assert_eq!(validate.status.code(), Some(1));
+}
+#[test]
+fn incomplete_handoff_lists_stops_and_deferred_units() {
+    let run = Run::new();
+    run.put("findings.json", json!({"findings":[]}));
+    run.put(
+        "coverage-ledger.json",
+        json!({"units":[{"id":"stack:dotnet","surface":"stack checklist","attack_classes":[],"status":"deferred","note":"not hunted in this run"}]}),
+    );
+    run.event(start("red-mcp", "hunter")).unwrap();
+    run.event(stop("red-mcp", "provider")).unwrap();
+    let report = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .arg("report")
+        .arg("--findings")
+        .arg(run.0.join("findings.json"))
+        .arg("--out")
+        .arg(&run.0)
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let text = std::fs::read_to_string(run.0.join("HANDOFF.md")).unwrap();
+    assert!(text.contains("Review state: incomplete"), "{text}");
+    assert!(text.contains("## Unfinished work"), "{text}");
+    assert!(text.contains("attempt red-mcp: stopped"), "{text}");
+    assert!(text.contains("deferred: stack:dotnet"), "{text}");
+    let json: Value =
+        serde_json::from_str(&std::fs::read_to_string(run.0.join("handoff.json")).unwrap())
+            .unwrap();
+    let open = json["open_work"].as_array().unwrap();
+    assert!(
+        open.iter().any(|v| v == "attempt red-mcp: stopped"),
+        "{json}"
+    );
 }

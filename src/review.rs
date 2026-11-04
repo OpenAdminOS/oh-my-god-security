@@ -367,9 +367,10 @@ impl View {
     }
 
     /// Strict finding validation reuses the evidence checks in this view.
+    /// Run-level attempt gaps limit the review, not the findings, so they are
+    /// reported through the review state; per-finding attempt gaps stay errors.
     pub fn validation_errors(&self) -> Vec<String> {
         let mut errors = self.strict_errors.clone();
-        errors.extend(self.attempt_gaps.clone());
         errors.extend(self.decision_errors.values().flatten().cloned());
         let mut seen = std::collections::BTreeSet::new();
         errors.retain(|error| seen.insert(error.clone()));

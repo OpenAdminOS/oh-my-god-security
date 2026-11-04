@@ -36,7 +36,7 @@ Every inventory class stays accountable. Test, docs, data, assets and vendored g
 This includes `assets:excluded`, which blocks the critic until resolved. Assign these units
 to hunters to skim or sample, then hunt with `covered` plus evidence or record `out_of_scope` with
 `--note "reviewed, not security relevant: <reason>"`. For out_of_scope, cite at least one displayed
-sampled path with --evidence. Describe the review and why the group is irrelevant; classification
+sampled path with --evidence, alone or followed by a line reference or note (`path:3-9 header only`). Describe the review and why the group is irrelevant; classification
 alone cannot justify exclusion. Blocked or deferred exclusions remain critic failures. The first 20
 paths are a sample, not the entire scope. Resolution reasons appear in ledger output and reports.
 
