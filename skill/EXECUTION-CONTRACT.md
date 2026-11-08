@@ -164,3 +164,8 @@ against new dispatch/proofs. It never kills a PID or independently certifies ter
 or repeated tokens and false termination attestations are refused. Remaining active proofs and
 unreleased resources still prevent cleanup completion. Final cleanup receipts retain all proof
 resolutions, including their host-attested assurance level.
+
+Cleanup begin and finish check active proof records across the entire registered run family,
+including nested fixes and uncertain proofs, under the shared family lock. Resolve each proof in
+its owning run before removing shared resources. The three-call hunter reserve applies to pilot
+and review dispatch alike and includes proof charges and linked-run spending.

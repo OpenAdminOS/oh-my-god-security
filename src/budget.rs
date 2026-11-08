@@ -607,6 +607,35 @@ impl Drop for ProofAdmission {
         }
     }
 }
+/// Caller holds the family lock. Nested fixes are registered directly at the root.
+pub(crate) fn family_active_proofs_locked(
+    run: &Path,
+    current: &Map<String, Value>,
+) -> Result<bool, String> {
+    let root = original(run)?;
+    let current_path = run_path(run)?;
+    let root_meta = read_run(&root)?;
+    // Validate every identity/link before relying on the family inventory.
+    allowance(&root)?;
+    let mut paths = vec![root.clone()];
+    paths.extend(
+        fix_runs(&root_meta, root.parent().ok_or("root needs parent")?)?
+            .into_iter()
+            .map(|r| r.path),
+    );
+    for path in paths {
+        let active = if path == current_path {
+            active_proofs(current)?
+        } else {
+            active_proofs(&read_run(&path)?)?
+        };
+        if active {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn active_proofs(m: &Map<String, Value>) -> Result<bool, String> {
     match m.get("active_proofs") {
         None => Ok(false),

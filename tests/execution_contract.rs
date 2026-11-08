@@ -772,3 +772,77 @@ fn nested_fix_preserves_its_intermediate_parents_stop() {
         .contains("parent pilot failed"));
     assert!(!r.1.join("third").exists());
 }
+
+#[test]
+fn pilot_hunter_preserves_proof_inclusive_reserve() {
+    let r = Run::new();
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("budget_agent_calls".into(), json!(6));
+        Ok(())
+    })
+    .unwrap();
+    let mut c = r.contract();
+    c.verification = "sandbox_tests".into();
+    contract::lock(&r.0, c).unwrap();
+    r.ready();
+    for _ in 0..3 {
+        omgs::budget::charge_proof(&r.0).unwrap();
+    }
+    r.start("hunter", "hunter", "pilot");
+    assert!(r.dispatch("hunter", "1").unwrap_err().contains("reserved"));
+    assert_eq!(omgs::budget::allowance(&r.0).unwrap().remaining, Some(3));
+    r.start("verifier", "verifier", "pilot");
+    r.dispatch("verifier", "1").unwrap();
+}
+
+#[test]
+fn cleanup_checks_running_and_uncertain_proofs_across_nested_family() {
+    let r = Run::new();
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("run_id".into(), json!("root"));
+        Ok(())
+    })
+    .unwrap();
+    let child = initialize_linked_fix(&r.0).unwrap();
+    let nested = initialize_named_fix(&child, "nested").unwrap();
+    let proof = omgs::budget::ProofAdmission::admit(&nested, None, None).unwrap();
+    proof.start(None).unwrap();
+    for path in [&r.0, &child] {
+        assert!(omgs::cleanup::begin(path)
+            .unwrap_err()
+            .contains("active proofs"));
+    }
+    drop(proof); // A started proof remains uncertain until host resolution.
+    for path in [&r.0, &child] {
+        assert!(omgs::cleanup::begin(path)
+            .unwrap_err()
+            .contains("active proofs"));
+        assert!(omgs::cleanup::finish(path)
+            .unwrap_err()
+            .contains("active proofs"));
+        assert!(omgs::runmeta::read(path)
+            .unwrap()
+            .get("cleanup_receipt")
+            .is_none());
+    }
+    let state = omgs::runmeta::read(&nested).unwrap();
+    let token = state["active_proofs"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    omgs::cleanup::resolve_proof(
+        &nested,
+        omgs::cleanup::ProofResolution {
+            token,
+            actor: "host".into(),
+            evidence: "verified no surviving processes".into(),
+            processes_stopped: true,
+        },
+    )
+    .unwrap();
+    omgs::cleanup::begin(&r.0).unwrap();
+    omgs::cleanup::finish(&r.0).unwrap();
+}

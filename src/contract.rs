@@ -304,11 +304,11 @@ pub fn check_dispatch(run: &Path, m: &Map<String, Value>, id: &str) -> Result<()
                 .cloned()
                 .ok_or("pilot has not passed; scaled dispatch refused")?,
         )?;
-        if a.role == "hunter"
-            && crate::budget::remaining_locked(run, m)?.is_some_and(|remaining| remaining <= 3)
-        {
-            return Err("remaining calls reserved for verification and reporting".into());
-        }
+    }
+    if a.role == "hunter"
+        && crate::budget::remaining_locked(run, m)?.is_some_and(|remaining| remaining <= 3)
+    {
+        return Err("remaining calls reserved for verification and reporting".into());
     }
     Ok(())
 }
