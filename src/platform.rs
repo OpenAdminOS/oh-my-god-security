@@ -1026,10 +1026,13 @@ pub fn safe_path(path: &Path) -> std::io::Result<()> {
             Ok(())
         };
         check().map_err(|e| {
-            Error::other(format!(
-                "storage {}: {e}; see README.md#storage-migration",
-                entry.display()
-            ))
+            Error::new(
+                e.kind(),
+                format!(
+                    "storage {}: {e}; see README.md#storage-migration",
+                    entry.display()
+                ),
+            )
         })?;
     }
     Ok(())

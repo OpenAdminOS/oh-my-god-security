@@ -54,10 +54,13 @@ pub(super) fn check_dir(path: &Path, owner: libc::uid_t) -> Result<()> {
         .open(path)
         .and_then(|file| check_file(&file, owner));
     result.map_err(|e| {
-        Error::other(format!(
-            "storage {}: {e}; see README.md#storage-migration",
-            path.display()
-        ))
+        Error::new(
+            e.kind(),
+            format!(
+                "storage {}: {e}; see README.md#storage-migration",
+                path.display()
+            ),
+        )
     })
 }
 
@@ -185,6 +188,24 @@ mod tests {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
     }
+    #[test]
+    fn retired_directory_preserves_not_found_for_recovery() {
+        let fixture = Fixture::new();
+        let retired = fixture.0.join("retired");
+        platform::create_private_dir_new(&retired).unwrap();
+        let owner =
+            std::os::unix::fs::MetadataExt::uid(&std::fs::symlink_metadata(&retired).unwrap());
+        // Recovery can observe a directory just before its live owner removes it.
+        std::fs::remove_dir(&retired).unwrap();
+        let error = check_dir(&retired, owner).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("storage-migration"));
+        assert_eq!(
+            platform::check_private_dir(&retired).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
     fn add_acl(path: &Path, entry: &str) {
         let result = Command::new("/bin/chmod")
             .arg("+a")

@@ -19,6 +19,9 @@
   Hosts still perform ownership-checked deletion and process termination; OMGS does not infer
   cleanup from an empty process list or execute arbitrary resource locators.
 
+- Preserve missing-directory errors during macOS storage admission so concurrent job recovery
+  can skip directories already retired by their owners without weakening ACL checks.
+
 ### Operational notes
 
 - Contract and resource records are host assertions, not authenticated backend attestations.
