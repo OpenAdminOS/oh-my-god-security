@@ -204,6 +204,11 @@ pub enum AppendOutcome {
 
 pub fn append(run: &Path, event: Event) -> Result<AppendOutcome, String> {
     crate::runmeta::update(run, |m| {
+        if m.contains_key("cleanup_started_at")
+            && matches!(&event, Event::Start { .. } | Event::Dispatch { .. })
+        {
+            return Err("run is closing; new attempts and dispatch refused".into());
+        }
         let mut h = history(m)?;
         if let Event::Dispatch { id, turn, .. } = &event {
             if let Some(previous) = h.iter().find(|r| matches!(&r.record, Event::Dispatch { id: old_id, turn: old_turn, .. } if old_id == id && old_turn == turn)) {
@@ -211,6 +216,17 @@ pub fn append(run: &Path, event: Event) -> Result<AppendOutcome, String> {
                 if state.get(id).is_some_and(|a| a.state == "stopped") { return Err("stopped attempts cannot dispatch again".into()); }
                 if previous.record != event { return Err("turn id is already recorded with different dispatch details".into()); }
                 return Ok(AppendOutcome::AlreadyRecorded);
+            }
+        }
+        if let Event::Dispatch { id, .. } = &event {
+            crate::contract::check_dispatch(m, id)?;
+            if m.get("execution_bindings")
+                .and_then(|v| v.get(id))
+                .and_then(|v| v.get("phase"))
+                .and_then(Value::as_str)
+                == Some("pilot")
+            {
+                m.remove("pilot");
             }
         }
         let dispatch = matches!(&event, Event::Dispatch { .. });
@@ -243,6 +259,9 @@ pub fn append(run: &Path, event: Event) -> Result<AppendOutcome, String> {
                 );
         }
         let stopped = matches!(h.last().map(|r| &r.record), Some(Event::Stop { .. }));
+        if stopped {
+            m.remove("pilot");
+        }
         m.insert(
             "run_status".into(),
             json!(if stopped { "partial" } else { "in_progress" }),

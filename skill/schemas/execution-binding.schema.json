@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "execution-binding",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "attempt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "location": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "provider",
+        "model",
+        "location"
+      ]
+    },
+    "phase": {
+      "enum": [
+        "pilot",
+        "review"
+      ]
+    },
+    "boundary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "actor": {
+      "type": "string",
+      "minLength": 1
+    },
+    "entry": {
+      "type": "string",
+      "minLength": 1
+    },
+    "effect": {
+      "type": "string",
+      "minLength": 1
+    },
+    "invariant": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "required": [
+    "attempt",
+    "execution",
+    "phase",
+    "boundary",
+    "actor",
+    "entry",
+    "effect",
+    "invariant"
+  ]
+}

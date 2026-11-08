@@ -7,9 +7,11 @@ pub mod batch;
 pub mod bench;
 pub mod budget;
 pub mod classes;
+pub mod cleanup;
 pub mod clone;
 #[cfg(target_os = "macos")]
 pub mod coalition;
+pub mod contract;
 pub mod critic;
 pub mod handoff;
 pub mod help;

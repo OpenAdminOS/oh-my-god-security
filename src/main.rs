@@ -160,6 +160,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
             "--run --stage --state --label --parent --detail --counter --log --accounting",
             false,
         ),
+        "contract" | "cleanup" => ("--run --from", true),
         "attempt" => ("--run --event --resolve-blocker --actor --reason --replacement", false),
         "watch" => ("--run --max-ms", false),
         "route" => ("--run --role --refused --reason --models --model", false),
@@ -296,6 +297,8 @@ fn main() -> ExitCode {
         "critic" => cmd_critic(rest),
         "budget" => cmd_budget(rest),
         "batch" => cmd_batch(rest),
+        "contract" => cmd_contract(rest),
+        "cleanup" => cmd_cleanup(rest),
         "attempt" => cmd_attempt(rest),
         "status" => cmd_status(rest),
         "watch" => cmd_watch(rest),
@@ -712,6 +715,9 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     #[cfg(unix)]
     let _signals = omgs::supervise::interruption::Guard::install().map_err(|e| e.to_string())?;
     let run = flag(args, "--run").map(PathBuf::from);
+    if let Some(run) = &run {
+        omgs::contract::check_proof(&omgs::runmeta::read_optional(run)?.unwrap_or_default())?;
+    }
     #[cfg(target_os = "macos")]
     {
         for path in std::iter::once(data_dir()).chain(run.iter().cloned()) {
@@ -2022,6 +2028,9 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         &supplied_models,
         &publication,
         |saved, writes| {
+            for (role, model) in &supplied_models {
+                omgs::contract::check_model(saved, role, model)?;
+            }
             submission.apply(saved)?;
             omgs::runmeta::check_numeric_fields(saved)?;
             let saved = saved.clone();
@@ -2144,6 +2153,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 source_ref: defaulted(None, "source_ref", "working tree"),
                 mode: defaulted(flag(args, "--mode"), "mode", "advisory"),
                 sandbox: defaulted(None, "sandbox", "not recorded"),
+                execution_contract: omgs::contract::describe(&saved)?,
                 artifact_base: String::new(),
                 review_limits: Vec::new(),
                 timeline: Vec::new(),
@@ -4140,6 +4150,9 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
         let labels = omgs::route::parse_identities(&[format!("{role}={label}")])?;
         omgs::runmeta::update(&run, |m| {
             omgs::batch::check_meta_types(m)?;
+            for (role, value) in &labels {
+                omgs::contract::check_model(m, role, value)?;
+            }
             let saved = m
                 .entry("models")
                 .or_insert_with(|| serde_json::json!({}))
@@ -4215,7 +4228,17 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
                 refused.push(model.clone());
             }
         }
-        let next = if default_route && !refused.is_empty() {
+        let locked = omgs::contract::load(m)?;
+        let next = if let Some(c) = locked {
+            if !refused.is_empty() {
+                Err("locked contract forbids fallback after refusal".into())
+            } else {
+                c.roles
+                    .get(&role)
+                    .map(|e| e.model.clone())
+                    .ok_or_else(|| "role absent from execution contract".to_string())
+            }
+        } else if default_route && !refused.is_empty() {
             Err(format!(
                 "no configured fallback for role '{role}' after refusal; keep the blocker recorded"
             ))
@@ -4408,6 +4431,67 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err("usage: omgs intent list [--stack <s>] [--attack-class <c>] | omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]".into()),
+    }
+}
+
+fn cmd_cleanup(args: &[String]) -> Result<(), String> {
+    let run = PathBuf::from(flag(args, "--run").ok_or("cleanup requires --run")?);
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or("cleanup requires register, release, begin, finish or show")?;
+    if ["begin", "finish", "show"].contains(&action) {
+        if flag(args, "--from").is_some() {
+            return Err("this cleanup action does not accept --from".into());
+        }
+        return match action {
+            "begin" => omgs::cleanup::begin(&run),
+            "finish" => omgs::cleanup::finish(&run),
+            _ => {
+                omgs::out::line(
+                    &serde_json::to_string_pretty(&omgs::cleanup::show(&run)?)
+                        .map_err(|e| e.to_string())?,
+                );
+                Ok(())
+            }
+        };
+    }
+    let path = flag(args, "--from").ok_or("cleanup resource action requires --from")?;
+    let value = omgs::shape::strict_json(&omgs::run_artifact::text_path(
+        Path::new(&path),
+        omgs::run_artifact::METADATA_BYTES,
+    )?)?;
+    match action {
+        "register" => omgs::cleanup::register(&run, omgs::contract::decode(value)?),
+        "release" => omgs::cleanup::release(&run, omgs::contract::decode(value)?),
+        _ => Err("unknown cleanup action".into()),
+    }
+}
+
+fn cmd_contract(args: &[String]) -> Result<(), String> {
+    let run = PathBuf::from(flag(args, "--run").ok_or("contract requires --run")?);
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or("contract requires lock, readiness, bind, pilot or show")?;
+    if action == "show" {
+        if flag(args, "--from").is_some() {
+            return Err("show does not accept --from".into());
+        }
+        let meta = omgs::runmeta::read(&run)?;
+        let contract = omgs::contract::load(&meta)?.ok_or("no execution contract locked")?;
+        omgs::out::line(&serde_json::to_string_pretty(&contract).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+    let path = flag(args, "--from").ok_or("contract update requires --from <json>")?;
+    let text = omgs::run_artifact::text_path(Path::new(&path), omgs::run_artifact::METADATA_BYTES)?;
+    let value = omgs::shape::strict_json(&text)?;
+    match action {
+        "lock" => omgs::contract::lock(&run, omgs::contract::decode(value)?),
+        "readiness" => omgs::contract::readiness(&run, omgs::contract::decode(value)?),
+        "bind" => omgs::contract::bind(&run, omgs::contract::decode(value)?),
+        "pilot" => omgs::contract::accept_pilot(&run, omgs::contract::decode(value)?),
+        _ => Err("unknown contract action".into()),
     }
 }
 

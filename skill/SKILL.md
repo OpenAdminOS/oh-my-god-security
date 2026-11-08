@@ -7,8 +7,7 @@ description: >-
 
 # Oh My God Security
 
-OMGS is a defensive review of code the user owns or is authorized to review. Its purpose is to find
-and fix vulnerabilities before release. Results stay local in a private run directory. Target code
+OMGS reviews authorized code defensively. Results stay in a private local run directory. Target code
 only ever runs inside the SHA-256 pinned Microsoft MXC sandbox through `omgs prove`, with external
 network denied, synthetic fixtures and dummy data. Nothing is ever run against live systems,
 third-party services or other people's infrastructure.
@@ -18,8 +17,8 @@ reports. OMGS sends no telemetry and has no hosted service. Code context still g
 already used by the chosen host unless it runs locally. Local results do not imply that provider
 processing is local.
 
-The method applies across stacks. TypeScript and Next.js App Router have the strongest benchmarks;
-other stacks use the same evidence bar. Read only the guides required for the current role.
+TypeScript and Next.js App Router have the strongest benchmarks; all stacks use the same evidence
+bar. Read only the current role guides.
 
 ## Authorization and stop conditions
 
@@ -55,6 +54,9 @@ that command yourself. Read [POLICY-AND-GATE.md](POLICY-AND-GATE.md) for headles
 replacement behavior and trusted-base policy. Show resolved mode and budget before calls.
 Proofs never install or fetch dependencies. Missing tools and offline databases are gaps, never
 permission to fetch.
+
+Before dispatch, follow [execution agreement, pilot and cleanup](EXECUTION-CONTRACT.md):
+lock the contract, pass readiness/pilot and register resources.
 
 ## Seven phases
 
