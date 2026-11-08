@@ -234,7 +234,7 @@ pub fn bind(run: &Path, b: Binding) -> Result<(), String> {
         Ok(())
     })
 }
-pub fn check_dispatch(m: &Map<String, Value>, id: &str) -> Result<(), String> {
+pub fn check_dispatch(run: &Path, m: &Map<String, Value>, id: &str) -> Result<(), String> {
     let Some(c) = load(m)? else {
         return Ok(());
     }; // Legacy runs remain readable/usable.
@@ -242,6 +242,9 @@ pub fn check_dispatch(m: &Map<String, Value>, id: &str) -> Result<(), String> {
         return Err("run is closing; new dispatch refused".into());
     }
     ready(m)?;
+    if m.contains_key("pilot_failure") {
+        return Err("pilot failed; further calls require a new authorized run".into());
+    }
     if !crate::attempts::active_blockers(m)?.is_empty() {
         return Err("active blocker prevents dispatch".into());
     }
@@ -281,15 +284,7 @@ pub fn check_dispatch(m: &Map<String, Value>, id: &str) -> Result<(), String> {
                 .ok_or("pilot has not passed; scaled dispatch refused")?,
         )?;
         if a.role == "hunter"
-            && m.get("budget_agent_calls")
-                .and_then(Value::as_u64)
-                .is_some_and(|cap| {
-                    m.get("agent_calls_used")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        .saturating_add(3)
-                        >= cap
-                })
+            && crate::budget::remaining_locked(run, m)?.is_some_and(|remaining| remaining <= 3)
         {
             return Err("remaining calls reserved for verification and reporting".into());
         }
@@ -298,7 +293,16 @@ pub fn check_dispatch(m: &Map<String, Value>, id: &str) -> Result<(), String> {
 }
 pub fn accept_pilot(run: &Path, p: Pilot) -> Result<(), String> {
     if !(p.source_accuracy && p.counterevidence && p.structured_output) || p.evidence.is_empty() {
-        return Err("pilot failed quality checks; do not scale".into());
+        crate::runmeta::update(run, |m| {
+            require(m)?;
+            m.remove("pilot");
+            m.insert("run_status".into(), json!("partial"));
+            m.insert("pilot_failure".into(), json!({"decision":p,"recorded_at":crate::runmeta::timestamp(crate::runmeta::now_ms())}));
+            Ok(())
+        })?;
+        return Err(
+            "pilot failed quality checks; stop persisted; new authorization/run required".into(),
+        );
     }
     for e in &p.evidence {
         crate::run_artifact::check_containment(run, Path::new(e))?;
@@ -306,6 +310,9 @@ pub fn accept_pilot(run: &Path, p: Pilot) -> Result<(), String> {
     crate::runmeta::update(run, |m| {
         let c = require(m)?;
         ready(m)?;
+        if m.contains_key("pilot_failure") {
+            return Err("failed pilot cannot be overwritten; new authorized run required".into());
+        }
         if !crate::attempts::active_blockers(m)?.is_empty() {
             return Err("active blocker prevents pilot acceptance".into());
         }
@@ -388,6 +395,9 @@ pub fn gaps(m: &Map<String, Value>) -> Result<Vec<String>, String> {
     if let Err(e) = ready(m) {
         gaps.push(format!("Readiness: {e}"));
     }
+    if m.contains_key("pilot_failure") {
+        gaps.push("Pilot failed; further calls are stopped".into());
+    }
     if !m.contains_key("pilot") {
         gaps.push("Pilot quality/validation gate has not passed".into());
     }
@@ -422,6 +432,9 @@ pub fn check_proof(m: &Map<String, Value>) -> Result<(), String> {
         return Err("run is closing; proof refused".into());
     }
     if let Some(c) = load(m)? {
+        if m.contains_key("pilot_failure") {
+            return Err("failed pilot prevents proof".into());
+        }
         if c.verification != "sandbox_tests" {
             return Err("source-only contract excludes target execution".into());
         }
@@ -434,6 +447,24 @@ pub fn check_proof(m: &Map<String, Value>) -> Result<(), String> {
             .any(|a| a.state == "stopped" && a.replacement.is_none())
         {
             return Err("unresolved safety stop prevents proof".into());
+        }
+    }
+    Ok(())
+}
+
+/// Validate both the prepared request identity and the current checkout at admission.
+pub fn check_proof_target(
+    m: &Map<String, Value>,
+    target: Option<&Path>,
+    expected_head: Option<&str>,
+) -> Result<(), String> {
+    check_proof(m)?;
+    if let Some(c) = load(m)? {
+        let head = target.and_then(crate::proof::git_head);
+        if expected_head != Some(c.source_ref.as_str())
+            || head.as_deref() != Some(c.source_ref.as_str())
+        {
+            return Err("proof target revision differs from locked source_ref".into());
         }
     }
     Ok(())

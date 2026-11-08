@@ -9,6 +9,9 @@
   requires this for new reviews. Existing run directories remain compatible.
 - Readiness and a bounded three-role quality pilot gate broad dispatch. Refusals do not select
   a fallback in locked runs. Hunter calls preserve a verification/reporting reserve.
+- Failed pilot decisions persist and revoke earlier approval. Hunter reserves include charged
+  proofs and linked runs. Proof admission tracks active work, blocks cleanup until certified release,
+  and rechecks source revision and lifecycle stops immediately before workload launch.
 - Reports disclose the execution agreement and retain readiness, pilot and source-only limitations.
 - A resource ledger closes dispatch before cleanup and records host-attested resource releases.
   Hosts still perform ownership-checked deletion and process termination; OMGS does not infer

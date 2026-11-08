@@ -219,7 +219,7 @@ pub fn append(run: &Path, event: Event) -> Result<AppendOutcome, String> {
             }
         }
         if let Event::Dispatch { id, .. } = &event {
-            crate::contract::check_dispatch(m, id)?;
+            crate::contract::check_dispatch(run, m, id)?;
             if m.get("execution_bindings")
                 .and_then(|v| v.get(id))
                 .and_then(|v| v.get("phase"))

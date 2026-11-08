@@ -715,9 +715,6 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
     #[cfg(unix)]
     let _signals = omgs::supervise::interruption::Guard::install().map_err(|e| e.to_string())?;
     let run = flag(args, "--run").map(PathBuf::from);
-    if let Some(run) = &run {
-        omgs::contract::check_proof(&omgs::runmeta::read_optional(run)?.unwrap_or_default())?;
-    }
     #[cfg(target_os = "macos")]
     {
         for path in std::iter::once(data_dir()).chain(run.iter().cloned()) {
@@ -1061,12 +1058,15 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         }
     }
     omgs::supervise::check_interrupted().map_err(|e| e.to_string())?;
+    let mut admission = None;
     let proof_dir = match &run {
         Some(r) => {
             // Check and charge the budget in one locked step, before anything
             // runs, so concurrent proofs cannot overspend it. A run that is
             // interrupted keeps its charge; a blocked one gets it back below.
-            let charged = omgs::budget::charge_proof(r);
+            let charged =
+                omgs::budget::ProofAdmission::admit(r, target.as_deref(), target_head.as_deref())
+                    .map(|guard| admission = Some(guard));
             if let Err(e) = charged {
                 if e.starts_with("run budget exhausted") {
                     omgs::out::err(&format!(
@@ -1191,9 +1191,12 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         ));
     }
     let started_at_ms = omgs::runmeta::now_ms();
-    let result = match prove(&request) {
+    let result = match omgs::sandbox::prove_admitted(&request, admission.as_ref()) {
         ProveOutcome::Blocked { reason } => {
             release();
+            if let Some(admission) = &admission {
+                admission.finish()?;
+            }
             omgs::out::err(&format!(
                 "needs_validation: target code was not executed. {}",
                 omgs::platform::escape_controls(&reason)
@@ -1295,6 +1298,11 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             p
         }
     };
+    if s.cleanup_complete {
+        if let Some(admission) = &admission {
+            admission.finish()?;
+        }
+    }
     omgs::out::text(&record.output);
     omgs::out::err(&format!(
         "sandbox: MXC {} ({}), executor {} sha256 {}",

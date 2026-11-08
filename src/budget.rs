@@ -245,6 +245,13 @@ pub fn charge_proof(run: &Path) -> Result<(), String> {
 }
 
 fn charge_proof_checked(run: &Path, after_check: impl FnOnce()) -> Result<(), String> {
+    charge_proof_admitted(run, after_check, None)
+}
+fn charge_proof_admitted(
+    run: &Path,
+    after_check: impl FnOnce(),
+    admission: Option<(&str, Option<&Path>, Option<&str>)>,
+) -> Result<(), String> {
     let run = run_path(run)?;
     let root = original(&run)?;
     runmeta::with_lock(&root, || {
@@ -285,6 +292,19 @@ fn charge_proof_checked(run: &Path, after_check: impl FnOnce()) -> Result<(), St
                 return Err(
                     "run budget exhausted: cumulative original and fix allowance consumed".into(),
                 );
+            }
+            crate::contract::check_proof(&meta)?;
+            if let Some((token, target, expected_head)) = admission {
+                crate::contract::check_proof_target(&meta, target, expected_head)?;
+                let slots = meta
+                    .entry("active_proofs")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .ok_or("active_proofs must be an object")?;
+                if slots.contains_key(token) {
+                    return Err("proof admission token already used".into());
+                }
+                slots.insert(token.into(),serde_json::json!({"state":"preparing","admitted_at":runmeta::timestamp(runmeta::now_ms())}));
             }
             charge(&mut meta)?;
             runmeta::write_atomic(
@@ -444,6 +464,103 @@ pub fn summary_proposed_locked(
     ))
 }
 
+/// Caller holds the family lock. Include both proofs and calls, plus linked runs.
+pub(crate) fn remaining_locked(run: &Path, m: &Map<String, Value>) -> Result<Option<u64>, String> {
+    let family = allowance(&original(run)?)?.remaining;
+    let local = m
+        .get("budget_agent_calls")
+        .and_then(Value::as_u64)
+        .map(|cap| {
+            cap.saturating_sub(
+                m.get("agent_calls_used")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(
+                        m.get("proof_runs_used")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    ),
+            )
+        });
+    Ok(match (family, local) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    })
+}
+
+/// An admitted proof holds cleanup closed through preparation, execution and publication.
+/// A process crash or uncertain execution leaves its record active for host investigation.
+pub struct ProofAdmission {
+    run: std::path::PathBuf,
+    token: String,
+    expected_head: Option<String>,
+    started: std::cell::Cell<bool>,
+    finished: std::cell::Cell<bool>,
+}
+impl ProofAdmission {
+    pub fn admit(
+        run: &Path,
+        target: Option<&Path>,
+        expected_head: Option<&str>,
+    ) -> Result<Self, String> {
+        let token = crate::platform::random_nonce().map_err(|e| e.to_string())?;
+        charge_proof_admitted(run, || {}, Some((&token, target, expected_head)))?;
+        Ok(Self {
+            run: run.to_path_buf(),
+            token,
+            expected_head: expected_head.map(str::to_owned),
+            started: std::cell::Cell::new(false),
+            finished: std::cell::Cell::new(false),
+        })
+    }
+    /// Called after sandbox preparation and before each workload launch, including fallback.
+    pub fn start(&self, target: Option<&Path>) -> Result<(), String> {
+        runmeta::update(&self.run, |m| {
+            crate::contract::check_proof_target(m, target, self.expected_head.as_deref())?;
+            let slot = m
+                .get_mut("active_proofs")
+                .and_then(Value::as_object_mut)
+                .and_then(|v| v.get_mut(&self.token))
+                .ok_or("proof admission disappeared")?;
+            *slot = serde_json::json!({"state":"running","started_at":runmeta::timestamp(runmeta::now_ms())});
+            Ok(())
+        })?;
+        self.started.set(true);
+        Ok(())
+    }
+    /// Call only after the runner reports no execution or certified complete cleanup.
+    pub fn finish(&self) -> Result<(), String> {
+        runmeta::update(&self.run, |m| {
+            let slots = m
+                .get_mut("active_proofs")
+                .and_then(Value::as_object_mut)
+                .ok_or("proof admissions missing")?;
+            slots
+                .remove(&self.token)
+                .ok_or("proof admission disappeared")?;
+            Ok(())
+        })?;
+        self.finished.set(true);
+        Ok(())
+    }
+}
+impl Drop for ProofAdmission {
+    fn drop(&mut self) {
+        if !self.started.get() && !self.finished.get() {
+            let _ = self.finish();
+        }
+    }
+}
+pub(crate) fn active_proofs(m: &Map<String, Value>) -> Result<bool, String> {
+    match m.get("active_proofs") {
+        None => Ok(false),
+        Some(v) => Ok(!v
+            .as_object()
+            .ok_or("active_proofs must be an object")?
+            .is_empty()),
+    }
+}
+
 #[cfg(test)]
 mod regressions {
     use super::*;
@@ -482,6 +599,40 @@ mod regressions {
         )
         .unwrap();
         (dir, root, child)
+    }
+
+    #[test]
+    fn reserve_uses_family_proofs_and_local_cap() {
+        let (dir, root, child) = family("contract-reserve");
+        runmeta::update(&root, |m| {
+            m.insert("budget_agent_calls".into(), json!(12));
+            m.insert("agent_calls_used".into(), json!(3));
+            m.insert("proof_runs_used".into(), json!(3));
+            Ok(())
+        })
+        .unwrap();
+        runmeta::update(&child, |m| {
+            m.insert("budget_agent_calls".into(), json!(12));
+            m.insert("proof_runs_used".into(), json!(3));
+            Ok(())
+        })
+        .unwrap();
+        with_family_lock(&root, || {
+            assert_eq!(remaining_locked(&root, &read_run(&root)?)?, Some(3));
+            Ok(())
+        })
+        .unwrap();
+        runmeta::update(&child, |m| {
+            m.insert("budget_agent_calls".into(), json!(4));
+            Ok(())
+        })
+        .unwrap();
+        with_family_lock(&child, || {
+            assert_eq!(remaining_locked(&child, &read_run(&child)?)?, Some(1));
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

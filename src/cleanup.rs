@@ -102,6 +102,9 @@ pub fn release(run: &Path, r: Release) -> Result<(), String> {
 }
 pub fn begin(run: &Path) -> Result<(), String> {
     crate::runmeta::update(run, |m| {
+        if crate::budget::active_proofs(m)? {
+            return Err("active proofs prevent cleanup".into());
+        }
         if crate::attempts::states(&crate::attempts::history(m)?)?
             .values()
             .any(|a| a.state == "active")
@@ -115,6 +118,9 @@ pub fn begin(run: &Path) -> Result<(), String> {
 }
 pub fn finish(run: &Path) -> Result<(), String> {
     crate::runmeta::update(run, |m| {
+        if crate::budget::active_proofs(m)? {
+            return Err("active proofs prevent cleanup completion".into());
+        }
         if !m.contains_key("cleanup_started_at") {
             return Err("begin cleanup first".into());
         }

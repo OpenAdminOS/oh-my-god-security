@@ -39,7 +39,10 @@ impl Run {
         contract::readiness(
             &self.0,
             contract::Readiness {
-                source_ref: "abc".into(),
+                source_ref: omgs::runmeta::read(&self.0).unwrap()["source_ref"]
+                    .as_str()
+                    .unwrap()
+                    .into(),
                 checks,
             },
         )
@@ -217,6 +220,22 @@ fn successful_pilot_allows_review_until_cleanup_closes_it() {
         .unwrap_err()
         .contains("source-only"));
     r.start("review", "hunter", "review");
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("proof_runs_used".into(), json!(6));
+        Ok(())
+    })
+    .unwrap();
+    assert!(r.dispatch("review", "1").unwrap_err().contains("reserved"));
+    assert_eq!(
+        omgs::runmeta::read(&r.0).unwrap()["agent_calls_used"],
+        json!(3)
+    );
+    // Restore the synthetic fixture to exercise the ordinary successful path too.
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("proof_runs_used".into(), json!(0));
+        Ok(())
+    })
+    .unwrap();
     r.dispatch("review", "1").unwrap();
     assert!(omgs::cleanup::begin(&r.0).unwrap_err().contains("active"));
     attempts::append(
@@ -295,4 +314,175 @@ fn cli_route_refusal_records_blocker_without_fallback() {
         .status
         .success());
     assert!(call(&["contract", "show"]).status.success());
+}
+
+#[test]
+fn failed_pilot_is_durable_and_cannot_be_reaccepted() {
+    let r = Run::new();
+    let mut c = r.contract();
+    c.pilot_call_limit = 6;
+    contract::lock(&r.0, c).unwrap();
+    r.ready();
+    for role in ["hunter", "verifier", "evaluator"] {
+        r.start(role, role, "pilot");
+        r.dispatch(role, "1").unwrap();
+        attempts::append(
+            &r.0,
+            Event::Complete {
+                id: role.into(),
+                actor: "host".into(),
+                reason: "done".into(),
+            },
+        )
+        .unwrap();
+    }
+    omgs::runmeta::write_atomic(&r.0.join("quality.json"), "{}").unwrap();
+    let mut p = contract::Pilot {
+        hunter: "hunter".into(),
+        verifier: "verifier".into(),
+        evaluator: "evaluator".into(),
+        source_accuracy: true,
+        counterevidence: true,
+        structured_output: true,
+        evidence: vec!["quality.json".into()],
+        proof_ref: None,
+    };
+    contract::accept_pilot(&r.0, p.clone()).unwrap();
+    p.source_accuracy = false;
+    assert!(contract::accept_pilot(&r.0, p.clone())
+        .unwrap_err()
+        .contains("persisted"));
+    let m = omgs::runmeta::read(&r.0).unwrap();
+    assert!(m.get("pilot").is_none());
+    assert!(m.get("pilot_failure").is_some());
+    r.start("pilot", "hunter", "pilot");
+    assert!(r
+        .dispatch("pilot", "1")
+        .unwrap_err()
+        .contains("pilot failed"));
+    r.start("scaled", "hunter", "review");
+    assert!(r
+        .dispatch("scaled", "1")
+        .unwrap_err()
+        .contains("pilot failed"));
+    p.source_accuracy = true;
+    assert!(contract::accept_pilot(&r.0, p)
+        .unwrap_err()
+        .contains("cannot be overwritten"));
+}
+
+#[test]
+fn proof_admission_rechecks_stop_and_revision_and_holds_cleanup_closed() {
+    let r = Run::new();
+    let target = r.0.join("target");
+    std::fs::create_dir(&target).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&target)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "A",
+    ]);
+    let a = omgs::proof::git_head(&target).unwrap();
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("source_ref".into(), json!(a));
+        Ok(())
+    })
+    .unwrap();
+    let mut c = r.contract();
+    c.source_ref = a.clone();
+    c.verification = "sandbox_tests".into();
+    contract::lock(&r.0, c).unwrap();
+    r.ready();
+    let admission = omgs::budget::ProofAdmission::admit(&r.0, Some(&target), Some(&a)).unwrap();
+    assert!(omgs::cleanup::begin(&r.0)
+        .unwrap_err()
+        .contains("active proofs"));
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("blockers".into(), json!(["safety stop during preparation"]));
+        Ok(())
+    })
+    .unwrap();
+    assert!(admission
+        .start(Some(&target))
+        .unwrap_err()
+        .contains("blocker"));
+    drop(admission);
+    assert!(omgs::runmeta::read(&r.0).unwrap()["active_proofs"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+    omgs::runmeta::update(&r.0, |m| {
+        m.remove("blockers");
+        Ok(())
+    })
+    .unwrap();
+    let admission = omgs::budget::ProofAdmission::admit(&r.0, Some(&target), Some(&a)).unwrap();
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "B",
+    ]);
+    assert!(admission
+        .start(Some(&target))
+        .unwrap_err()
+        .contains("revision"));
+    assert!(
+        omgs::budget::ProofAdmission::admit(&r.0, Some(&target), Some(&a))
+            .err()
+            .unwrap()
+            .contains("revision")
+    );
+    drop(admission);
+    git(&["checkout", "-q", &a]);
+    let admission = omgs::budget::ProofAdmission::admit(&r.0, Some(&target), Some(&a)).unwrap();
+    admission.start(Some(&target)).unwrap();
+    drop(admission); // Uncertain cleanup must remain active, never be silently certified by Drop.
+    assert!(omgs::cleanup::begin(&r.0)
+        .unwrap_err()
+        .contains("active proofs"));
+}
+
+#[test]
+fn cleanup_closes_atomic_proof_admission_without_spending() {
+    let r = Run::new();
+    let proof = omgs::budget::ProofAdmission::admit(&r.0, None, None).unwrap();
+    proof.start(None).unwrap();
+    proof.finish().unwrap();
+    omgs::cleanup::begin(&r.0).unwrap();
+    let before = omgs::runmeta::read(&r.0).unwrap();
+    assert!(omgs::budget::ProofAdmission::admit(&r.0, None, None)
+        .err()
+        .unwrap()
+        .contains("closing"));
+    assert_eq!(
+        omgs::runmeta::read(&r.0).unwrap()["proof_runs_used"],
+        before["proof_runs_used"]
+    );
+    assert!(omgs::runmeta::read(&r.0).unwrap()["active_proofs"]
+        .as_object()
+        .unwrap()
+        .is_empty());
 }

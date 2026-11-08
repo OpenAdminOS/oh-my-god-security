@@ -1621,6 +1621,13 @@ fn stage_workspace(
 }
 
 pub fn prove(req: &ProveRequest) -> ProveOutcome {
+    prove_admitted(req, None)
+}
+/// Run-associated callers carry an admission through the final preparation boundary.
+pub fn prove_admitted(
+    req: &ProveRequest,
+    admission: Option<&crate::budget::ProofAdmission>,
+) -> ProveOutcome {
     #[cfg(any(unix, windows))]
     let _signals = match supervise::interruption::Guard::install() {
         Ok(guard) => guard,
@@ -1921,6 +1928,11 @@ pub fn prove(req: &ProveRequest) -> ProveOutcome {
         }
         if let Err(reason) = preflight::dry_run_result(&validation) {
             return blocked(reason);
+        }
+        if let Some(admission) = admission {
+            if let Err(reason) = admission.start(req.target.as_deref()) {
+                return blocked(reason);
+            }
         }
         let cmd = preflight::workload_command(&executor, &config_path, &run_dir);
         let run = supervise::run_contracted(

@@ -81,6 +81,8 @@ using `omgs contract pilot --run OUTPUT_DIR --from pilot.json` only when all pas
 clean runner-attested proof for this source is mandatory. Pilot success is a host quality judgment,
 not a vulnerability confirmation. All finding proof and adjudication rules still apply.
 
+Failed pilot decisions are persisted, revoke previous approval and stop further calls. Positive
+resubmission cannot clear the stop; recovery needs a separately authorized new run.
 Failed pilot: stop, report why, spend no additional calls. Do not silently choose a larger model,
 cloud provider, extra budget or narrower question until authorized. Source-only review remains
 explicitly incomplete for runtime assurance, even when all authorized source units are covered.
@@ -97,6 +99,12 @@ omgs cleanup register --run OUTPUT_DIR --from resource.json
 Fields: `id`, `kind` (`checkout`, `evidence`, `scratch`, `process`, `tunnel`, `remote_job`),
 `location`, `owner`, `locator`. Use run-specific directories and durable job identifiers. A PID
 alone is insufficient ownership evidence. Do not register shared runtimes/models as disposable.
+
+Proof admission atomically checks the contract and charges the shared allowance, including proofs
+and linked runs. Admitted proofs keep cleanup closed. After sandbox preparation, the runner checks
+stops and the locked target revision again before each workload launch, including replay. A crash or
+uncertified cleanup leaves an active proof record for host investigation; do not delete that record
+to make cleanup pass. An in-flight stop still requires the host to stop its owned execution process.
 
 After reporting, end active attempts and call `omgs cleanup begin --run OUTPUT_DIR`. New attempts,
 dispatches and run-associated proofs are then closed. The host stops owned jobs, checks no survivors
