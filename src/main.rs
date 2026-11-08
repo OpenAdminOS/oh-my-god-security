@@ -4165,6 +4165,7 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
         let labels = omgs::route::parse_identities(&[format!("{role}={label}")])?;
         omgs::runmeta::update(&run, |m| {
             omgs::batch::check_meta_types(m)?;
+            omgs::budget::check_fix_parent_locked(&run, m, true)?;
             omgs::contract::require_if_marked(m)?;
             for (role, value) in &labels {
                 omgs::contract::check_model(m, role, value)?;
@@ -4207,6 +4208,7 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
     // Read the refusal history, pick the next model, and record the result in
     // one locked transaction, so concurrent reroutes never lose an entry.
     let next = omgs::runmeta::update(&run, |m| {
+        omgs::budget::check_fix_parent_locked(&run, m, true)?;
         omgs::contract::require_if_marked(m)?;
         // Malformed history must stop the command: silently ignoring it would
         // forget earlier refusals and send work back to a refusing model.
@@ -4458,7 +4460,7 @@ fn cmd_cleanup(args: &[String]) -> Result<(), String> {
     let action = args
         .first()
         .map(String::as_str)
-        .ok_or("cleanup requires register, release, begin, finish or show")?;
+        .ok_or("cleanup requires register, release, resolve-proof, begin, finish or show")?;
     if ["begin", "finish", "show"].contains(&action) {
         if flag(args, "--from").is_some() {
             return Err("this cleanup action does not accept --from".into());
@@ -4483,6 +4485,7 @@ fn cmd_cleanup(args: &[String]) -> Result<(), String> {
     match action {
         "register" => omgs::cleanup::register(&run, omgs::contract::decode(value)?),
         "release" => omgs::cleanup::release(&run, omgs::contract::decode(value)?),
+        "resolve-proof" => omgs::cleanup::resolve_proof(&run, omgs::contract::decode(value)?),
         _ => Err("unknown cleanup action".into()),
     }
 }
@@ -4932,6 +4935,7 @@ mod cli_tests {
         ("contract", "show"),
         ("cleanup", "register"),
         ("cleanup", "release"),
+        ("cleanup", "resolve-proof"),
         ("cleanup", "begin"),
         ("cleanup", "finish"),
         ("cleanup", "show"),

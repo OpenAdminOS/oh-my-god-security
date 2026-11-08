@@ -136,3 +136,31 @@ Report start/finish times, elapsed review and test durations separately, scope, 
 limits, tools, exact provider/model/location and unresolved work. A finished job is not a complete
 audit. Confirmed findings, pending candidates, hardening suggestions and unreviewed areas stay
 separate.
+
+## Linked fixes and source identity
+
+A protected parent's linked fix is automatically marked `contract_required`, even if the caller
+omits the flag. It must lock its own approved contract for the changed revision and pass its own
+readiness/pilot. A failed parent pilot, unresolved stop/blocker, cleanup underway, or source-only
+parent refuses linked fixes. Existing fixes recheck the original and intermediate parents before
+dispatch, routing, proof admission and workload launch. A linked fix cannot clear its parent's stop.
+
+The automated source identity check compares Git HEAD, not working-tree contents. Uncommitted
+edits can retain that HEAD. Use an unchanged, pinned checkout when commit-exact validation is
+required. Proof records separately hash the executed snapshot; replay checks that snapshot hash.
+The report discloses this HEAD-only limitation.
+
+## Recover a stranded proof record
+
+A crash or publication error can leave an active proof record after execution has ended. Inspect
+`omgs cleanup show --run OUTPUT_DIR` for its token. The host must stop/inspect the coordinator and
+all owned descendants, establish no execution remains, and end active attempts before recovery.
+Do not infer termination solely from a missing coordinator or delete the active record manually.
+
+Submit `omgs cleanup resolve-proof --run OUTPUT_DIR --from resolution.json`. Fields are `token`,
+`actor`, `evidence` (a nonempty observation without secrets), and `processes_stopped: true`.
+The command records a host-attested resolution with the previous proof state and closes the run
+against new dispatch/proofs. It never kills a PID or independently certifies termination. Unknown
+or repeated tokens and false termination attestations are refused. Remaining active proofs and
+unreleased resources still prevent cleanup completion. Final cleanup receipts retain all proof
+resolutions, including their host-attested assurance level.

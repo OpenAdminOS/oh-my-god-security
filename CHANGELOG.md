@@ -22,6 +22,12 @@
 - Preserve missing-directory errors during macOS storage admission so concurrent job recovery
   can skip directories already retired by their owners without weakening ACL checks.
 
+- Linked fixes inherit the contract requirement and cannot reset parent stops, failed pilots,
+  cleanup or source-only scope. Each fix locks its own revision before work.
+- Operators can record a host-attested resolution for stranded proofs after checking termination;
+  the resolution closes the run and is retained in the cleanup receipt.
+- Reports explicitly disclose that source admission compares HEAD, not uncommitted file contents.
+
 ### Operational notes
 
 - Contract and resource records are host assertions, not authenticated backend attestations.

@@ -591,3 +591,184 @@ fn source_only_view_refuses_imported_runtime_credit() {
         .flatten()
         .any(|e| e.contains("source-only contract cannot credit runtime proof")));
 }
+
+fn initialize_linked_fix(run: &std::path::Path) -> Result<PathBuf, String> {
+    initialize_named_fix(run, "fix")
+}
+fn initialize_named_fix(run: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+    omgs::budget::init_fix(
+        run,
+        |_| Ok(Some(12)),
+        |root, _, _| {
+            let child = root.parent().unwrap().join(name);
+            omgs::platform::create_private_dir(&child).map_err(|e| e.to_string())?;
+            omgs::runmeta::write_atomic(
+                &child.join(omgs::runmeta::FILE),
+                &json!({"run_id":name,"source_ref":"changed","budget_agent_calls":12}).to_string(),
+            )?;
+            Ok(child)
+        },
+    )
+}
+#[test]
+fn linked_fixes_refuse_failed_stopped_closing_or_source_only_parents() {
+    for state in ["pilot", "stop", "cleanup", "source_only"] {
+        let r = Run::new();
+        omgs::runmeta::update(&r.0, |m| {
+            m.insert("run_id".into(), json!("root"));
+            Ok(())
+        })
+        .unwrap();
+        let mut c = r.contract();
+        if state != "source_only" {
+            c.verification = "sandbox_tests".into();
+        }
+        contract::lock(&r.0, c).unwrap();
+        match state {
+            "pilot" => omgs::runmeta::update(&r.0, |m| {
+                m.insert("pilot_failure".into(), json!({"source_accuracy":false}));
+                Ok(())
+            })
+            .unwrap(),
+            "stop" => {
+                r.start("stopped", "hunter", "pilot");
+                attempts::append(
+                    &r.0,
+                    Event::Stop {
+                        id: "stopped".into(),
+                        actor: "host".into(),
+                        kind: "provider".into(),
+                        reason: "safety stop".into(),
+                        artifacts: vec![],
+                        disposition: "discarded".into(),
+                    },
+                )
+                .unwrap();
+            }
+            "cleanup" => omgs::cleanup::begin(&r.0).unwrap(),
+            _ => {}
+        }
+        assert!(
+            initialize_linked_fix(&r.0)
+                .unwrap_err()
+                .contains("fix run refused"),
+            "{state}"
+        );
+        assert!(!r.1.join("fix").exists());
+    }
+}
+#[test]
+fn protected_fix_is_marked_and_later_parent_stop_blocks_it() {
+    let r = Run::new();
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("run_id".into(), json!("root"));
+        Ok(())
+    })
+    .unwrap();
+    let mut c = r.contract();
+    c.verification = "sandbox_tests".into();
+    contract::lock(&r.0, c.clone()).unwrap();
+    let child = initialize_linked_fix(&r.0).unwrap();
+    let meta = omgs::runmeta::read(&child).unwrap();
+    assert_eq!(meta["contract_required"], json!(true));
+    assert!(contract::check_dispatch(&child, &meta, "none")
+        .unwrap_err()
+        .contains("own locked"));
+    assert!(omgs::budget::ProofAdmission::admit(&child, None, None)
+        .err()
+        .unwrap()
+        .contains("own locked"));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["route", "--role", "hunter", "--run"])
+        .arg(&child)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("own locked"));
+    c.source_ref = "changed".into();
+    contract::lock(&child, c).unwrap();
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("pilot_failure".into(), json!({"source_accuracy":false}));
+        Ok(())
+    })
+    .unwrap();
+    let meta = omgs::runmeta::read(&child).unwrap();
+    assert!(contract::check_dispatch(&child, &meta, "none")
+        .unwrap_err()
+        .contains("parent pilot failed"));
+    assert!(omgs::budget::ProofAdmission::admit(&child, None, None)
+        .err()
+        .unwrap()
+        .contains("parent pilot failed"));
+}
+#[test]
+fn stranded_proof_recovery_is_host_attested_and_closes_dispatch() {
+    let r = Run::new();
+    let proof = omgs::budget::ProofAdmission::admit(&r.0, None, None).unwrap();
+    proof.start(None).unwrap();
+    drop(proof);
+    let state = omgs::cleanup::show(&r.0).unwrap();
+    let token = state["active_proofs"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let mut resolution = omgs::cleanup::ProofResolution {
+        token,
+        actor: "operator".into(),
+        evidence: "coordinator and owned descendants inspected and stopped".into(),
+        processes_stopped: false,
+    };
+    assert!(omgs::cleanup::resolve_proof(&r.0, resolution.clone()).is_err());
+    resolution.processes_stopped = true;
+    omgs::cleanup::resolve_proof(&r.0, resolution.clone()).unwrap();
+    assert!(omgs::cleanup::resolve_proof(&r.0, resolution).is_err());
+    assert!(omgs::budget::ProofAdmission::admit(&r.0, None, None)
+        .err()
+        .unwrap()
+        .contains("closing"));
+    omgs::cleanup::finish(&r.0).unwrap();
+    let receipt = omgs::cleanup::show(&r.0).unwrap();
+    assert_eq!(
+        receipt["receipt"]["proof_resolutions"][0]["assurance"],
+        json!("host_attested")
+    );
+}
+
+#[test]
+fn nested_fix_preserves_its_intermediate_parents_stop() {
+    let r = Run::new();
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("run_id".into(), json!("root"));
+        Ok(())
+    })
+    .unwrap();
+    let mut c = r.contract();
+    c.verification = "sandbox_tests".into();
+    contract::lock(&r.0, c.clone()).unwrap();
+    let child = initialize_linked_fix(&r.0).unwrap();
+    c.source_ref = "changed".into();
+    contract::lock(&child, c.clone()).unwrap();
+    let nested = initialize_named_fix(&child, "nested").unwrap();
+    contract::lock(&nested, c).unwrap();
+    omgs::runmeta::update(&child, |m| {
+        m.insert("pilot_failure".into(), json!({"source_accuracy":false}));
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        contract::check_dispatch(&nested, &omgs::runmeta::read(&nested).unwrap(), "none")
+            .unwrap_err()
+            .contains("parent pilot failed")
+    );
+    assert!(omgs::budget::ProofAdmission::admit(&nested, None, None)
+        .err()
+        .unwrap()
+        .contains("parent pilot failed"));
+    assert!(initialize_named_fix(&nested, "third")
+        .unwrap_err()
+        .contains("parent pilot failed"));
+    assert!(!r.1.join("third").exists());
+}

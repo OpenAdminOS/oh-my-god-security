@@ -64,9 +64,14 @@ assertion:
 
 ```text
 omgs budget --run OUTPUT_DIR
-omgs audit init --target TARGET --out FIX_OUTPUT_DIR --no-sensors --fix-of OUTPUT_DIR [--persona ORIGINAL_PERSONA]
+omgs audit init --target TARGET --out FIX_OUTPUT_DIR --no-sensors --require-contract --fix-of OUTPUT_DIR [--persona ORIGINAL_PERSONA]
 omgs prove --run FIX_OUTPUT_DIR --test RELATIVE_TEST --test-from OUTPUT_DIR/DRAFT --cmd COMMAND
 ```
+
+Before dispatch, routing or proof in FIX_OUTPUT_DIR, lock its own approved contract for the changed
+source revision and pass readiness/pilot as described in [execution
+agreement](../EXECUTION-CONTRACT.md).
+Parent failed pilots, unresolved stops, cleanup, and source-only contracts prohibit linked fix runs.
 
 `omgs budget --run OUTPUT_DIR` is the authoritative cumulative total and remaining allowance. The
 CLI sums each run's own agent_calls_used and proof_runs_used exactly once across the original run

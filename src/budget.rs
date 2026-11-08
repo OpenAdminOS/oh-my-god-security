@@ -293,6 +293,7 @@ fn charge_proof_admitted(
                     "run budget exhausted: cumulative original and fix allowance consumed".into(),
                 );
             }
+            check_fix_parent_locked(&run, &meta, true)?;
             crate::contract::check_proof(&meta)?;
             if let Some((token, target, expected_head)) = admission {
                 crate::contract::check_proof_target(&meta, target, expected_head)?;
@@ -328,8 +329,14 @@ pub fn init_fix(
     init: impl FnOnce(&Path, &Map<String, Value>, Option<u64>) -> Result<PathBuf, String>,
 ) -> Result<PathBuf, String> {
     let root = original(parent)?;
-    runmeta::with_lock(&root, || {
+    with_family_lock(parent, || {
         let mut meta = read_run(&root)?;
+        let root_requires = crate::contract::fix_parent(&meta)?;
+        let parent_meta = read_run(&run_path(parent)?)?;
+        check_fix_parent_locked(parent, &parent_meta, false)?;
+        let parent_requires = crate::contract::fix_parent(&parent_meta)?;
+        let fix_parent_id = run_id(&parent_meta)?.to_owned();
+        let require_contract = root_requires || parent_requires;
         let cap = family_cap(&root)?;
         let used = allowance(&root)?.calls_and_proofs_used;
         let remaining = cap.map(|cap| cap.saturating_sub(used));
@@ -344,6 +351,10 @@ pub fn init_fix(
                 let mut m = read_run(&child)?;
                 if run_id(&m)? != child_id {
                     return Err("linked run identity changed during registration".into());
+                }
+                m.insert("fix_parent_id".into(), Value::from(fix_parent_id.clone()));
+                if require_contract {
+                    m.insert("contract_required".into(), Value::Bool(true));
                 }
                 m.insert(
                     "budget_parent".into(),
@@ -464,6 +475,50 @@ pub fn summary_proposed_locked(
     ))
 }
 
+/// Called under the family lock, including at workload launch after preparation.
+pub fn check_fix_parent_locked(
+    run: &Path,
+    m: &Map<String, Value>,
+    require_locked: bool,
+) -> Result<(), String> {
+    let root = original(run)?;
+    if root == run_path(run)? {
+        return Ok(());
+    }
+    let root_meta = read_run(&root)?;
+    let root_id = run_id(&root_meta)?;
+    let mut protected = crate::contract::fix_parent(&root_meta)?;
+    let registered = fix_runs(&root_meta, root.parent().ok_or("root needs parent")?)?;
+    let mut seen = std::collections::BTreeSet::new();
+    seen.insert(run_id(m)?.to_owned());
+    let mut ancestor = m.clone();
+    while let Some(value) = ancestor.get("fix_parent_id") {
+        let id = value
+            .as_str()
+            .ok_or("fix_parent_id must be a string")?
+            .to_owned();
+        if id == root_id {
+            break;
+        }
+        if !seen.insert(id.clone()) {
+            return Err("fix parent lineage contains a cycle".into());
+        }
+        let registered_parent = registered
+            .iter()
+            .find(|r| r.run_id == id)
+            .ok_or("fix parent identity is not registered")?;
+        ancestor = read_run(&registered_parent.path)?;
+        if run_id(&ancestor)? != id {
+            return Err("fix parent identity changed".into());
+        }
+        protected |= crate::contract::fix_parent(&ancestor)?;
+    }
+    if protected && require_locked && crate::contract::load(m)?.is_none() {
+        return Err("fix run requires its own locked execution contract".into());
+    }
+    Ok(())
+}
+
 /// Caller holds the family lock. Include both proofs and calls, plus linked runs.
 pub(crate) fn remaining_locked(run: &Path, m: &Map<String, Value>) -> Result<Option<u64>, String> {
     let family = allowance(&original(run)?)?.remaining;
@@ -516,6 +571,7 @@ impl ProofAdmission {
     /// Called after sandbox preparation and before each workload launch, including fallback.
     pub fn start(&self, target: Option<&Path>) -> Result<(), String> {
         runmeta::update(&self.run, |m| {
+            check_fix_parent_locked(&self.run, m, true)?;
             crate::contract::check_proof_target(m, target, self.expected_head.as_deref())?;
             let slot = m
                 .get_mut("active_proofs")

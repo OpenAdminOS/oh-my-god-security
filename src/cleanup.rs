@@ -21,6 +21,45 @@ pub struct Release {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProofResolution {
+    pub token: String,
+    pub actor: String,
+    pub evidence: String,
+    pub processes_stopped: bool,
+}
+/// Explicit host recovery, never an inference that a missing coordinator means no survivors.
+pub fn resolve_proof(run: &Path, resolution: ProofResolution) -> Result<(), String> {
+    for s in [&resolution.token, &resolution.actor, &resolution.evidence] {
+        text(s)?;
+    }
+    if !resolution.processes_stopped {
+        return Err("host must verify proof processes and descendants are stopped".into());
+    }
+    crate::runmeta::update(run, |m| {
+        if m.contains_key("cleanup_receipt") {
+            return Err("cleanup receipt already sealed".into());
+        }
+        if crate::attempts::states(&crate::attempts::history(m)?)?
+            .values()
+            .any(|a| a.state == "active")
+        {
+            return Err("stop or complete active attempts before resolving a proof".into());
+        }
+        let previous = m
+            .get_mut("active_proofs")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|v| v.remove(&resolution.token))
+            .ok_or("unknown active proof token")?;
+        m.entry("proof_resolutions").or_insert_with(||json!([])).as_array_mut().ok_or("proof_resolutions must be an array")?
+            .push(json!({"assurance":"host_attested","resolution":resolution,"previous":previous,"at":crate::runmeta::timestamp(crate::runmeta::now_ms())}));
+        m.entry("cleanup_started_at")
+            .or_insert_with(|| json!(crate::runmeta::timestamp(crate::runmeta::now_ms())));
+        Ok(())
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Entry {
     resource: Resource,
     release: Option<Release>,
@@ -128,13 +167,17 @@ pub fn finish(run: &Path) -> Result<(), String> {
         if resources.values().any(|e| e.release.is_none()) {
             return Err("every registered resource needs a host release attestation".into());
         }
-        m.entry("cleanup_receipt").or_insert_with(||json!({"assurance":"host_attested","finished_at":crate::runmeta::timestamp(crate::runmeta::now_ms()),"resources":resources,"limitation":"Only registered resources covered. OMGS did not independently verify deletion or process termination."}));
+        let proof_resolutions = m
+            .get("proof_resolutions")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        m.entry("cleanup_receipt").or_insert_with(||json!({"proof_resolutions":proof_resolutions,"assurance":"host_attested","finished_at":crate::runmeta::timestamp(crate::runmeta::now_ms()),"resources":resources,"limitation":"Only registered resources covered. OMGS did not independently verify deletion or process termination."}));
         Ok(())
     })
 }
 pub fn show(run: &Path) -> Result<serde_json::Value, String> {
     let m = crate::runmeta::read(run)?;
     Ok(
-        json!({"resources":entries(&m)?,"started_at":m.get("cleanup_started_at"),"receipt":m.get("cleanup_receipt")}),
+        json!({"resources":entries(&m)?,"active_proofs":m.get("active_proofs"),"proof_resolutions":m.get("proof_resolutions"),"started_at":m.get("cleanup_started_at"),"receipt":m.get("cleanup_receipt")}),
     )
 }

@@ -111,6 +111,7 @@ pub fn lock(run: &Path, c: Contract) -> Result<(), String> {
         }
     }
     crate::runmeta::update(run, |m| {
+        crate::budget::check_fix_parent_locked(run, m, false)?;
         if let Some(old) = load(m)? {
             return if old == c {
                 Ok(())
@@ -254,6 +255,7 @@ pub fn bind(run: &Path, b: Binding) -> Result<(), String> {
     })
 }
 pub fn check_dispatch(run: &Path, m: &Map<String, Value>, id: &str) -> Result<(), String> {
+    crate::budget::check_fix_parent_locked(run, m, true)?;
     let Some(c) = load(m)? else {
         return require_if_marked(m);
     }; // Unmarked runs retain legacy behavior.
@@ -436,6 +438,7 @@ pub fn describe(m: &Map<String, Value>) -> Result<Vec<String>, String> {
         c.scope.join("; "),
         c.exclusions.join("; ")
     )];
+    lines.push("Source check: Git HEAD only; uncommitted changes are not excluded. Proof records separately hash the executed snapshot.".into());
     for (role, e) in c.roles {
         lines.push(format!(
             "{role}: {} / {} on {}",
@@ -499,4 +502,26 @@ pub fn require_if_marked(m: &Map<String, Value>) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Linked fixes may not reset their parent's safety or execution scope.
+pub(crate) fn fix_parent(m: &Map<String, Value>) -> Result<bool, String> {
+    if m.contains_key("pilot_failure") || m.contains_key("cleanup_started_at") {
+        return Err("fix run refused: parent pilot failed or cleanup has begun; a new authorized run is required".into());
+    }
+    if !crate::attempts::active_blockers(m)?.is_empty()
+        || crate::attempts::states(&crate::attempts::history(m)?)?
+            .values()
+            .any(|a| a.state == "stopped" && a.replacement.is_none())
+    {
+        return Err("fix run refused: parent has an unresolved stop or blocker".into());
+    }
+    let contract = load(m)?;
+    if contract
+        .as_ref()
+        .is_some_and(|c| c.verification == "source_only")
+    {
+        return Err("fix run refused: parent has a source-only contract".into());
+    }
+    Ok(contract.is_some() || m.get("contract_required").and_then(Value::as_bool) == Some(true))
 }
