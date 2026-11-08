@@ -173,3 +173,8 @@ and review dispatch alike and includes proof charges and linked-run spending.
 
 Cleanup also refuses while any registered family member has an active agent attempt. Unmarked
 legacy parents retain their prior stop/blocker behavior; protected parent gates remain enforced.
+
+Beginning cleanup in any registered family member closes admission across the entire family.
+The shared lock serializes this barrier with attempt starts, dispatch, proof admission/launch,
+routing and fix registration. A child or sibling cannot reopen work while shared resources are
+being removed. Host-attested proof recovery also establishes this barrier.

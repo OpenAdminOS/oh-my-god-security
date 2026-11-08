@@ -917,3 +917,83 @@ fn cleanup_refuses_active_agent_attempts_in_nested_fix() {
             .contains("active attempts"));
     }
 }
+
+#[test]
+fn cleanup_of_any_member_closes_all_family_admission() {
+    for closing in 0..4 {
+        let r = Run::new();
+        omgs::runmeta::update(&r.0, |m| {
+            m.insert("run_id".into(), json!("root"));
+            Ok(())
+        })
+        .unwrap();
+        let child = initialize_linked_fix(&r.0).unwrap();
+        let sibling = initialize_named_fix(&r.0, "sibling").unwrap();
+        let nested = initialize_named_fix(&child, "nested").unwrap();
+        let family = [&r.0, &child, &sibling, &nested];
+        omgs::cleanup::begin(family[closing]).unwrap();
+        for path in family {
+            let err = attempts::append(
+                path,
+                Event::Start {
+                    id: "new".into(),
+                    role: "hunter".into(),
+                    identity: "h".into(),
+                    context: "h".into(),
+                    inputs: vec!["scope".into()],
+                    outputs: vec!["result".into()],
+                    isolation: "procedural".into(),
+                },
+            )
+            .unwrap_err();
+            assert!(err.contains("closing"), "{err}");
+            let meta = omgs::runmeta::read(path).unwrap();
+            assert!(contract::check_dispatch(path, &meta, "new")
+                .unwrap_err()
+                .contains("closing"));
+            assert!(omgs::budget::ProofAdmission::admit(path, None, None)
+                .err()
+                .unwrap()
+                .contains("closing"));
+            assert!(initialize_named_fix(path, "forbidden").is_err());
+        }
+        assert!(!r.1.join("forbidden").exists());
+        omgs::cleanup::finish(family[closing]).unwrap();
+    }
+}
+
+#[test]
+fn proof_launch_rechecks_sibling_recovery_barrier() {
+    let r = Run::new();
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("run_id".into(), json!("root"));
+        Ok(())
+    })
+    .unwrap();
+    let child = initialize_linked_fix(&r.0).unwrap();
+    let pending = omgs::budget::ProofAdmission::admit(&r.0, None, None).unwrap();
+    let stranded = omgs::budget::ProofAdmission::admit(&child, None, None).unwrap();
+    stranded.start(None).unwrap();
+    drop(stranded);
+    let state = omgs::runmeta::read(&child).unwrap();
+    let token = state["active_proofs"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    omgs::cleanup::resolve_proof(
+        &child,
+        omgs::cleanup::ProofResolution {
+            token,
+            actor: "host".into(),
+            evidence: "verified child termination".into(),
+            processes_stopped: true,
+        },
+    )
+    .unwrap();
+    assert!(pending.start(None).unwrap_err().contains("closing"));
+    drop(pending);
+    omgs::cleanup::finish(&child).unwrap();
+}

@@ -213,6 +213,9 @@ pub fn append(run: &Path, event: Event) -> Result<AppendOutcome, String> {
                 return Ok(AppendOutcome::AlreadyRecorded);
             }
         }
+        if matches!(&event, Event::Start { .. } | Event::Dispatch { .. }) {
+            crate::budget::check_family_open_locked(run, m)?;
+        }
         if m.contains_key("cleanup_started_at")
             && matches!(&event, Event::Start { .. } | Event::Dispatch { .. })
         {

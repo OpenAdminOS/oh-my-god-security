@@ -481,6 +481,7 @@ pub fn check_fix_parent_locked(
     m: &Map<String, Value>,
     require_locked: bool,
 ) -> Result<(), String> {
+    check_family_open_locked(run, m)?;
     let root = original(run)?;
     if root == run_path(run)? {
         return Ok(());
@@ -607,6 +608,37 @@ impl Drop for ProofAdmission {
         }
     }
 }
+/// A cleanup marker on any member is the family admission barrier. All writers
+/// and callers hold the root lock, so checking and admitting cannot race begin.
+pub(crate) fn check_family_open_locked(
+    run: &Path,
+    current: &Map<String, Value>,
+) -> Result<(), String> {
+    let root = original(run)?;
+    let current_path = run_path(run)?;
+    let root_meta = read_run(&root)?;
+    allowance(&root)?;
+    let mut paths = vec![root.clone()];
+    paths.extend(
+        fix_runs(&root_meta, root.parent().ok_or("root needs parent")?)?
+            .into_iter()
+            .map(|r| r.path),
+    );
+    for path in paths {
+        let stored;
+        let meta = if path == current_path {
+            current
+        } else {
+            stored = read_run(&path)?;
+            &stored
+        };
+        if meta.contains_key("cleanup_started_at") || meta.contains_key("cleanup_receipt") {
+            return Err("family cleanup is closing; new work refused".into());
+        }
+    }
+    Ok(())
+}
+
 /// Caller holds the family lock. Nested fixes are registered directly at the root.
 /// Active agent attempts return an error; active proofs return true.
 pub(crate) fn family_active_proofs_locked(
