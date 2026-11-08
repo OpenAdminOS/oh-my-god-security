@@ -17,6 +17,7 @@ fn boolean_option(name: &str) -> bool {
         "--replace",
         "--verify-mxc",
         "--no-sensors",
+        "--require-contract",
         "--screenshots",
         "--live",
         "--help",
@@ -119,13 +120,13 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "install-self" => ("--to --staging --binary --binary-sha256 --mxc --mxc-sha256 --license --license-sha256", false),
         "identity" => ("--skill-dir", false),
         "artifact-check" => ("--run --path", false),
-        "review" => ("--skill-dir --repo-url --mode --budget --no-sensors --persona --out --clone-root", false),
+        "review" => ("--require-contract --skill-dir --repo-url --mode --budget --no-sensors --persona --out --clone-root", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
-            "--skill-dir --target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of --clone-root",
+            "--require-contract --skill-dir --target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of --clone-root",
             true,
         ),
         "batch" if args.first().is_some_and(|a| a == "init") => {
-            ("--skill-dir --list --out --mode --budget --no-sensors --persona --clone-root", true)
+            ("--require-contract --skill-dir --list --out --mode --budget --no-sensors --persona --clone-root", true)
         }
         "batch" if args.first().is_some_and(|a| a == "index") => ("--batch --out", true),
         "bench" if args.first().is_some_and(|a| a == "score") => ("--cases --runs", true),
@@ -2711,6 +2712,9 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     let run = audit_init_selected(rest)?;
     admit_bundle_cache(&fences)?;
     omgs::runmeta::update(&run, |meta| {
+        if has(rest, "--require-contract") {
+            meta.insert("contract_required".into(), serde_json::json!(true));
+        }
         meta.insert("skill_dir".into(), serde_json::json!(skill));
         meta.insert("skill_identity".into(), omgs::setup::identity());
         Ok(())
@@ -3759,6 +3763,9 @@ fn init_args(dest: &Path, args: &[String], out: Option<&Path>) -> Vec<String> {
         v.push("--out".into());
         v.push(o.to_string_lossy().to_string());
     }
+    if has(args, "--require-contract") {
+        v.push("--require-contract".into());
+    }
     if has(args, "--no-sensors") {
         v.push("--no-sensors".into());
     }
@@ -4158,6 +4165,7 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
         let labels = omgs::route::parse_identities(&[format!("{role}={label}")])?;
         omgs::runmeta::update(&run, |m| {
             omgs::batch::check_meta_types(m)?;
+            omgs::contract::require_if_marked(m)?;
             for (role, value) in &labels {
                 omgs::contract::check_model(m, role, value)?;
             }
@@ -4199,6 +4207,7 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
     // Read the refusal history, pick the next model, and record the result in
     // one locked transaction, so concurrent reroutes never lose an entry.
     let next = omgs::runmeta::update(&run, |m| {
+        omgs::contract::require_if_marked(m)?;
         // Malformed history must stop the command: silently ignoring it would
         // forget earlier refusals and send work back to a refusing model.
         omgs::batch::check_meta_types(m)?;
@@ -4237,6 +4246,7 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
             }
         }
         let locked = omgs::contract::load(m)?;
+        let is_locked = locked.is_some();
         let next = if let Some(c) = locked {
             if !refused.is_empty() {
                 Err("locked contract forbids fallback after refusal".into())
@@ -4286,6 +4296,7 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
                     obj.insert(role.clone(), serde_json::json!(model));
                 }
             }
+            Err(_) if is_locked && newly.is_none() => {}
             Err(e) => {
                 let count = m
                     .get("blocker_events")

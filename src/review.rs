@@ -196,6 +196,11 @@ impl View {
                 findings: vec![finding.clone()],
             };
             let mut errors = crate::attempts::finding_gaps_for(&saved, &one)?;
+            if crate::contract::load(&saved)?.is_some_and(|c| c.verification == "source_only")
+                && finding.proof_tier != crate::model::ProofTier::Traced
+            {
+                errors.push("source-only contract cannot credit runtime proof".into());
+            }
             let proofs = crate::proof::validate_proofs(&one, run);
             proof_errors.extend(proofs.clone());
             errors.extend(proofs);

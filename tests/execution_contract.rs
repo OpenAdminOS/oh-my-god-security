@@ -5,7 +5,7 @@ use omgs::{
 };
 use serde_json::json;
 use std::path::PathBuf;
-struct Run(PathBuf);
+struct Run(PathBuf, PathBuf);
 impl Run {
     fn new() -> Self {
         let p = omgs::platform::temp_root().unwrap().join(format!(
@@ -13,12 +13,15 @@ impl Run {
             omgs::platform::random_nonce().unwrap()
         ));
         omgs::platform::create_private_tree(&p).unwrap();
+        let root = p;
+        let p = root.join("run");
+        omgs::platform::create_private_dir(&p).unwrap();
         omgs::runmeta::write_atomic(
             &p.join(omgs::runmeta::FILE),
             &json!({"source_ref":"abc", "budget_agent_calls":12}).to_string(),
         )
         .unwrap();
-        Self(p)
+        Self(p, root)
     }
     fn contract(&self) -> contract::Contract {
         contract::decode(json!({"version":1,"source_ref":"abc","scope":["source"],"exclusions":["Windows runtime"],"roles":{"hunter":{"provider":"ollama","model":"local","location":"mini"},"verifier":{"provider":"ollama","model":"local","location":"mini"},"evaluator":{"provider":"ollama","model":"local","location":"mini"}},"verification":"source_only","retention":"reports_only","pilot_call_limit":3,"accepted_by":"owner"})).unwrap()
@@ -91,7 +94,7 @@ impl Run {
 }
 impl Drop for Run {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.1);
     }
 }
 #[test]
@@ -260,6 +263,10 @@ fn successful_pilot_allows_review_until_cleanup_closes_it() {
     .unwrap();
     omgs::cleanup::begin(&r.0).unwrap();
     assert!(r.dispatch("review", "2").unwrap_err().contains("closing"));
+    assert_eq!(
+        r.dispatch("review", "1").unwrap(),
+        attempts::AppendOutcome::AlreadyRecorded
+    );
     assert!(omgs::cleanup::finish(&r.0).is_err());
     omgs::cleanup::release(
         &r.0,
@@ -314,6 +321,9 @@ fn cli_route_refusal_records_blocker_without_fallback() {
         .status
         .success());
     assert!(call(&["contract", "show"]).status.success());
+    let before = omgs::runmeta::read(&r.0).unwrap()["blocker_events"].clone();
+    assert!(!call(&["route", "--role", "hunter"]).status.success());
+    assert_eq!(omgs::runmeta::read(&r.0).unwrap()["blocker_events"], before);
 }
 
 #[test]
@@ -485,4 +495,99 @@ fn cleanup_closes_atomic_proof_admission_without_spending() {
         .as_object()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn lock_rejects_spent_calls_and_existing_proof_artifacts() {
+    let r = Run::new();
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("agent_calls_used".into(), json!(3));
+        Ok(())
+    })
+    .unwrap();
+    assert!(contract::lock(&r.0, r.contract())
+        .unwrap_err()
+        .contains("before spending"));
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("agent_calls_used".into(), json!(0));
+        Ok(())
+    })
+    .unwrap();
+    omgs::platform::create_private_dir(&r.0.join("proofs")).unwrap();
+    omgs::runmeta::write_atomic(&r.0.join("proofs/1.json"), "{}").unwrap();
+    assert!(contract::lock(&r.0, r.contract())
+        .unwrap_err()
+        .contains("proof artifacts"));
+}
+
+#[test]
+fn required_contract_marker_blocks_unlocked_new_workflow_runs() {
+    let r = Run::new();
+    let target = r.1.join("source");
+    std::fs::create_dir(&target).unwrap();
+    let run = r.1.join("newrun");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args([
+            "audit",
+            "init",
+            "--require-contract",
+            "--no-sensors",
+            "--target",
+        ])
+        .arg(&target)
+        .arg("--out")
+        .arg(&run)
+        .env("OMGS_HOME", r.1.join("home"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let m = omgs::runmeta::read(&run).unwrap();
+    assert_eq!(m["contract_required"], json!(true));
+    assert!(contract::check_dispatch(&run, &m, "missing")
+        .unwrap_err()
+        .contains("requires a locked"));
+    assert!(contract::check_proof(&m)
+        .unwrap_err()
+        .contains("requires a locked"));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["route", "--role", "hunter", "--run"])
+        .arg(&run)
+        .env("OMGS_HOME", r.1.join("home"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("requires a locked"));
+    assert!(!contract::gaps(&m).unwrap().is_empty());
+}
+
+#[test]
+fn empty_cleanup_receipt_covers_no_resources() {
+    let r = Run::new();
+    omgs::cleanup::begin(&r.0).unwrap();
+    omgs::cleanup::finish(&r.0).unwrap();
+    let receipt = omgs::cleanup::show(&r.0).unwrap();
+    assert!(receipt["receipt"]["resources"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+    assert_eq!(receipt["receipt"]["assurance"], json!("host_attested"));
+}
+
+#[test]
+fn source_only_view_refuses_imported_runtime_credit() {
+    let r = Run::new();
+    contract::lock(&r.0, r.contract()).unwrap();
+    let mut findings: omgs::model::FindingsFile =
+        serde_json::from_str(include_str!("fixtures/report-run/findings.json")).unwrap();
+    findings.findings[0].proof_tier = omgs::model::ProofTier::TestProven;
+    let view = omgs::review::View::with_findings(&r.0, &findings).unwrap();
+    assert!(view
+        .decision_errors
+        .values()
+        .flatten()
+        .any(|e| e.contains("source-only contract cannot credit runtime proof")));
 }

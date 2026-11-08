@@ -6,7 +6,9 @@
 
 - New opt-in execution contracts lock source revision, role provider/model/location, scope,
   exclusions, validation mode and retention before dispatch. The packaged review workflow now
-  requires this for new reviews. Existing run directories remain compatible.
+  requires `--require-contract` at initialization for new reviews. Marked runs refuse dispatch,
+  routing and proofs until locked. Unmarked CLI runs remain compatible with the legacy API.
+  Locking after spent calls or existing proof artifacts is refused.
 - Readiness and a bounded three-role quality pilot gate broad dispatch. Refusals do not select
   a fallback in locked runs. Hunter calls preserve a verification/reporting reserve.
 - Failed pilot decisions persist and revoke earlier approval. Hunter reserves include charged

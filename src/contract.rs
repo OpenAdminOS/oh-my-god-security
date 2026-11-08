@@ -124,13 +124,32 @@ pub fn lock(run: &Path, c: Contract) -> Result<(), String> {
         if m.get("source_ref").and_then(Value::as_str) != Some(&c.source_ref) {
             return Err("contract source_ref must match initialized run".into());
         }
-        if m.get("budget_agent_calls")
-            .and_then(Value::as_u64)
+        if ["agent_calls_used", "proof_runs_used"]
+            .iter()
+            .any(|k| m.get(*k).and_then(Value::as_u64).unwrap_or(0) > 0)
+        {
+            return Err("lock contract before spending calls or running proofs".into());
+        }
+        let proofs = run.join(crate::proof::DIR);
+        match std::fs::symlink_metadata(&proofs) {
+            Ok(meta) => {
+                if crate::platform::is_link(&meta)
+                    || !meta.is_dir()
+                    || std::fs::read_dir(&proofs)
+                        .map_err(|e| e.to_string())?
+                        .next()
+                        .is_some()
+                {
+                    return Err("lock contract before creating proof artifacts".into());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if crate::budget::remaining_locked(run, m)?
             .is_some_and(|n| n < u64::from(c.pilot_call_limit) + 3)
         {
-            return Err(
-                "budget cannot fund pilot plus three reserved verification/reporting calls".into(),
-            );
+            return Err("remaining family budget cannot fund pilot plus three reserved verification/reporting calls".into());
         }
         m.insert(
             "execution_contract".into(),
@@ -236,8 +255,8 @@ pub fn bind(run: &Path, b: Binding) -> Result<(), String> {
 }
 pub fn check_dispatch(run: &Path, m: &Map<String, Value>, id: &str) -> Result<(), String> {
     let Some(c) = load(m)? else {
-        return Ok(());
-    }; // Legacy runs remain readable/usable.
+        return require_if_marked(m);
+    }; // Unmarked runs retain legacy behavior.
     if m.contains_key("cleanup_started_at") {
         return Err("run is closing; new dispatch refused".into());
     }
@@ -389,7 +408,7 @@ pub fn check_model(m: &Map<String, Value>, role: &str, model: &str) -> Result<()
 }
 pub fn gaps(m: &Map<String, Value>) -> Result<Vec<String>, String> {
     let Some(c) = load(m)? else {
-        return Ok(vec![]);
+        return Ok(require_if_marked(m).err().into_iter().collect());
     };
     let mut gaps = vec![];
     if let Err(e) = ready(m) {
@@ -428,6 +447,7 @@ pub fn describe(m: &Map<String, Value>) -> Result<Vec<String>, String> {
 
 /// Proofs cannot expand a source-only contract or resume a closing/stopped run.
 pub fn check_proof(m: &Map<String, Value>) -> Result<(), String> {
+    require_if_marked(m)?;
     if m.contains_key("cleanup_started_at") {
         return Err("run is closing; proof refused".into());
     }
@@ -466,6 +486,17 @@ pub fn check_proof_target(
         {
             return Err("proof target revision differs from locked source_ref".into());
         }
+    }
+    Ok(())
+}
+
+/// New workflow callers opt into a fail-closed marker at initialization.
+pub fn require_if_marked(m: &Map<String, Value>) -> Result<(), String> {
+    if m.get("contract_required").and_then(Value::as_bool) == Some(true) && load(m)?.is_none() {
+        return Err(
+            "this run requires a locked execution contract before dispatch, routing or proofs"
+                .into(),
+        );
     }
     Ok(())
 }

@@ -125,7 +125,7 @@ pub fn finish(run: &Path) -> Result<(), String> {
             return Err("begin cleanup first".into());
         }
         let resources = entries(m)?;
-        if resources.is_empty() || resources.values().any(|e| e.release.is_none()) {
+        if resources.values().any(|e| e.release.is_none()) {
             return Err("every registered resource needs a host release attestation".into());
         }
         m.entry("cleanup_receipt").or_insert_with(||json!({"assurance":"host_attested","finished_at":crate::runmeta::timestamp(crate::runmeta::now_ms()),"resources":resources,"limitation":"Only registered resources covered. OMGS did not independently verify deletion or process termination."}));

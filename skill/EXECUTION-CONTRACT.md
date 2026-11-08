@@ -8,7 +8,11 @@ not necessarily different models.
 
 ## Lock before dispatch
 
-After initialization, write a private JSON file and run:
+Initialize new workflow reviews with `--require-contract` on `audit init`, `review`, or `batch
+init`.
+This marker prevents dispatch, route selection and proofs until a contract is locked. Unmarked
+CLI runs retain legacy behavior for compatibility; the workflow must not omit this flag.
+Then write a private JSON file and run:
 
 ```text
 omgs contract lock --run OUTPUT_DIR --from contract.json
@@ -37,11 +41,14 @@ Example (replace the source ref and approved identity):
 
 `verification` is `source_only` or `sandbox_tests`; `retention` is `reports_only` or `evidence`.
 Pilot limits range from 3 to 12 charged dispatches. The total call budget must also reserve at least
-three calls for verification/reporting. Once locked the agreement cannot change. A separately
+three calls for verification/reporting. Locking is refused after calls have been spent or proof
+artifacts created. Once locked the
+agreement cannot change. A separately
 approved new run is needed for a legitimate scope change; it never erases a stop or permits routing
 around a provider restriction. Historical runs without contracts remain usable, but do not claim
 that their model selection was locked. These are host declarations enforced at CLI dispatch,
-not authenticated proof of where inference occurred or a host network sandbox.
+not authenticated proof of where inference occurred or a host network sandbox. Standalone
+`prove --target` without `--run` has no run contract; never use it to bypass a contracted review.
 
 ## Readiness and a small pilot
 
@@ -115,7 +122,8 @@ locator strings, kill processes, or delete directories.
 For each observed removal/termination submit `omgs cleanup release --run OUTPUT_DIR --from
 release.json` with `id`, `actor`, `evidence`. Evidence is a concise host observation, not a copied
 secret or raw target evidence. Then `omgs cleanup finish --run OUTPUT_DIR` requires all registered
-resources released. `omgs cleanup show --run OUTPUT_DIR` provides the host-attested receipt. It
+resources released. An empty ledger can produce a receipt, but attests to no registered resources.
+`omgs cleanup show --run OUTPUT_DIR` provides the host-attested receipt. It
 covers registered resources only and is not independent deletion verification.
 
 For `reports_only`, first export and inspect final reports outside every disposable resource.

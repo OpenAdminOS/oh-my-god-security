@@ -204,11 +204,6 @@ pub enum AppendOutcome {
 
 pub fn append(run: &Path, event: Event) -> Result<AppendOutcome, String> {
     crate::runmeta::update(run, |m| {
-        if m.contains_key("cleanup_started_at")
-            && matches!(&event, Event::Start { .. } | Event::Dispatch { .. })
-        {
-            return Err("run is closing; new attempts and dispatch refused".into());
-        }
         let mut h = history(m)?;
         if let Event::Dispatch { id, turn, .. } = &event {
             if let Some(previous) = h.iter().find(|r| matches!(&r.record, Event::Dispatch { id: old_id, turn: old_turn, .. } if old_id == id && old_turn == turn)) {
@@ -217,6 +212,11 @@ pub fn append(run: &Path, event: Event) -> Result<AppendOutcome, String> {
                 if previous.record != event { return Err("turn id is already recorded with different dispatch details".into()); }
                 return Ok(AppendOutcome::AlreadyRecorded);
             }
+        }
+        if m.contains_key("cleanup_started_at")
+            && matches!(&event, Event::Start { .. } | Event::Dispatch { .. })
+        {
+            return Err("run is closing; new attempts and dispatch refused".into());
         }
         if let Event::Dispatch { id, .. } = &event {
             crate::contract::check_dispatch(run, m, id)?;

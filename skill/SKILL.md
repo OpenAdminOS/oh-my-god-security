@@ -56,7 +56,7 @@ Proofs never install or fetch dependencies. Missing tools and offline databases 
 permission to fetch.
 
 Before dispatch, follow [execution agreement, pilot and cleanup](EXECUTION-CONTRACT.md):
-lock the contract, pass readiness/pilot and register resources.
+use `--require-contract`, lock, pass readiness/pilot and register resources.
 
 ## Seven phases
 
