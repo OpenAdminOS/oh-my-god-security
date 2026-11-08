@@ -506,8 +506,19 @@ pub fn require_if_marked(m: &Map<String, Value>) -> Result<(), String> {
 
 /// Linked fixes may not reset their parent's safety or execution scope.
 pub(crate) fn fix_parent(m: &Map<String, Value>) -> Result<bool, String> {
-    if m.contains_key("pilot_failure") || m.contains_key("cleanup_started_at") {
-        return Err("fix run refused: parent pilot failed or cleanup has begun; a new authorized run is required".into());
+    if m.contains_key("cleanup_started_at") {
+        return Err("fix run refused: parent cleanup has begun".into());
+    }
+    let contract = load(m)?;
+    let protected =
+        contract.is_some() || m.get("contract_required").and_then(Value::as_bool) == Some(true);
+    if !protected {
+        return Ok(false);
+    }
+    if m.contains_key("pilot_failure") {
+        return Err(
+            "fix run refused: parent pilot failed; a new authorized run is required".into(),
+        );
     }
     if !crate::attempts::active_blockers(m)?.is_empty()
         || crate::attempts::states(&crate::attempts::history(m)?)?
@@ -516,12 +527,11 @@ pub(crate) fn fix_parent(m: &Map<String, Value>) -> Result<bool, String> {
     {
         return Err("fix run refused: parent has an unresolved stop or blocker".into());
     }
-    let contract = load(m)?;
     if contract
         .as_ref()
         .is_some_and(|c| c.verification == "source_only")
     {
         return Err("fix run refused: parent has a source-only contract".into());
     }
-    Ok(contract.is_some() || m.get("contract_required").and_then(Value::as_bool) == Some(true))
+    Ok(true)
 }

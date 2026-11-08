@@ -608,6 +608,7 @@ impl Drop for ProofAdmission {
     }
 }
 /// Caller holds the family lock. Nested fixes are registered directly at the root.
+/// Active agent attempts return an error; active proofs return true.
 pub(crate) fn family_active_proofs_locked(
     run: &Path,
     current: &Map<String, Value>,
@@ -624,11 +625,20 @@ pub(crate) fn family_active_proofs_locked(
             .map(|r| r.path),
     );
     for path in paths {
-        let active = if path == current_path {
-            active_proofs(current)?
+        let stored;
+        let meta = if path == current_path {
+            current
         } else {
-            active_proofs(&read_run(&path)?)?
+            stored = read_run(&path)?;
+            &stored
         };
+        if crate::attempts::states(&crate::attempts::history(meta)?)?
+            .values()
+            .any(|a| a.state == "active")
+        {
+            return Err("stop or complete active attempts across the family before cleanup".into());
+        }
+        let active = active_proofs(meta)?;
         if active {
             return Ok(true);
         }

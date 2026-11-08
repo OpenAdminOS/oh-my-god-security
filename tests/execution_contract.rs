@@ -846,3 +846,74 @@ fn cleanup_checks_running_and_uncertain_proofs_across_nested_family() {
     omgs::cleanup::begin(&r.0).unwrap();
     omgs::cleanup::finish(&r.0).unwrap();
 }
+
+#[test]
+fn legacy_parent_blockers_do_not_disable_fix_execution() {
+    let r = Run::new();
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("run_id".into(), json!("root"));
+        m.insert("blockers".into(), json!(["hunter refused"]));
+        Ok(())
+    })
+    .unwrap();
+    let child = initialize_linked_fix(&r.0).unwrap();
+    let meta = omgs::runmeta::read(&child).unwrap();
+    assert!(meta.get("contract_required").is_none());
+    contract::check_dispatch(&child, &meta, "legacy").unwrap();
+    omgs::budget::charge_proof(&child).unwrap();
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("blockers".into(), json!(["later refusal"]));
+        Ok(())
+    })
+    .unwrap();
+    let admission = omgs::budget::ProofAdmission::admit(&child, None, None).unwrap();
+    admission.start(None).unwrap();
+    admission.finish().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+        .args(["route", "--role", "hunter", "--run"])
+        .arg(&child)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    omgs::cleanup::begin(&r.0).unwrap();
+    assert!(omgs::budget::charge_proof(&child)
+        .unwrap_err()
+        .contains("cleanup"));
+}
+
+#[test]
+fn cleanup_refuses_active_agent_attempts_in_nested_fix() {
+    let r = Run::new();
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("run_id".into(), json!("root"));
+        Ok(())
+    })
+    .unwrap();
+    let child = initialize_linked_fix(&r.0).unwrap();
+    let nested = initialize_named_fix(&child, "nested").unwrap();
+    attempts::append(
+        &nested,
+        Event::Start {
+            id: "hunter".into(),
+            role: "hunter".into(),
+            identity: "h".into(),
+            context: "h".into(),
+            inputs: vec!["scope".into()],
+            outputs: vec!["result".into()],
+            isolation: "procedural".into(),
+        },
+    )
+    .unwrap();
+    for path in [&r.0, &child] {
+        assert!(omgs::cleanup::begin(path)
+            .unwrap_err()
+            .contains("active attempts"));
+        assert!(omgs::cleanup::finish(path)
+            .unwrap_err()
+            .contains("active attempts"));
+    }
+}

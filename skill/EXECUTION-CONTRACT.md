@@ -141,8 +141,9 @@ separate.
 
 A protected parent's linked fix is automatically marked `contract_required`, even if the caller
 omits the flag. It must lock its own approved contract for the changed revision and pass its own
-readiness/pilot. A failed parent pilot, unresolved stop/blocker, cleanup underway, or source-only
-parent refuses linked fixes. Existing fixes recheck the original and intermediate parents before
+readiness/pilot. A protected parent refuses linked fixes after failed pilots or
+unresolved stops/blockers, or with a source-only contract. Cleanup prohibits fixes for every parent.
+Existing fixes recheck the original and intermediate parents before
 dispatch, routing, proof admission and workload launch. A linked fix cannot clear its parent's stop.
 
 The automated source identity check compares Git HEAD, not working-tree contents. Uncommitted
@@ -169,3 +170,6 @@ Cleanup begin and finish check active proof records across the entire registered
 including nested fixes and uncertain proofs, under the shared family lock. Resolve each proof in
 its owning run before removing shared resources. The three-call hunter reserve applies to pilot
 and review dispatch alike and includes proof charges and linked-run spending.
+
+Cleanup also refuses while any registered family member has an active agent attempt. Unmarked
+legacy parents retain their prior stop/blocker behavior; protected parent gates remain enforced.
