@@ -245,6 +245,13 @@ pub fn charge_proof(run: &Path) -> Result<(), String> {
 }
 
 fn charge_proof_checked(run: &Path, after_check: impl FnOnce()) -> Result<(), String> {
+    charge_proof_admitted(run, after_check, None)
+}
+fn charge_proof_admitted(
+    run: &Path,
+    after_check: impl FnOnce(),
+    admission: Option<(&str, Option<&Path>, Option<&str>)>,
+) -> Result<(), String> {
     let run = run_path(run)?;
     let root = original(&run)?;
     runmeta::with_lock(&root, || {
@@ -286,6 +293,20 @@ fn charge_proof_checked(run: &Path, after_check: impl FnOnce()) -> Result<(), St
                     "run budget exhausted: cumulative original and fix allowance consumed".into(),
                 );
             }
+            check_fix_parent_locked(&run, &meta, true)?;
+            crate::contract::check_proof(&meta)?;
+            if let Some((token, target, expected_head)) = admission {
+                crate::contract::check_proof_target(&meta, target, expected_head)?;
+                let slots = meta
+                    .entry("active_proofs")
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .ok_or("active_proofs must be an object")?;
+                if slots.contains_key(token) {
+                    return Err("proof admission token already used".into());
+                }
+                slots.insert(token.into(),serde_json::json!({"state":"preparing","admitted_at":runmeta::timestamp(runmeta::now_ms())}));
+            }
             charge(&mut meta)?;
             runmeta::write_atomic(
                 &run.join(runmeta::FILE),
@@ -308,8 +329,14 @@ pub fn init_fix(
     init: impl FnOnce(&Path, &Map<String, Value>, Option<u64>) -> Result<PathBuf, String>,
 ) -> Result<PathBuf, String> {
     let root = original(parent)?;
-    runmeta::with_lock(&root, || {
+    with_family_lock(parent, || {
         let mut meta = read_run(&root)?;
+        let root_requires = crate::contract::fix_parent(&meta)?;
+        let parent_meta = read_run(&run_path(parent)?)?;
+        check_fix_parent_locked(parent, &parent_meta, false)?;
+        let parent_requires = crate::contract::fix_parent(&parent_meta)?;
+        let fix_parent_id = run_id(&parent_meta)?.to_owned();
+        let require_contract = root_requires || parent_requires;
         let cap = family_cap(&root)?;
         let used = allowance(&root)?.calls_and_proofs_used;
         let remaining = cap.map(|cap| cap.saturating_sub(used));
@@ -324,6 +351,10 @@ pub fn init_fix(
                 let mut m = read_run(&child)?;
                 if run_id(&m)? != child_id {
                     return Err("linked run identity changed during registration".into());
+                }
+                m.insert("fix_parent_id".into(), Value::from(fix_parent_id.clone()));
+                if require_contract {
+                    m.insert("contract_required".into(), Value::Bool(true));
                 }
                 m.insert(
                     "budget_parent".into(),
@@ -444,6 +475,219 @@ pub fn summary_proposed_locked(
     ))
 }
 
+/// Called under the family lock, including at workload launch after preparation.
+pub fn check_fix_parent_locked(
+    run: &Path,
+    m: &Map<String, Value>,
+    require_locked: bool,
+) -> Result<(), String> {
+    check_family_open_locked(run, m)?;
+    let root = original(run)?;
+    if root == run_path(run)? {
+        return Ok(());
+    }
+    let root_meta = read_run(&root)?;
+    let root_id = run_id(&root_meta)?;
+    let mut protected = crate::contract::fix_parent(&root_meta)?;
+    let registered = fix_runs(&root_meta, root.parent().ok_or("root needs parent")?)?;
+    let mut seen = std::collections::BTreeSet::new();
+    seen.insert(run_id(m)?.to_owned());
+    let mut ancestor = m.clone();
+    while let Some(value) = ancestor.get("fix_parent_id") {
+        let id = value
+            .as_str()
+            .ok_or("fix_parent_id must be a string")?
+            .to_owned();
+        if id == root_id {
+            break;
+        }
+        if !seen.insert(id.clone()) {
+            return Err("fix parent lineage contains a cycle".into());
+        }
+        let registered_parent = registered
+            .iter()
+            .find(|r| r.run_id == id)
+            .ok_or("fix parent identity is not registered")?;
+        ancestor = read_run(&registered_parent.path)?;
+        if run_id(&ancestor)? != id {
+            return Err("fix parent identity changed".into());
+        }
+        protected |= crate::contract::fix_parent(&ancestor)?;
+    }
+    if protected && require_locked && crate::contract::load(m)?.is_none() {
+        return Err("fix run requires its own locked execution contract".into());
+    }
+    Ok(())
+}
+
+/// Caller holds the family lock. Include both proofs and calls, plus linked runs.
+pub(crate) fn remaining_locked(run: &Path, m: &Map<String, Value>) -> Result<Option<u64>, String> {
+    let family = allowance(&original(run)?)?.remaining;
+    let local = m
+        .get("budget_agent_calls")
+        .and_then(Value::as_u64)
+        .map(|cap| {
+            cap.saturating_sub(
+                m.get("agent_calls_used")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(
+                        m.get("proof_runs_used")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    ),
+            )
+        });
+    Ok(match (family, local) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    })
+}
+
+/// An admitted proof holds cleanup closed through preparation, execution and publication.
+/// A process crash or uncertain execution leaves its record active for host investigation.
+pub struct ProofAdmission {
+    run: std::path::PathBuf,
+    token: String,
+    expected_head: Option<String>,
+    started: std::cell::Cell<bool>,
+    finished: std::cell::Cell<bool>,
+}
+impl ProofAdmission {
+    pub fn admit(
+        run: &Path,
+        target: Option<&Path>,
+        expected_head: Option<&str>,
+    ) -> Result<Self, String> {
+        let token = crate::platform::random_nonce().map_err(|e| e.to_string())?;
+        charge_proof_admitted(run, || {}, Some((&token, target, expected_head)))?;
+        Ok(Self {
+            run: run.to_path_buf(),
+            token,
+            expected_head: expected_head.map(str::to_owned),
+            started: std::cell::Cell::new(false),
+            finished: std::cell::Cell::new(false),
+        })
+    }
+    /// Called after sandbox preparation and before each workload launch, including fallback.
+    pub fn start(&self, target: Option<&Path>) -> Result<(), String> {
+        runmeta::update(&self.run, |m| {
+            check_fix_parent_locked(&self.run, m, true)?;
+            crate::contract::check_proof_target(m, target, self.expected_head.as_deref())?;
+            let slot = m
+                .get_mut("active_proofs")
+                .and_then(Value::as_object_mut)
+                .and_then(|v| v.get_mut(&self.token))
+                .ok_or("proof admission disappeared")?;
+            *slot = serde_json::json!({"state":"running","started_at":runmeta::timestamp(runmeta::now_ms())});
+            Ok(())
+        })?;
+        self.started.set(true);
+        Ok(())
+    }
+    /// Call only after the runner reports no execution or certified complete cleanup.
+    pub fn finish(&self) -> Result<(), String> {
+        runmeta::update(&self.run, |m| {
+            let slots = m
+                .get_mut("active_proofs")
+                .and_then(Value::as_object_mut)
+                .ok_or("proof admissions missing")?;
+            slots
+                .remove(&self.token)
+                .ok_or("proof admission disappeared")?;
+            Ok(())
+        })?;
+        self.finished.set(true);
+        Ok(())
+    }
+}
+impl Drop for ProofAdmission {
+    fn drop(&mut self) {
+        if !self.started.get() && !self.finished.get() {
+            let _ = self.finish();
+        }
+    }
+}
+/// A cleanup marker on any member is the family admission barrier. All writers
+/// and callers hold the root lock, so checking and admitting cannot race begin.
+pub(crate) fn check_family_open_locked(
+    run: &Path,
+    current: &Map<String, Value>,
+) -> Result<(), String> {
+    let root = original(run)?;
+    let current_path = run_path(run)?;
+    let root_meta = read_run(&root)?;
+    allowance(&root)?;
+    let mut paths = vec![root.clone()];
+    paths.extend(
+        fix_runs(&root_meta, root.parent().ok_or("root needs parent")?)?
+            .into_iter()
+            .map(|r| r.path),
+    );
+    for path in paths {
+        let stored;
+        let meta = if path == current_path {
+            current
+        } else {
+            stored = read_run(&path)?;
+            &stored
+        };
+        if meta.contains_key("cleanup_started_at") || meta.contains_key("cleanup_receipt") {
+            return Err("family cleanup is closing; new work refused".into());
+        }
+    }
+    Ok(())
+}
+
+/// Caller holds the family lock. Nested fixes are registered directly at the root.
+/// Active agent attempts return an error; active proofs return true.
+pub(crate) fn family_active_proofs_locked(
+    run: &Path,
+    current: &Map<String, Value>,
+) -> Result<bool, String> {
+    let root = original(run)?;
+    let current_path = run_path(run)?;
+    let root_meta = read_run(&root)?;
+    // Validate every identity/link before relying on the family inventory.
+    allowance(&root)?;
+    let mut paths = vec![root.clone()];
+    paths.extend(
+        fix_runs(&root_meta, root.parent().ok_or("root needs parent")?)?
+            .into_iter()
+            .map(|r| r.path),
+    );
+    for path in paths {
+        let stored;
+        let meta = if path == current_path {
+            current
+        } else {
+            stored = read_run(&path)?;
+            &stored
+        };
+        if crate::attempts::states(&crate::attempts::history(meta)?)?
+            .values()
+            .any(|a| a.state == "active")
+        {
+            return Err("stop or complete active attempts across the family before cleanup".into());
+        }
+        let active = active_proofs(meta)?;
+        if active {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(crate) fn active_proofs(m: &Map<String, Value>) -> Result<bool, String> {
+    match m.get("active_proofs") {
+        None => Ok(false),
+        Some(v) => Ok(!v
+            .as_object()
+            .ok_or("active_proofs must be an object")?
+            .is_empty()),
+    }
+}
+
 #[cfg(test)]
 mod regressions {
     use super::*;
@@ -482,6 +726,40 @@ mod regressions {
         )
         .unwrap();
         (dir, root, child)
+    }
+
+    #[test]
+    fn reserve_uses_family_proofs_and_local_cap() {
+        let (dir, root, child) = family("contract-reserve");
+        runmeta::update(&root, |m| {
+            m.insert("budget_agent_calls".into(), json!(12));
+            m.insert("agent_calls_used".into(), json!(3));
+            m.insert("proof_runs_used".into(), json!(3));
+            Ok(())
+        })
+        .unwrap();
+        runmeta::update(&child, |m| {
+            m.insert("budget_agent_calls".into(), json!(12));
+            m.insert("proof_runs_used".into(), json!(3));
+            Ok(())
+        })
+        .unwrap();
+        with_family_lock(&root, || {
+            assert_eq!(remaining_locked(&root, &read_run(&root)?)?, Some(3));
+            Ok(())
+        })
+        .unwrap();
+        runmeta::update(&child, |m| {
+            m.insert("budget_agent_calls".into(), json!(4));
+            Ok(())
+        })
+        .unwrap();
+        with_family_lock(&child, || {
+            assert_eq!(remaining_locked(&child, &read_run(&child)?)?, Some(1));
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

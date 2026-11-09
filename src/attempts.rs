@@ -213,6 +213,25 @@ pub fn append(run: &Path, event: Event) -> Result<AppendOutcome, String> {
                 return Ok(AppendOutcome::AlreadyRecorded);
             }
         }
+        if matches!(&event, Event::Start { .. } | Event::Dispatch { .. }) {
+            crate::budget::check_family_open_locked(run, m)?;
+        }
+        if m.contains_key("cleanup_started_at")
+            && matches!(&event, Event::Start { .. } | Event::Dispatch { .. })
+        {
+            return Err("run is closing; new attempts and dispatch refused".into());
+        }
+        if let Event::Dispatch { id, .. } = &event {
+            crate::contract::check_dispatch(run, m, id)?;
+            if m.get("execution_bindings")
+                .and_then(|v| v.get(id))
+                .and_then(|v| v.get("phase"))
+                .and_then(Value::as_str)
+                == Some("pilot")
+            {
+                m.remove("pilot");
+            }
+        }
         let dispatch = matches!(&event, Event::Dispatch { .. });
         h.push(Record {
             at: crate::runmeta::timestamp(crate::runmeta::now_ms()),
@@ -243,6 +262,9 @@ pub fn append(run: &Path, event: Event) -> Result<AppendOutcome, String> {
                 );
         }
         let stopped = matches!(h.last().map(|r| &r.record), Some(Event::Stop { .. }));
+        if stopped {
+            m.remove("pilot");
+        }
         m.insert(
             "run_status".into(),
             json!(if stopped { "partial" } else { "in_progress" }),

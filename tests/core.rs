@@ -101,6 +101,7 @@ fn html_report_escapes_target_content() {
     let html = render_html(
         &file,
         &ReportMeta {
+            execution_contract: Vec::new(),
             repo: "x".into(),
             source_ref: "abc".into(),
             mode: "gate".into(),
@@ -248,6 +249,7 @@ fn markdown_report_shows_rejected_and_pending_evidence() {
     let md = render_markdown(
         &file,
         &ReportMeta {
+            execution_contract: Vec::new(),
             repo: "x".into(),
             source_ref: "abc".into(),
             mode: "advisory".into(),
@@ -277,6 +279,7 @@ fn markdown_report_shows_rejected_and_pending_evidence() {
 
 fn meta() -> ReportMeta {
     ReportMeta {
+        execution_contract: Vec::new(),
         repo: "acme/shop".into(),
         source_ref: "abc123".into(),
         mode: "advisory".into(),
@@ -408,6 +411,7 @@ fn html_escapes_hostile_strings_end_to_end() {
         findings: vec![f, q],
     };
     let hostile_meta = ReportMeta {
+        execution_contract: Vec::new(),
         repo: "<script>alert(9)</script>".into(),
         source_ref: "\"><img src=x>".into(),
         mode: "<b>gate</b>".into(),
@@ -585,6 +589,7 @@ fn report_shows_run_metadata_or_not_recorded() {
 
     // Nothing recorded renders each value as "not recorded".
     let bare = ReportMeta {
+        execution_contract: Vec::new(),
         repo: "x".into(),
         source_ref: "abc".into(),
         mode: "advisory".into(),

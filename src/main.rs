@@ -17,6 +17,7 @@ fn boolean_option(name: &str) -> bool {
         "--replace",
         "--verify-mxc",
         "--no-sensors",
+        "--require-contract",
         "--screenshots",
         "--live",
         "--help",
@@ -119,13 +120,13 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
         "install-self" => ("--to --staging --binary --binary-sha256 --mxc --mxc-sha256 --license --license-sha256", false),
         "identity" => ("--skill-dir", false),
         "artifact-check" => ("--run --path", false),
-        "review" => ("--skill-dir --repo-url --mode --budget --no-sensors --persona --out --clone-root", false),
+        "review" => ("--require-contract --skill-dir --repo-url --mode --budget --no-sensors --persona --out --clone-root", false),
         "audit" if args.first().is_some_and(|a| a == "init") => (
-            "--skill-dir --target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of --clone-root",
+            "--require-contract --skill-dir --target --base --out --mode --budget --no-sensors --hunter --verifier --persona --fix-of --clone-root",
             true,
         ),
         "batch" if args.first().is_some_and(|a| a == "init") => {
-            ("--skill-dir --list --out --mode --budget --no-sensors --persona --clone-root", true)
+            ("--require-contract --skill-dir --list --out --mode --budget --no-sensors --persona --clone-root", true)
         }
         "batch" if args.first().is_some_and(|a| a == "index") => ("--batch --out", true),
         "bench" if args.first().is_some_and(|a| a == "score") => ("--cases --runs", true),
@@ -160,6 +161,7 @@ fn validate_options(cmd: &str, args: &[String]) -> Result<bool, String> {
             "--run --stage --state --label --parent --detail --counter --log --accounting",
             false,
         ),
+        "contract" | "cleanup" => ("--run --from", true),
         "attempt" => ("--run --event --resolve-blocker --actor --reason --replacement", false),
         "watch" => ("--run --max-ms", false),
         "route" => ("--run --role --refused --reason --models --model", false),
@@ -296,6 +298,8 @@ fn main() -> ExitCode {
         "critic" => cmd_critic(rest),
         "budget" => cmd_budget(rest),
         "batch" => cmd_batch(rest),
+        "contract" => cmd_contract(rest),
+        "cleanup" => cmd_cleanup(rest),
         "attempt" => cmd_attempt(rest),
         "status" => cmd_status(rest),
         "watch" => cmd_watch(rest),
@@ -1055,12 +1059,15 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         }
     }
     omgs::supervise::check_interrupted().map_err(|e| e.to_string())?;
+    let mut admission = None;
     let proof_dir = match &run {
         Some(r) => {
             // Check and charge the budget in one locked step, before anything
             // runs, so concurrent proofs cannot overspend it. A run that is
             // interrupted keeps its charge; a blocked one gets it back below.
-            let charged = omgs::budget::charge_proof(r);
+            let charged =
+                omgs::budget::ProofAdmission::admit(r, target.as_deref(), target_head.as_deref())
+                    .map(|guard| admission = Some(guard));
             if let Err(e) = charged {
                 if e.starts_with("run budget exhausted") {
                     omgs::out::err(&format!(
@@ -1185,9 +1192,12 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
         ));
     }
     let started_at_ms = omgs::runmeta::now_ms();
-    let result = match prove(&request) {
+    let result = match omgs::sandbox::prove_admitted(&request, admission.as_ref()) {
         ProveOutcome::Blocked { reason } => {
             release();
+            if let Some(admission) = &admission {
+                admission.finish()?;
+            }
             omgs::out::err(&format!(
                 "needs_validation: target code was not executed. {}",
                 omgs::platform::escape_controls(&reason)
@@ -1289,6 +1299,11 @@ fn cmd_prove(args: &[String]) -> Result<(), String> {
             p
         }
     };
+    if s.cleanup_complete {
+        if let Some(admission) = &admission {
+            admission.finish()?;
+        }
+    }
     omgs::out::text(&record.output);
     omgs::out::err(&format!(
         "sandbox: MXC {} ({}), executor {} sha256 {}",
@@ -2022,6 +2037,9 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
         &supplied_models,
         &publication,
         |saved, writes| {
+            for (role, model) in &supplied_models {
+                omgs::contract::check_model(saved, role, model)?;
+            }
             submission.apply(saved)?;
             omgs::runmeta::check_numeric_fields(saved)?;
             let saved = saved.clone();
@@ -2144,6 +2162,7 @@ fn cmd_report(args: &[String]) -> Result<(), String> {
                 source_ref: defaulted(None, "source_ref", "working tree"),
                 mode: defaulted(flag(args, "--mode"), "mode", "advisory"),
                 sandbox: defaulted(None, "sandbox", "not recorded"),
+                execution_contract: omgs::contract::describe(&saved)?,
                 artifact_base: String::new(),
                 review_limits: Vec::new(),
                 timeline: Vec::new(),
@@ -2693,6 +2712,9 @@ fn audit_init(rest: &[String]) -> Result<PathBuf, String> {
     let run = audit_init_selected(rest)?;
     admit_bundle_cache(&fences)?;
     omgs::runmeta::update(&run, |meta| {
+        if has(rest, "--require-contract") {
+            meta.insert("contract_required".into(), serde_json::json!(true));
+        }
         meta.insert("skill_dir".into(), serde_json::json!(skill));
         meta.insert("skill_identity".into(), omgs::setup::identity());
         Ok(())
@@ -3741,6 +3763,9 @@ fn init_args(dest: &Path, args: &[String], out: Option<&Path>) -> Vec<String> {
         v.push("--out".into());
         v.push(o.to_string_lossy().to_string());
     }
+    if has(args, "--require-contract") {
+        v.push("--require-contract".into());
+    }
     if has(args, "--no-sensors") {
         v.push("--no-sensors".into());
     }
@@ -4140,6 +4165,11 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
         let labels = omgs::route::parse_identities(&[format!("{role}={label}")])?;
         omgs::runmeta::update(&run, |m| {
             omgs::batch::check_meta_types(m)?;
+            omgs::budget::check_fix_parent_locked(&run, m, true)?;
+            omgs::contract::require_if_marked(m)?;
+            for (role, value) in &labels {
+                omgs::contract::check_model(m, role, value)?;
+            }
             let saved = m
                 .entry("models")
                 .or_insert_with(|| serde_json::json!({}))
@@ -4178,6 +4208,8 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
     // Read the refusal history, pick the next model, and record the result in
     // one locked transaction, so concurrent reroutes never lose an entry.
     let next = omgs::runmeta::update(&run, |m| {
+        omgs::budget::check_fix_parent_locked(&run, m, true)?;
+        omgs::contract::require_if_marked(m)?;
         // Malformed history must stop the command: silently ignoring it would
         // forget earlier refusals and send work back to a refusing model.
         omgs::batch::check_meta_types(m)?;
@@ -4215,7 +4247,18 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
                 refused.push(model.clone());
             }
         }
-        let next = if default_route && !refused.is_empty() {
+        let locked = omgs::contract::load(m)?;
+        let is_locked = locked.is_some();
+        let next = if let Some(c) = locked {
+            if !refused.is_empty() {
+                Err("locked contract forbids fallback after refusal".into())
+            } else {
+                c.roles
+                    .get(&role)
+                    .map(|e| e.model.clone())
+                    .ok_or_else(|| "role absent from execution contract".to_string())
+            }
+        } else if default_route && !refused.is_empty() {
             Err(format!(
                 "no configured fallback for role '{role}' after refusal; keep the blocker recorded"
             ))
@@ -4255,6 +4298,7 @@ fn cmd_route(args: &[String]) -> Result<(), String> {
                     obj.insert(role.clone(), serde_json::json!(model));
                 }
             }
+            Err(_) if is_locked && newly.is_none() => {}
             Err(e) => {
                 let count = m
                     .get("blocker_events")
@@ -4408,6 +4452,68 @@ fn cmd_intent(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err("usage: omgs intent list [--stack <s>] [--attack-class <c>] | omgs intent answer --target <repo> --id <id> --answer <text> --source <who> [--scope repo|<path>]".into()),
+    }
+}
+
+fn cmd_cleanup(args: &[String]) -> Result<(), String> {
+    let run = PathBuf::from(flag(args, "--run").ok_or("cleanup requires --run")?);
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or("cleanup requires register, release, resolve-proof, begin, finish or show")?;
+    if ["begin", "finish", "show"].contains(&action) {
+        if flag(args, "--from").is_some() {
+            return Err("this cleanup action does not accept --from".into());
+        }
+        return match action {
+            "begin" => omgs::cleanup::begin(&run),
+            "finish" => omgs::cleanup::finish(&run),
+            _ => {
+                omgs::out::line(
+                    &serde_json::to_string_pretty(&omgs::cleanup::show(&run)?)
+                        .map_err(|e| e.to_string())?,
+                );
+                Ok(())
+            }
+        };
+    }
+    let path = flag(args, "--from").ok_or("cleanup resource action requires --from")?;
+    let value = omgs::shape::strict_json(&omgs::run_artifact::text_path(
+        Path::new(&path),
+        omgs::run_artifact::METADATA_BYTES,
+    )?)?;
+    match action {
+        "register" => omgs::cleanup::register(&run, omgs::contract::decode(value)?),
+        "release" => omgs::cleanup::release(&run, omgs::contract::decode(value)?),
+        "resolve-proof" => omgs::cleanup::resolve_proof(&run, omgs::contract::decode(value)?),
+        _ => Err("unknown cleanup action".into()),
+    }
+}
+
+fn cmd_contract(args: &[String]) -> Result<(), String> {
+    let run = PathBuf::from(flag(args, "--run").ok_or("contract requires --run")?);
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or("contract requires lock, readiness, bind, pilot or show")?;
+    if action == "show" {
+        if flag(args, "--from").is_some() {
+            return Err("show does not accept --from".into());
+        }
+        let meta = omgs::runmeta::read(&run)?;
+        let contract = omgs::contract::load(&meta)?.ok_or("no execution contract locked")?;
+        omgs::out::line(&serde_json::to_string_pretty(&contract).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+    let path = flag(args, "--from").ok_or("contract update requires --from <json>")?;
+    let text = omgs::run_artifact::text_path(Path::new(&path), omgs::run_artifact::METADATA_BYTES)?;
+    let value = omgs::shape::strict_json(&text)?;
+    match action {
+        "lock" => omgs::contract::lock(&run, omgs::contract::decode(value)?),
+        "readiness" => omgs::contract::readiness(&run, omgs::contract::decode(value)?),
+        "bind" => omgs::contract::bind(&run, omgs::contract::decode(value)?),
+        "pilot" => omgs::contract::accept_pilot(&run, omgs::contract::decode(value)?),
+        _ => Err("unknown contract action".into()),
     }
 }
 
@@ -4822,6 +4928,17 @@ mod cli_tests {
         ("ledger", "set"),
         ("critic", ""),
         ("budget", ""),
+        ("contract", "lock"),
+        ("contract", "readiness"),
+        ("contract", "bind"),
+        ("contract", "pilot"),
+        ("contract", "show"),
+        ("cleanup", "register"),
+        ("cleanup", "release"),
+        ("cleanup", "resolve-proof"),
+        ("cleanup", "begin"),
+        ("cleanup", "finish"),
+        ("cleanup", "show"),
         ("attempt", ""),
         ("status", ""),
         ("watch", ""),

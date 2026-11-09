@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pilot",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "hunter": {
+      "type": "string",
+      "minLength": 1
+    },
+    "verifier": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evaluator": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_accuracy": {
+      "type": "boolean"
+    },
+    "counterevidence": {
+      "type": "boolean"
+    },
+    "structured_output": {
+      "type": "boolean"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "proof_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "hunter",
+    "verifier",
+    "evaluator",
+    "source_accuracy",
+    "counterevidence",
+    "structured_output",
+    "evidence"
+  ]
+}

@@ -1,5 +1,9 @@
 # Budgets and routing
 
+New reviews follow [the locked execution agreement](EXECUTION-CONTRACT.md). A locked run never
+selects fallback providers/models after refusal; record the stop and preserve it. The routing
+configuration below remains available for legacy runs and cannot override a locked contract.
+
 ### Model routing on refusal
 
 A model may refuse security review work mid-task. Configure an ordered model list per role in

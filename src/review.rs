@@ -196,6 +196,11 @@ impl View {
                 findings: vec![finding.clone()],
             };
             let mut errors = crate::attempts::finding_gaps_for(&saved, &one)?;
+            if crate::contract::load(&saved)?.is_some_and(|c| c.verification == "source_only")
+                && finding.proof_tier != crate::model::ProofTier::Traced
+            {
+                errors.push("source-only contract cannot credit runtime proof".into());
+            }
             let proofs = crate::proof::validate_proofs(&one, run);
             proof_errors.extend(proofs.clone());
             errors.extend(proofs);
@@ -207,6 +212,7 @@ impl View {
         let attempt_gaps = crate::attempts::gaps(&saved)?;
         let mut meta = ReportMeta {
             review_limits: attempt_gaps.clone(),
+            execution_contract: crate::contract::describe(&saved)?,
             timeline: read(
                 crate::report::timeline_document(&progress),
                 crate::status::FILE,
@@ -215,6 +221,7 @@ impl View {
             )?,
             ..Default::default()
         };
+        meta.review_limits.extend(crate::contract::gaps(&saved)?);
         meta.review_limits
             .extend(crate::model::validate_drafts(&raw));
         meta.review_limits
@@ -383,6 +390,8 @@ impl View {
 
     /// Carry the canonical completion inputs into a format renderer.
     pub fn apply(&self, meta: &mut ReportMeta) {
+        meta.execution_contract
+            .clone_from(&self.meta.execution_contract);
         meta.review_limits.clone_from(&self.meta.review_limits);
         meta.timeline = self.meta.timeline.clone();
         meta.coverage.clone_from(&self.meta.coverage);

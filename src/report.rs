@@ -32,6 +32,7 @@ pub struct ReportMeta {
     pub critic: Option<CriticReport>,
     /// Model per role, for example "hunter: model-a", from run metadata.
     pub models: Vec<String>,
+    pub execution_contract: Vec<String>,
     /// Recorded reroutes after a refusal, one line each.
     pub reroutes: Vec<String>,
     /// The reviewer's recorded intent answers for this run.
@@ -222,6 +223,7 @@ fn push_intent(out: &mut String, meta: &ReportMeta, f: &Finding) {
 
 fn models_text(meta: &ReportMeta) -> Option<String> {
     let mut parts = Vec::new();
+    parts.extend(meta.execution_contract.clone());
     if !meta.models.is_empty() {
         parts.push(meta.models.join(", "));
     }
@@ -1777,6 +1779,9 @@ pub fn publish_prepared(
             }
             m.insert("agent_calls_used".into(), serde_json::json!(n));
         }
+        for (role, model) in models {
+            crate::contract::check_model(m, role, model)?;
+        }
         let saved = m
             .entry("models")
             .or_insert_with(|| serde_json::json!({}))
@@ -1799,6 +1804,7 @@ pub fn publish_prepared(
             }
             labels.insert((*key).into(), serde_json::json!(value));
         }
+        crate::contract::check_publication(m)?;
         crate::runmeta::check_numeric_fields(m)?;
         let completion = render(m, &mut writes)?;
         if let Some(n) = completion.hunters {
