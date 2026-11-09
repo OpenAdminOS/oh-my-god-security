@@ -1079,3 +1079,87 @@ fn lock_reconciles_preexisting_route_labels_atomically() {
         }
     }
 }
+
+#[test]
+fn saved_publication_revision_cannot_contradict_contract() {
+    let r = Run::new();
+    let publish = |labels: std::collections::BTreeMap<&str, String>| {
+        omgs::report::publish(Some(&r.0), Some(0), &Default::default(), &labels, |_| {
+            Ok(omgs::report::Completion {
+                hunters: None,
+                verifier: None,
+                complete: false,
+            })
+        })
+    };
+    publish(std::collections::BTreeMap::from([(
+        "source_ref",
+        "other".into(),
+    )]))
+    .unwrap();
+    let before = omgs::runmeta::read(&r.0).unwrap();
+    assert!(contract::lock(&r.0, r.contract())
+        .unwrap_err()
+        .contains("publication source"));
+    assert_eq!(omgs::runmeta::read(&r.0).unwrap(), before);
+    publish(std::collections::BTreeMap::from([(
+        "source_ref",
+        "abc".into(),
+    )]))
+    .unwrap();
+    contract::lock(&r.0, r.contract()).unwrap();
+    publish(Default::default()).unwrap();
+    assert!(publish(std::collections::BTreeMap::from([(
+        "source_ref",
+        "other".into()
+    )]))
+    .unwrap_err()
+    .contains("publication source"));
+    // A conflicting saved record is refused even without proposed labels.
+    omgs::runmeta::update(&r.0, |m| {
+        m.insert("publication".into(), json!({"source_ref":"other"}));
+        Ok(())
+    })
+    .unwrap();
+    assert!(publish(Default::default())
+        .unwrap_err()
+        .contains("publication source"));
+}
+
+#[test]
+fn contract_and_cleanup_action_help_include_usage() {
+    for (cmd, actions) in [
+        (
+            "contract",
+            vec!["lock", "readiness", "bind", "pilot", "show"],
+        ),
+        (
+            "cleanup",
+            vec![
+                "register",
+                "release",
+                "resolve-proof",
+                "begin",
+                "finish",
+                "show",
+            ],
+        ),
+    ] {
+        for action in actions {
+            let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+                .args([cmd, action, "--help"])
+                .output()
+                .unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success());
+            assert!(
+                text.contains(&format!("omgs {cmd} {action} --run")),
+                "{text}"
+            );
+        }
+    }
+}

@@ -163,6 +163,7 @@ pub fn lock(run: &Path, c: Contract) -> Result<(), String> {
                 check_model(m, role, model)?;
             }
         }
+        check_publication(m)?;
         m.insert(
             "contract_locked_at".into(),
             json!(crate::runmeta::timestamp(crate::runmeta::now_ms())),
@@ -409,6 +410,20 @@ pub fn accept_pilot(run: &Path, p: Pilot) -> Result<(), String> {
         Ok(())
     })
 }
+pub fn check_publication(m: &Map<String, Value>) -> Result<(), String> {
+    if let Some(c) = load(m)? {
+        if let Some(saved) = m.get("publication") {
+            let labels = saved.as_object().ok_or("publication must be an object")?;
+            if let Some(source) = labels.get("source_ref") {
+                if source.as_str() != Some(c.source_ref.as_str()) {
+                    return Err("publication source differs from locked contract".into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn check_model(m: &Map<String, Value>, role: &str, model: &str) -> Result<(), String> {
     if let Some(c) = load(m)? {
         if c.roles.get(role).is_none_or(|e| e.model != model) {

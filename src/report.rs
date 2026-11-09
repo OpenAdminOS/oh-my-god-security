@@ -1790,14 +1790,6 @@ pub fn publish_prepared(
         for (role, model) in models {
             saved.insert(role.clone(), serde_json::json!(model));
         }
-        if let Some(c) = crate::contract::load(m)? {
-            if publication
-                .get("source_ref")
-                .is_some_and(|source| source != &c.source_ref)
-            {
-                return Err("publication source differs from locked contract".into());
-            }
-        }
         let labels = m
             .entry("publication")
             .or_insert_with(|| serde_json::json!({}))
@@ -1812,6 +1804,7 @@ pub fn publish_prepared(
             }
             labels.insert((*key).into(), serde_json::json!(value));
         }
+        crate::contract::check_publication(m)?;
         crate::runmeta::check_numeric_fields(m)?;
         let completion = render(m, &mut writes)?;
         if let Some(n) = completion.hunters {
