@@ -52,12 +52,15 @@ impl Run {
         .unwrap();
     }
     fn start(&self, id: &str, role: &str, phase: &str) {
+        self.start_as(id, role, phase, id);
+    }
+    fn start_as(&self, id: &str, role: &str, phase: &str, identity: &str) {
         attempts::append(
             &self.0,
             Event::Start {
                 id: id.into(),
                 role: role.into(),
-                identity: id.into(),
+                identity: identity.into(),
                 context: id.into(),
                 inputs: vec!["scope".into()],
                 outputs: vec!["result".into()],
@@ -996,4 +999,55 @@ fn proof_launch_rechecks_sibling_recovery_barrier() {
     assert!(pending.start(None).unwrap_err().contains("closing"));
     drop(pending);
     omgs::cleanup::finish(&child).unwrap();
+}
+
+#[test]
+fn pilot_rejects_case_and_whitespace_identity_aliases() {
+    for alias in ["Reviewer", " reviewer "] {
+        let r = Run::new();
+        contract::lock(&r.0, r.contract()).unwrap();
+        r.ready();
+        for (role, identity) in [
+            ("hunter", "reviewer"),
+            ("verifier", alias),
+            ("evaluator", "third"),
+        ] {
+            r.start_as(role, role, "pilot", identity);
+            r.dispatch(role, "1").unwrap();
+            attempts::append(
+                &r.0,
+                Event::Complete {
+                    id: role.into(),
+                    actor: "host".into(),
+                    reason: "done".into(),
+                },
+            )
+            .unwrap();
+        }
+        omgs::runmeta::write_atomic(&r.0.join("result.json"), "{}").unwrap();
+        let err = contract::accept_pilot(
+            &r.0,
+            contract::Pilot {
+                hunter: "hunter".into(),
+                verifier: "verifier".into(),
+                evaluator: "evaluator".into(),
+                source_accuracy: true,
+                counterevidence: true,
+                structured_output: true,
+                evidence: vec!["result.json".into()],
+                proof_ref: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("independent role identities"),
+            "{alias}: {err}"
+        );
+        assert!(omgs::runmeta::read(&r.0).unwrap().get("pilot").is_none());
+        r.start("review", "hunter", "review");
+        assert!(r
+            .dispatch("review", "1")
+            .unwrap_err()
+            .contains("pilot has not passed"));
+    }
 }

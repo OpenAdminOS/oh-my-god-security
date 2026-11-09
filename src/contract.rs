@@ -347,7 +347,9 @@ pub fn accept_pilot(run: &Path, p: Pilot) -> Result<(), String> {
             (&p.evaluator, "evaluator"),
         ] {
             let a = states.get(id).ok_or("pilot attempt missing")?;
-            if a.role != role || a.state != "complete" || !identities.insert(&a.identity) {
+            let identity = crate::model::identity(&Some(a.identity.clone()))
+                .ok_or("pilot requires nonempty independent role identities")?;
+            if a.role != role || a.state != "complete" || !identities.insert(identity) {
                 return Err("pilot requires three completed independent role identities".into());
             }
             let context = history
