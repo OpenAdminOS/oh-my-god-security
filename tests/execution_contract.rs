@@ -1051,3 +1051,31 @@ fn pilot_rejects_case_and_whitespace_identity_aliases() {
             .contains("pilot has not passed"));
     }
 }
+
+#[test]
+fn lock_reconciles_preexisting_route_labels_atomically() {
+    for model in ["cloud", "local"] {
+        let r = Run::new();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_omgs"))
+            .args(["route", "--role", "hunter", "--model", model, "--run"])
+            .arg(&r.0)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let result = contract::lock(&r.0, r.contract());
+        let meta = omgs::runmeta::read(&r.0).unwrap();
+        assert_eq!(meta["models"]["hunter"], json!(model));
+        if model == "cloud" {
+            assert!(result.unwrap_err().contains("model label/route differs"));
+            assert!(meta.get("execution_contract").is_none());
+            assert!(meta.get("contract_locked_at").is_none());
+        } else {
+            result.unwrap();
+            assert!(meta.get("execution_contract").is_some());
+        }
+    }
+}

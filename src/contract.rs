@@ -156,6 +156,13 @@ pub fn lock(run: &Path, c: Contract) -> Result<(), String> {
             "execution_contract".into(),
             serde_json::to_value(c).map_err(|e| e.to_string())?,
         );
+        if let Some(saved) = m.get("models") {
+            let labels = saved.as_object().ok_or("models must be an object")?;
+            for (role, value) in labels {
+                let model = value.as_str().ok_or("model label must be a string")?;
+                check_model(m, role, model)?;
+            }
+        }
         m.insert(
             "contract_locked_at".into(),
             json!(crate::runmeta::timestamp(crate::runmeta::now_ms())),
